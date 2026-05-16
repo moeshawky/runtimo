@@ -38,7 +38,7 @@ impl BackupManager {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::BackupError`](crate::Error::BackupError) if the backup
+    /// Returns [`crate::Error::BackupError`] if the backup
     /// directory cannot be created.
     pub fn new(backup_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&backup_dir)
@@ -61,7 +61,7 @@ impl BackupManager {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::BackupError`](crate::Error::BackupError) if the source
+    /// Returns [`crate::Error::BackupError`] if the source
     /// file does not exist or the copy fails.
     pub fn create_backup(&self, file_path: &Path, job_id: &str) -> Result<PathBuf> {
         if !file_path.exists() {
@@ -94,7 +94,7 @@ impl BackupManager {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::BackupError`](crate::Error::BackupError) if the backup
+    /// Returns [`crate::Error::BackupError`] if the backup
     /// file does not exist or the copy fails.
     pub fn restore(&self, backup_path: &Path, target_path: &Path) -> Result<()> {
         if !backup_path.exists() {

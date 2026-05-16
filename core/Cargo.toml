@@ -4,6 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+description = "Agent-centric capability runtime with telemetry, process tracking, and crash recovery for persistent machines"
+keywords = ["agent", "runtime", "telemetry", "capability", "recovery"]
+categories = ["os", "development-tools"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 serde.workspace = true

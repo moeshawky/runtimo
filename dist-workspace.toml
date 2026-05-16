@@ -1,0 +1,44 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.31.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = ["shell", "powershell"]
+# Target platforms to build apps for (Rust target-triple syntax)
+# Free tier runners: ubuntu-latest (x64), windows-latest, macos-latest (ARM), macos-13 (Intel)
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "x86_64-pc-windows-msvc",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+]
+# Which actions to run on pull requests
+pr-run-mode = "plan"
+# Whether to install an updater program
+install-updater = false
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Allow dirty CI (don't fail on out-of-date workflow)
+allow-dirty = ["ci"]
+
+# Custom runner mappings for GitHub free tier
+[dist.github-custom-runners]
+# Linux x64 — native on ubuntu-latest
+"x86_64-unknown-linux-gnu" = "ubuntu-latest"
+# Linux musl — native on ubuntu-latest
+"x86_64-unknown-linux-musl" = "ubuntu-latest"
+# Windows — native on windows-latest
+"x86_64-pc-windows-msvc" = "windows-latest"
+# macOS Intel — macos-13 is the last free Intel runner
+"x86_64-apple-darwin" = "macos-13"
+# macOS ARM — macos-latest is ARM-native
+"aarch64-apple-darwin" = "macos-latest"
+# Linux ARM — cross-compile from ubuntu-latest (zig is auto-detected)
+"aarch64-unknown-linux-gnu" = "ubuntu-latest"

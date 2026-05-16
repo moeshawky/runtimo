@@ -1,12 +1,13 @@
 [package]
-name = "runtimo"
+name = "runtimo-daemon"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
 
 [[bin]]
-name = "runtimo"
+name = "runtimo-daemon"
 path = "src/main.rs"
 
 [dependencies]

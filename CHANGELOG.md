@@ -5,6 +5,19 @@ All notable changes to Runtimo are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0] - 2026-05-16
+
+### Added
+
+- **Capability runtime** — Pluggable operations with name, schema, validate, execute
+- **Two-layer telemetry** — Hardware (CPU, RAM, disk, GPU/TPU, services, network) + Process snapshot (ps aux, zombies, top consumers)
+- **Resource guards** — llmosafe circuit breaker reads /proc/stat and /proc/self/status
+- **Write-ahead log** — Append-only, fsync'd event log for crash recovery
+- **Backup/undo** — Files backed up before mutation, rollback by job ID
+- **CLI** — run, list, status, logs, undo, telemetry, processes commands
+- **Daemon** — Unix socket JSON-RPC server for remote capability execution
+- **Unified path validation** — Single validate_path() module prevents path traversal and symlink attacks
+
 ## [0.1.0-alpha.2] - 2026-05-16
 
 ### Security Fixes

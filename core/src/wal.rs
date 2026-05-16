@@ -205,7 +205,7 @@ impl WalReader {
 
     /// Reads only the last `n` lines from the WAL file.
     ///
-    /// More efficient than [`load`] when only recent events are needed.
+    /// More efficient than [`WalReader::load`] when only recent events are needed.
     /// Malformed lines are silently skipped.
     ///
     /// # Errors

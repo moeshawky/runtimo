@@ -84,7 +84,7 @@ impl FileWrite {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::BackupError`](crate::Error::BackupError) if the backup
+    /// Returns [`crate::Error::BackupError`] if the backup
     /// directory cannot be created.
     pub fn new(backup_dir: PathBuf) -> Result<Self> {
         Ok(Self {
