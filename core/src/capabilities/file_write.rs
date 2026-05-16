@@ -115,22 +115,22 @@ impl Capability for FileWrite {
     }
 
     /// Validates the path argument using unified validation module.
+    ///
+    /// Write operations use relaxed path validation: the file need not exist
+    /// (we create new files), but path traversal and prefix restrictions are
+    /// enforced to prevent writes to sensitive directories.
     fn validate(&self, args: &Value) -> Result<()> {
         let args: FileWriteArgs = serde_json::from_value(args.clone())
             .map_err(|e| Error::SchemaValidationFailed(e.to_string()))?;
 
-        // For FileWrite, we use a relaxed validation:
-        // - Empty path not allowed
-        // - No path traversal  
-        // - Path must be in allowed directories
-        // - File existence NOT required (we create new files)
-        
-        if args.path.is_empty() {
-            return Err(Error::SchemaValidationFailed("path is empty".into()));
-        }
-        if args.path.contains("..") {
-            return Err(Error::SchemaValidationFailed("path traversal not allowed".into()));
-        }
+        let ctx = PathContext {
+            require_exists: false,
+            require_file: false,
+            ..Default::default()
+        };
+
+        validate_path(&args.path, &ctx)
+            .map_err(Error::SchemaValidationFailed)?;
 
         Ok(())
     }
@@ -256,7 +256,7 @@ mod tests {
         );
 
         std::fs::remove_file(&target).ok();
-        std::fs::remove_dir_all(&test_backup_dir()).ok();
+        std::fs::remove_dir_all(test_backup_dir()).ok();
     }
 
     #[test]
@@ -278,7 +278,7 @@ mod tests {
         .expect("Execution failed");
 
         assert!(!target.exists());
-        std::fs::remove_dir_all(&test_backup_dir()).ok();
+        std::fs::remove_dir_all(test_backup_dir()).ok();
     }
 
     #[test]
@@ -291,6 +291,6 @@ mod tests {
             }))
             .unwrap_err();
         assert!(err.to_string().contains("traversal"));
-        std::fs::remove_dir_all(&test_backup_dir()).ok();
+        std::fs::remove_dir_all(test_backup_dir()).ok();
     }
 }

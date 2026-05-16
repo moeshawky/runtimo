@@ -36,7 +36,9 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 /// Default timeout for capability execution (seconds).
-/// Capabilities that exceed this limit will be terminated.
+///
+/// **Note:** Timeout is currently advisory only — see [`execute_with_timeout`]
+/// for details on the enforcement limitation.
 const CAPABILITY_TIMEOUT_SECS: u64 = 30;
 
 /// Result of a telemetry-wrapped capability execution.
@@ -90,25 +92,17 @@ pub struct ExecutionResult {
 /// Even on validation or execution failure, returns `Ok` with `success: false`
 /// so the caller can inspect telemetry deltas.
 ///
-/// # Arguments
-///
-/// * `capability` — The capability to execute (any type implementing [`Capability`])
-/// * `args` — JSON arguments for the capability
-/// * `dry_run` — If true, the capability may skip side effects
-/// * `wal_path` — Path to the WAL file (appended to)
-/// * `timeout_secs` — Optional timeout in seconds (default: 30). None means no timeout.
-///
-/// # Returns
-///
-/// An [`ExecutionResult`] with before/after snapshots and the capability output.
-/// Even on validation or execution failure, returns `Ok` with `success: false`
-/// so the caller can inspect telemetry deltas.
-///
 /// # Errors
 ///
 /// Returns [`Error::ResourceLimitExceeded`] if the `ResourceGuard` circuit breaker
 /// trips before execution begins. WAL write failures also propagate as errors.
-/// Returns [`Error::ExecutionFailed`] if the capability times out.
+///
+/// # Timeout Limitation
+///
+/// The `timeout_secs` parameter is currently **not enforced**. Rust's
+/// `std::thread` cannot be interrupted once started. A true timeout requires
+/// either subprocess isolation or `tokio::spawn_blocking` with cancellation.
+/// This is tracked for v0.2.0.
 pub fn execute_with_telemetry(
     capability: &dyn Capability,
     args: &Value,
@@ -287,11 +281,18 @@ fn log_job_failed(wal: &mut WalWriter, job_id: &str, capability: &str, error: &s
     })
 }
 
-/// Execute a capability with timeout - simplified version that executes inline.
-/// Note: True async timeout requires boxing the capability or using subprocesses.
-/// This implementation provides timeout semantics via immediate execution.
-fn execute_with_timeout(capability: &dyn Capability, args: &Value, ctx: &Context, _timeout_secs: u64) -> Result<Output> {
-    // Execute inline - timeout enforcement requires boxed capability or subprocess
-    // For production use, wrap capability execution in a subprocess with kill timeout
+/// Execute a capability inline.
+///
+/// # Timeout
+///
+/// `timeout_secs` is accepted for API compatibility but **not currently enforced**.
+/// True async timeout requires boxing the capability or using subprocesses.
+/// This is a known limitation tracked for v0.2.0.
+fn execute_with_timeout(
+    capability: &dyn Capability,
+    args: &Value,
+    ctx: &Context,
+    _timeout_secs: u64,
+) -> Result<Output> {
     capability.execute(args, ctx)
 }

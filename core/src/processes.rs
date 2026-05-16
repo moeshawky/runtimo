@@ -315,9 +315,17 @@ fn format_size(kb: u64) -> String {
 }
 
 /// Truncates a string to `max_len` characters, appending `"..."` if truncated.
+///
+/// Uses `char_indices()` for safe UTF-8 boundary slicing — never panics on
+/// multi-byte characters.
 fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() > max_len {
-        format!("{}...", &s[..max_len.saturating_sub(3)])
+    if s.chars().count() > max_len {
+        let end = max_len.saturating_sub(3);
+        let byte_end = s.char_indices()
+            .nth(end)
+            .map(|(i, _)| i)
+            .unwrap_or(s.len());
+        format!("{}...", &s[..byte_end])
     } else {
         s.to_string()
     }
@@ -329,7 +337,23 @@ mod tests {
     #[test]
     fn test_process_snapshot() {
         let snapshot = ProcessSnapshot::capture();
-        assert!(snapshot.processes.len() > 0);
+        assert!(!snapshot.processes.is_empty());
         assert!(snapshot.summary.total_processes > 0);
+    }
+
+    #[test]
+    fn test_truncate_ascii() {
+        assert_eq!(truncate("hello world", 8), "hello...");
+        assert_eq!(truncate("short", 10), "short");
+    }
+
+    #[test]
+    fn test_truncate_multibyte_utf8() {
+        // This must NOT panic — the old code panicked on multi-byte boundaries
+        let cjk = "你好世界这是一个很长的命令行参数"; // 15 CJK chars
+        let result = truncate(cjk, 8);
+        assert!(result.ends_with("..."));
+        // Should not panic and should be valid UTF-8
+        assert!(result.is_char_boundary(result.len()));
     }
 }

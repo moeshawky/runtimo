@@ -5,6 +5,54 @@ All notable changes to Runtimo are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-alpha.2] - 2026-05-16
+
+### Security Fixes
+
+- **P0: FileWrite validation bypass** — `FileWrite::validate()` now uses the unified `validate_path()` module
+  with `allowed_prefixes` enforcement. Previously, agents could write to arbitrary paths (`/etc/shadow`, etc.)
+  because the unified validation was imported but never called. (G-SEC-1)
+- **TOCTOU mitigation** — Path validation now canonicalizes the parent directory for non-existent
+  paths (write targets), catching symlink-based directory escapes. Added symlink escape test. (G-SEC-2)
+- **Prefix enforcement for writes** — Write operations now go through the same prefix check as reads
+  (`/tmp`, `/var/tmp`, `/home`). Previously, no prefix restriction existed. (G-SEC-3)
+
+### Bug Fixes
+
+- **WAL cleanup data duplication** — `WalWriter::cleanup()` now truncates the file before rewriting
+  retained events. Previously, it opened in append mode, doubling all retained entries. (G-EDGE-1)
+- **UTF-8 truncation panic** — `truncate()` in process reports now uses `char_indices()` for safe
+  slicing. Previously panicked on multi-byte character boundaries (CJK, emoji, Arabic). (G-EDGE-2)
+- **Daemon startup panic** — `DaemonState::new()` now returns `Result` instead of panicking with
+  `unwrap_or_else`. Backup directory or WAL directory creation failures are now graceful errors. (G-ERR-2)
+- **Undo path reconstruction** — Removed fragile fallback that guessed original file paths from
+  backup directory structure. Now returns a clear error if the WAL doesn't contain the original
+  path for a job. (G-CTX-2)
+
+### Improved
+
+- **Path deduplication** — CLI and daemon now use `runtimo_core::utils::{data_dir, wal_path, backup_dir}`
+  instead of duplicating the path logic in 3 locations. (G-CTX-1)
+- **WAL tail() performance** — Changed from `Vec::remove(0)` (O(n) shift) to `VecDeque::pop_front()`
+  (O(1) amortized) for the sliding window. (G-PERF-A)
+- **Timeout documentation** — Executor timeout limitation is now prominently documented as
+  "not currently enforced" with v0.2.0 tracking. Removed misleading duplicate docblock. (G-SEM-1)
+- **Documentation accuracy** — Fixed stale `schema() -> &str` signature (now `-> Value`),
+  fixed `FileWrite` examples to show constructor pattern, fixed license reference. (G-SEM-2)
+- **Clippy clean** — Zero clippy warnings (was 7): fixed `needless_borrows`, `len_zero`, `ptr_arg`,
+  removed unused imports.
+
+### Added
+
+- 6 new tests (52 total, up from 46):
+  - `test_truncate_ascii` / `test_truncate_multibyte_utf8` — UTF-8 safety verification
+  - `accepts_existing_tmp_file` — positive path validation
+  - `accepts_nonexistent_tmp_file_for_writes` — write path validation
+  - `rejects_write_outside_allowed` — prefix enforcement for writes
+  - `rejects_symlink_escape` — symlink attack prevention
+
+---
+
 ## [0.1.0-alpha] - 2026-05-16
 
 ### Added
@@ -76,7 +124,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **undo** - Restore files from backup by job ID
 
 #### Documentation
-- Unit tests (13 tests)
+- Unit tests (21 tests)
 - Integration tests (31 tests)
 - Doc tests (7 passing, 12 ignored)
 - Example programs: `basic_read`, `telemetry_demo`, `write_and_undo`
@@ -108,10 +156,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `jsonschema` - JSON Schema validation (via examples)
 
 #### Test Coverage
-- **13 unit tests** - Capability validation, execution, error handling
+- **21 unit tests** - Capability validation, execution, error handling, path security
 - **31 integration tests** - End-to-end workflows, security checks, edge cases
 - **7 doc tests** - API documentation examples
-- **Total: 51 tests passing**
+- **Total: 52 tests passing**
 
 ### Known Issues
 

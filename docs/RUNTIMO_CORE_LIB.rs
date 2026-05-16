@@ -20,7 +20,7 @@ Runtimo absorbs agent hallucinations through:
 ┌─────────────────────────────────────────┐
 │ Capability Trait                        │
 │ - name() -> &str                        │
-│ - schema() -> &str                      │
+│ - schema() -> Value                     │
 │ - validate(&Value) -> Result<()>        │
 │ - execute(&Value, &Context) -> Result<Output> │
 └─────────────────────────────────────────┘
@@ -66,7 +66,7 @@ Capabilities are pluggable operations that implement the [`Capability`] trait:
 ```rust
 pub trait Capability {
     fn name(&self) -> &'static str;
-    fn schema(&self) -> &'static str;
+    fn schema(&self) -> Value;
     fn validate(&self, args: &Value) -> Result<()>;
     fn execute(&self, args: &Value, ctx: &Context) -> Result<Output>;
 }
@@ -134,9 +134,9 @@ let result = execute_with_telemetry(&cap, &args, false, Path::new("/tmp/wal.json
 ```rust
 use runtimo_core::{FileWrite, Capability, execute_with_telemetry};
 use serde_json::json;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-let cap = FileWrite;
+let cap = FileWrite::new(PathBuf::from("/tmp/backups")).expect("backup dir");
 let args = json!({
     "path": "/tmp/hello.txt",
     "content": "hello runtimo"
@@ -149,9 +149,9 @@ let result = execute_with_telemetry(&cap, &args, false, Path::new("/tmp/wal.json
 ```rust
 use runtimo_core::{FileWrite, Capability, execute_with_telemetry};
 use serde_json::json;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-let cap = FileWrite;
+let cap = FileWrite::new(PathBuf::from("/tmp/backups")).expect("backup dir");
 let args = json!({"path": "/tmp/test.txt", "content": "test"});
 
 // Validate without executing
@@ -293,4 +293,4 @@ The `moe` CLI binary provides:
 
 # License
 
-MIT License
+Runtimo-1.0

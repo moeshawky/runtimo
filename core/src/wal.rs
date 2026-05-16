@@ -213,23 +213,24 @@ impl WalReader {
     /// Returns [`Error::WalError`](crate::Error::WalError) if the file cannot
     /// be read.
     pub fn tail(path: &Path, n: usize) -> Result<Self> {
+        use std::collections::VecDeque;
         use std::io::{BufRead, BufReader};
         let file = std::fs::File::open(path)
             .map_err(|e| crate::Error::WalError(e.to_string()))?;
         let reader = BufReader::new(file);
 
-        let mut events: Vec<WalEvent> = Vec::with_capacity(n);
+        let mut window: VecDeque<WalEvent> = VecDeque::with_capacity(n + 1);
         for line in reader.lines() {
             let line = line.map_err(|e| crate::Error::WalError(e.to_string()))?;
             if let Ok(event) = serde_json::from_str(&line) {
-                events.push(event);
-                if events.len() > n {
-                    events.remove(0);
+                window.push_back(event);
+                if window.len() > n {
+                    window.pop_front();
                 }
             }
         }
 
-        Ok(Self { events })
+        Ok(Self { events: window.into() })
     }
 }
 
@@ -268,10 +269,14 @@ impl WalWriter {
             .filter(|e| e.ts >= cutoff)
             .collect();
 
-        let removed = content.lines().filter_map(|line| serde_json::from_str::<WalEvent>(line).ok()).count() - retained.len();
+        let total = content.lines().filter_map(|line| serde_json::from_str::<WalEvent>(line).ok()).count();
+        let removed = total - retained.len();
 
-        // Rewrite WAL with retained events
+        // Rewrite WAL: truncate first to prevent appending to stale data
         if removed > 0 {
+            std::fs::write(path, "").map_err(|e| crate::Error::WalError(
+                format!("truncate WAL before cleanup: {}", e)
+            ))?;
             let mut new_wal = WalWriter::create(path)?;
             for event in retained {
                 new_wal.append(event)?;

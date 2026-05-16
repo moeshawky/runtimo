@@ -52,33 +52,14 @@ enum Commands {
     List,
 }
 
-// WAL and backup paths use XDG_DATA_HOME for security (avoid world-writable /tmp).
-// Falls back to ~/.local/share/runtimo/, then /tmp/runtimo/ if HOME is unavailable.
-// Override with env vars for custom deployments.
-
-fn data_dir() -> PathBuf {
-    std::env::var("XDG_DATA_HOME")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| PathBuf::from(h).join(".local/share"))
-        })
-        .unwrap_or_else(std::env::temp_dir)
-        .join("runtimo")
-}
+// Use core's canonical path utilities to avoid drift (G-CTX-1)
 
 fn wal_path() -> PathBuf {
-    std::env::var("RUNTIMO_WAL_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| data_dir().join("wal.jsonl"))
+    runtimo_core::utils::wal_path()
 }
 
 fn backup_dir() -> PathBuf {
-    std::env::var("RUNTIMO_BACKUP_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| data_dir().join("backups"))
+    runtimo_core::utils::backup_dir()
 }
 
 fn make_registry() -> CapabilityRegistry {
@@ -218,11 +199,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let target = if let Some(target_path) = target_paths.get(&job_id) {
                     std::path::PathBuf::from(target_path)
                 } else {
-                    bd.parent()
-                        .ok_or_else(|| "Invalid backup structure".to_string())?
-                        .parent()
-                        .ok_or_else(|| "Invalid backup structure".to_string())?
-                        .join(bp.file_name().ok_or_else(|| "Invalid filename".to_string())?)
+                    // No original path found in WAL — cannot safely reconstruct
+                    return Err(format!(
+                        "Cannot determine original path for backup file {:?}. \
+                         WAL does not contain the target path for job {}.",
+                        bp.file_name().unwrap_or_default(),
+                        job_id
+                    ).into());
                 };
                 BackupManager::new(backup_dir())?.restore(&bp, &target)?;
                 restored += 1;

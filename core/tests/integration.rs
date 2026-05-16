@@ -16,14 +16,14 @@ fn unique_test_dir() -> PathBuf {
     std::env::temp_dir().join(format!("runtimo_test_{}_{}", std::process::id(), ns))
 }
 
-fn wal_path(base: &PathBuf) -> PathBuf {
-    let mut p = base.clone();
+fn wal_path(base: &std::path::Path) -> PathBuf {
+    let mut p = base.to_path_buf();
     p.push("wal_dir/wal.jsonl");
     p
 }
 
-fn backup_dir(base: &PathBuf) -> PathBuf {
-    let mut p = base.clone();
+fn backup_dir(base: &std::path::Path) -> PathBuf {
+    let mut p = base.to_path_buf();
     p.push("backups");
     p
 }
@@ -39,7 +39,7 @@ fn cleanup(dir: &PathBuf) {
     fs::remove_dir_all(dir).ok();
 }
 
-fn make_file(dir: &PathBuf, name: &str, content: &str) -> PathBuf {
+fn make_file(dir: &std::path::Path, name: &str, content: &str) -> PathBuf {
     let p = dir.join(name);
     let mut f = fs::File::create(&p).unwrap();
     write!(f, "{}", content).unwrap();
@@ -112,7 +112,7 @@ fn captures_telemetry() {
 #[test]
 fn captures_process_snapshot() {
     let s = ProcessSnapshot::capture();
-    assert!(s.processes.len() > 0);
+    assert!(!s.processes.is_empty());
 }
 
 #[test]
@@ -127,10 +127,10 @@ fn registry_lists_capabilities() {
     cleanup(&dir);
 }
 
-fn make_registry(bd: &PathBuf) -> CapabilityRegistry {
+fn make_registry(bd: &std::path::Path) -> CapabilityRegistry {
     let mut r = CapabilityRegistry::new();
     r.register(FileRead);
-    r.register(FileWrite::new(bd.clone()).expect("Failed to create FileWrite"));
+    r.register(FileWrite::new(bd.to_path_buf()).expect("Failed to create FileWrite"));
     r
 }
 

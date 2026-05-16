@@ -17,17 +17,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+// Use core's canonical path utilities to avoid drift (G-CTX-1)
 fn data_dir() -> PathBuf {
-    std::env::var("XDG_DATA_HOME")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| PathBuf::from(h).join(".local/share"))
-        })
-        .unwrap_or_else(std::env::temp_dir)
-        .join("runtimo")
+    runtimo_core::utils::data_dir()
 }
 
 fn default_socket_path() -> PathBuf {
@@ -35,7 +27,7 @@ fn default_socket_path() -> PathBuf {
 }
 
 fn default_wal_path() -> PathBuf {
-    data_dir().join("wal.jsonl")
+    runtimo_core::utils::wal_path()
 }
 
 fn ensure_data_dir() -> std::io::Result<()> {
@@ -99,26 +91,26 @@ struct DaemonState {
 }
 
 impl DaemonState {
-    fn new(wal_path: &Path) -> Self {
+    fn new(wal_path: &Path) -> std::result::Result<Self, Box<dyn std::error::Error>> {
         let mut registry = CapabilityRegistry::new();
         registry.register(FileRead);
 
         let backup_dir = data_dir().join("backups");
         let file_write = FileWrite::new(backup_dir)
-            .unwrap_or_else(|e| panic!("Failed to create FileWrite capability: {}", e));
+            .map_err(|e| format!("Failed to create FileWrite capability: {}", e))?;
         registry.register(file_write);
 
         // Ensure WAL directory exists
         if let Some(parent) = wal_path.parent() {
             std::fs::create_dir_all(parent)
-                .unwrap_or_else(|e| panic!("Failed to create WAL directory: {}", e));
+                .map_err(|e| format!("Failed to create WAL directory: {}", e))?;
         }
 
-        Self {
+        Ok(Self {
             registry,
             wal_path: wal_path.to_path_buf(),
             wal_mutex: Arc::new(Mutex::new(())),
-        }
+        })
     }
 }
 
@@ -380,7 +372,7 @@ fn parse_args() -> Args {
             println!("Removed stale socket file");
         }
 
-    let state = Arc::new(DaemonState::new(&wal_path));
+    let state = Arc::new(DaemonState::new(&wal_path)?);
 
     let listener = tokio::net::UnixListener::bind(&args.socket)?;
     println!("Listening on {}", args.socket.display());
