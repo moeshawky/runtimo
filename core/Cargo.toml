@@ -1,0 +1,27 @@
+[package]
+name = "runtimo-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+llmosafe = "0.6"
+
+[dev-dependencies]
+anyhow = "1.0"
+
+[[example]]
+name = "basic_read"
+path = "examples/basic_read.rs"
+
+[[example]]
+name = "telemetry_demo"
+path = "examples/telemetry_demo.rs"
+
+[[example]]
+name = "write_and_undo"
+path = "examples/write_and_undo.rs"
