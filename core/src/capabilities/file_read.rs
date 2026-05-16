@@ -23,7 +23,6 @@ use crate::validation::path::{validate_path, PathContext};
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::Path;
 
 /// Maximum file size allowed for reading (100 MB).
 /// Prevents OOM on persistent machines when agents request multi-gigabyte files.
@@ -106,10 +105,18 @@ impl Capability for FileRead {
         let args: FileReadArgs = serde_json::from_value(args.clone())
             .map_err(|e| Error::ExecutionFailed(e.to_string()))?;
 
-        let path = Path::new(&args.path);
+        let ctx = PathContext {
+            require_exists: true,
+            require_file: true,
+            ..Default::default()
+        };
+
+        let path = validate_path(&args.path, &ctx)
+            .map_err(|e| Error::ExecutionFailed(format!("path validation: {}", e)))?;
+
         let metadata = path
             .metadata()
-            .map_err(|e| Error::ExecutionFailed(format!("stat {}: {}", args.path, e)))?;
+            .map_err(|e| Error::ExecutionFailed(format!("stat {}: {}", path.display(), e)))?;
 
         if metadata.len() > MAX_FILE_SIZE {
             return Err(Error::ExecutionFailed(format!(
@@ -119,13 +126,17 @@ impl Capability for FileRead {
             )));
         }
 
-        let content = std::fs::read_to_string(&args.path)
-            .map_err(|e| Error::ExecutionFailed(format!("read {}: {}", args.path, e)))?;
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| Error::ExecutionFailed(format!("read {}: {}", path.display(), e)))?;
 
         Ok(Output {
             success: true,
-            data: serde_json::json!({ "content": content, "path": args.path }),
-            message: Some(format!("Read {} bytes from {}", content.len(), args.path)),
+            data: serde_json::json!({ "content": content, "path": path.display().to_string() }),
+            message: Some(format!(
+                "Read {} bytes from {}",
+                content.len(),
+                path.display()
+            )),
         })
     }
 }

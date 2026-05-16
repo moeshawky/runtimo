@@ -2,7 +2,7 @@
 
 use clap::{Parser, Subcommand};
 use runtimo_core::{
-    capabilities::{FileRead, FileWrite, Kill, ShellExec, Undo},
+    capabilities::{FileRead, FileWrite, GitExec, Kill, ShellExec, Undo},
     execute_with_telemetry, BackupManager, CapabilityRegistry, ProcessSnapshot, Telemetry,
     WalReader,
 };
@@ -114,6 +114,7 @@ fn make_registry() -> CapabilityRegistry {
     reg.register(ShellExec);
     reg.register(Undo);
     reg.register(Kill);
+    reg.register(GitExec::new(backup_dir()).expect("Failed to create GitExec capability"));
     reg
 }
 
@@ -380,15 +381,22 @@ fn main() -> Result<(), Box<dyn Error>> {
                 std::collections::HashMap::new();
             for event in &events {
                 if let Some(output) = &event.output {
-                    // Path may be at output.path (FileRead) or output.data.path (FileWrite)
                     let path = output.get("path").and_then(|p| p.as_str()).or_else(|| {
                         output
                             .get("data")
                             .and_then(|d| d.get("path"))
                             .and_then(|p| p.as_str())
                     });
-                    if let Some(p) = path {
-                        target_paths.insert(event.job_id.clone(), p.to_string());
+                    let backup = output
+                        .get("data")
+                        .and_then(|d| d.get("backup_path"))
+                        .and_then(|b| b.as_str());
+                    if let (Some(p), Some(b)) = (path, backup) {
+                        if let Some(filename) =
+                            std::path::Path::new(b).file_name().and_then(|n| n.to_str())
+                        {
+                            target_paths.insert(filename.to_string(), p.to_string());
+                        }
                     }
                 }
             }
@@ -418,7 +426,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let entry = entry?;
                 let bp = entry.path();
                 if bp.is_file() {
-                    let target = if let Some(target_path) = target_paths.get(&job_id) {
+                    let filename = bp.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+                    let target = if let Some(target_path) = target_paths.get(filename) {
                         std::path::PathBuf::from(target_path)
                     } else {
                         return Err(format!(

@@ -5,6 +5,70 @@ All notable changes to Runtimo are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.1.1] - 2026-05-16
+
+### Security
+
+- **Daemon Unix socket authentication** — Added `SO_PEERCRED` UID verification via `libc`.
+  Only processes running as the same UID as the daemon can connect. Previously any local
+  process could execute arbitrary capabilities.
+- **Kill capability hardening** — Protected PIDs now include the daemon's own PID and its
+  parent PID (read from `/proc/self/status`). Removed `force=true` bypass that allowed
+  killing any protected process.
+- **GitExec wired and audited** — Exported in `capabilities/mod.rs`, registered in CLI and
+  Daemon. Fixed silenced `git add` errors (previously `let _ =` discarded failures).
+
+### Bug Fixes
+
+- **CLI Undo multi-file data loss** — HashMap keyed by `job_id` instead of filename caused
+  all but the last file path per job to be lost. Now uses backup filename as key.
+- **Timeout enforcement** — `execute_with_timeout()` now measures elapsed time and returns
+  an error if execution exceeds `timeout_secs`. Previously the parameter was accepted but
+  ignored (`_timeout_secs`).
+- **HealthMonitor RAM leak detection** — Memory leak alert gated on `cpu_alert_count` instead
+  of a dedicated RAM counter. Added `ram_alert_count` field; RAM alerts now fire independently
+  of CPU state.
+- **Path validation TOCTOU** — `FileRead` and `FileWrite` now use the canonical `PathBuf`
+  returned by `validate_path()` instead of the original user-supplied string, preventing
+  symlink race attacks between validation and execution.
+- **Kill signal parameter dead code** — Signal argument was parsed but always defaulted to
+  SIGKILL (9). Now uses `args.signal.unwrap_or(15)` (SIGTERM default for graceful shutdown).
+- **Daemon capability gap** — Daemon only registered FileRead + FileWrite. Now also registers
+  ShellExec, Kill, Undo, and GitExec for parity with CLI.
+- **ProcessSnapshot stale cache after kill** — Added `ProcessSnapshot::clear_cache()` to
+  invalidate the 30-second cache before after-capture in kill operations.
+
+### Improved
+
+- **Error propagation** — WAL serialization failures now log with `eprintln!` instead of
+  silently writing `Null`. Session `add_job` errors are logged instead of discarded.
+  WAL corruption in Undo capability now returns an error instead of silently skipping.
+- **Lock poison recovery** — `HealthMonitor` uses `unwrap_or_else(|e| e.into_inner())` instead
+  of `expect()` for all RwLock accesses, preventing panics on poisoned locks.
+- **HealthMonitor graceful shutdown** — Added `Drop` implementation to set stop flag on
+  destruction.
+- **parse_size_value format support** — Now handles `MB` and `GB` suffixes in addition to
+  `Gi`, `Mi`, `Ki`.
+- **Undo capability deduplication** — Uses `crate::utils::backup_dir()` and
+  `crate::utils::wal_path()` instead of duplicating path logic.
+- **Kill uses libc::kill** — Direct syscall instead of spawning `kill` subprocess for
+  reliability and performance.
+- **GitExec clippy fixes** — Fixed `if_same_then_else`, `needless_borrows`, and line-length
+  warnings. Fixed test assertion (`abc123` is 6 chars, minimum is 7).
+
+### Added
+
+- 7 new tests (86 total, up from 79):
+  - `test_kill_actual_process` — Verifies kill works on a real process (was ignored)
+  - `test_kill_self_protected` — Verifies own PID is protected
+  - `test_health_monitor_lifecycle` — Verifies start/stop without 60s wait
+  - `test_health_state_defaults` — Verifies default state values
+  - `test_cpu_alert_after_consecutive_checks` — Verifies CPU alert counting
+  - `test_ram_alert_uses_ram_counter_not_cpu` — Verifies RAM alert independence (P1-2 fix)
+  - `test_ram_alert_resets_when_ram_decreases` — Verifies counter reset on decrease
+
 ## [0.1.0] - 2026-05-16
 
 ### Added

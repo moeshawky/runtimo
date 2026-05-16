@@ -6,9 +6,14 @@
 //!   --socket <PATH>    Unix socket path (default: /tmp/runtimo.sock)
 //!   --http             Enable HTTP listener (placeholder)
 //!   --http-port <PORT> HTTP port (default: 8080)
+//!
+//! # Security
+//!
+//! Connections are authenticated via Unix socket peer credentials (`SO_PEERCRED`).
+//! Only processes running as the same UID as the daemon are accepted.
 
 use runtimo_core::{
-    capabilities::{FileRead, FileWrite},
+    capabilities::{FileRead, FileWrite, GitExec, Kill, ShellExec, Undo},
     execute_with_telemetry, CapabilityRegistry, WalReader,
 };
 use serde::{Deserialize, Serialize};
@@ -16,6 +21,43 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+/// Authenticate a Unix stream connection via SO_PEERCRED.
+/// Returns Ok(()) if the peer's UID matches the daemon's UID.
+fn authenticate_peer(stream: &tokio::net::UnixStream) -> Result<(), String> {
+    use std::os::unix::io::AsRawFd;
+
+    let fd = stream.as_raw_fd();
+    let mut ucred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut ucred as *mut _ as *mut _,
+            &mut len,
+        )
+    };
+
+    if ret != 0 {
+        return Err(format!(
+            "getsockopt(SO_PEERCRED) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let daemon_uid = unsafe { libc::getuid() };
+    if ucred.uid != daemon_uid {
+        return Err(format!(
+            "UID mismatch: peer={}, daemon={}",
+            ucred.uid, daemon_uid
+        ));
+    }
+
+    Ok(())
+}
 
 // Use core's canonical path utilities to avoid drift (G-CTX-1)
 fn data_dir() -> PathBuf {
@@ -96,9 +138,17 @@ impl DaemonState {
         registry.register(FileRead);
 
         let backup_dir = data_dir().join("backups");
-        let file_write = FileWrite::new(backup_dir)
+        let file_write = FileWrite::new(backup_dir.clone())
             .map_err(|e| format!("Failed to create FileWrite capability: {}", e))?;
         registry.register(file_write);
+
+        let git_exec = GitExec::new(backup_dir.clone())
+            .map_err(|e| format!("Failed to create GitExec capability: {}", e))?;
+        registry.register(git_exec);
+
+        registry.register(ShellExec);
+        registry.register(Kill);
+        registry.register(Undo);
 
         // Ensure WAL directory exists
         if let Some(parent) = wal_path.parent() {
@@ -255,6 +305,11 @@ async fn handle_client(
     state: Arc<DaemonState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    // Authenticate peer via SO_PEERCRED
+    if let Err(e) = authenticate_peer(&stream) {
+        return Err(format!("Authentication failed: {}", e).into());
+    }
 
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);

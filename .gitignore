@@ -33,5 +33,14 @@ __pycache__/
 .venv/
 venv/
 
+# Test artifacts
+core/test.txt
+runtimo_test_*.txt
+runtimo_fw_*.txt
+runtimo_git_test/
+runtimo_test_undo/
+runtimo_test_sessions_*/
+runtimo_symlink_test
+
 # cell_txt.txt (Kaggle session artifacts)
 cell_txt.txt

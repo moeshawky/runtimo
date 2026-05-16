@@ -94,15 +94,15 @@ impl GitExec {
         let commit_sha = Self::run_git(repo_path, &["rev-parse", "HEAD"])
             .map(|s| s.trim().to_string())
             .ok();
-        
+
         let branch = Self::run_git(repo_path, &["rev-parse", "--abbrev-ref", "HEAD"])
             .map(|s| s.trim().to_string())
             .ok();
-        
+
         let remote_url = Self::run_git(repo_path, &["remote", "get-url", "origin"])
             .map(|s| s.trim().to_string())
             .ok();
-        
+
         let is_clean = Self::is_working_tree_clean(repo_path);
 
         Ok(GitState {
@@ -124,7 +124,11 @@ impl GitExec {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(Error::ExecutionFailed(format!("git {}: {}", args.join(" "), stderr)));
+            return Err(Error::ExecutionFailed(format!(
+                "git {}: {}",
+                args.join(" "),
+                stderr
+            )));
         }
 
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -134,9 +138,9 @@ impl GitExec {
     fn is_working_tree_clean(repo_path: &Path) -> bool {
         let output = Command::new("git")
             .current_dir(repo_path)
-            .args(&["status", "--porcelain"])
+            .args(["status", "--porcelain"])
             .output();
-        
+
         match output {
             Ok(out) => out.stdout.is_empty() && out.stderr.is_empty(),
             Err(_) => false,
@@ -145,12 +149,15 @@ impl GitExec {
 
     /// Validates a git URL format.
     fn validate_url(url: &str) -> Result<()> {
-        if url.starts_with("http://") || url.starts_with("https://") {
-            Ok(())
-        } else if url.contains('@') && url.contains(':') {
+        let is_http = url.starts_with("http://") || url.starts_with("https://");
+        let is_ssh = url.contains('@') && url.contains(':');
+        if is_http || is_ssh {
             Ok(())
         } else {
-            Err(Error::SchemaValidationFailed(format!("Invalid git URL: {}", url)))
+            Err(Error::SchemaValidationFailed(format!(
+                "Invalid git URL: {}",
+                url
+            )))
         }
     }
 
@@ -160,7 +167,10 @@ impl GitExec {
             return Err(Error::SchemaValidationFailed("Branch name is empty".into()));
         }
         if branch.contains("..") || branch.contains("@{") {
-            return Err(Error::SchemaValidationFailed(format!("Invalid branch name: {}", branch)));
+            return Err(Error::SchemaValidationFailed(format!(
+                "Invalid branch name: {}",
+                branch
+            )));
         }
         Ok(())
     }
@@ -168,28 +178,39 @@ impl GitExec {
     /// Validates a commit SHA.
     fn validate_commit_sha(sha: &str) -> Result<()> {
         if sha.len() < 7 || sha.len() > 40 {
-            return Err(Error::SchemaValidationFailed(format!("Invalid commit SHA length: {}", sha)));
+            return Err(Error::SchemaValidationFailed(format!(
+                "Invalid commit SHA length: {}",
+                sha
+            )));
         }
         if !sha.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(Error::SchemaValidationFailed(format!("Invalid commit SHA: {}", sha)));
+            return Err(Error::SchemaValidationFailed(format!(
+                "Invalid commit SHA: {}",
+                sha
+            )));
         }
         Ok(())
     }
 
     /// Executes git clone operation.
     fn op_clone(&self, args: &GitExecArgs, ctx: &Context) -> Result<Output> {
-        let url = args.url.as_ref().ok_or_else(|| {
-            Error::ExecutionFailed("URL required for clone".into())
-        })?;
-        let path = args.path.as_ref().ok_or_else(|| {
-            Error::ExecutionFailed("Path required for clone".into())
-        })?;
+        let url = args
+            .url
+            .as_ref()
+            .ok_or_else(|| Error::ExecutionFailed("URL required for clone".into()))?;
+        let path = args
+            .path
+            .as_ref()
+            .ok_or_else(|| Error::ExecutionFailed("Path required for clone".into()))?;
 
         Self::validate_url(url)?;
-        
+
         let path = Path::new(path);
         if path.exists() {
-            return Err(Error::ExecutionFailed(format!("Path already exists: {}", path.display())));
+            return Err(Error::ExecutionFailed(format!(
+                "Path already exists: {}",
+                path.display()
+            )));
         }
 
         if ctx.dry_run {
@@ -201,28 +222,37 @@ impl GitExec {
                     "path": path.display().to_string(),
                     "dry_run": true
                 }),
-                message: Some(format!("DRY RUN: would clone {} to {}", url, path.display())),
+                message: Some(format!(
+                    "DRY RUN: would clone {} to {}",
+                    url,
+                    path.display()
+                )),
             });
         }
 
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| Error::ExecutionFailed(format!("mkdir {}: {}", parent.display(), e)))?;
+            std::fs::create_dir_all(parent).map_err(|e| {
+                Error::ExecutionFailed(format!("mkdir {}: {}", parent.display(), e))
+            })?;
         }
 
         let mut cmd = Command::new("git");
         cmd.arg("clone").arg(url).arg(path);
-        
+
         if let Some(branch) = &args.branch {
             cmd.arg("-b").arg(branch);
         }
 
-        let output = cmd.output()
+        let output = cmd
+            .output()
             .map_err(|e| Error::ExecutionFailed(format!("git clone failed: {}", e)))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(Error::ExecutionFailed(format!("git clone failed: {}", stderr)));
+            return Err(Error::ExecutionFailed(format!(
+                "git clone failed: {}",
+                stderr
+            )));
         }
 
         let state = Self::capture_state(path).unwrap_or(GitState {
@@ -248,9 +278,12 @@ impl GitExec {
     }
 
     /// Executes git pull operation.
-    fn op_pull(&self, args: &GitExecArgs, ctx: &Context, repo_path: &Path) -> Result<Output> {
+    fn op_pull(&self, _args: &GitExecArgs, ctx: &Context, repo_path: &Path) -> Result<Output> {
         if !repo_path.exists() {
-            return Err(Error::ExecutionFailed(format!("Repository not found: {}", repo_path.display())));
+            return Err(Error::ExecutionFailed(format!(
+                "Repository not found: {}",
+                repo_path.display()
+            )));
         }
 
         let state_before = Self::capture_state(repo_path)?;
@@ -275,13 +308,16 @@ impl GitExec {
 
         let output = Command::new("git")
             .current_dir(repo_path)
-            .args(&["pull"])
+            .args(["pull"])
             .output()
             .map_err(|e| Error::ExecutionFailed(format!("git pull failed: {}", e)))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(Error::ExecutionFailed(format!("git pull failed: {}", stderr)));
+            return Err(Error::ExecutionFailed(format!(
+                "git pull failed: {}",
+                stderr
+            )));
         }
 
         let state_after = Self::capture_state(repo_path)?;
@@ -303,12 +339,16 @@ impl GitExec {
     /// Executes git commit operation.
     fn op_commit(&self, args: &GitExecArgs, ctx: &Context, repo_path: &Path) -> Result<Output> {
         if !repo_path.exists() {
-            return Err(Error::ExecutionFailed(format!("Repository not found: {}", repo_path.display())));
+            return Err(Error::ExecutionFailed(format!(
+                "Repository not found: {}",
+                repo_path.display()
+            )));
         }
 
-        let message = args.message.as_ref().ok_or_else(|| {
-            Error::ExecutionFailed("Commit message required".into())
-        })?;
+        let message = args
+            .message
+            .as_ref()
+            .ok_or_else(|| Error::ExecutionFailed("Commit message required".into()))?;
 
         let state_before = Self::capture_state(repo_path)?;
 
@@ -329,27 +369,46 @@ impl GitExec {
 
         if let Some(files) = &args.files {
             for file in files {
-                let _ = Command::new("git")
+                let output = Command::new("git")
                     .current_dir(repo_path)
-                    .args(&["add", file])
-                    .output();
+                    .args(["add", file])
+                    .output()
+                    .map_err(|e| Error::ExecutionFailed(format!("git add failed: {}", e)))?;
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return Err(Error::ExecutionFailed(format!(
+                        "git add {} failed: {}",
+                        file, stderr
+                    )));
+                }
             }
         } else {
-            let _ = Command::new("git")
+            let output = Command::new("git")
                 .current_dir(repo_path)
-                .args(&["add", "-A"])
-                .output();
+                .args(["add", "-A"])
+                .output()
+                .map_err(|e| Error::ExecutionFailed(format!("git add -A failed: {}", e)))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(Error::ExecutionFailed(format!(
+                    "git add -A failed: {}",
+                    stderr
+                )));
+            }
         }
 
         let output = Command::new("git")
             .current_dir(repo_path)
-            .args(&["commit", "-m", message])
+            .args(["commit", "-m", message])
             .output()
             .map_err(|e| Error::ExecutionFailed(format!("git commit failed: {}", e)))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(Error::ExecutionFailed(format!("git commit failed: {}", stderr)));
+            return Err(Error::ExecutionFailed(format!(
+                "git commit failed: {}",
+                stderr
+            )));
         }
 
         let state_after = Self::capture_state(repo_path)?;
@@ -372,12 +431,16 @@ impl GitExec {
     /// Executes git revert operation.
     fn op_revert(&self, args: &GitExecArgs, ctx: &Context, repo_path: &Path) -> Result<Output> {
         if !repo_path.exists() {
-            return Err(Error::ExecutionFailed(format!("Repository not found: {}", repo_path.display())));
+            return Err(Error::ExecutionFailed(format!(
+                "Repository not found: {}",
+                repo_path.display()
+            )));
         }
 
-        let commit_sha = args.commit_sha.as_ref().ok_or_else(|| {
-            Error::ExecutionFailed("Commit SHA required for revert".into())
-        })?;
+        let commit_sha = args
+            .commit_sha
+            .as_ref()
+            .ok_or_else(|| Error::ExecutionFailed("Commit SHA required for revert".into()))?;
 
         Self::validate_commit_sha(commit_sha)?;
 
@@ -400,13 +463,16 @@ impl GitExec {
 
         let output = Command::new("git")
             .current_dir(repo_path)
-            .args(&["revert", "--no-edit", commit_sha])
+            .args(["revert", "--no-edit", commit_sha])
             .output()
             .map_err(|e| Error::ExecutionFailed(format!("git revert failed: {}", e)))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(Error::ExecutionFailed(format!("git revert failed: {}", stderr)));
+            return Err(Error::ExecutionFailed(format!(
+                "git revert failed: {}",
+                stderr
+            )));
         }
 
         let state_after = Self::capture_state(repo_path)?;
@@ -427,9 +493,12 @@ impl GitExec {
     }
 
     /// Executes git clean operation.
-    fn op_clean(&self, args: &GitExecArgs, ctx: &Context, repo_path: &Path) -> Result<Output> {
+    fn op_clean(&self, _args: &GitExecArgs, ctx: &Context, repo_path: &Path) -> Result<Output> {
         if !repo_path.exists() {
-            return Err(Error::ExecutionFailed(format!("Repository not found: {}", repo_path.display())));
+            return Err(Error::ExecutionFailed(format!(
+                "Repository not found: {}",
+                repo_path.display()
+            )));
         }
 
         let state_before = Self::capture_state(repo_path)?;
@@ -450,13 +519,16 @@ impl GitExec {
 
         let output = Command::new("git")
             .current_dir(repo_path)
-            .args(&["clean", "-fd"])
+            .args(["clean", "-fd"])
             .output()
             .map_err(|e| Error::ExecutionFailed(format!("git clean failed: {}", e)))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(Error::ExecutionFailed(format!("git clean failed: {}", stderr)));
+            return Err(Error::ExecutionFailed(format!(
+                "git clean failed: {}",
+                stderr
+            )));
         }
 
         let state_after = Self::capture_state(repo_path)?;
@@ -477,13 +549,16 @@ impl GitExec {
     /// Executes git status operation.
     fn op_status(&self, _args: &GitExecArgs, _ctx: &Context, repo_path: &Path) -> Result<Output> {
         if !repo_path.exists() {
-            return Err(Error::ExecutionFailed(format!("Repository not found: {}", repo_path.display())));
+            return Err(Error::ExecutionFailed(format!(
+                "Repository not found: {}",
+                repo_path.display()
+            )));
         }
 
         let state = Self::capture_state(repo_path)?;
 
-        let status_output = Self::run_git(repo_path, &["status", "--porcelain"])
-            .unwrap_or_default();
+        let status_output =
+            Self::run_git(repo_path, &["status", "--porcelain"]).unwrap_or_default();
 
         let branch = state.branch.clone().unwrap_or_default();
         let remote_url = state.remote_url.clone().unwrap_or_default();
@@ -499,7 +574,11 @@ impl GitExec {
                 "is_clean": state.is_clean,
                 "status": status_output
             }),
-            message: Some(format!("On branch {}: {}", branch, if state.is_clean { "clean" } else { "dirty" })),
+            message: Some(format!(
+                "On branch {}: {}",
+                branch,
+                if state.is_clean { "clean" } else { "dirty" }
+            )),
         })
     }
 }
@@ -543,7 +622,9 @@ impl Capability for GitExec {
             if let Some(url) = &args.url {
                 Self::validate_url(url)?;
             } else {
-                return Err(Error::SchemaValidationFailed("URL required for clone".into()));
+                return Err(Error::SchemaValidationFailed(
+                    "URL required for clone".into(),
+                ));
             }
             if let Some(path) = &args.path {
                 let ctx = PathContext {
@@ -584,33 +665,38 @@ impl Capability for GitExec {
         match args.operation.as_str() {
             "clone" => self.op_clone(&args, ctx),
             "pull" => {
-                let path = args.path.as_ref().ok_or_else(|| {
-                    Error::ExecutionFailed("Path required for pull".into())
-                })?;
+                let path = args
+                    .path
+                    .as_ref()
+                    .ok_or_else(|| Error::ExecutionFailed("Path required for pull".into()))?;
                 self.op_pull(&args, ctx, Path::new(path))
             }
             "commit" => {
-                let path = args.path.as_ref().ok_or_else(|| {
-                    Error::ExecutionFailed("Path required for commit".into())
-                })?;
+                let path = args
+                    .path
+                    .as_ref()
+                    .ok_or_else(|| Error::ExecutionFailed("Path required for commit".into()))?;
                 self.op_commit(&args, ctx, Path::new(path))
             }
             "revert" => {
-                let path = args.path.as_ref().ok_or_else(|| {
-                    Error::ExecutionFailed("Path required for revert".into())
-                })?;
+                let path = args
+                    .path
+                    .as_ref()
+                    .ok_or_else(|| Error::ExecutionFailed("Path required for revert".into()))?;
                 self.op_revert(&args, ctx, Path::new(path))
             }
             "clean" => {
-                let path = args.path.as_ref().ok_or_else(|| {
-                    Error::ExecutionFailed("Path required for clean".into())
-                })?;
+                let path = args
+                    .path
+                    .as_ref()
+                    .ok_or_else(|| Error::ExecutionFailed("Path required for clean".into()))?;
                 self.op_clean(&args, ctx, Path::new(path))
             }
             "status" => {
-                let path = args.path.as_ref().ok_or_else(|| {
-                    Error::ExecutionFailed("Path required for status".into())
-                })?;
+                let path = args
+                    .path
+                    .as_ref()
+                    .ok_or_else(|| Error::ExecutionFailed("Path required for status".into()))?;
                 self.op_status(&args, ctx, Path::new(path))
             }
             _ => Err(Error::ExecutionFailed(format!(
@@ -635,10 +721,10 @@ mod tests {
         assert!(GitExec::validate_url("https://github.com/user/repo.git").is_ok());
         assert!(GitExec::validate_url("http://example.com/repo.git").is_ok());
         assert!(GitExec::validate_url("git@github.com:user/repo.git").is_ok());
-        
+
         assert!(GitExec::validate_url("not-a-url").is_err());
         assert!(GitExec::validate_url("").is_err());
-        
+
         std::fs::remove_dir_all(test_backup_dir()).ok();
     }
 
@@ -647,7 +733,7 @@ mod tests {
         assert!(GitExec::validate_branch_name("main").is_ok());
         assert!(GitExec::validate_branch_name("feature/my-branch").is_ok());
         assert!(GitExec::validate_branch_name("v1.0").is_ok());
-        
+
         assert!(GitExec::validate_branch_name("").is_err());
         assert!(GitExec::validate_branch_name("bad..name").is_err());
         assert!(GitExec::validate_branch_name("@{..}").is_err());
@@ -655,11 +741,11 @@ mod tests {
 
     #[test]
     fn validates_commit_sha() {
-        assert!(GitExec::validate_commit_sha("abc123").is_ok());
+        assert!(GitExec::validate_commit_sha("abc1234").is_ok());
         assert!(GitExec::validate_commit_sha("a1b2c3d4").is_ok());
         assert!(GitExec::validate_commit_sha("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0").is_ok());
-        
-        assert!(GitExec::validate_commit_sha("abc").is_err());
+
+        assert!(GitExec::validate_commit_sha("abc123").is_err());
         assert!(GitExec::validate_commit_sha("").is_err());
         assert!(GitExec::validate_commit_sha("xyz123").is_err());
     }
@@ -667,13 +753,15 @@ mod tests {
     #[test]
     fn rejects_path_traversal() {
         let cap = GitExec::new(test_backup_dir()).expect("Failed to create GitExec");
-        
-        let err = cap.validate(&serde_json::json!({
-            "operation": "clone",
-            "url": "https://github.com/user/repo.git",
-            "path": "../../../etc/passwd"
-        })).unwrap_err();
-        
+
+        let err = cap
+            .validate(&serde_json::json!({
+                "operation": "clone",
+                "url": "https://github.com/user/repo.git",
+                "path": "../../../etc/passwd"
+            }))
+            .unwrap_err();
+
         assert!(err.to_string().contains("traversal"));
         std::fs::remove_dir_all(test_backup_dir()).ok();
     }
@@ -681,11 +769,13 @@ mod tests {
     #[test]
     fn rejects_invalid_operation() {
         let cap = GitExec::new(test_backup_dir()).expect("Failed to create GitExec");
-        
-        let err = cap.validate(&serde_json::json!({
-            "operation": "invalid_op"
-        })).unwrap_err();
-        
+
+        let err = cap
+            .validate(&serde_json::json!({
+                "operation": "invalid_op"
+            }))
+            .unwrap_err();
+
         assert!(err.to_string().contains("Invalid operation"));
         std::fs::remove_dir_all(test_backup_dir()).ok();
     }
@@ -693,7 +783,7 @@ mod tests {
     #[test]
     fn status_on_nonexistent_repo() {
         let cap = GitExec::new(test_backup_dir()).expect("Failed to create GitExec");
-        
+
         let result = cap.execute(
             &serde_json::json!({
                 "operation": "status",
@@ -703,9 +793,9 @@ mod tests {
                 dry_run: false,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
-            }
+            },
         );
-        
+
         assert!(result.is_err());
         std::fs::remove_dir_all(test_backup_dir()).ok();
     }

@@ -28,7 +28,7 @@ use crate::validation::path::{validate_path, PathContext};
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Maximum content size allowed for writing (100 MB).
 /// Prevents disk exhaustion when agents attempt multi-gigabyte writes.
@@ -156,11 +156,18 @@ impl Capability for FileWrite {
             )));
         }
 
-        let path = Path::new(&args.path);
+        let write_ctx = PathContext {
+            require_exists: false,
+            require_file: false,
+            ..Default::default()
+        };
+
+        let path = validate_path(&args.path, &write_ctx)
+            .map_err(|e| Error::ExecutionFailed(format!("path validation: {}", e)))?;
 
         // Backup existing file before overwriting — enables undo via WAL
         let backup_path = if path.exists() {
-            match self.backup_mgr.create_backup(path, &ctx.job_id) {
+            match self.backup_mgr.create_backup(&path, &ctx.job_id) {
                 Ok(bp) => Some(bp),
                 Err(e) => return Err(Error::ExecutionFailed(format!("backup: {}", e))),
             }
@@ -177,7 +184,7 @@ impl Capability for FileWrite {
             return Ok(Output {
                 success: true,
                 data: serde_json::json!({
-                    "path": args.path,
+                    "path": path.display().to_string(),
                     "content_length": args.content.len(),
                     "dry_run": true,
                     "backup_path": backup_path.map(|p| p.to_string_lossy().to_string()),
@@ -185,7 +192,7 @@ impl Capability for FileWrite {
                 message: Some(format!(
                     "DRY RUN: would write {} bytes to {}",
                     args.content.len(),
-                    args.path
+                    path.display()
                 )),
             });
         }
@@ -195,19 +202,19 @@ impl Capability for FileWrite {
             let mut file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(&args.path)
-                .map_err(|e| Error::ExecutionFailed(format!("open {}: {}", args.path, e)))?;
+                .open(&path)
+                .map_err(|e| Error::ExecutionFailed(format!("open {}: {}", path.display(), e)))?;
             file.write_all(args.content.as_bytes())
-                .map_err(|e| Error::ExecutionFailed(format!("write {}: {}", args.path, e)))?;
+                .map_err(|e| Error::ExecutionFailed(format!("write {}: {}", path.display(), e)))?;
         } else {
-            std::fs::write(&args.path, &args.content)
-                .map_err(|e| Error::ExecutionFailed(format!("write {}: {}", args.path, e)))?;
+            std::fs::write(&path, &args.content)
+                .map_err(|e| Error::ExecutionFailed(format!("write {}: {}", path.display(), e)))?;
         }
 
         Ok(Output {
             success: true,
             data: serde_json::json!({
-                "path": args.path,
+                "path": path.display().to_string(),
                 "bytes_written": args.content.len(),
                 "append": args.append,
                 "backup_path": backup_path.map(|p| p.to_string_lossy().to_string()),
@@ -215,7 +222,7 @@ impl Capability for FileWrite {
             message: Some(format!(
                 "Wrote {} bytes to {}",
                 args.content.len(),
-                args.path
+                path.display()
             )),
         })
     }

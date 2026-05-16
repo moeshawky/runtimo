@@ -132,6 +132,14 @@ impl ProcessSnapshot {
         snapshot
     }
 
+    /// Clears the process snapshot cache.
+    ///
+    /// Use before capturing an after-kill snapshot to ensure fresh data.
+    pub fn clear_cache() {
+        let mut cache = PROCESS_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        *cache = None;
+    }
+
     /// Returns the top `n` processes by CPU usage.
     pub fn top_by_cpu(&self, n: usize) -> Vec<&ProcessInfo> {
         let mut procs: Vec<_> = self.processes.iter().collect();

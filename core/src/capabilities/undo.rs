@@ -61,23 +61,8 @@ impl Capability for Undo {
         let args: UndoArgs = serde_json::from_value(args.clone())
             .map_err(|e| crate::Error::SchemaValidationFailed(e.to_string()))?;
 
-        // Get backup directory from environment or default
-        let backup_dir = std::env::var("RUNTIMO_BACKUP_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| {
-                use std::path::PathBuf;
-                std::env::var("XDG_DATA_HOME")
-                    .ok()
-                    .map(PathBuf::from)
-                    .or_else(|| {
-                        std::env::var("HOME")
-                            .ok()
-                            .map(|h| PathBuf::from(h).join(".local/share"))
-                    })
-                    .unwrap_or_else(std::env::temp_dir)
-                    .join("runtimo")
-                    .join("backups")
-            });
+        // Get backup directory from canonical utility
+        let backup_dir = crate::utils::backup_dir();
 
         let backup_mgr = crate::BackupManager::new(backup_dir.clone())?;
 
@@ -93,48 +78,40 @@ impl Capability for Undo {
         let mut restored = Vec::new();
 
         // Read WAL to find original paths for this job
-        let wal_path = std::env::var("RUNTIMO_WAL_PATH")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| {
-                use std::path::PathBuf;
-                std::env::var("XDG_DATA_HOME")
-                    .ok()
-                    .map(PathBuf::from)
-                    .or_else(|| {
-                        std::env::var("HOME")
-                            .ok()
-                            .map(|h| PathBuf::from(h).join(".local/share"))
-                    })
-                    .unwrap_or_else(std::env::temp_dir)
-                    .join("runtimo")
-                    .join("wal.jsonl")
-            });
+        let wal_path = crate::utils::wal_path();
 
         let mut original_paths: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         if wal_path.exists() {
-            if let Ok(reader) = crate::WalReader::load(&wal_path) {
-                for event in reader.events() {
-                    if event.job_id == args.job_id {
-                        if let Some(output) = &event.output {
-                            // Extract path from FileWrite output (nested under "data")
-                            if let Some(data) = output.get("data") {
-                                if let Some(path) = data.get("path").and_then(|p| p.as_str()) {
-                                    if let Some(backup) =
-                                        data.get("backup_path").and_then(|b| b.as_str())
-                                    {
-                                        if let Some(filename) = std::path::Path::new(backup)
-                                            .file_name()
-                                            .and_then(|n| n.to_str())
+            match crate::WalReader::load(&wal_path) {
+                Ok(reader) => {
+                    for event in reader.events() {
+                        if event.job_id == args.job_id {
+                            if let Some(output) = &event.output {
+                                if let Some(data) = output.get("data") {
+                                    if let Some(path) = data.get("path").and_then(|p| p.as_str()) {
+                                        if let Some(backup) =
+                                            data.get("backup_path").and_then(|b| b.as_str())
                                         {
-                                            original_paths
-                                                .insert(filename.to_string(), path.to_string());
+                                            if let Some(filename) = std::path::Path::new(backup)
+                                                .file_name()
+                                                .and_then(|n| n.to_str())
+                                            {
+                                                original_paths
+                                                    .insert(filename.to_string(), path.to_string());
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
                     }
+                }
+                Err(e) => {
+                    return Err(crate::Error::ExecutionFailed(format!(
+                        "Failed to load WAL for undo: {}",
+                        e
+                    )));
                 }
             }
         }

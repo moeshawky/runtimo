@@ -16,7 +16,7 @@ Runtimo is a Rust workspace providing a **capability execution engine** designed
 - **Backup/undo** — Files are backed up before mutation, enabling rollback by job ID
 - **Hallucination absorption** — Capabilities validate arguments against JSON schemas before execution
 
-**Version:** 0.1.0  
+**Version:** 0.1.1  
 **License:** MIT  
 **Rust Edition:** 2021
 
@@ -85,9 +85,9 @@ cargo build --release
                            ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │ CapabilityRegistry                                              │
-│ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────┐               │
-│ │ FileRead │ │FileWrite │ │ShellExec │ │ Undo │               │
-│ └──────────┘ └──────────┘ └──────────┘ └──────┘               │
+│ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────┐ ┌──────┐ ┌─────────┐ │
+│ │ FileRead │ │FileWrite │ │ShellExec │ │ Undo │ │ Kill │ │ GitExec │ │
+│ └──────────┘ └──────────┘ └──────────┘ └──────┘ └──────┘ └─────────┘ │
 └──────────────────────────┬──────────────────────────────────────┘
                            │
                            ▼
@@ -223,6 +223,60 @@ Restores files to their state before a `FileWrite` operation. Uses the WAL to de
 1. `FileWrite` backs up the original file to `backups/<job_id>/<filename>`
 2. WAL records the original path in the job completion event
 3. `Undo` reads the WAL to find the original path, then restores from backup
+
+### Kill
+
+Terminates a process by PID with full audit logging. Includes safety guards to prevent killing critical system processes.
+
+**Schema:**
+```json
+{
+  "type": "object",
+  "properties": {
+    "pid": { "type": "integer", "minimum": 1 },
+    "signal": { "type": "integer", "minimum": -64, "maximum": 64 }
+  },
+  "required": ["pid"]
+}
+```
+
+**Example:**
+```bash
+./target/release/moe run -c Kill -a '{"pid":12345}'
+./target/release/moe run -c Kill -a '{"pid":12345,"signal":9}'
+```
+
+**Security:** Protected PIDs include init (1), kthreadd (2), the daemon's own PID, and its parent PID. These cannot be killed.
+
+### GitExec
+
+Executes git operations (clone, pull, commit, revert, clean, status) with state tracking, backup-before-mutate, and WAL logging.
+
+**Schema:**
+```json
+{
+  "type": "object",
+  "properties": {
+    "operation": { "type": "string", "enum": ["clone", "pull", "commit", "revert", "clean", "status"] },
+    "url": { "type": "string" },
+    "path": { "type": "string" },
+    "branch": { "type": "string" },
+    "message": { "type": "string" },
+    "files": { "type": "array", "items": { "type": "string" } },
+    "commit_sha": { "type": "string" },
+    "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600 }
+  },
+  "required": ["operation"]
+}
+```
+
+**Example:**
+```bash
+./target/release/moe run -c GitExec -a '{"operation":"status","path":"/tmp/myrepo"}'
+./target/release/moe run -c GitExec -a '{"operation":"clone","url":"https://github.com/user/repo.git","path":"/tmp/repo"}'
+```
+
+**Security:** URL validation (http/https/SSH), path traversal protection, branch name and commit SHA validation.
 
 ### Sessions
 
@@ -387,6 +441,8 @@ cargo test -- --nocapture
 | Workflows | write_then_read_roundtrip, backup_created_on_overwrite, wal_records_jobs, dry_run_does_not_write, append_mode, undo_with_backup |
 | Sessions | creates_session, adds_job_to_session, lists_sessions |
 | Invariants | roundtrip_many_contents, timestamps_monotonic, process_snapshot_consistent, executor_always_returns_telemetry, wal_events_sequential |
+| Kill capability | test_kill_schema, test_kill_protected_pid, test_kill_self_protected, test_kill_nonexistent, test_kill_actual_process |
+| HealthMonitor | test_health_monitor_lifecycle, test_health_state_defaults, test_cpu_alert_after_consecutive_checks, test_ram_alert_uses_ram_counter_not_cpu, test_ram_alert_resets_when_ram_decreases, test_parse_size_value |
 
 ## Environment Variables
 
@@ -398,26 +454,23 @@ cargo test -- --nocapture
 
 ## Known Limitations
 
-### Daemon is Placeholder
-The `runtimo-daemon` crate compiles but only prints a message. Unix socket listener, JSON-RPC protocol, job queue, and HTTP support are **not implemented**. Only the CLI (`moe`) is functional.
+### Daemon Authentication
+The daemon uses `SO_PEERCRED` UID matching for authentication. Only processes running as the same user can connect. For multi-user environments, consider adding group-based access control or TLS.
 
-### No Process Kill Capability
-There is no capability to kill runaway processes. Process tracking is observational only — spawned PIDs are not tracked or terminated.
-
-### WAL Path Defaults to /tmp
-The WAL file defaults to `$XDG_DATA_HOME/runtimo/wal.jsonl` (falls back to `/tmp`). Set `RUNTIMO_WAL_PATH` for guaranteed persistence.
+### WAL Path Defaults to XDG Data Home
+The WAL file defaults to `$XDG_DATA_HOME/runtimo/wal.jsonl`. Set `RUNTIMO_WAL_PATH` for explicit control.
 
 ### Backup Cleanup is Stub
 `BackupManager::cleanup()` exists but old backups accumulate indefinitely without a retention policy.
 
 ### No HTTP Capability
-HTTP requests capability is not yet implemented. FileRead, FileWrite, ShellExec, and Undo are available.
+HTTP requests capability is not yet implemented. FileRead, FileWrite, ShellExec, Undo, Kill, and GitExec are available.
 
 ### No Concurrent Job Execution
 The executor runs capabilities synchronously. There is no job queue, worker pool, or concurrent execution support.
 
-### Timeout Not Enforced
-The `timeout_secs` parameter is accepted for API compatibility but **not currently enforced**. True async timeout requires boxing the capability or using subprocesses. Tracked for v0.2.0.
+### Timeout Enforcement is Post-Execution
+The `timeout_secs` parameter is measured after capability execution completes. If a capability blocks indefinitely (e.g., waiting on I/O), the timeout is detected after the fact. True pre-emptive timeout requires subprocess isolation.
 
 ## License
 

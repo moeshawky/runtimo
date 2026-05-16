@@ -24,21 +24,37 @@ use crate::processes::ProcessSnapshot;
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::process::Command;
 use std::time::Duration;
 
+#[cfg(test)]
+use std::process::Command;
+
 /// Protected PIDs that cannot be killed (safety guard).
-const PROTECTED_PIDS: &[u32] = &[1, 2]; // init, kthreadd
+/// Includes init, kthreadd, and the current process (self-protection).
+fn protected_pids() -> Vec<u32> {
+    let mut pids = vec![1, 2];
+    pids.push(std::process::id());
+    if let Ok(status) = std::fs::read_to_string(format!("/proc/{}/status", std::process::id())) {
+        if let Some(ppid_str) = status
+            .lines()
+            .find(|l| l.starts_with("PPid:"))
+            .and_then(|l| l.split_whitespace().nth(1))
+        {
+            if let Ok(ppid) = ppid_str.parse::<u32>() {
+                pids.push(ppid);
+            }
+        }
+    }
+    pids
+}
 
 /// Arguments for the [`Kill`] capability.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KillArgs {
     /// Process ID to kill.
     pub pid: u32,
-    /// Signal to send (default: 9 = SIGKILL).
+    /// Signal to send (default: 15 = SIGTERM).
     pub signal: Option<i32>,
-    /// Force kill even if PID is protected (requires special authorization).
-    pub force: Option<bool>,
 }
 
 /// Capability that terminates a process by PID with full audit logging.
@@ -66,8 +82,7 @@ impl Capability for Kill {
             "type": "object",
             "properties": {
                 "pid": { "type": "integer", "minimum": 1 },
-                "signal": { "type": "integer", "minimum": -64, "maximum": 64 },
-                "force": { "type": "boolean" }
+                "signal": { "type": "integer", "minimum": -64, "maximum": 64 }
             },
             "required": ["pid"]
         })
@@ -83,11 +98,12 @@ impl Capability for Kill {
         let args: KillArgs = serde_json::from_value(args.clone())
             .map_err(|e| Error::ExecutionFailed(e.to_string()))?;
 
-        // Safety check: protected PIDs
-        if PROTECTED_PIDS.contains(&args.pid) && !args.force.unwrap_or(false) {
+        // Safety check: protected PIDs (init, kthreadd, self, parent)
+        let protected = protected_pids();
+        if protected.contains(&args.pid) {
             return Err(Error::ExecutionFailed(format!(
-                "PID {} is a protected system process. Use force=true to override.",
-                args.pid
+                "PID {} is a protected system process (protected: {:?})",
+                args.pid, protected
             )));
         }
 
@@ -114,36 +130,39 @@ impl Capability for Kill {
             .find(|p| p.pid == args.pid)
             .map(|p| (p.command.clone(), p.user.clone()));
 
-        // Determine signal - always use SIGKILL (9) for reliability
-        let signal = 9;
-        let signal_arg = "-9";
+        // Determine signal — default to SIGTERM (15) for graceful shutdown
+        let signal = args.signal.unwrap_or(15);
 
-        // Execute kill command - use SIGKILL for immediate termination
-        let output = Command::new("kill")
-            .arg(signal_arg)
-            .arg(args.pid.to_string())
-            .output()
-            .map_err(|e| Error::ExecutionFailed(format!("Failed to spawn kill: {}", e)))?;
+        // Execute kill via libc for reliability (avoids shell/PATH issues)
+        let kill_result = unsafe { libc::kill(args.pid as libc::pid_t, signal) };
+        let success = kill_result == 0;
+        let stderr_str = if !success {
+            std::io::Error::last_os_error().to_string()
+        } else {
+            String::new()
+        };
 
-        let success = output.status.success();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        // Delay to let process terminate and be removed from process table
+        std::thread::sleep(Duration::from_millis(500));
 
-        // Small delay to let process terminate
-        std::thread::sleep(Duration::from_millis(200));
+        // Clear cache to ensure fresh snapshot (cached data would show pre-kill state)
+        ProcessSnapshot::clear_cache();
 
         // Capture process snapshot after kill
         let process_after = ProcessSnapshot::capture();
 
-        // Check if process still exists
-        let process_still_exists = process_after.processes.iter().any(|p| p.pid == args.pid);
+        // Check if process still exists (zombies count as dead — they've been terminated)
+        let process_still_exists = process_after
+            .processes
+            .iter()
+            .any(|p| p.pid == args.pid && !p.stat.starts_with('Z'));
 
-        let stderr_str = stderr.to_string();
         let message = if success && !process_still_exists {
             format!("Killed process {} (signal {})", args.pid, signal)
         } else if !success {
             format!("Failed to kill process {}: {}", args.pid, stderr_str)
         } else {
-            format!("Process {} still exists after kill", args.pid)
+            format!("Process {} still exists after signal {}", args.pid, signal)
         };
 
         Ok(Output {
@@ -154,7 +173,7 @@ impl Capability for Kill {
                 "signal": signal,
                 "command": process_info.as_ref().map(|(cmd, _)| cmd),
                 "user": process_info.as_ref().map(|(_, user)| user),
-                "stderr": if !success { stderr_str } else { String::new() },
+                "stderr": if !success { stderr_str.clone() } else { String::new() },
                 "process_before": {
                     "count": process_before.summary.total_processes,
                     "zombies": process_before.summary.zombie_count
@@ -205,6 +224,23 @@ mod tests {
     }
 
     #[test]
+    fn test_kill_self_protected() {
+        let cap = Kill;
+        let self_pid = std::process::id();
+        let result = cap.execute(
+            &serde_json::json!({ "pid": self_pid }),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::current_dir().unwrap(),
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("protected"));
+    }
+
+    #[test]
     fn test_kill_nonexistent() {
         let cap = Kill;
         // Use a PID that's very unlikely to exist
@@ -224,7 +260,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Flaky test - depends on process timing"]
     fn test_kill_actual_process() {
         // Start a long-running process (sleep)
         let mut child = Command::new("sleep").arg("60").spawn().unwrap();
@@ -233,11 +268,21 @@ mod tests {
         // Give it time to start
         thread::sleep(Duration::from_millis(100));
 
-        // Now kill it via the capability
+        // Verify process exists before kill
+        let pre_check = Command::new("kill").arg("-0").arg(pid.to_string()).output();
+        assert!(
+            pre_check.unwrap().status.success(),
+            "Process should exist before kill"
+        );
+
+        // Clear cache so kill sees fresh process list
+        ProcessSnapshot::clear_cache();
+
+        // Kill it via the capability using SIGKILL for reliability
         let cap = Kill;
         let result = cap
             .execute(
-                &serde_json::json!({ "pid": pid }),
+                &serde_json::json!({ "pid": pid, "signal": 9 }),
                 &Context {
                     dry_run: false,
                     job_id: "test".into(),
@@ -246,10 +291,27 @@ mod tests {
             )
             .unwrap();
 
-        assert!(result.success, "Kill failed: {:?}", result.data);
-        assert!(result.data["killed"].as_bool() == Some(true));
+        // Kill should succeed — process becomes zombie until reaped
+        assert!(
+            result.data["killed"].as_bool() == Some(true),
+            "Kill failed: {:?}",
+            result.data
+        );
+        assert!(
+            result.data["signal"].as_i64() == Some(9),
+            "Should use SIGKILL"
+        );
 
-        // Cleanup: ensure process is actually dead
+        // Reap the zombie so it disappears from process table
         let _ = child.wait();
+
+        // Verify process is fully gone after reaping
+        let post_check = Command::new("kill").arg("-0").arg(pid.to_string()).output();
+        let still_alive = post_check.map(|o| o.status.success()).unwrap_or(false);
+        assert!(
+            !still_alive,
+            "Process {} should be dead after kill and reap",
+            pid
+        );
     }
 }

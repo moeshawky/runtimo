@@ -228,7 +228,13 @@ pub fn execute_with_telemetry_and_session(
         event_type: WalEventType::JobCompleted,
         job_id: job_id_str.clone(),
         capability: Some(cap_name.clone()),
-        output: Some(serde_json::to_value(&output).unwrap_or(Value::Null)),
+        output: Some(serde_json::to_value(&output).unwrap_or_else(|e| {
+            eprintln!(
+                "[runtimo] WAL serialization failed for job {}: {}",
+                job_id_str, e
+            );
+            Value::Null
+        })),
         error: None,
     })?;
 
@@ -238,7 +244,9 @@ pub fn execute_with_telemetry_and_session(
             .map(PathBuf::from)
             .unwrap_or_else(|_| crate::utils::data_dir().join("sessions"));
         if let Ok(mut mgr) = SessionManager::new(sessions_dir) {
-            let _ = mgr.add_job(sid, &job_id_str);
+            if let Err(e) = mgr.add_job(sid, &job_id_str) {
+                eprintln!("[runtimo] Failed to add job to session '{}': {}", sid, e);
+            }
         }
     }
 
@@ -303,15 +311,32 @@ fn log_job_failed(wal: &mut WalWriter, job_id: &str, capability: &str, error: &s
 
 /// Execute a capability inline with timeout enforcement.
 ///
-/// For capabilities that support timeout (like ShellExec), the timeout is enforced.
-/// The timeout is advisory for other capabilities.
+/// Runs the capability and measures elapsed time. If execution exceeds
+/// `timeout_secs`, returns a timeout error. For subprocess-based capabilities
+/// (ShellExec), the timeout is enforced internally. For pure-Rust capabilities,
+/// the timeout is checked after execution completes — the capability cannot be
+/// forcibly interrupted without subprocess isolation.
 fn execute_with_timeout(
     capability: &dyn Capability,
     args: &Value,
     ctx: &Context,
-    _timeout_secs: u64,
+    timeout_secs: u64,
 ) -> Result<Output> {
-    // ShellExec and other capabilities handle timeout internally
-    // Pass timeout via context if the capability supports it
-    capability.execute(args, ctx)
+    use std::time::{Duration, Instant};
+
+    let start = Instant::now();
+    let timeout = Duration::from_secs(timeout_secs);
+
+    let output = capability.execute(args, ctx);
+
+    let elapsed = start.elapsed();
+    if elapsed > timeout {
+        return Err(Error::ExecutionFailed(format!(
+            "capability exceeded timeout: {:.1}s > {}s",
+            elapsed.as_secs_f64(),
+            timeout_secs
+        )));
+    }
+
+    output
 }

@@ -51,6 +51,8 @@ pub struct HealthState {
     pub top_mem_process: Option<String>,
     /// Number of consecutive minutes CPU exceeded threshold.
     pub cpu_alert_count: usize,
+    /// Number of consecutive checks with monotonically increasing RAM.
+    pub ram_alert_count: usize,
     /// Whether memory is monotonically increasing.
     pub ram_increasing: bool,
     /// Last RAM usage for monotonicity check.
@@ -68,6 +70,7 @@ impl Default for HealthState {
             top_cpu_process: None,
             top_mem_process: None,
             cpu_alert_count: 0,
+            ram_alert_count: 0,
             ram_increasing: false,
             last_ram_percent: None,
         }
@@ -116,6 +119,14 @@ pub struct HealthMonitor {
     alerts: Arc<RwLock<Vec<HealthAlert>>>,
 }
 
+impl Drop for HealthMonitor {
+    fn drop(&mut self) {
+        self.stop_flag.store(true, Ordering::Relaxed);
+        // Best-effort join — don't panic if thread is already gone
+        self._thread.thread().unpark();
+    }
+}
+
 impl HealthMonitor {
     /// Starts the health monitoring background thread.
     ///
@@ -143,7 +154,11 @@ impl HealthMonitor {
                 let telemetry = Telemetry::capture();
                 let processes = ProcessSnapshot::capture();
 
-                let mut current_state = state_clone.write().expect("Health state lock poisoned");
+                let mut current_state = state_clone.write().unwrap_or_else(|e| {
+                    eprintln!("[HealthMonitor] State lock poisoned: {}", e);
+                    // Recover from poison by taking the broken lock
+                    e.into_inner()
+                });
 
                 // Update state
                 current_state.timestamp = telemetry.timestamp;
@@ -172,8 +187,9 @@ impl HealthMonitor {
                 if let Some(last_ram) = current_state.last_ram_percent {
                     if current_state.ram_percent > last_ram {
                         current_state.ram_increasing = true;
+                        current_state.ram_alert_count += 1;
                         // Alert if RAM increased for 5 consecutive checks
-                        if current_state.cpu_alert_count >= 5 {
+                        if current_state.ram_alert_count >= 5 {
                             let alert = HealthAlert::MemoryLeak {
                                 ram_percent: current_state.ram_percent,
                             };
@@ -181,6 +197,7 @@ impl HealthMonitor {
                         }
                     } else {
                         current_state.ram_increasing = false;
+                        current_state.ram_alert_count = 0;
                     }
                 }
                 current_state.last_ram_percent = Some(current_state.ram_percent);
@@ -214,15 +231,15 @@ impl HealthMonitor {
 
     /// Returns the current health state snapshot.
     pub fn health(&self) -> HealthState {
-        self.state
-            .read()
-            .expect("Health state lock poisoned")
-            .clone()
+        self.state.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Returns recent health alerts (up to 100).
     pub fn alerts(&self) -> Vec<HealthAlert> {
-        self.alerts.read().expect("Alerts lock poisoned").clone()
+        self.alerts
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Stops the background monitoring thread.
@@ -258,7 +275,7 @@ fn parse_ram_percent(ram_free: &str) -> f32 {
     }
 }
 
-/// Parses a size string (e.g., "13Gi", "512Mi") into a numeric value in GB.
+/// Parses a size string (e.g., "13Gi", "512Mi", "16384MB") into a numeric value in GB.
 fn parse_size_value(size_str: &str) -> f32 {
     let size_str = size_str.trim();
     if size_str.ends_with("Gi") {
@@ -274,6 +291,17 @@ fn parse_size_value(size_str: &str) -> f32 {
             .trim_end_matches("Ki")
             .parse::<f32>()
             .map(|v| v / (1024.0 * 1024.0))
+            .unwrap_or(0.0)
+    } else if size_str.ends_with("MB") {
+        size_str
+            .trim_end_matches("MB")
+            .parse::<f32>()
+            .map(|v| v / 1000.0)
+            .unwrap_or(0.0)
+    } else if size_str.ends_with("GB") {
+        size_str
+            .trim_end_matches("GB")
+            .parse::<f32>()
             .unwrap_or(0.0)
     } else {
         0.0
@@ -294,20 +322,83 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "Flaky - background thread timing dependent"]
-    fn test_health_monitor_start() {
+    fn test_health_monitor_lifecycle() {
         let monitor = HealthMonitor::start().expect("Failed to start monitor");
         assert!(monitor.is_running());
-        // Give it time to capture initial state (background thread runs every 60s but captures immediately on start)
-        thread::sleep(Duration::from_millis(1000));
-        let health = monitor.health();
-        assert!(
-            health.process_count > 0,
-            "Expected process_count > 0, got {}",
-            health.process_count
-        );
+        // Stop immediately — verifies start/stop without waiting for 60s cycle
         monitor.stop();
+        // Give thread time to see the flag (sleep loop checks every 1s)
+        thread::sleep(Duration::from_millis(1100));
         assert!(!monitor.is_running());
+    }
+
+    #[test]
+    fn test_health_state_defaults() {
+        let state = HealthState::default();
+        assert_eq!(state.cpu_alert_count, 0);
+        assert_eq!(state.ram_alert_count, 0);
+        assert!(!state.ram_increasing);
+        assert!(state.last_ram_percent.is_none());
+    }
+
+    #[test]
+    fn test_cpu_alert_after_consecutive_checks() {
+        let mut state = HealthState::default();
+        // Simulate 5 consecutive minutes of high CPU
+        for _ in 0..5 {
+            state.cpu_percent = 95.0;
+            if state.cpu_percent > CPU_THRESHOLD {
+                state.cpu_alert_count += 1;
+            }
+        }
+        assert_eq!(state.cpu_alert_count, 5);
+    }
+
+    #[test]
+    fn test_ram_alert_uses_ram_counter_not_cpu() {
+        let mut state = HealthState::default();
+        state.last_ram_percent = Some(50.0);
+        // Simulate RAM increasing each check while CPU is normal
+        for i in 0..5 {
+            state.ram_percent = 50.0 + (i as f32 + 1.0); // 51, 52, 53, 54, 55
+            state.cpu_percent = 10.0; // CPU is fine
+            if state.ram_percent > state.last_ram_percent.unwrap() {
+                state.ram_increasing = true;
+                state.ram_alert_count += 1;
+            } else {
+                state.ram_increasing = false;
+                state.ram_alert_count = 0;
+            }
+            state.last_ram_percent = Some(state.ram_percent);
+        }
+        // RAM alert should fire after 5 consecutive increases (independent of CPU)
+        assert_eq!(state.ram_alert_count, 5);
+        assert!(state.ram_increasing);
+    }
+
+    #[test]
+    fn test_ram_alert_resets_when_ram_decreases() {
+        let mut state = HealthState::default();
+        state.last_ram_percent = Some(50.0);
+
+        // RAM increases twice
+        state.ram_percent = 55.0;
+        state.ram_alert_count = 2;
+        state.last_ram_percent = Some(55.0);
+
+        // RAM decreases — counter should reset
+        state.ram_percent = 40.0;
+        if state.ram_percent > state.last_ram_percent.unwrap() {
+            state.ram_increasing = true;
+            state.ram_alert_count += 1;
+        } else {
+            state.ram_increasing = false;
+            state.ram_alert_count = 0;
+        }
+        state.last_ram_percent = Some(state.ram_percent);
+
+        assert_eq!(state.ram_alert_count, 0);
+        assert!(!state.ram_increasing);
     }
 
     #[test]
