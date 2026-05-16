@@ -3,15 +3,28 @@
 //! Central validation for all path-based capabilities. Handles both existing
 //! paths (canonicalize directly) and new paths (canonicalize the parent).
 //! Rejects path traversal, empty paths, and paths outside `allowed_prefixes`.
+//!
+//! # Configuration
+//!
+//! Allowed prefixes can be extended via the `RUNTIMO_ALLOWED_PATHS` environment
+//! variable (colon-separated). Example:
+//! ```bash
+//! export RUNTIMO_ALLOWED_PATHS="/tmp:/var/tmp:/home:/srv:/opt"
+//! ```
+//! This is merged with the built-in defaults (`/tmp`, `/var/tmp`, `/home`).
 
 use std::path::{Path, PathBuf};
+
+/// Built-in default allowed prefixes.
+const DEFAULT_PREFIXES: &[&str] = &["/tmp", "/var/tmp", "/home"];
 
 /// Context for path validation.
 ///
 /// Controls which checks are applied. [`Default`] enables all checks
-/// with prefixes `["/tmp", "/var/tmp", "/home"]`.
+/// with built-in prefixes (`/tmp`, `/var/tmp`, `/home`), extended by
+/// `RUNTIMO_ALLOWED_PATHS` env var if set.
 pub struct PathContext {
-    /// Allowed directory prefixes (canonical form).
+    /// Additional allowed directory prefixes (merged with defaults + env var).
     pub allowed_prefixes: &'static [&'static str],
     /// If true, the path must already exist on disk.
     pub require_exists: bool,
@@ -22,11 +35,39 @@ pub struct PathContext {
 impl Default for PathContext {
     fn default() -> Self {
         Self {
-            allowed_prefixes: &["/tmp", "/var/tmp", "/home"],
+            allowed_prefixes: &[],
             require_exists: true,
             require_file: true,
         }
     }
+}
+
+/// Returns the full set of allowed path prefixes.
+///
+/// Combines built-in defaults with `RUNTIMO_ALLOWED_PATHS` env var
+/// (colon-separated) and any context-specific prefixes.
+fn get_allowed_prefixes(ctx: &PathContext) -> Vec<String> {
+    let mut prefixes: Vec<String> = DEFAULT_PREFIXES.iter().map(|s| s.to_string()).collect();
+
+    // Extend with env var (colon-separated)
+    if let Ok(env_paths) = std::env::var("RUNTIMO_ALLOWED_PATHS") {
+        for p in env_paths.split(':').filter(|s| !s.is_empty()) {
+            let trimmed = p.trim().to_string();
+            if !prefixes.contains(&trimmed) {
+                prefixes.push(trimmed);
+            }
+        }
+    }
+
+    // Add context-specific prefixes
+    for p in ctx.allowed_prefixes {
+        let trimmed = p.trim().to_string();
+        if !prefixes.contains(&trimmed) {
+            prefixes.push(trimmed);
+        }
+    }
+
+    prefixes
 }
 
 /// Validates a path with canonicalization and prefix checking.
@@ -99,14 +140,15 @@ pub fn validate_path(path_str: &str, ctx: &PathContext) -> Result<PathBuf, Strin
 
     // Check allowed prefixes against the resolved path
     let resolved_str = resolved.to_string_lossy();
-    if !ctx
-        .allowed_prefixes
+    let allowed = get_allowed_prefixes(ctx);
+    if !allowed
         .iter()
-        .any(|prefix| resolved_str.starts_with(prefix))
+        .any(|prefix| resolved_str.starts_with(prefix.as_str()))
     {
         return Err(format!(
-            "path outside allowed directories: {}",
+            "path outside allowed directories: {} (allowed: {})",
             resolved.display(),
+            allowed.join(", ")
         ));
     }
 
@@ -178,5 +220,37 @@ mod tests {
                 std::fs::remove_file(&link_path).ok();
             }
         }
+    }
+
+    #[test]
+    fn env_var_extends_allowed_prefixes() {
+        // /srv is not in defaults, should be rejected
+        let ctx = PathContext {
+            require_exists: false,
+            require_file: false,
+            ..Default::default()
+        };
+        assert!(validate_path("/srv/myapp/config", &ctx).is_err());
+
+        // Set env var to allow /srv
+        std::env::set_var("RUNTIMO_ALLOWED_PATHS", "/srv:/opt");
+        assert!(validate_path("/srv/myapp/config", &ctx).is_ok());
+        assert!(validate_path("/opt/tools/bin", &ctx).is_ok());
+
+        // Cleanup
+        std::env::remove_var("RUNTIMO_ALLOWED_PATHS");
+        assert!(validate_path("/srv/myapp/config", &ctx).is_err());
+    }
+
+    #[test]
+    fn error_message_shows_allowed_prefixes() {
+        let ctx = PathContext {
+            require_exists: false,
+            require_file: false,
+            ..Default::default()
+        };
+        let err = validate_path("/etc/shadow", &ctx).unwrap_err();
+        assert!(err.contains("/tmp"), "error should list /tmp as allowed");
+        assert!(err.contains("/home"), "error should list /home as allowed");
     }
 }
