@@ -71,7 +71,7 @@ pub mod validation;
 pub mod wal;
 
 pub use backup::BackupManager;
-pub use capabilities::{FileRead, FileWrite};
+pub use capabilities::{FileRead, FileWrite, ShellExec};
 pub use capability::{Capability, CapabilityRegistry, Context, Output};
 pub use executor::{execute_with_telemetry, ExecutionResult};
 pub use job::{Job, JobId, JobState};

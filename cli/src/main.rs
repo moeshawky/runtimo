@@ -2,7 +2,7 @@
 
 use clap::{Parser, Subcommand};
 use runtimo_core::{
-    capabilities::{FileRead, FileWrite},
+    capabilities::{FileRead, FileWrite, ShellExec},
     execute_with_telemetry, BackupManager, CapabilityRegistry, ProcessSnapshot, Telemetry,
     WalReader,
 };
@@ -111,6 +111,7 @@ fn make_registry() -> CapabilityRegistry {
     let mut reg = CapabilityRegistry::new();
     reg.register(FileRead);
     reg.register(FileWrite::new(backup_dir()).expect("Failed to create FileWrite capability"));
+    reg.register(ShellExec);
     reg
 }
 

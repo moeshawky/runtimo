@@ -161,6 +161,36 @@ Writes content to a file with automatic backup-before-mutate. If the target file
 
 **Security:** Rejects path traversal (`..`) and empty paths. Creates parent directories automatically. Content size limited to 10 MB.
 
+### ShellExec
+
+Executes shell commands with full telemetry capture, audit logging, and timeout enforcement. Every command is logged to the WAL for audit purposes.
+
+**Schema:**
+```json
+{
+  "type": "object",
+  "properties": {
+    "cmd": { "type": "string" },
+    "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 300 },
+    "cwd": { "type": "string" }
+  },
+  "required": ["cmd"]
+}
+```
+
+**Example:**
+```bash
+./target/release/moe run -c ShellExec -a '{"cmd":"uptime"}'
+./target/release/moe run -c ShellExec -a '{"cmd":"ls -la /tmp"}'
+./target/release/moe run -c ShellExec -a '{"cmd":"pwd","timeout_secs":10}'
+```
+
+**Security:** 
+- All commands logged to WAL for audit
+- Timeout enforcement (default 30s, max 300s)
+- Runs with minimal privileges
+- **Warning:** Do not interpolate untrusted input into command strings
+
 ## Safety Model
 
 ### Two-Layer Telemetry (Observational)
