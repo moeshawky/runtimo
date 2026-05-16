@@ -92,7 +92,8 @@ impl ProcessSnapshot {
     pub fn capture() -> Self {
         let now = std::time::Instant::now();
         {
-            let cache = PROCESS_CACHE.lock().unwrap();
+            // Handle poison error by recovering from the poisoned state
+            let cache = PROCESS_CACHE.lock().unwrap_or_else(|e| e.into_inner());
             if let Some((cached, instant)) = cache.as_ref() {
                 if now.duration_since(*instant).as_secs() < CACHE_TTL_SECS {
                     return cached.clone();
@@ -102,19 +103,19 @@ impl ProcessSnapshot {
 
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
 
-    let mut processes = Vec::new();
-    // Use ps with explicit format to get PPID: PID,PPID,USER,CPU,MEM,VSZ,RSS,STAT,START,TIME,COMMAND
-    // This gives us parent process ID for lineage tracking
-    let ps_output = run_cmd("ps -eo pid,ppid,user,%cpu,%mem,vsz,rss,stat,start,time,comm --no-headers");
+        let mut processes = Vec::new();
+        // Use ps with explicit format to get PPID: PID,PPID,USER,CPU,MEM,VSZ,RSS,STAT,START,TIME,COMMAND
+        // This gives us parent process ID for lineage tracking
+        let ps_output = run_cmd("ps -eo pid,ppid,user,%cpu,%mem,vsz,rss,stat,start,time,comm --no-headers");
 
-    for line in ps_output.lines() {
-        if let Some(proc) = parse_ps_line(line) {
-            processes.push(proc);
+        for line in ps_output.lines() {
+            if let Some(proc) = parse_ps_line(line) {
+                processes.push(proc);
+            }
         }
-    }
 
         let summary = ProcessSummary::compute(&processes);
 
@@ -124,7 +125,8 @@ impl ProcessSnapshot {
             summary,
         };
 
-        let mut cache = PROCESS_CACHE.lock().unwrap();
+        // Handle poison error by recovering from the poisoned state
+        let mut cache = PROCESS_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         *cache = Some((snapshot.clone(), now));
         snapshot
     }

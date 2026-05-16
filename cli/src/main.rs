@@ -84,7 +84,7 @@ fn backup_dir() -> PathBuf {
 fn make_registry() -> CapabilityRegistry {
     let mut reg = CapabilityRegistry::new();
     reg.register(FileRead);
-    reg.register(FileWrite::new(backup_dir()));
+    reg.register(FileWrite::new(backup_dir()).expect("Failed to create FileWrite capability"));
     reg
 }
 
@@ -224,7 +224,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         .ok_or_else(|| "Invalid backup structure".to_string())?
                         .join(bp.file_name().ok_or_else(|| "Invalid filename".to_string())?)
                 };
-                BackupManager::new(backup_dir()).restore(&bp, &target)?;
+                BackupManager::new(backup_dir())?.restore(&bp, &target)?;
                 restored += 1;
             }
         }

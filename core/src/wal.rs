@@ -232,3 +232,52 @@ impl WalReader {
         Ok(Self { events })
     }
 }
+
+/// WAL cleanup and rotation utilities.
+impl WalWriter {
+    /// Cleans up WAL entries older than max_age_secs.
+    /// 
+    /// # Arguments
+    /// * `path` - Path to WAL file
+    /// * `max_age_secs` - Maximum age in seconds
+    /// 
+    /// # Returns
+    /// * `Ok(usize)` - Number of entries removed
+    /// * `Err(Error)` - Cleanup failure
+    pub fn cleanup(path: &Path, max_age_secs: u64) -> Result<usize> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        
+        let cutoff = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+            .saturating_sub(max_age_secs);
+
+        // Read all events
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| crate::Error::WalError(e.to_string()))?;
+        
+        let events: Vec<WalEvent> = content
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+
+        // Filter out old events
+        let retained: Vec<_> = events
+            .into_iter()
+            .filter(|e| e.ts >= cutoff)
+            .collect();
+
+        let removed = content.lines().filter_map(|line| serde_json::from_str::<WalEvent>(line).ok()).count() - retained.len();
+
+        // Rewrite WAL with retained events
+        if removed > 0 {
+            let mut new_wal = WalWriter::create(path)?;
+            for event in retained {
+                new_wal.append(event)?;
+            }
+        }
+
+        Ok(removed)
+    }
+}

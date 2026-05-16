@@ -19,6 +19,7 @@
 //! ```
 
 use crate::capability::{Capability, Context, Output};
+use crate::validation::path::{validate_path, PathContext};
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -79,60 +80,19 @@ impl Capability for FileRead {
         })
     }
 
-    /// Validates the path argument.
-    ///
-    /// Checks:
-    /// - Path is not empty
-    /// - Path does not contain `..` (traversal protection)
-    /// - Path exists on disk
-    /// - Path is a file (not a directory)
-    /// - Canonical path does not escape allowed directories
+    /// Validates the path argument using unified validation module.
     fn validate(&self, args: &Value) -> Result<()> {
         let args: FileReadArgs = serde_json::from_value(args.clone())
             .map_err(|e| Error::SchemaValidationFailed(e.to_string()))?;
 
-        if args.path.is_empty() {
-            return Err(Error::SchemaValidationFailed("path is empty".into()));
-        }
-        // Reject ".." sequences — agents have been known to try reading ../../etc/passwd
-        if args.path.contains("..") {
-            return Err(Error::SchemaValidationFailed(
-                "path traversal not allowed".into(),
-            ));
-        }
+        let ctx = PathContext {
+            require_exists: true,
+            require_file: true,
+            ..Default::default()
+        };
 
-        let path = Path::new(&args.path);
-        if !path.exists() {
-            return Err(Error::SchemaValidationFailed(format!(
-                "path does not exist: {}",
-                args.path
-            )));
-        }
-
-        // Resolve symlinks to their true target to prevent bypass attacks
-        let canonical = path
-            .canonicalize()
-            .map_err(|e| Error::SchemaValidationFailed(format!("canonicalize failed: {}", e)))?;
-
-        // After canonicalization, verify it's still a file (not a directory)
-        if !canonical.is_file() {
-            return Err(Error::SchemaValidationFailed(format!(
-                "not a file: {}",
-                args.path
-            )));
-        }
-
-        // Security: reject paths that resolve outside /tmp, /var/tmp, /home
-        // This prevents symlink attacks where /tmp/safe_link -> /etc/shadow
-        let allowed_prefixes = ["/tmp", "/var/tmp", "/home"];
-        let path_str = canonical.to_string_lossy();
-        if !allowed_prefixes.iter().any(|prefix| path_str.starts_with(prefix)) {
-            return Err(Error::SchemaValidationFailed(format!(
-                "path outside allowed directories: {} (resolved from {})",
-                canonical.display(),
-                args.path
-            )));
-        }
+        validate_path(&args.path, &ctx)
+            .map_err(Error::SchemaValidationFailed)?;
 
         Ok(())
     }

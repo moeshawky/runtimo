@@ -1,0 +1,99 @@
+# Runtimo License 1.0 (Nagware License)
+
+## Summary
+
+This software is **free for all uses** (personal, educational, research, and commercial) under the following conditions:
+
+1. **Attribution Required**: You must display "Powered by Runtimo" prominently in your application
+2. **Commercial Use**: Free, but commercial entities are encouraged to support development
+3. **No Warranty**: Provided "as is" without any guarantees
+
+## Full License Terms
+
+### Permissions
+
+You are free to:
+- ✅ **Use commercially** - Use in commercial products and services
+- ✅ **Modify** - Adapt and modify the software
+- ✅ **Distribute** - Share original or modified versions
+- ✅ **Private use** - Use internally without distribution
+
+### Conditions
+
+#### 1. Attribution (Required)
+
+All uses **must** include visible attribution:
+
+**For applications with UI:**
+- Display "Powered by [Runtimo](https://github.com/runtimo/runtimo)" in about screen, credits, or documentation
+- Minimum font size: 10pt or equivalent
+- Must be visible to end users
+
+**For libraries/APIs:**
+- Include attribution in documentation
+- Mention in README or equivalent
+
+**Example attribution:**
+```
+This project uses Runtimo - https://github.com/runtimo/runtimo
+Licensed under Runtimo License 1.0 (Nagware)
+```
+
+#### 2. Commercial Use Notice
+
+Commercial entities using Runtimo are **encouraged but not required** to:
+- Sponsor the project financially
+- Report usage to help prioritize development
+- Contribute improvements back to the community
+
+**Suggested (not required):**
+- $50-500/month for small businesses
+- $500-5000/month for medium enterprises  
+- Custom pricing for large corporations
+
+Contact: moe@libermoe.com for sponsorship options.
+
+#### 3. License Notice
+
+- Preserve copyright and license notices
+- Include copy of this license in distributions
+- State changes made to the software
+
+#### 4. Same License
+
+Modified versions must be distributed under the same terms.
+
+### Limitations
+
+- ✕ **No Warranty** - Provided "as is" without warranty
+- ✕ **No Liability** - Authors not liable for damages
+- ✕ **No Trademark** - No rights to "Runtimo" name or logo
+
+## Enforcement
+
+This is an **honor system** license:
+- No technical restrictions or "time bombs"
+- No license key requirements
+- Relies on community goodwill and social pressure
+
+Commercial users who benefit from Runtimo are expected (but not legally required) to support the project financially if able.
+
+## Why This License?
+
+This "nagware" model:
+1. **Maximizes adoption** - No barriers to entry
+2. **Builds community** - Users become supporters
+3. **Sustainable** - Successful users fund development
+4. **Transparent** - Clear expectations, no gotchas
+
+Inspired by WinRAR, PKZIP, and other successful nagware products.
+
+## Legal Disclaimer
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+---
+
+*For questions, sponsorship inquiries, or to report attribution violations:*
+*Contact: moe@libermoe.com*
+*GitHub: https://github.com/runtimo/runtimo*

@@ -117,7 +117,8 @@ impl Telemetry {
     pub fn capture() -> Self {
         let now = std::time::Instant::now();
         {
-            let cache = TELEMETRY_CACHE.lock().unwrap();
+            // Handle poison error by recovering from the poisoned state
+            let cache = TELEMETRY_CACHE.lock().unwrap_or_else(|e| e.into_inner());
             if let Some((cached, instant)) = cache.as_ref() {
                 if now.duration_since(*instant).as_secs() < CACHE_TTL_SECS {
                     return cached.clone();
@@ -127,8 +128,8 @@ impl Telemetry {
 
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
 
         let telemetry = Self {
             timestamp,
@@ -138,7 +139,8 @@ impl Telemetry {
             network: NetworkInfo::capture(),
         };
 
-        let mut cache = TELEMETRY_CACHE.lock().unwrap();
+        // Handle poison error by recovering from the poisoned state
+        let mut cache = TELEMETRY_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         *cache = Some((telemetry.clone(), now));
         telemetry
     }

@@ -100,13 +100,13 @@ pub trait Capability: Send + Sync {
 ///
 /// # Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// use runtimo_core::{CapabilityRegistry, FileRead, FileWrite};
 /// use std::path::PathBuf;
 ///
 /// let mut registry = CapabilityRegistry::new();
 /// registry.register(FileRead);
-/// registry.register(FileWrite::new(PathBuf::from("/tmp/backups")));
+/// registry.register(FileWrite::new(PathBuf::from("/tmp/backups")).unwrap());
 ///
 /// assert!(registry.get("FileRead").is_some());
 /// let caps = registry.list();

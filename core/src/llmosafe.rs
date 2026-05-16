@@ -144,8 +144,8 @@ mod tests {
     fn check_passes_under_normal_load() {
         let guard = LlmoSafeGuard::new();
         let result = guard.check();
-        if result.is_err() {
-            eprintln!("System under pressure: {}", result.unwrap_err());
+        if let Err(e) = result {
+            eprintln!("System under pressure: {}", e);
         }
     }
 

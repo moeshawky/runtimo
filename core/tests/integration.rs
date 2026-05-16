@@ -72,6 +72,7 @@ fn writes_file_content() {
     let dir = setup();
     let target = dir.join("w.txt");
     let result = FileWrite::new(backup_dir(&dir))
+        .expect("Failed to create FileWrite")
         .execute(
             &json!({
                 "path": target.to_str().unwrap(),
@@ -129,7 +130,7 @@ fn registry_lists_capabilities() {
 fn make_registry(bd: &PathBuf) -> CapabilityRegistry {
     let mut r = CapabilityRegistry::new();
     r.register(FileRead);
-    r.register(FileWrite::new(bd.clone()));
+    r.register(FileWrite::new(bd.clone()).expect("Failed to create FileWrite"));
     r
 }
 
@@ -145,7 +146,7 @@ fn rejects_path_traversal_read() {
 #[test]
 fn rejects_path_traversal_write() {
     let dir = setup();
-    let cap = FileWrite::new(backup_dir(&dir));
+    let cap = FileWrite::new(backup_dir(&dir)).expect("Failed to create FileWrite");
     assert!(cap
         .validate(&json!({ "path": "../../../tmp/x.txt", "content": "x" }))
         .is_err());
@@ -165,7 +166,7 @@ fn rejects_reading_directory() {
 fn rejects_empty_path() {
     let dir = setup();
     assert!(FileRead.validate(&json!({ "path": "" })).is_err());
-    let cap = FileWrite::new(backup_dir(&dir));
+    let cap = FileWrite::new(backup_dir(&dir)).expect("Failed to create FileWrite");
     assert!(cap
         .validate(&json!({ "path": "", "content": "x" }))
         .is_err());
@@ -213,6 +214,7 @@ fn writes_unicode() {
     let target = dir.join("uni_w.txt");
     let content = "日本語 🔥 مرحبا";
     FileWrite::new(backup_dir(&dir))
+        .expect("Failed to create FileWrite")
         .execute(
             &json!({
                 "path": target.to_str().unwrap(), "content": content
@@ -230,6 +232,7 @@ fn creates_parent_directories() {
     let deep = dir.join("a/b/c");
     let target = deep.join("f.txt");
     FileWrite::new(backup_dir(&dir))
+        .expect("Failed to create FileWrite")
         .execute(
             &json!({
                 "path": target.to_str().unwrap(), "content": "deep"
@@ -254,7 +257,7 @@ fn rejects_missing_file() {
 fn rejects_missing_field_in_args() {
     let dir = setup();
     assert!(FileRead.validate(&json!({ "wrong_field": "v" })).is_err());
-    let cap = FileWrite::new(backup_dir(&dir));
+    let cap = FileWrite::new(backup_dir(&dir)).expect("Failed to create FileWrite");
     assert!(cap.validate(&json!({ "path": "/tmp/x.txt" })).is_err()); // missing content
     cleanup(&dir);
 }
@@ -294,6 +297,7 @@ fn write_then_read_roundtrip() {
     let original = "roundtrip\nmulti-line 你好";
 
     FileWrite::new(backup_dir(&dir))
+        .expect("Failed to create FileWrite")
         .execute(
             &json!({
                 "path": target.to_str().unwrap(), "content": original
@@ -317,6 +321,7 @@ fn backup_created_on_overwrite() {
     let target = dir.join("bk.txt");
 
     FileWrite::new(bd.clone())
+        .expect("Failed to create FileWrite")
         .execute(
             &json!({
                 "path": target.to_str().unwrap(), "content": "original"
@@ -326,6 +331,7 @@ fn backup_created_on_overwrite() {
         .unwrap();
 
     let r = FileWrite::new(bd.clone())
+        .expect("Failed to create FileWrite")
         .execute(
             &json!({
                 "path": target.to_str().unwrap(), "content": "modified"
@@ -341,6 +347,7 @@ fn backup_created_on_overwrite() {
     assert_eq!(fs::read_to_string(&bp).unwrap(), "original");
 
     BackupManager::new(bd.clone())
+        .expect("Failed to create BackupManager")
         .restore(&bp, &target)
         .unwrap();
     assert_eq!(fs::read_to_string(&target).unwrap(), "original");
@@ -378,6 +385,7 @@ fn dry_run_does_not_write() {
     let dir = setup();
     let target = dir.join("dry.txt");
     FileWrite::new(backup_dir(&dir))
+        .expect("Failed to create FileWrite")
         .execute(
             &json!({
                 "path": target.to_str().unwrap(), "content": "nope"
@@ -400,6 +408,7 @@ fn append_mode() {
     let bw = backup_dir(&dir);
 
     FileWrite::new(bw.clone())
+        .expect("Failed to create FileWrite")
         .execute(
             &json!({
                 "path": target.to_str().unwrap(), "content": "line1\n"
@@ -408,7 +417,7 @@ fn append_mode() {
         )
         .unwrap();
 
-    FileWrite::new(bw)
+    FileWrite::new(bw).expect("Failed to create FileWrite")
         .execute(
             &json!({
                 "path": target.to_str().unwrap(), "content": "line2\n", "append": true
@@ -430,7 +439,7 @@ fn multiple_jobs_in_sequence() {
     let target = dir.join("seq.txt");
 
     execute_with_telemetry(
-        &FileWrite::new(backup_dir(&dir)),
+        &FileWrite::new(backup_dir(&dir)).expect("Failed to create FileWrite"),
         &json!({ "path": target.to_str().unwrap(), "content": "seq test" }),
         false,
         &wp,
@@ -444,7 +453,10 @@ fn multiple_jobs_in_sequence() {
         &wp,
     )
     .unwrap();
-    assert_eq!(r.output.data["content"].as_str().unwrap(), "seq test");
+    // Debug: check what's in the output
+    println!("Success: {}, Output: {:?}", r.success, r.output);
+    assert!(r.success, "FileRead failed: {:?}", r.output.message);
+    assert_eq!(r.output.data["content"].as_str().unwrap_or("CONTENT_MISSING"), "seq test");
 
     assert!(WalReader::load(&wp).unwrap().events().len() >= 4);
     cleanup(&dir);
@@ -468,6 +480,7 @@ fn roundtrip_many_contents() {
     for (i, content) in cases.into_iter().enumerate() {
         let target = dir.join(format!("r{}.txt", i));
         FileWrite::new(backup_dir(&dir))
+            .expect("Failed to create FileWrite")
             .execute(
                 &json!({
                     "path": target.to_str().unwrap(), "content": content

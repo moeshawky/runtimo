@@ -9,8 +9,8 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
-authors = ["Moe"]
+license = "Runtimo-1.0"
+authors = ["Moe Shawky"]
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }

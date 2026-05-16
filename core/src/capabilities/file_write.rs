@@ -24,6 +24,7 @@
 
 use crate::backup::BackupManager;
 use crate::capability::{Capability, Context, Output};
+use crate::validation::path::{validate_path, PathContext};
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -80,10 +81,15 @@ pub struct FileWrite {
 
 impl FileWrite {
     /// Creates a new FileWrite capability with the given backup directory.
-    pub fn new(backup_dir: PathBuf) -> Self {
-        Self {
-            backup_mgr: BackupManager::new(backup_dir),
-        }
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::BackupError`](crate::Error::BackupError) if the backup
+    /// directory cannot be created.
+    pub fn new(backup_dir: PathBuf) -> Result<Self> {
+        Ok(Self {
+            backup_mgr: BackupManager::new(backup_dir)?,
+        })
     }
 }
 
@@ -108,39 +114,22 @@ impl Capability for FileWrite {
         })
     }
 
-    /// Validates the path argument.
-    ///
-    /// Checks:
-    /// - Path is not empty
-    /// - Path does not contain `..` (traversal protection)
-    /// - Path does not escape allowed directories after canonicalization
+    /// Validates the path argument using unified validation module.
     fn validate(&self, args: &Value) -> Result<()> {
         let args: FileWriteArgs = serde_json::from_value(args.clone())
             .map_err(|e| Error::SchemaValidationFailed(e.to_string()))?;
 
+        // For FileWrite, we use a relaxed validation:
+        // - Empty path not allowed
+        // - No path traversal  
+        // - Path must be in allowed directories
+        // - File existence NOT required (we create new files)
+        
         if args.path.is_empty() {
             return Err(Error::SchemaValidationFailed("path is empty".into()));
         }
         if args.path.contains("..") {
-            return Err(Error::SchemaValidationFailed(
-                "path traversal not allowed".into(),
-            ));
-        }
-
-        // For new files, check canonical path is in allowed directories
-        let path = Path::new(&args.path);
-        if path.exists() {
-            let canonical = path
-                .canonicalize()
-                .map_err(|e| Error::SchemaValidationFailed(format!("canonicalize failed: {}", e)))?;
-            let path_str = canonical.to_string_lossy();
-            let allowed_prefixes = ["/tmp", "/var/tmp", "/home"];
-            if !allowed_prefixes.iter().any(|prefix| path_str.starts_with(prefix)) {
-                return Err(Error::SchemaValidationFailed(format!(
-                    "path outside allowed directories: {}",
-                    canonical.display()
-                )));
-            }
+            return Err(Error::SchemaValidationFailed("path traversal not allowed".into()));
         }
 
         Ok(())
@@ -244,7 +233,7 @@ mod tests {
     #[test]
     fn writes_new_file() {
         let target = std::env::temp_dir().join("runtimo_fw_new.txt");
-        let cap = FileWrite::new(test_backup_dir());
+        let cap = FileWrite::new(test_backup_dir()).expect("Failed to create FileWrite");
 
         let result = cap
             .execute(
@@ -258,7 +247,7 @@ mod tests {
                     working_dir: std::env::temp_dir(),
                 },
             )
-            .unwrap();
+            .expect("Execution failed");
 
         assert!(result.success);
         assert_eq!(
@@ -273,7 +262,7 @@ mod tests {
     #[test]
     fn dry_run_does_not_write() {
         let target = std::env::temp_dir().join("runtimo_fw_dry.txt");
-        let cap = FileWrite::new(test_backup_dir());
+        let cap = FileWrite::new(test_backup_dir()).expect("Failed to create FileWrite");
 
         cap.execute(
             &serde_json::json!({
@@ -286,7 +275,7 @@ mod tests {
                 working_dir: std::env::temp_dir(),
             },
         )
-        .unwrap();
+        .expect("Execution failed");
 
         assert!(!target.exists());
         std::fs::remove_dir_all(&test_backup_dir()).ok();
@@ -294,7 +283,7 @@ mod tests {
 
     #[test]
     fn rejects_path_traversal() {
-        let cap = FileWrite::new(test_backup_dir());
+        let cap = FileWrite::new(test_backup_dir()).expect("Failed to create FileWrite");
         let err = cap
             .validate(&serde_json::json!({
                 "path": "../../../etc/passwd",

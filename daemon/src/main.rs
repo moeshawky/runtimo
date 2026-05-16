@@ -104,11 +104,14 @@ impl DaemonState {
         registry.register(FileRead);
 
         let backup_dir = data_dir().join("backups");
-        registry.register(FileWrite::new(backup_dir));
+        let file_write = FileWrite::new(backup_dir)
+            .unwrap_or_else(|e| panic!("Failed to create FileWrite capability: {}", e));
+        registry.register(file_write);
 
         // Ensure WAL directory exists
         if let Some(parent) = wal_path.parent() {
-            std::fs::create_dir_all(parent).expect("Failed to create WAL directory");
+            std::fs::create_dir_all(parent)
+                .unwrap_or_else(|e| panic!("Failed to create WAL directory: {}", e));
         }
 
         Self {

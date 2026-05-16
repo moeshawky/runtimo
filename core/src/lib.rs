@@ -34,6 +34,7 @@ pub mod llmosafe;
 pub mod processes;
 pub mod schema;
 pub mod telemetry;
+pub mod validation;
 pub mod wal;
 
 pub use backup::BackupManager;
@@ -88,3 +89,32 @@ pub enum Error {
 
 /// Result alias for runtimo-core operations.
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Utility functions for path management.
+pub mod utils {
+use std::path::PathBuf;
+
+/// Returns the data directory following XDG spec.
+pub fn data_dir() -> PathBuf {
+std::env::var("XDG_DATA_HOME")
+.ok()
+.map(PathBuf::from)
+.or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".local/share")))
+.unwrap_or_else(std::env::temp_dir)
+.join("runtimo")
+}
+
+/// Returns the WAL path (env override or default).
+pub fn wal_path() -> PathBuf {
+std::env::var("RUNTIMO_WAL_PATH")
+.map(PathBuf::from)
+.unwrap_or_else(|_| data_dir().join("wal.jsonl"))
+}
+
+/// Returns the backup directory (env override or default).
+pub fn backup_dir() -> PathBuf {
+std::env::var("RUNTIMO_BACKUP_DIR")
+.map(PathBuf::from)
+.unwrap_or_else(|_| data_dir().join("backups"))
+}
+}

@@ -23,7 +23,7 @@ fn main() -> anyhow::Result<()> {
 
     // ── Step 1: Write initial content ──────────────────────────────
     println!("=== Step 1: Write initial file ===");
-    let file_write = FileWrite::new(backup_dir.clone());
+    let file_write = FileWrite::new(backup_dir.clone()).expect("Failed to create FileWrite");
     let result = execute_with_telemetry(
         &file_write,
         &serde_json::json!({
@@ -56,7 +56,7 @@ fn main() -> anyhow::Result<()> {
 
     // ── Step 2: Overwrite (creates backup automatically) ───────────
     println!("\n=== Step 2: Overwrite file (backup created) ===");
-    let file_write2 = FileWrite::new(backup_dir.clone());
+    let file_write2 = FileWrite::new(backup_dir.clone()).expect("Failed to create FileWrite");
     let result2 = execute_with_telemetry(
         &file_write2,
         &serde_json::json!({
@@ -106,7 +106,7 @@ fn main() -> anyhow::Result<()> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("No backup path in write output"))?;
 
-    let backup_mgr = BackupManager::new(backup_dir.clone());
+    let backup_mgr = BackupManager::new(backup_dir.clone()).expect("Failed to create BackupManager");
     backup_mgr.restore(Path::new(backup_path_str), Path::new(tmp_path))?;
     println!("Restored from: {backup_path_str}");
 

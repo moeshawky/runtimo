@@ -4,7 +4,20 @@
 
 [![Crates.io](https://img.shields.io/crates/v/runtimo-core.svg)](https://crates.io/crates/runtimo-core)
 [![Documentation](https://docs.rs/runtimo-core/badge.svg)](https://docs.rs/runtimo-core)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: Runtimo-1.0](https://img.shields.io/badge/License-Runtimo--1.0-blue.svg)](LICENSE)
+
+### 💝 Free for All Uses (Nagware License)
+
+Runtimo is **free for personal, educational, research, AND commercial use** under the Runtimo License 1.0:
+
+- ✅ **Free forever** for all uses
+- ✅ **No restrictions** on commercial deployment
+- ℹ️ **Attribution required**: Display "Powered by Runtimo" in your app
+- 💰 **Sponsorships encouraged**: Successful companies are invited (not required) to support development
+
+**Why this model?** Like WinRAR, we believe in trust over restrictions. If Runtimo powers your business, consider supporting continued development.
+
+[→ View Full License](LICENSE)
 
 ## What Is Runtimo?
 
@@ -304,3 +317,34 @@ MIT License - see [LICENSE](LICENSE) for details.
 - Built with hallucination absorption patterns from agent execution research
 - Inspired by capability-based security models
 - Designed for persistent machines that cannot be factory-reset
+
+---
+
+## 💰 Sponsorship & Support
+
+Runtimo uses a **"nagware" license model** - free for all uses, but commercial users are encouraged (not required) to support development.
+
+### Suggested Sponsorship Tiers
+
+| Tier | Price/Month | For | Benefits |
+|------|-------------|-----|----------|
+| 🥉 **Supporter** | $50 | Small startups | Name in README, priority support |
+| 🥈 **Sponsor** | $250 | Growing companies | Logo in README, feature requests, Discord access |
+| 🥇 **Partner** | $1000+ | Enterprises | Custom features, SLA support, consulting |
+
+### How to Sponsor
+
+1. **GitHub Sponsors**: [Sponsor @moeshawky](../../sponsor)
+2. **Open Collective**: [Coming soon]
+3. **Direct**: Contact moe@libermoe.com
+
+### Why Sponsor?
+
+- **Ethical**: Support open source sustainability
+- **Impact**: Direct influence on roadmap
+- **Goodwill**: Public recognition
+- **Reliability**: Priority support when you need it
+
+**Remember**: Sponsorship is voluntary but appreciated. Runtimo remains free regardless.
+
+---
