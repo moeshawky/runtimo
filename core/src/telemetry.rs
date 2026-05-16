@@ -19,9 +19,9 @@
 //! // ...
 //! ```
 
+use crate::cmd::run_cmd;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
-use crate::cmd::run_cmd;
 
 static TELEMETRY_CACHE: Mutex<Option<(Telemetry, std::time::Instant)>> = Mutex::new(None);
 const CACHE_TTL_SECS: u64 = 30;

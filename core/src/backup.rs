@@ -41,8 +41,9 @@ impl BackupManager {
     /// Returns [`crate::Error::BackupError`] if the backup
     /// directory cannot be created.
     pub fn new(backup_dir: PathBuf) -> Result<Self> {
-        std::fs::create_dir_all(&backup_dir)
-            .map_err(|e| crate::Error::BackupError(format!("Failed to create backup directory: {}", e)))?;
+        std::fs::create_dir_all(&backup_dir).map_err(|e| {
+            crate::Error::BackupError(format!("Failed to create backup directory: {}", e))
+        })?;
         Ok(Self { backup_dir })
     }
 
@@ -68,19 +69,18 @@ impl BackupManager {
             return Err(crate::Error::BackupError("File does not exist".to_string()));
         }
 
-        let backup_path = self
-            .backup_dir
-            .join(job_id)
-            .join(
-                file_path
-                    .file_name()
-                    .ok_or_else(|| crate::Error::BackupError("Invalid filename".to_string()))?,
-            );
-        
-        let parent = backup_path.parent()
+        let backup_path = self.backup_dir.join(job_id).join(
+            file_path
+                .file_name()
+                .ok_or_else(|| crate::Error::BackupError("Invalid filename".to_string()))?,
+        );
+
+        let parent = backup_path
+            .parent()
             .ok_or_else(|| crate::Error::BackupError("Invalid backup path".to_string()))?;
-        std::fs::create_dir_all(parent)
-            .map_err(|e| crate::Error::BackupError(format!("Failed to create backup directory: {}", e)))?;
+        std::fs::create_dir_all(parent).map_err(|e| {
+            crate::Error::BackupError(format!("Failed to create backup directory: {}", e))
+        })?;
 
         std::fs::copy(file_path, &backup_path)
             .map_err(|e| crate::Error::BackupError(e.to_string()))?;

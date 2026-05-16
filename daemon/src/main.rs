@@ -352,25 +352,26 @@ fn parse_args() -> Args {
 
 // ── Main ────────────────────────────────────────────────────────────────────
 
-    #[tokio::main]
-    async fn main() -> Result<(), Box<dyn std::error::Error>> {
-        let args = parse_args();
-        let wal_path = PathBuf::from(
-            std::env::var("RUNTIMO_WAL_PATH").unwrap_or_else(|_| default_wal_path().to_string_lossy().to_string()),
-        );
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = parse_args();
+    let wal_path = PathBuf::from(
+        std::env::var("RUNTIMO_WAL_PATH")
+            .unwrap_or_else(|_| default_wal_path().to_string_lossy().to_string()),
+    );
 
-        println!("Runtimo Daemon v{}", env!("CARGO_PKG_VERSION"));
-        println!("Socket: {}", args.socket.display());
-        println!("WAL:    {}", wal_path.display());
+    println!("Runtimo Daemon v{}", env!("CARGO_PKG_VERSION"));
+    println!("Socket: {}", args.socket.display());
+    println!("WAL:    {}", wal_path.display());
 
-        // Ensure data directory exists with proper permissions
-        ensure_data_dir()?;
+    // Ensure data directory exists with proper permissions
+    ensure_data_dir()?;
 
-        // Clean up stale socket file
-        if args.socket.exists() {
-            std::fs::remove_file(&args.socket)?;
-            println!("Removed stale socket file");
-        }
+    // Clean up stale socket file
+    if args.socket.exists() {
+        std::fs::remove_file(&args.socket)?;
+        println!("Removed stale socket file");
+    }
 
     let state = Arc::new(DaemonState::new(&wal_path)?);
 

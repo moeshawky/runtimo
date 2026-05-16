@@ -79,20 +79,20 @@ cargo build --release
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │ moe CLI                                                         │
-│ (run, status, undo, logs, telemetry, processes, list)           │
+│ (run, status, undo, logs, telemetry, processes, list, session)  │
 └──────────────────────────┬──────────────────────────────────────┘
                            │
                            ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │ CapabilityRegistry                                              │
-│ ┌──────────┐ ┌──────────┐                                      │
-│ │ FileRead │ │FileWrite │                                      │
-│ └──────────┘ └──────────┘                                      │
+│ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────┐               │
+│ │ FileRead │ │FileWrite │ │ShellExec │ │ Undo │               │
+│ └──────────┘ └──────────┘ └──────────┘ └──────┘               │
 └──────────────────────────┬──────────────────────────────────────┘
                            │
                            ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ execute_with_telemetry()                                        │
+│ execute_with_telemetry() / execute_with_telemetry_and_session() │
 │                                                                 │
 │ 1. Telemetry::capture()         ← hardware snapshot            │
 │ 2. ProcessSnapshot::capture()   ← process list with PPIDs      │
@@ -103,6 +103,7 @@ cargo build --release
 │ 7. Telemetry::capture()         ← after snapshot               │
 │ 8. ProcessSnapshot::capture()   ← after snapshot               │
 │ 9. WalWriter::append(Completed) ← WAL event (fsync)            │
+│ 10. SessionManager::add_job()   ← track job in session (opt)   │
 │                                                                 │
 │ Returns: ExecutionResult with before/after telemetry           │
 └─────────────────────────────────────────────────────────────────┘
@@ -191,6 +192,81 @@ Executes shell commands with full telemetry capture, audit logging, and timeout 
 - Runs with minimal privileges
 - **Warning:** Do not interpolate untrusted input into command strings
 
+### Undo
+
+Restores files to their state before a `FileWrite` operation. Uses the WAL to determine original file paths and restores from automatic backups.
+
+**Schema:**
+```json
+{
+  "type": "object",
+  "properties": {
+    "job_id": { "type": "string" }
+  },
+  "required": ["job_id"]
+}
+```
+
+**Example:**
+```bash
+# Write a file (creates backup)
+./target/release/moe run -c FileWrite -a '{"path":"/tmp/config.txt","content":"v2"}'
+# job: abc123  cap: FileWrite  ok: true
+
+# Undo the write (restores original)
+./target/release/moe run -c Undo -a '{"job_id":"abc123"}'
+# Or use the dedicated undo command:
+./target/release/moe undo -j abc123
+```
+
+**How it works:**
+1. `FileWrite` backs up the original file to `backups/<job_id>/<filename>`
+2. WAL records the original path in the job completion event
+3. `Undo` reads the WAL to find the original path, then restores from backup
+
+### Sessions
+
+Sessions group related job executions together, enabling session resume after disconnect, audit trails per session, and batch undo/rollback.
+
+**CLI Commands:**
+```bash
+# Create a new session
+./target/release/moe session --create "ssh-import"
+# Created session: abc123  name: ssh-import  status: active
+
+# List all sessions
+./target/release/moe session --list
+# 2 session(s):
+#   abc123 - 5 job(s) [ssh-import]
+#   def456 - 3 job(s) [unnamed]
+
+# Run a capability within a session
+./target/release/moe run -c FileRead -a '{"path":"/tmp/test.txt"}' --session abc123
+
+# Resume a session (view jobs)
+./target/release/moe session --resume abc123
+# Session abc123: 5 job(s)
+#   - job_id_1
+#   - job_id_2
+#   ...
+```
+
+**Programmatic usage:**
+```rust
+use runtimo_core::{SessionManager, execute_with_telemetry_and_session};
+use std::path::PathBuf;
+
+let mut mgr = SessionManager::new(PathBuf::from("/tmp/sessions")).unwrap();
+let session = mgr.create_session(Some("import-job")).unwrap();
+
+// Execute with automatic session tracking
+let result = execute_with_telemetry_and_session(
+    &cap, &args, false, &wal_path,
+    Some(&session.id), 30
+)?;
+// Job is automatically added to session on completion
+```
+
 ## Safety Model
 
 ### Two-Layer Telemetry (Observational)
@@ -245,7 +321,7 @@ Measured on AMD EPYC 7B13 system:
 | Telemetry capture | <100ms | 15+ shell subprocesses |
 | Process snapshot | <50ms | ps aux parse |
 | Memory baseline | <50MB | RSS at idle |
-| Test suite (51 tests) | <3.5s | Single-threaded |
+| Test suite (59 tests) | <3.5s | Single-threaded |
 | Doc build | <4s | No-deps |
 
 ## Project Structure
@@ -266,6 +342,7 @@ runtimo/
 │   │   ├── llmosafe.rs     # llmosafe ResourceGuard integration
 │   │   ├── wal.rs          # Write-ahead log (WalWriter, WalReader)
 │   │   ├── backup.rs       # BackupManager for undo support
+│   │   ├── session.rs      # Session tracking and persistence
 │   │   ├── cmd.rs          # Shell command execution
 │   │   ├── validation/     # Unified path validation
 │   │   │   ├── mod.rs
@@ -273,12 +350,14 @@ runtimo/
 │   │   └── capabilities/
 │   │       ├── mod.rs
 │   │       ├── file_read.rs
-│   │       └── file_write.rs
+│   │       ├── file_write.rs
+│   │       ├── shell_exec.rs
+│   │       └── undo.rs
 │   └── tests/
 │       └── integration.rs  # Integration tests
 ├── cli/                    # moe binary
 │   └── src/
-│       └── main.rs         # 7 CLI commands via clap
+│       └── main.rs         # CLI commands via clap (run, undo, session, etc.)
 └── daemon/                 # runtimo-daemon binary
     └── src/
         └── main.rs         # Placeholder (future JSON-RPC server)
@@ -297,7 +376,7 @@ cargo test -p runtimo-core
 cargo test -- --nocapture
 ```
 
-**Test coverage (51+ total tests):**
+**Test coverage (59+ total tests):**
 
 | Category | Tests |
 |----------|-------|
@@ -305,7 +384,8 @@ cargo test -- --nocapture
 | Security | rejects_path_traversal_read, rejects_path_traversal_write, rejects_reading_directory, rejects_empty_path, rejects_symlink_escape |
 | Edge cases | reads_empty_file, reads_unicode, reads_large_file, writes_unicode, creates_parent_directories, truncate_multibyte_utf8 |
 | Error handling | rejects_missing_file, rejects_missing_field_in_args, llmosafe_guard_reports_pressure, llmosafe_guard_reports_entropy |
-| Workflows | write_then_read_roundtrip, backup_created_on_overwrite, wal_records_jobs, dry_run_does_not_write, append_mode |
+| Workflows | write_then_read_roundtrip, backup_created_on_overwrite, wal_records_jobs, dry_run_does_not_write, append_mode, undo_with_backup |
+| Sessions | creates_session, adds_job_to_session, lists_sessions |
 | Invariants | roundtrip_many_contents, timestamps_monotonic, process_snapshot_consistent, executor_always_returns_telemetry, wal_events_sequential |
 
 ## Environment Variables
@@ -314,6 +394,7 @@ cargo test -- --nocapture
 |----------|---------|-------------|
 | `RUNTIMO_WAL_PATH` | `$XDG_DATA_HOME/runtimo/wal.jsonl` | Override WAL file path |
 | `RUNTIMO_BACKUP_DIR` | `$XDG_DATA_HOME/runtimo/backups` | Override backup directory |
+| `RUNTIMO_SESSIONS_DIR` | `$XDG_DATA_HOME/runtimo/sessions` | Override session storage directory |
 
 ## Known Limitations
 
@@ -329,8 +410,8 @@ The WAL file defaults to `$XDG_DATA_HOME/runtimo/wal.jsonl` (falls back to `/tmp
 ### Backup Cleanup is Stub
 `BackupManager::cleanup()` exists but old backups accumulate indefinitely without a retention policy.
 
-### No ShellExec or HTTP Capabilities
-Only `FileRead` and `FileWrite` are implemented. Shell execution, HTTP requests, and process management capabilities do not exist.
+### No HTTP Capability
+HTTP requests capability is not yet implemented. FileRead, FileWrite, ShellExec, and Undo are available.
 
 ### No Concurrent Job Execution
 The executor runs capabilities synchronously. There is no job queue, worker pool, or concurrent execution support.

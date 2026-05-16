@@ -1,5 +1,5 @@
 //! Unified path validation module.
-//! 
+//!
 //! Centralizes path validation logic for all capabilities.
 
 pub mod path;

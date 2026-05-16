@@ -109,7 +109,8 @@ impl ProcessSnapshot {
         let mut processes = Vec::new();
         // Use ps with explicit format to get PPID: PID,PPID,USER,CPU,MEM,VSZ,RSS,STAT,START,TIME,COMMAND
         // This gives us parent process ID for lineage tracking
-        let ps_output = run_cmd("ps -eo pid,ppid,user,%cpu,%mem,vsz,rss,stat,start,time,comm --no-headers");
+        let ps_output =
+            run_cmd("ps -eo pid,ppid,user,%cpu,%mem,vsz,rss,stat,start,time,comm --no-headers");
 
         for line in ps_output.lines() {
             if let Some(proc) = parse_ps_line(line) {
@@ -272,23 +273,23 @@ impl ProcessSummary {
         let total_cpu_percent: f32 = processes.iter().map(|p| p.cpu_percent).sum();
         let total_mem_percent: f32 = processes.iter().map(|p| p.mem_percent).sum();
 
-    let top_cpu_consumer = processes
-        .iter()
-        .max_by(|a, b| {
-            a.cpu_percent
-                .partial_cmp(&b.cpu_percent)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map(|p| p.command.clone());
+        let top_cpu_consumer = processes
+            .iter()
+            .max_by(|a, b| {
+                a.cpu_percent
+                    .partial_cmp(&b.cpu_percent)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|p| p.command.clone());
 
-    let top_mem_consumer = processes
-        .iter()
-        .max_by(|a, b| {
-            a.mem_percent
-                .partial_cmp(&b.mem_percent)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map(|p| p.command.clone());
+        let top_mem_consumer = processes
+            .iter()
+            .max_by(|a, b| {
+                a.mem_percent
+                    .partial_cmp(&b.mem_percent)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|p| p.command.clone());
 
         let zombie_count = processes.iter().filter(|p| p.stat.starts_with('Z')).count();
 
@@ -321,10 +322,7 @@ fn format_size(kb: u64) -> String {
 fn truncate(s: &str, max_len: usize) -> String {
     if s.chars().count() > max_len {
         let end = max_len.saturating_sub(3);
-        let byte_end = s.char_indices()
-            .nth(end)
-            .map(|(i, _)| i)
-            .unwrap_or(s.len());
+        let byte_end = s.char_indices().nth(end).map(|(i, _)| i).unwrap_or(s.len());
         format!("{}...", &s[..byte_end])
     } else {
         s.to_string()

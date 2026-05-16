@@ -2,7 +2,7 @@
 
 use clap::{Parser, Subcommand};
 use runtimo_core::{
-    capabilities::{FileRead, FileWrite, ShellExec},
+    capabilities::{FileRead, FileWrite, Kill, ShellExec, Undo},
     execute_with_telemetry, BackupManager, CapabilityRegistry, ProcessSnapshot, Telemetry,
     WalReader,
 };
@@ -112,6 +112,8 @@ fn make_registry() -> CapabilityRegistry {
     reg.register(FileRead);
     reg.register(FileWrite::new(backup_dir()).expect("Failed to create FileWrite capability"));
     reg.register(ShellExec);
+    reg.register(Undo);
+    reg.register(Kill);
     reg
 }
 
@@ -150,17 +152,20 @@ fn main() -> Result<(), Box<dyn Error>> {
             let result = execute_with_telemetry(cap, &args, dry_run, &wp)?;
 
             if json {
-                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                    "success": result.success,
-                    "job_id": result.job_id,
-                    "capability": result.capability,
-                    "output": result.output,
-                    "telemetry_before": result.telemetry_before,
-                    "telemetry_after": result.telemetry_after,
-                    "process_before": result.process_before,
-                    "process_after": result.process_after,
-                    "wal_seq": result.wal_seq,
-                }))?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "success": result.success,
+                        "job_id": result.job_id,
+                        "capability": result.capability,
+                        "output": result.output,
+                        "telemetry_before": result.telemetry_before,
+                        "telemetry_after": result.telemetry_after,
+                        "process_before": result.process_before,
+                        "process_after": result.process_after,
+                        "wal_seq": result.wal_seq,
+                    }))?
+                );
             } else {
                 println!(
                     "job: {}  cap: {}  ok: {}",
@@ -237,10 +242,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                     let events: Vec<_> =
                         reader.events().iter().filter(|e| e.job_id == id).collect();
                     if json {
-                        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                            "job_id": id,
-                            "events": events,
-                        }))?);
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "job_id": id,
+                                "events": events,
+                            }))?
+                        );
                     } else if events.is_empty() {
                         println!("no events for {}", id);
                     } else {
@@ -262,19 +270,25 @@ fn main() -> Result<(), Box<dyn Error>> {
                         jobs.entry(&e.job_id).or_default().push(e);
                     }
                     if json {
-                        let summary: Vec<_> = jobs.iter().map(|(jid, evts)| {
-                            let last = evts.last().unwrap();
-                            serde_json::json!({
-                                "job_id": jid,
-                                "status": last.event_type,
-                                "capability": last.capability,
-                                "event_count": evts.len(),
+                        let summary: Vec<_> = jobs
+                            .iter()
+                            .map(|(jid, evts)| {
+                                let last = evts.last().unwrap();
+                                serde_json::json!({
+                                    "job_id": jid,
+                                    "status": last.event_type,
+                                    "capability": last.capability,
+                                    "event_count": evts.len(),
+                                })
                             })
-                        }).collect();
-                        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                            "total_events": events.len(),
-                            "jobs": summary,
-                        }))?);
+                            .collect();
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "total_events": events.len(),
+                                "jobs": summary,
+                            }))?
+                        );
                     } else {
                         println!("{} events total:", events.len());
                         for (jid, evts) in &jobs {
@@ -292,7 +306,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             Ok(())
         }
 
-        Commands::Logs { job_id, limit, json } => {
+        Commands::Logs {
+            job_id,
+            limit,
+            json,
+        } => {
             let wp = wal_path();
             if !wp.exists() {
                 if json {
@@ -310,11 +328,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             let show: Vec<_> = filtered.iter().rev().take(limit).rev().collect();
 
             if json {
-                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                    "events": show,
-                    "total": filtered.len(),
-                    "showing": show.len(),
-                }))?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "events": show,
+                        "total": filtered.len(),
+                        "showing": show.len(),
+                    }))?
+                );
             } else {
                 println!("{} events:", show.len());
                 for e in show.iter().rev() {
@@ -355,12 +376,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                 return Err(format!("no backup for job {}", job_id).into());
             }
 
-            let mut target_paths: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            let mut target_paths: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
             for event in &events {
                 if let Some(output) = &event.output {
                     // Path may be at output.path (FileRead) or output.data.path (FileWrite)
-                    let path = output.get("path").and_then(|p| p.as_str())
-                        .or_else(|| output.get("data").and_then(|d| d.get("path")).and_then(|p| p.as_str()));
+                    let path = output.get("path").and_then(|p| p.as_str()).or_else(|| {
+                        output
+                            .get("data")
+                            .and_then(|d| d.get("path"))
+                            .and_then(|p| p.as_str())
+                    });
                     if let Some(p) = path {
                         target_paths.insert(event.job_id.clone(), p.to_string());
                     }
@@ -368,7 +394,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
 
             if dry_run {
-                println!("Would restore {} file(s) for job {}:", bd.read_dir()?.count(), job_id);
+                println!(
+                    "Would restore {} file(s) for job {}:",
+                    bd.read_dir()?.count(),
+                    job_id
+                );
                 for entry in std::fs::read_dir(&bd)? {
                     let entry = entry?;
                     let bp = entry.path();
@@ -396,7 +426,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                              WAL does not contain the target path for job {}.",
                             bp.file_name().unwrap_or_default(),
                             job_id
-                        ).into());
+                        )
+                        .into());
                     };
                     BackupManager::new(backup_dir())?.restore(&bp, &target)?;
                     restored += 1;

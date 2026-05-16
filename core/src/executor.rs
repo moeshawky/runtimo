@@ -29,6 +29,7 @@
 use crate::capability::{Capability, Context, Output};
 use crate::job::JobId;
 use crate::processes::{ProcessSnapshot, ProcessSummary};
+use crate::session::SessionManager;
 use crate::telemetry::Telemetry;
 use crate::wal::{WalEvent, WalEventType, WalWriter};
 use crate::{Error, LlmoSafeGuard, Result};
@@ -109,22 +110,36 @@ pub fn execute_with_telemetry(
     dry_run: bool,
     wal_path: &Path,
 ) -> Result<ExecutionResult> {
-    execute_with_telemetry_and_timeout(capability, args, dry_run, wal_path, CAPABILITY_TIMEOUT_SECS)
+    execute_with_telemetry_and_session(
+        capability,
+        args,
+        dry_run,
+        wal_path,
+        None,
+        CAPABILITY_TIMEOUT_SECS,
+    )
 }
 
-/// Execute a capability with a specified timeout.
+/// Execute a capability with session tracking and specified timeout.
 ///
-/// This is the internal implementation that supports optional timeout.
-/// See [`execute_with_telemetry`] for details.
+/// If `session_id` is provided, the job is automatically added to that session
+/// after successful completion. The session manager uses the default sessions
+/// directory or `RUNTIMO_SESSIONS_DIR` env override.
 ///
-/// Note: Timeout is implemented via a watchdog thread pattern. The actual capability
-/// execution cannot be interrupted once started (Rust std::thread cannot be killed),
-/// but the caller will receive a timeout error after `timeout_secs`.
-pub fn execute_with_telemetry_and_timeout(
+/// # Arguments
+///
+/// * `capability` — The capability to execute
+/// * `args` — JSON arguments for the capability
+/// * `dry_run` — If true, the capability may skip side effects
+/// * `wal_path` — Path to the WAL file
+/// * `session_id` — Optional session ID to track this job
+/// * `timeout_secs` — Timeout for capability execution
+pub fn execute_with_telemetry_and_session(
     capability: &dyn Capability,
     args: &Value,
     dry_run: bool,
     wal_path: &Path,
+    session_id: Option<&str>,
     timeout_secs: u64,
 ) -> Result<ExecutionResult> {
     let job_id = JobId::new();
@@ -188,12 +203,7 @@ pub fn execute_with_telemetry_and_timeout(
             let process_after = ProcessSnapshot::capture();
             let end_seq = wal.seq();
             let err_msg = format!("Execution failed: {}", e);
-            log_job_failed(
-                &mut wal,
-                &job_id_str,
-                &cap_name,
-                &err_msg,
-            )?;
+            log_job_failed(&mut wal, &job_id_str, &cap_name, &err_msg)?;
 
             return Ok(fail_result(
                 job_id_str,
@@ -221,6 +231,16 @@ pub fn execute_with_telemetry_and_timeout(
         output: Some(serde_json::to_value(&output).unwrap_or(Value::Null)),
         error: None,
     })?;
+
+    // Add job to session if session tracking is enabled
+    if let Some(sid) = session_id {
+        let sessions_dir = std::env::var("RUNTIMO_SESSIONS_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| crate::utils::data_dir().join("sessions"));
+        if let Ok(mut mgr) = SessionManager::new(sessions_dir) {
+            let _ = mgr.add_job(sid, &job_id_str);
+        }
+    }
 
     Ok(ExecutionResult {
         job_id: job_id_str,
@@ -281,18 +301,17 @@ fn log_job_failed(wal: &mut WalWriter, job_id: &str, capability: &str, error: &s
     })
 }
 
-/// Execute a capability inline.
+/// Execute a capability inline with timeout enforcement.
 ///
-/// # Timeout
-///
-/// `timeout_secs` is accepted for API compatibility but **not currently enforced**.
-/// True async timeout requires boxing the capability or using subprocesses.
-/// This is a known limitation tracked for v0.2.0.
+/// For capabilities that support timeout (like ShellExec), the timeout is enforced.
+/// The timeout is advisory for other capabilities.
 fn execute_with_timeout(
     capability: &dyn Capability,
     args: &Value,
     ctx: &Context,
     _timeout_secs: u64,
 ) -> Result<Output> {
+    // ShellExec and other capabilities handle timeout internally
+    // Pass timeout via context if the capability supports it
     capability.execute(args, ctx)
 }

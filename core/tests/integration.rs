@@ -417,7 +417,8 @@ fn append_mode() {
         )
         .unwrap();
 
-    FileWrite::new(bw).expect("Failed to create FileWrite")
+    FileWrite::new(bw)
+        .expect("Failed to create FileWrite")
         .execute(
             &json!({
                 "path": target.to_str().unwrap(), "content": "line2\n", "append": true
@@ -456,7 +457,12 @@ fn multiple_jobs_in_sequence() {
     // Debug: check what's in the output
     println!("Success: {}, Output: {:?}", r.success, r.output);
     assert!(r.success, "FileRead failed: {:?}", r.output.message);
-    assert_eq!(r.output.data["content"].as_str().unwrap_or("CONTENT_MISSING"), "seq test");
+    assert_eq!(
+        r.output.data["content"]
+            .as_str()
+            .unwrap_or("CONTENT_MISSING"),
+        "seq test"
+    );
 
     assert!(WalReader::load(&wp).unwrap().events().len() >= 4);
     cleanup(&dir);
@@ -567,4 +573,3 @@ fn wal_events_sequential() {
     assert!(WalReader::load(&wp).unwrap().events().len() >= 6);
     cleanup(&dir);
 }
-

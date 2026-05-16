@@ -106,7 +106,8 @@ fn main() -> anyhow::Result<()> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("No backup path in write output"))?;
 
-    let backup_mgr = BackupManager::new(backup_dir.clone()).expect("Failed to create BackupManager");
+    let backup_mgr =
+        BackupManager::new(backup_dir.clone()).expect("Failed to create BackupManager");
     backup_mgr.restore(Path::new(backup_path_str), Path::new(tmp_path))?;
     println!("Restored from: {backup_path_str}");
 

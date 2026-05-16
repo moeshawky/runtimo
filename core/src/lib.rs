@@ -64,20 +64,24 @@ pub mod cmd;
 pub mod executor;
 pub mod job;
 pub mod llmosafe;
+pub mod monitor;
 pub mod processes;
 pub mod schema;
+pub mod session;
 pub mod telemetry;
 pub mod validation;
 pub mod wal;
 
 pub use backup::BackupManager;
-pub use capabilities::{FileRead, FileWrite, ShellExec};
+pub use capabilities::{FileRead, FileWrite, Kill, ShellExec, Undo};
 pub use capability::{Capability, CapabilityRegistry, Context, Output};
-pub use executor::{execute_with_telemetry, ExecutionResult};
+pub use executor::{execute_with_telemetry, execute_with_telemetry_and_session, ExecutionResult};
 pub use job::{Job, JobId, JobState};
 pub use llmosafe::LlmoSafeGuard;
+pub use monitor::{HealthAlert, HealthMonitor, HealthState};
 pub use processes::ProcessSnapshot;
 pub use schema::SchemaValidator;
+pub use session::{Session, SessionManager};
 pub use telemetry::Telemetry;
 pub use wal::{WalEvent, WalEventType, WalReader, WalWriter};
 
@@ -125,29 +129,33 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Utility functions for path management.
 pub mod utils {
-use std::path::PathBuf;
+    use std::path::PathBuf;
 
-/// Returns the data directory following XDG spec.
-pub fn data_dir() -> PathBuf {
-std::env::var("XDG_DATA_HOME")
-.ok()
-.map(PathBuf::from)
-.or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".local/share")))
-.unwrap_or_else(std::env::temp_dir)
-.join("runtimo")
-}
+    /// Returns the data directory following XDG spec.
+    pub fn data_dir() -> PathBuf {
+        std::env::var("XDG_DATA_HOME")
+            .ok()
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var("HOME")
+                    .ok()
+                    .map(|h| PathBuf::from(h).join(".local/share"))
+            })
+            .unwrap_or_else(std::env::temp_dir)
+            .join("runtimo")
+    }
 
-/// Returns the WAL path (env override or default).
-pub fn wal_path() -> PathBuf {
-std::env::var("RUNTIMO_WAL_PATH")
-.map(PathBuf::from)
-.unwrap_or_else(|_| data_dir().join("wal.jsonl"))
-}
+    /// Returns the WAL path (env override or default).
+    pub fn wal_path() -> PathBuf {
+        std::env::var("RUNTIMO_WAL_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| data_dir().join("wal.jsonl"))
+    }
 
-/// Returns the backup directory (env override or default).
-pub fn backup_dir() -> PathBuf {
-std::env::var("RUNTIMO_BACKUP_DIR")
-.map(PathBuf::from)
-.unwrap_or_else(|_| data_dir().join("backups"))
-}
+    /// Returns the backup directory (env override or default).
+    pub fn backup_dir() -> PathBuf {
+        std::env::var("RUNTIMO_BACKUP_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| data_dir().join("backups"))
+    }
 }

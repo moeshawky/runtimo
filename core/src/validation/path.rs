@@ -75,7 +75,8 @@ pub fn validate_path(path_str: &str, ctx: &PathContext) -> Result<PathBuf, Strin
             let canonical_parent = parent
                 .canonicalize()
                 .map_err(|e| format!("canonicalize parent failed: {}", e))?;
-            let filename = path.file_name()
+            let filename = path
+                .file_name()
                 .ok_or_else(|| "invalid filename".to_string())?;
             canonical_parent.join(filename)
         } else {
@@ -98,7 +99,11 @@ pub fn validate_path(path_str: &str, ctx: &PathContext) -> Result<PathBuf, Strin
 
     // Check allowed prefixes against the resolved path
     let resolved_str = resolved.to_string_lossy();
-    if !ctx.allowed_prefixes.iter().any(|prefix| resolved_str.starts_with(prefix)) {
+    if !ctx
+        .allowed_prefixes
+        .iter()
+        .any(|prefix| resolved_str.starts_with(prefix))
+    {
         return Err(format!(
             "path outside allowed directories: {}",
             resolved.display(),

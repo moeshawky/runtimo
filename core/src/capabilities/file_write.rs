@@ -129,8 +129,7 @@ impl Capability for FileWrite {
             ..Default::default()
         };
 
-        validate_path(&args.path, &ctx)
-            .map_err(Error::SchemaValidationFailed)?;
+        validate_path(&args.path, &ctx).map_err(Error::SchemaValidationFailed)?;
 
         Ok(())
     }

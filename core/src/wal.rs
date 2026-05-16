@@ -215,8 +215,7 @@ impl WalReader {
     pub fn tail(path: &Path, n: usize) -> Result<Self> {
         use std::collections::VecDeque;
         use std::io::{BufRead, BufReader};
-        let file = std::fs::File::open(path)
-            .map_err(|e| crate::Error::WalError(e.to_string()))?;
+        let file = std::fs::File::open(path).map_err(|e| crate::Error::WalError(e.to_string()))?;
         let reader = BufReader::new(file);
 
         let mut window: VecDeque<WalEvent> = VecDeque::with_capacity(n + 1);
@@ -230,24 +229,26 @@ impl WalReader {
             }
         }
 
-        Ok(Self { events: window.into() })
+        Ok(Self {
+            events: window.into(),
+        })
     }
 }
 
 /// WAL cleanup and rotation utilities.
 impl WalWriter {
     /// Cleans up WAL entries older than max_age_secs.
-    /// 
+    ///
     /// # Arguments
     /// * `path` - Path to WAL file
     /// * `max_age_secs` - Maximum age in seconds
-    /// 
+    ///
     /// # Returns
     /// * `Ok(usize)` - Number of entries removed
     /// * `Err(Error)` - Cleanup failure
     pub fn cleanup(path: &Path, max_age_secs: u64) -> Result<usize> {
         use std::time::{SystemTime, UNIX_EPOCH};
-        
+
         let cutoff = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -255,28 +256,28 @@ impl WalWriter {
             .saturating_sub(max_age_secs);
 
         // Read all events
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| crate::Error::WalError(e.to_string()))?;
-        
+        let content =
+            std::fs::read_to_string(path).map_err(|e| crate::Error::WalError(e.to_string()))?;
+
         let events: Vec<WalEvent> = content
             .lines()
             .filter_map(|line| serde_json::from_str(line).ok())
             .collect();
 
         // Filter out old events
-        let retained: Vec<_> = events
-            .into_iter()
-            .filter(|e| e.ts >= cutoff)
-            .collect();
+        let retained: Vec<_> = events.into_iter().filter(|e| e.ts >= cutoff).collect();
 
-        let total = content.lines().filter_map(|line| serde_json::from_str::<WalEvent>(line).ok()).count();
+        let total = content
+            .lines()
+            .filter_map(|line| serde_json::from_str::<WalEvent>(line).ok())
+            .count();
         let removed = total - retained.len();
 
         // Rewrite WAL: truncate first to prevent appending to stale data
         if removed > 0 {
-            std::fs::write(path, "").map_err(|e| crate::Error::WalError(
-                format!("truncate WAL before cleanup: {}", e)
-            ))?;
+            std::fs::write(path, "").map_err(|e| {
+                crate::Error::WalError(format!("truncate WAL before cleanup: {}", e))
+            })?;
             let mut new_wal = WalWriter::create(path)?;
             for event in retained {
                 new_wal.append(event)?;
