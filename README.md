@@ -50,36 +50,36 @@ println!("WAL seq: {}", result.wal_seq);
 cargo build --release
 
 # List available capabilities
-./target/release/moe list
+./target/release/runtimo list
 
 # Execute a capability with telemetry
-./target/release/moe run -c FileRead -a '{"path":"/etc/hostname"}'
+./target/release/runtimo run -c FileRead -a '{"path":"/etc/hostname"}'
 
 # Write a file (creates automatic backup)
-./target/release/moe run -c FileWrite -a '{"path":"/tmp/hello.txt","content":"hello runtimo"}'
+./target/release/runtimo run -c FileWrite -a '{"path":"/tmp/hello.txt","content":"hello runtimo"}'
 
 # Dry run (validate without executing)
-./target/release/moe run -c FileWrite -a '{"path":"/tmp/test.txt","content":"test"}' --dry-run
+./target/release/runtimo run -c FileWrite -a '{"path":"/tmp/test.txt","content":"test"}' --dry-run
 
 # View system telemetry
-./target/release/moe telemetry
+./target/release/runtimo telemetry
 
 # View process snapshot (with PPID tracking)
-./target/release/moe processes
+./target/release/runtimo processes
 
 # View WAL events
-./target/release/moe logs
+./target/release/runtimo logs
 
 # Undo a job (restores from backup)
-./target/release/moe undo -j <job_id>
+./target/release/runtimo undo -j <job_id>
 ```
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│ moe CLI                                                         │
-│ (run, status, undo, logs, telemetry, processes, list, session)  │
+│ runtimo CLI │
+│ (run, status, undo, logs, telemetry, processes, list, session) │
 └──────────────────────────┬──────────────────────────────────────┘
                            │
                            ▼
@@ -128,14 +128,14 @@ Reads the contents of a file. Validates that the path exists, is a file (not a d
 
 **Example:**
 ```bash
-./target/release/moe run -c FileRead -a '{"path":"/tmp/test.txt"}'
+./target/release/runtimo run -c FileRead -a '{"path":"/tmp/test.txt"}'
 ```
 
 **Security:** Rejects path traversal (`..`), empty paths, directories, and non-existent files. File size limited to 100 MB.
 
 ### FileWrite
 
-Writes content to a file with automatic backup-before-mutate. If the target file exists, it is copied to the backup directory before being overwritten, enabling undo via `moe undo`.
+Writes content to a file with automatic backup-before-mutate. If the target file exists, it is copied to the backup directory before being overwritten, enabling undo via `runtimo undo`.
 
 **Schema:**
 ```json
@@ -152,12 +152,12 @@ Writes content to a file with automatic backup-before-mutate. If the target file
 
 **Example — overwrite:**
 ```bash
-./target/release/moe run -c FileWrite -a '{"path":"/tmp/out.txt","content":"new content"}'
+./target/release/runtimo run -c FileWrite -a '{"path":"/tmp/out.txt","content":"new content"}'
 ```
 
 **Example — append:**
 ```bash
-./target/release/moe run -c FileWrite -a '{"path":"/tmp/out.txt","content":"\nappended line","append":true}'
+./target/release/runtimo run -c FileWrite -a '{"path":"/tmp/out.txt","content":"\nappended line","append":true}'
 ```
 
 **Security:** Rejects path traversal (`..`) and empty paths. Creates parent directories automatically. Content size limited to 10 MB.
@@ -181,9 +181,9 @@ Executes shell commands with full telemetry capture, audit logging, and timeout 
 
 **Example:**
 ```bash
-./target/release/moe run -c ShellExec -a '{"cmd":"uptime"}'
-./target/release/moe run -c ShellExec -a '{"cmd":"ls -la /tmp"}'
-./target/release/moe run -c ShellExec -a '{"cmd":"pwd","timeout_secs":10}'
+./target/release/runtimo run -c ShellExec -a '{"cmd":"uptime"}'
+./target/release/runtimo run -c ShellExec -a '{"cmd":"ls -la /tmp"}'
+./target/release/runtimo run -c ShellExec -a '{"cmd":"pwd","timeout_secs":10}'
 ```
 
 **Security:** 
@@ -210,13 +210,13 @@ Restores files to their state before a `FileWrite` operation. Uses the WAL to de
 **Example:**
 ```bash
 # Write a file (creates backup)
-./target/release/moe run -c FileWrite -a '{"path":"/tmp/config.txt","content":"v2"}'
+./target/release/runtimo run -c FileWrite -a '{"path":"/tmp/config.txt","content":"v2"}'
 # job: abc123  cap: FileWrite  ok: true
 
 # Undo the write (restores original)
-./target/release/moe run -c Undo -a '{"job_id":"abc123"}'
+./target/release/runtimo run -c Undo -a '{"job_id":"abc123"}'
 # Or use the dedicated undo command:
-./target/release/moe undo -j abc123
+./target/release/runtimo undo -j abc123
 ```
 
 **How it works:**
@@ -242,8 +242,8 @@ Terminates a process by PID with full audit logging. Includes safety guards to p
 
 **Example:**
 ```bash
-./target/release/moe run -c Kill -a '{"pid":12345}'
-./target/release/moe run -c Kill -a '{"pid":12345,"signal":9}'
+./target/release/runtimo run -c Kill -a '{"pid":12345}'
+./target/release/runtimo run -c Kill -a '{"pid":12345,"signal":9}'
 ```
 
 **Security:** Protected PIDs include init (1), kthreadd (2), the daemon's own PID, and its parent PID. These cannot be killed.
@@ -272,8 +272,8 @@ Executes git operations (clone, pull, commit, revert, clean, status) with state 
 
 **Example:**
 ```bash
-./target/release/moe run -c GitExec -a '{"operation":"status","path":"/tmp/myrepo"}'
-./target/release/moe run -c GitExec -a '{"operation":"clone","url":"https://github.com/user/repo.git","path":"/tmp/repo"}'
+./target/release/runtimo run -c GitExec -a '{"operation":"status","path":"/tmp/myrepo"}'
+./target/release/runtimo run -c GitExec -a '{"operation":"clone","url":"https://github.com/user/repo.git","path":"/tmp/repo"}'
 ```
 
 **Security:** URL validation (http/https/SSH), path traversal protection, branch name and commit SHA validation.
@@ -285,20 +285,20 @@ Sessions group related job executions together, enabling session resume after di
 **CLI Commands:**
 ```bash
 # Create a new session
-./target/release/moe session --create "ssh-import"
+./target/release/runtimo session --create "ssh-import"
 # Created session: abc123  name: ssh-import  status: active
 
 # List all sessions
-./target/release/moe session --list
+./target/release/runtimo session --list
 # 2 session(s):
 #   abc123 - 5 job(s) [ssh-import]
 #   def456 - 3 job(s) [unnamed]
 
 # Run a capability within a session
-./target/release/moe run -c FileRead -a '{"path":"/tmp/test.txt"}' --session abc123
+./target/release/runtimo run -c FileRead -a '{"path":"/tmp/test.txt"}' --session abc123
 
 # Resume a session (view jobs)
-./target/release/moe session --resume abc123
+./target/release/runtimo session --resume abc123
 # Session abc123: 5 job(s)
 #   - job_id_1
 #   - job_id_2
@@ -361,7 +361,7 @@ All events are written to an append-only JSONL file with `fsync` after each writ
 
 ### Backup/Undo
 
-`FileWrite` creates a backup copy before mutating any existing file. Backups are stored per-job in `RUNTIMO_BACKUP_DIR/<job_id>/`. The `moe undo` command restores all files from a job's backup directory.
+`FileWrite` creates a backup copy before mutating any existing file. Backups are stored per-job in `RUNTIMO_BACKUP_DIR/<job_id>/`. The `runtimo undo` command restores all files from a job's backup directory.
 
 ## Performance (Measured)
 
@@ -409,7 +409,7 @@ runtimo/
 │   │       └── undo.rs
 │   └── tests/
 │       └── integration.rs  # Integration tests
-├── cli/                    # moe binary
+├── cli/ # runtimo binary
 │   └── src/
 │       └── main.rs         # CLI commands via clap (run, undo, session, etc.)
 └── daemon/                 # runtimo-daemon binary
