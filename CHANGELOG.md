@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-05-17
+
+### Bug Fixes
+
+- **`create_backup` fails on directories** — `BackupManager::create_backup()` used `std::fs::copy()` which only works for regular files. When backing up a git repository (directory), it failed with "the source path is neither a regular file nor a symlink to a regular file". Replaced with `copy_recursive()` that handles both files and directories.
+
+### Security
+
+- **Symlink attack vector in backup** — `copy_recursive()` now explicitly rejects symlinks using `symlink_metadata()` to prevent symlink attack vectors where an attacker could place symlinks to sensitive files (e.g., `/etc/passwd`) in a directory being backed up.
+
+### Features
+
+- **Directory backup support** — `create_backup()` now recursively copies entire directory trees, enabling backup of git repositories and other directory structures.
+- **Directory restore support** — `restore()` now uses `copy_recursive()` to restore both files and directories from backup.
+- **Permission preservation** — On Unix systems, file and directory permissions (including executable bits) are preserved during backup/restore operations.
+
+### Tests
+
+- Added `test_backup_directory()` — Verifies directory tree backup works correctly
+- Added `test_backup_rejects_symlinks()` — Verifies symlinks are rejected for security
+- Added `test_restore_directory()` — Verifies directory restore from backup
+- Added `test_backup_preserves_executable_bit()` — Verifies Unix permission preservation
+
 ## [0.1.4] - 2026-05-17
 
 ### Added
