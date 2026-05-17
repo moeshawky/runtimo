@@ -98,6 +98,10 @@ impl Capability for FileWrite {
         "FileWrite"
     }
 
+    fn description(&self) -> &'static str {
+        "Write content to a file. Creates automatic backups of existing files for undo support. Supports append mode."
+    }
+
     /// Returns the JSON Schema for FileWrite arguments.
     ///
     /// Schema requires `"path"` and `"content"` strings; `"append"` is an

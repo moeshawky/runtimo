@@ -52,6 +52,7 @@ pub struct Output {
 ///
 /// impl Capability for Echo {
 ///     fn name(&self) -> &'static str { "Echo" }
+///     fn description(&self) -> &'static str { "Echo back arguments" }
 ///     fn schema(&self) -> Value { serde_json::json!({"type":"object"}) }
 ///     fn validate(&self, _args: &Value) -> Result<()> { Ok(()) }
 ///     fn execute(&self, args: &Value, _ctx: &Context) -> Result<Output> {
@@ -64,6 +65,12 @@ pub trait Capability: Send + Sync {
     ///
     /// This name is used for registry lookups and WAL event tagging.
     fn name(&self) -> &'static str;
+
+    /// Returns a one-line human-readable description of what this capability does.
+    ///
+    /// Used by the CLI `list` command and `--help` output to help users
+    /// discover available capabilities.
+    fn description(&self) -> &'static str;
 
     /// Returns the JSON Schema for the capability's arguments.
     ///

@@ -7,6 +7,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-05-17
+
+### Added
+
+- **Persistent config file** — `~/.config/runtimo/config.toml` stores allowed path prefixes
+  across invocations. Merged with built-in defaults and `RUNTIMO_ALLOWED_PATHS` env var.
+- **CLI config subcommand** — `moe config allowed-paths add/list/remove` manages persistent
+  path prefixes without needing env vars on every SSH invocation.
+- **31 robust tests** covering 6 LLM failure mode categories:
+  - **G-EDGE**: Empty content, single chars, long filenames, null bytes, concurrent writes
+  - **G-SEC**: Encoded path traversal, null byte injection, symlink chains, type confusion,
+    adversarial JSON
+  - **G-ERR**: Directory reads, read-only locations, WAL failures, backup errors, invalid signals
+  - **G-CTX**: Config file loading, env var precedence, invalid TOML handling, path validation
+  - **G-SEM**: Backup numbering, WAL monotonicity, telemetry ordering, process consistency
+  - **G-DRIFT**: Telemetry/process/WAL format stability via golden file assertions
+- **4 property-based tests** (proptest):
+  - Write/read roundtrip for arbitrary strings
+  - Backup numbering produces no duplicates
+  - Path validation is consistent for equivalent paths
+  - WAL cleanup preserves recent events
+
+### Dependencies
+
+- Added `toml = "0.8"` for config file serialization
+- Added `proptest = "1.4"` for property-based testing (dev-dependency)
+
+## [0.1.3] - 2026-05-17
+
+### Added
+
+- **Capability descriptions** — All 6 capabilities now implement `description()` on the
+  `Capability` trait. CLI `list` command shows human-readable descriptions alongside names.
+- **CLI help text** — Every subcommand now has `about`, `long_about`, and `after_help` with
+  usage examples. `moe --help` shows quick-start commands.
+- **Timeout warning** — `execute_with_timeout_check` (renamed from `execute_with_timeout`)
+  now emits an `eprintln!` warning when a capability exceeds its timeout, making the advisory
+  nature visible to operators.
+- **2 new tests** (86 total):
+  - `respects_dry_run` — ShellExec returns immediately without spawning a process
+  - `test_kill_dry_run` — Kill reports what would be killed without sending a signal
+
+### Bug Fixes
+
+- **Double `%%` in CLI disk output** — Format string `"disk: {}%"` appended `%` to a value
+  that already included it from `df`. Removed the extra `%` from the format string.
+- **Dead `unpark()` in HealthMonitor Drop** — `self._thread.thread().unpark()` called on a
+  `JoinHandle` that never parks. Removed dead code.
+- **Curl hang in telemetry** — `NetworkInfo::capture()` called `curl ifconfig.me` with no
+  timeout. Added `--connect-timeout 5 --max-time 5` to prevent indefinite hangs.
+- **`parse_ram_percent` always returned 0%** — Function accepted a single formatted string
+  (`"16Gi total, 13Gi free"`) and tried to parse both values from it. Changed signature to
+  `parse_ram_percent(ram_total, ram_free)` accepting separate telemetry fields.
+- **ID collision from timestamp-based IDs** — `JobId::new()` and `SessionManager::create_session()`
+  used nanosecond timestamps, causing collisions under concurrent execution. Replaced with
+  `utils::generate_id()` using 16 bytes from `/dev/urandom` (32 hex chars, fallback to timestamp).
+- **Backup overwrite lost original state** — `BackupManager::create_backup()` overwrote the
+  backup file on repeated writes within the same job. Now appends numeric suffixes (`.1`, `.2`)
+  so the first backup always contains the true original.
+- **WAL cleanup race condition** — `WalWriter::cleanup()` truncated then rewrote the WAL,
+  losing events appended by concurrent writers during the window. Now writes to a temp file,
+  re-reads the original to merge any concurrent appends (by `seq` comparison), then atomically
+  renames.
+- **Dead code in `parse_ps_line`** — `parts.get(10).unwrap_or(&"").to_string()` was always
+  `None` when `parts.len() == 10`. Replaced with `parts.get(10..).map(...).unwrap_or_default()`.
+
+### Audit Findings Fixed
+
+- **G-CTX-1: ShellExec ignores `dry_run`** — `ShellExec.execute` now checks `ctx.dry_run`
+  and returns immediately without spawning any process.
+- **G-CTX-2: Kill ignores `dry_run`** — `Kill.execute` now checks `ctx.dry_run` and reports
+  what would be killed (with process snapshot) without sending a signal.
+- **G-EDGE-1: WAL cleanup concurrent-append race** — Fixed (see Bug Fixes above).
+
 ## [0.1.1] - 2026-05-16
 
 ### Security
@@ -276,16 +350,16 @@ This is the initial release (v0.1.0-alpha). No upgrade path needed.
 ## [Unreleased]
 
 ### Planned for v0.2.0
-- [ ] Process kill capability
-- [ ] ShellExec capability with proper sandboxing
+- [x] Process kill capability
+- [x] ShellExec capability with proper sandboxing
 - [ ] HTTP request capability
 - [ ] Concurrent job execution with worker pool
 - [ ] Daemon JSON-RPC server
 - [ ] Backup cleanup policy
 - [ ] Configurable WAL path persistence
 - [ ] True timeout enforcement (watchdog thread/subprocess)
-- [ ] Process lineage tracking (identify spawned PIDs)
-- [ ] Alerting on anomalies (zombie threshold, CPU spikes)
+- [x] Process lineage tracking (identify spawned PIDs)
+- [x] Alerting on anomalies (zombie threshold, CPU spikes)
 
 ### Under Consideration
 - Capability versioning
@@ -299,4 +373,7 @@ This is the initial release (v0.1.0-alpha). No upgrade path needed.
 ---
 
 **Released Versions:**
-- v0.1.0-alpha (2026-05-16) - Initial release with FileRead, FileWrite, telemetry, process tracking, WAL, backup/undo
+- v0.1.3 (2026-05-17) - Bug fixes, audit findings, capability descriptions, CLI help text
+- v0.1.2 (2026-05-16) - Telemetry + process tracking, 8 bug fixes, code audit remediation
+- v0.1.1 (2026-05-16) - Security hardening, daemon auth, Kill/GitExec wiring
+- v0.1.0 (2026-05-16) - Initial stable release with docs, release workflow, and runner fixes

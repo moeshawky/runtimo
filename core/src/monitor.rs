@@ -122,8 +122,6 @@ pub struct HealthMonitor {
 impl Drop for HealthMonitor {
     fn drop(&mut self) {
         self.stop_flag.store(true, Ordering::Relaxed);
-        // Best-effort join — don't panic if thread is already gone
-        self._thread.thread().unpark();
     }
 }
 
@@ -163,7 +161,7 @@ impl HealthMonitor {
                 // Update state
                 current_state.timestamp = telemetry.timestamp;
                 current_state.cpu_percent = processes.summary.total_cpu_percent;
-                current_state.ram_percent = parse_ram_percent(&telemetry.system.ram_free);
+                current_state.ram_percent = parse_ram_percent(&telemetry.system.ram_total, &telemetry.system.ram_free);
                 current_state.zombie_count = processes.summary.zombie_count;
                 current_state.process_count = processes.summary.total_processes;
                 current_state.top_cpu_process = processes.summary.top_cpu_consumer.clone();
@@ -253,20 +251,13 @@ impl HealthMonitor {
     }
 }
 
-/// Helper to parse RAM percentage from telemetry string (e.g., "13Gi" from "16Gi total, 13Gi free").
-fn parse_ram_percent(ram_free: &str) -> f32 {
-    // Extract free RAM value (e.g., "13Gi" from "16Gi total, 13Gi free")
-    let free_str = ram_free.trim_end_matches("free").trim();
-    let free_val = parse_size_value(free_str);
-
-    // Extract total RAM value
-    let total_str = ram_free
-        .split(',')
-        .next()
-        .unwrap_or("")
-        .trim_end_matches("total")
-        .trim();
-    let total_val = parse_size_value(total_str);
+/// Helper to compute RAM usage percentage from total and free values.
+///
+/// Accepts raw telemetry strings like "16Gi" (total) and "13Gi" (free).
+/// Returns used percentage: ((total - free) / total) * 100.
+fn parse_ram_percent(ram_total: &str, ram_free: &str) -> f32 {
+    let total_val = parse_size_value(ram_total.trim());
+    let free_val = parse_size_value(ram_free.trim());
 
     if total_val > 0.0 {
         ((total_val - free_val) / total_val) * 100.0

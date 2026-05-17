@@ -21,12 +21,82 @@
 
 use llmosafe::llmosafe_body::ResourceGuard;
 use llmosafe::llmosafe_integration::{EscalationPolicy, SafetyContext};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+/// Rolling resource usage tracker for cooldown enforcement (FINDING #16).
+struct ResourceHistory {
+    measurements: Vec<(Instant, u8)>,
+    window_secs: u64,
+    cooldown_secs: u64,
+    last_check: Option<Instant>,
+}
+
+impl ResourceHistory {
+    fn new(window_secs: u64, cooldown_secs: u64) -> Self {
+        Self {
+            measurements: Vec::with_capacity(60),
+            window_secs,
+            cooldown_secs,
+            last_check: None,
+        }
+    }
+
+    /// Records a pressure measurement and returns the rolling average.
+    fn record(&mut self, pressure: u8) -> f64 {
+        let now = Instant::now();
+        let cutoff = now - Duration::from_secs(self.window_secs);
+        self.measurements.retain(|(t, _)| *t > cutoff);
+        self.measurements.push((now, pressure));
+
+        if self.measurements.is_empty() {
+            return pressure as f64;
+        }
+        self.measurements
+            .iter()
+            .map(|(_, p)| *p as f64)
+            .sum::<f64>()
+            / self.measurements.len() as f64
+    }
+
+    /// Returns the rolling average pressure over the tracking window.
+    fn rolling_average(&self) -> Option<f64> {
+        if self.measurements.is_empty() {
+            return None;
+        }
+        Some(
+            self.measurements
+                .iter()
+                .map(|(_, p)| *p as f64)
+                .sum::<f64>()
+                / self.measurements.len() as f64,
+        )
+    }
+
+    /// Checks if we're in a cooldown period after a recent check.
+    fn is_in_cooldown(&self) -> bool {
+        if let Some(last) = self.last_check {
+            last.elapsed() < Duration::from_secs(self.cooldown_secs)
+        } else {
+            false
+        }
+    }
+
+    fn mark_checked(&mut self) {
+        self.last_check = Some(Instant::now());
+    }
+}
+
+static RESOURCE_HISTORY: Mutex<Option<ResourceHistory>> = Mutex::new(None);
 
 /// Resource guard wrapping `llmosafe::ResourceGuard` with safety context support.
 ///
 /// Monitors RSS memory, CPU load, and IO wait from `/proc`. Acts as a circuit
 /// breaker: if resource pressure exceeds the ceiling (default 80%), execution
 /// is rejected.
+///
+/// FINDING #16: Tracks rolling average of resource usage and enforces a cooldown
+/// period between executions to prevent threshold bypass via rapid repeated checks.
 pub struct LlmoSafeGuard {
     guard: ResourceGuard,
     policy: EscalationPolicy,
@@ -52,6 +122,10 @@ impl LlmoSafeGuard {
 
     /// Checks current resource usage via llmosafe's real `/proc/stat` reading.
     ///
+    /// FINDING #16: Uses rolling average over recent measurements instead of
+    /// instantaneous values, and enforces a cooldown period to prevent
+    /// threshold bypass via rapid repeated checks.
+    ///
     /// # Returns
     ///
     /// `Ok(())` if resources are within limits.
@@ -61,10 +135,42 @@ impl LlmoSafeGuard {
     /// Returns an error string if resource pressure exceeds 80% or the
     /// underlying `ResourceGuard::check()` fails.
     pub fn check(&self) -> Result<(), String> {
+        let mut history = RESOURCE_HISTORY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if history.is_none() {
+            *history = Some(ResourceHistory::new(30, 1)); // 30s window, 1s cooldown
+        }
+        let hist = history.as_mut().unwrap();
+
+        // FINDING #16: Enforce cooldown between checks
+        if hist.is_in_cooldown() {
+            if let Some(avg) = hist.rolling_average() {
+                if avg > 80.0 {
+                    return Err(format!(
+                        "Resource pressure averaging {:.1}% over last 30s (cooldown active)",
+                        avg
+                    ));
+                }
+            }
+            return Ok(());
+        }
+
         let pressure = self.guard.pressure();
+        let avg = hist.record(pressure);
+        hist.mark_checked();
+
+        // Check both instantaneous and rolling average
         if pressure > 80 {
             return Err(format!("Resource pressure at {}% (ceiling: 80%)", pressure));
         }
+        if avg > 80.0 {
+            return Err(format!(
+                "Rolling average resource pressure at {:.1}% (ceiling: 80%)",
+                avg
+            ));
+        }
+
         self.guard
             .check()
             .map(|_| ())
@@ -161,5 +267,27 @@ mod tests {
         let guard = LlmoSafeGuard::new();
         let e = guard.raw_entropy();
         assert!(e <= 1000, "Entropy should be 0-1000, got {}", e);
+    }
+
+    #[test]
+    fn test_resource_history_rolling_average() {
+        // FINDING #16: test rolling average computation
+        let mut hist = ResourceHistory::new(30, 1);
+        hist.record(50);
+        hist.record(60);
+        hist.record(70);
+
+        let avg = hist.rolling_average().unwrap();
+        assert!((avg - 60.0).abs() < 0.1, "Rolling avg should be ~60, got {}", avg);
+    }
+
+    #[test]
+    fn test_resource_history_cooldown() {
+        // FINDING #16: test cooldown enforcement
+        let mut hist = ResourceHistory::new(30, 1);
+        hist.record(90);
+        hist.mark_checked();
+
+        assert!(hist.is_in_cooldown(), "Should be in cooldown immediately after check");
     }
 }

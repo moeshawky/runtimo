@@ -24,15 +24,21 @@ use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Maximum file size allowed for reading (100 MB).
-/// Prevents OOM on persistent machines when agents request multi-gigabyte files.
-const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
+/// Maximum file size allowed for reading (10 MB).
+/// Reduced from 100 MB to prevent OOM on persistent machines (FINDING #10).
+const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+
+/// Default max bytes to read when max_bytes is not specified (1 MB).
+/// Prevents accidental large reads even for files under MAX_FILE_SIZE.
+const DEFAULT_MAX_BYTES: u64 = 1024 * 1024;
 
 /// Arguments for the [`FileRead`] capability.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileReadArgs {
     /// Absolute or relative path to the file to read.
     pub path: String,
+    /// Maximum bytes to read (default: 1 MB, max: 10 MB). FINDING #10.
+    pub max_bytes: Option<u64>,
 }
 
 /// Capability that reads the contents of a file.
@@ -66,14 +72,19 @@ impl Capability for FileRead {
         "FileRead"
     }
 
+    fn description(&self) -> &'static str {
+        "Read the contents of a file. Validates path existence, rejects directories and path traversal."
+    }
+
     /// Returns the JSON Schema for FileRead arguments.
     ///
-    /// Schema: `{"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}`
+    /// Schema: `{"type": "object", "properties": {"path": {"type": "string"}, "max_bytes": {"type": "integer"}}, "required": ["path"]}`
     fn schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string" }
+                "path": { "type": "string" },
+                "max_bytes": { "type": "integer", "minimum": 1, "maximum": 10485760 }
             },
             "required": ["path"]
         })
@@ -96,6 +107,9 @@ impl Capability for FileRead {
     }
 
     /// Reads the file and returns its contents.
+    ///
+    /// Respects `max_bytes` parameter (default 1 MB, max 10 MB) to limit
+    /// memory usage even for files under the hard MAX_FILE_SIZE cap.
     ///
     /// # Errors
     ///
@@ -126,16 +140,47 @@ impl Capability for FileRead {
             )));
         }
 
-        let content = std::fs::read_to_string(&path)
-            .map_err(|e| Error::ExecutionFailed(format!("read {}: {}", path.display(), e)))?;
+        // FINDING #10: Apply max_bytes limit (default 1 MB)
+        let max_bytes = args.max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
+        if max_bytes > MAX_FILE_SIZE {
+            return Err(Error::ExecutionFailed(format!(
+                "max_bytes {} exceeds maximum allowed {}",
+                max_bytes, MAX_FILE_SIZE
+            )));
+        }
+
+        let content = if metadata.len() <= max_bytes {
+            std::fs::read_to_string(&path)
+                .map_err(|e| Error::ExecutionFailed(format!("read {}: {}", path.display(), e)))?
+        } else {
+            // Read only up to max_bytes
+            let file = std::fs::File::open(&path)
+                .map_err(|e| Error::ExecutionFailed(format!("open {}: {}", path.display(), e)))?;
+            use std::io::Read;
+            let mut buf = String::new();
+            let mut handle = file.take(max_bytes);
+            handle
+                .read_to_string(&mut buf)
+                .map_err(|e| Error::ExecutionFailed(format!("read {}: {}", path.display(), e)))?;
+            buf
+        };
+
+        let truncated = metadata.len() > max_bytes;
 
         Ok(Output {
             success: true,
-            data: serde_json::json!({ "content": content, "path": path.display().to_string() }),
+            data: serde_json::json!({
+                "content": content,
+                "path": path.display().to_string(),
+                "bytes_read": content.len(),
+                "file_size": metadata.len(),
+                "truncated": truncated,
+            }),
             message: Some(format!(
-                "Read {} bytes from {}",
+                "Read {} bytes from {}{}",
                 content.len(),
-                path.display()
+                path.display(),
+                if truncated { " (truncated)" } else { "" }
             )),
         })
     }
@@ -189,5 +234,73 @@ mod tests {
         assert!(FileRead
             .validate(&serde_json::json!({ "path": "" }))
             .is_err());
+    }
+
+    #[test]
+    fn test_max_bytes_limits_output() {
+        // FINDING #10: verify max_bytes parameter works
+        let mut tmp = std::env::temp_dir();
+        tmp.push("runtimo_test_max_bytes.txt");
+        {
+            let mut f = std::fs::File::create(&tmp).unwrap();
+            for _ in 0..100 {
+                writeln!(f, "hello world line").unwrap();
+            }
+        }
+
+        let result = FileRead
+            .execute(
+                &serde_json::json!({ "path": tmp.to_str().unwrap(), "max_bytes": 50 }),
+                &Context {
+                    dry_run: false,
+                    job_id: "test".into(),
+                    working_dir: std::env::temp_dir(),
+                },
+            )
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.data["truncated"].as_bool() == Some(true));
+        assert!(result.data["bytes_read"].as_u64().unwrap() <= 50);
+        std::fs::remove_file(&tmp).ok();
+    }
+
+#[test]
+fn test_max_bytes_rejects_exceeding_limit() {
+    // FINDING #10: Runtime validation rejects max_bytes > 10MB
+    // Note: JSON Schema doesn't enforce maximum at parse time, but execute() checks it
+    let result = FileRead.execute(
+        &serde_json::json!({ "path": "/etc/hosts", "max_bytes": 9999999999u64 }),
+        &Context {
+            dry_run: false,
+            job_id: "test".into(),
+            working_dir: std::env::temp_dir(),
+        },
+    );
+    // Execution should fail because max_bytes exceeds MAX_FILE_SIZE (10MB)
+    assert!(result.is_err());
+}
+
+    #[test]
+    fn test_file_read_default_max_bytes() {
+        // Verify default max_bytes (1MB) is applied when not specified
+        let mut tmp = std::env::temp_dir();
+        tmp.push("runtimo_test_default_max.txt");
+        std::fs::write(&tmp, "small content").unwrap();
+
+        let result = FileRead
+            .execute(
+                &serde_json::json!({ "path": tmp.to_str().unwrap() }),
+                &Context {
+                    dry_run: false,
+                    job_id: "test".into(),
+                    working_dir: std::env::temp_dir(),
+                },
+            )
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.data["truncated"].as_bool() == Some(false));
+        std::fs::remove_file(&tmp).ok();
     }
 }

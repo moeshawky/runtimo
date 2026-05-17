@@ -23,13 +23,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct JobId(String);
 
 impl JobId {
-    /// Creates a new job ID from the current timestamp.
+    /// Creates a new job ID from 16 random bytes (32 hex chars).
     pub fn new() -> Self {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        Self(format!("{:x}", ts))
+        Self(crate::utils::generate_id())
     }
 
     /// Returns the job ID as a string slice.

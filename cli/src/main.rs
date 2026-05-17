@@ -3,8 +3,8 @@
 use clap::{Parser, Subcommand};
 use runtimo_core::{
     capabilities::{FileRead, FileWrite, GitExec, Kill, ShellExec, Undo},
-    execute_with_telemetry, BackupManager, CapabilityRegistry, ProcessSnapshot, Telemetry,
-    WalReader,
+    execute_with_telemetry, BackupManager, CapabilityRegistry, ProcessSnapshot, RuntimoConfig,
+    Telemetry, WalReader,
 };
 use std::error::Error;
 use std::path::PathBuf;
@@ -13,6 +13,11 @@ use std::path::PathBuf;
 #[command(
     name = "runtimo",
     about = "Agent capability runtime with telemetry, process tracking, and crash recovery",
+    long_about = "Runtimo is a capability-based runtime for AI agents on persistent machines.\n\
+        \n\
+        Every execution captures hardware telemetry and process snapshots before/after,\n\
+        with all events logged to a Write-Ahead Log (WAL) for crash recovery and undo.",
+    after_help = "Quick start:\n  moe list                                    List capabilities\n  moe run -c FileRead -a '{\"path\":\"/etc/hostname\"}'   Read a file\n  moe run -c FileWrite -a '{\"path\":\"/tmp/h.txt\",\"content\":\"hi\"}'  Write a file\n  moe run -c ShellExec -a '{\"cmd\":\"uptime\"}'          Run a command\n  moe logs                                      View history\n  moe telemetry                                 Hardware info\n  moe processes                                 Running processes",
     version
 )]
 struct Cli {
@@ -23,11 +28,16 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Execute a capability with full telemetry
+    #[command(
+        about = "Run a capability",
+        long_about = "Run a named capability with JSON arguments. Captures telemetry and process snapshots before/after execution.",
+        after_help = "Examples:\n  moe run -c FileRead -a '{\"path\":\"/etc/hostname\"}'\n  moe run -c FileWrite -a '{\"path\":\"/tmp/out.txt\",\"content\":\"hello\"}'\n  moe run -c ShellExec -a '{\"cmd\":\"uptime\"}'\n  moe run -c Kill -a '{\"pid\":12345}'\n  moe run -c FileRead -a '{\"path\":\"/tmp/test.txt\"}' --dry-run",
+    )]
     Run {
-        /// Capability name (e.g., FileRead, FileWrite)
+        /// Capability name (FileRead, FileWrite, ShellExec, Kill, GitExec, Undo)
         #[arg(short = 'c', long)]
         capability: String,
-        /// JSON arguments for the capability
+        /// JSON arguments, e.g. '{"path":"/tmp/test.txt"}' or '{"cmd":"uptime"}'
         #[arg(short = 'a', long, default_value = "{}")]
         args: String,
         /// Validate without executing
@@ -39,7 +49,7 @@ enum Commands {
         /// Suppress telemetry output (quiet mode)
         #[arg(short = 'q', long)]
         quiet: bool,
-        /// Show capability schema and exit
+        /// Show capability argument schema and exit
         #[arg(long)]
         schema: bool,
         /// Execution timeout in seconds (default: 30)
@@ -47,6 +57,11 @@ enum Commands {
         timeout: u64,
     },
     /// List available capabilities
+    #[command(
+        about = "List capabilities",
+        long_about = "List all registered capabilities with descriptions.",
+        after_help = "Use --schemas to see JSON argument schemas for each capability.\nUse --json for machine-readable output.",
+    )]
     List {
         /// Show schemas for each capability
         #[arg(long)]
@@ -56,6 +71,11 @@ enum Commands {
         json: bool,
     },
     /// Check job status
+    #[command(
+        about = "Check job status",
+        long_about = "Show job status from WAL (Write-Ahead Log) history.",
+        after_help = "Without --job-id, lists all jobs. With --job-id, shows all events for that job.",
+    )]
     Status {
         /// Filter by job ID
         #[arg(short = 'j', long)]
@@ -65,6 +85,11 @@ enum Commands {
         json: bool,
     },
     /// View WAL logs
+    #[command(
+        about = "View WAL logs",
+        long_about = "View the Write-Ahead Log — a sequential record of all capability executions.",
+        after_help = "The WAL records every job start, completion, telemetry snapshot, and error.\nUse --job-id to filter. Use --limit to control output size (default: 10).",
+    )]
     Logs {
         /// Filter by job ID
         #[arg(short = 'j', long)]
@@ -76,7 +101,12 @@ enum Commands {
         #[arg(short = 'o', long)]
         json: bool,
     },
-    /// Undo a completed job (restore from backup)
+    /// Undo a completed job
+    #[command(
+        about = "Undo a completed job",
+        long_about = "Restore files to their state before a job executed, using backups from FileWrite or GitExec.",
+        after_help = "Find job IDs with `moe logs` or `moe status`.\nExample: moe undo -j abc123 --dry-run",
+    )]
     Undo {
         /// Job ID to undo
         #[arg(short = 'j', long)]
@@ -86,17 +116,61 @@ enum Commands {
         dry_run: bool,
     },
     /// Print system telemetry
+    #[command(
+        about = "Print system telemetry",
+        long_about = "Print hardware info: CPU model, RAM, disk usage, network interfaces, and services.",
+    )]
     Telemetry {
         /// Output as JSON
         #[arg(short = 'j', long)]
         json: bool,
     },
     /// Print process snapshot
+    #[command(
+        about = "Print process snapshot",
+        long_about = "Print running processes: total count, zombies, and top CPU/memory consumers.",
+        after_help = "Useful for detecting runaway processes spawned by capabilities.",
+    )]
     Processes {
         /// Output as JSON
         #[arg(short = 'j', long)]
         json: bool,
     },
+    /// Manage configuration
+    #[command(
+        about = "Manage configuration",
+        long_about = "Add, remove, or list allowed path prefixes.",
+        after_help = "Examples:\n  moe config allowed-paths add /srv /opt\n  moe config allowed-paths list\n  moe config allowed-paths remove /opt",
+    )]
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Manage allowed path prefixes
+    AllowedPaths {
+        #[command(subcommand)]
+        subaction: AllowedPathsAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum AllowedPathsAction {
+    /// Add path prefixes to config
+    Add {
+        /// Path prefixes to add
+        paths: Vec<String>,
+    },
+    /// Remove path prefixes from config
+    Remove {
+        /// Path prefixes to remove
+        paths: Vec<String>,
+    },
+    /// List configured path prefixes
+    List,
 }
 
 fn wal_path() -> PathBuf {
@@ -177,7 +251,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
                 if !quiet {
                     println!(
-                        "  cpu: {}  ram: {} free  disk: {}%",
+                        "  cpu: {}  ram: {} free  disk: {}",
                         result.telemetry_before.system.cpu_model,
                         result.telemetry_before.system.ram_free,
                         result.telemetry_before.system.disk_used_percent
@@ -203,25 +277,32 @@ fn main() -> Result<(), Box<dyn Error>> {
                         if let Some(cap) = reg.get(name) {
                             list.push(serde_json::json!({
                                 "name": name,
+                                "description": cap.description(),
                                 "schema": cap.schema(),
                             }));
                         }
                     }
                     println!("{}", serde_json::to_string_pretty(&list)?);
                 } else {
-                    println!("{}", serde_json::to_string_pretty(&caps)?);
+                    let list: Vec<_> = caps.iter().map(|name| {
+                        let desc = reg.get(name).map(|c| c.description()).unwrap_or("");
+                        serde_json::json!({ "name": name, "description": desc })
+                    }).collect();
+                    println!("{}", serde_json::to_string_pretty(&list)?);
                 }
             } else if schemas {
                 for name in caps {
                     if let Some(cap) = reg.get(name) {
-                        println!("{}:", name);
+                        println!("{} — {}", name, cap.description());
                         println!("  {}", serde_json::to_string_pretty(&cap.schema())?);
                     }
                 }
             } else {
                 println!("{} capabilities:", caps.len());
                 for c in caps {
-                    println!("  {}", c);
+                    if let Some(cap) = reg.get(c) {
+                        println!("  {:<12} {}", c, cap.description());
+                    }
                 }
             }
             Ok(())
@@ -346,6 +427,21 @@ fn main() -> Result<(), Box<dyn Error>> {
                         e.job_id,
                         e.capability.as_deref().unwrap_or("-")
                     );
+                    if let Some(ref tel) = e.telemetry_before {
+                        println!(
+                            "    cpu={}  ram={}  procs={}",
+                            tel.system.cpu_model,
+                            tel.system.ram_free,
+                            e.process_before.as_ref().map(|p| p.total_processes).unwrap_or(0)
+                        );
+                    }
+                    if let Some(ref tel) = e.telemetry_after {
+                        println!(
+                            "    after: ram={}  procs={}",
+                            tel.system.ram_free,
+                            e.process_after.as_ref().map(|p| p.total_processes).unwrap_or(0)
+                        );
+                    }
                     if let Some(ref out) = e.output {
                         println!("    {}", out);
                     }
@@ -465,5 +561,49 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             Ok(())
         }
+
+        Commands::Config { action } => match action {
+            ConfigAction::AllowedPaths { subaction } => match subaction {
+                AllowedPathsAction::Add { paths } => {
+                    let mut config = RuntimoConfig::load();
+                    for p in &paths {
+                        if !config.allowed_paths.contains(p) {
+                            config.allowed_paths.push(p.clone());
+                        }
+                    }
+                    config.save().map_err(|e| format!("config save failed: {}", e))?;
+                    println!(
+                        "added {} path(s) to {}",
+                        paths.len(),
+                        RuntimoConfig::config_path().display()
+                    );
+                    Ok(())
+                }
+                AllowedPathsAction::Remove { paths } => {
+                    let mut config = RuntimoConfig::load();
+                    config.allowed_paths.retain(|p| !paths.contains(p));
+                    config.save().map_err(|e| format!("config save failed: {}", e))?;
+                    println!(
+                        "removed {} path(s) from {}",
+                        paths.len(),
+                        RuntimoConfig::config_path().display()
+                    );
+                    Ok(())
+                }
+                AllowedPathsAction::List => {
+                    let config = RuntimoConfig::load();
+                    let all = RuntimoConfig::get_allowed_prefixes();
+                    println!("configured paths:");
+                    for p in &config.allowed_paths {
+                        println!("  {}", p);
+                    }
+                    println!("effective paths (defaults + env + config):");
+                    for p in &all {
+                        println!("  {}", p);
+                    }
+                    Ok(())
+                }
+            },
+        },
     }
 }

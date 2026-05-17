@@ -61,6 +61,7 @@ pub mod backup;
 pub mod capabilities;
 pub mod capability;
 pub mod cmd;
+pub mod config;
 pub mod executor;
 pub mod job;
 pub mod llmosafe;
@@ -75,6 +76,7 @@ pub mod wal;
 pub use backup::BackupManager;
 pub use capabilities::{FileRead, FileWrite, GitExec, Kill, ShellExec, Undo};
 pub use capability::{Capability, CapabilityRegistry, Context, Output};
+pub use config::RuntimoConfig;
 pub use executor::{execute_with_telemetry, execute_with_telemetry_and_session, ExecutionResult};
 pub use job::{Job, JobId, JobState};
 pub use llmosafe::LlmoSafeGuard;
@@ -157,5 +159,28 @@ pub mod utils {
         std::env::var("RUNTIMO_BACKUP_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| data_dir().join("backups"))
+    }
+
+    /// Generates a unique ID from 16 random bytes (32 hex chars).
+    ///
+    /// Uses `/dev/urandom` for collision resistance — P(collision) < 10⁻¹⁵
+    /// even at 100 IDs/sec for 1 hour. Falls back to timestamp if urandom
+    /// is unavailable (e.g., non-Linux platforms).
+    pub fn generate_id() -> String {
+        let mut bytes = [0u8; 16];
+        if std::fs::File::open("/dev/urandom")
+            .ok()
+            .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut bytes).ok())
+            .is_some()
+        {
+            bytes.iter().map(|b| format!("{:02x}", b)).collect()
+        } else {
+            // Fallback: timestamp-based (collision possible but rare)
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            format!("{:x}", ts)
+        }
     }
 }

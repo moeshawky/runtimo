@@ -292,7 +292,7 @@ impl ServiceInfo {
 
 impl NetworkInfo {
     fn capture() -> Self {
-        let public_ip = run_cmd("curl -s ifconfig.me 2>/dev/null || echo 'unknown'");
+        let public_ip = run_cmd("curl -s --connect-timeout 5 --max-time 5 ifconfig.me 2>/dev/null || echo 'unknown'");
         let tunnel_output = run_cmd("pgrep -fa cloudflared");
         let tunnel_running = !tunnel_output.is_empty();
         let tunnel_name = if tunnel_running {

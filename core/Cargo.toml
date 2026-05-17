@@ -19,9 +19,12 @@ serde_json.workspace = true
 thiserror.workspace = true
 llmosafe = "0.6"
 libc = "0.2"
+toml = "0.8"
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 anyhow = "1.0"
+proptest = "1.4"
 
 [[example]]
 name = "basic_read"

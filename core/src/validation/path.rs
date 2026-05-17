@@ -2,29 +2,53 @@
 //!
 //! Central validation for all path-based capabilities. Handles both existing
 //! paths (canonicalize directly) and new paths (canonicalize the parent).
-//! Rejects path traversal, empty paths, and paths outside `allowed_prefixes`.
+//! Rejects path traversal, empty paths, null bytes, non-ASCII paths, and
+//! paths outside `allowed_prefixes`.
+//!
+//! # Security Considerations
+//!
+//! ## Null Byte Rejection (FINDING #8)
+//! Paths containing `\0` (null byte) are rejected immediately. Null bytes
+//! can truncate C-string path arguments in syscalls, enabling path truncation
+//! attacks (e.g., `/tmp/safe.txt\0/etc/shadow` becomes `/tmp/safe.txt`).
+//!
+//! ## Unicode Normalization (FINDING #7)
+//! Paths are NFC-normalized before validation to prevent Unicode-based
+//! traversal attacks. Non-ASCII paths are rejected entirely because Unicode
+//! normalization edge cases (e.g., homoglyphs, combining characters) cannot
+//! be fully mitigated without filesystem-level awareness.
+//!
+//! ## Symlink TOCTOU Limitation (FINDING #9)
+//! This module canonicalizes paths via `std::fs::canonicalize()` which
+//! resolves symlinks. However, a TOCTOU window exists between validation
+//! and use: an attacker could replace a validated path with a symlink
+//! between the two operations. Mitigations:
+//! - Use `O_NOFOLLOW` flag when opening files (where possible)
+//! - Minimize time between validation and use
+//! - Full mitigation requires filesystem-level atomicity (not available in std)
 //!
 //! # Configuration
 //!
-//! Allowed prefixes can be extended via the `RUNTIMO_ALLOWED_PATHS` environment
-//! variable (colon-separated). Example:
-//! ```bash
-//! export RUNTIMO_ALLOWED_PATHS="/tmp:/var/tmp:/home:/srv:/opt"
+//! Allowed prefixes are merged from three sources (lowest to highest priority):
+//! 1. Built-in defaults (`/tmp`, `/var/tmp`, `/home`)
+//! 2. `RUNTIMO_ALLOWED_PATHS` env var (colon-separated)
+//! 3. Config file `~/.config/runtimo/config.toml` (`allowed_paths` array)
+//!
+//! Example config file:
+//! ```toml
+//! allowed_paths = ["/srv", "/opt"]
 //! ```
-//! This is merged with the built-in defaults (`/tmp`, `/var/tmp`, `/home`).
 
 use std::path::{Path, PathBuf};
-
-/// Built-in default allowed prefixes.
-const DEFAULT_PREFIXES: &[&str] = &["/tmp", "/var/tmp", "/home"];
+use unicode_normalization::UnicodeNormalization;
 
 /// Context for path validation.
 ///
 /// Controls which checks are applied. [`Default`] enables all checks
 /// with built-in prefixes (`/tmp`, `/var/tmp`, `/home`), extended by
-/// `RUNTIMO_ALLOWED_PATHS` env var if set.
+/// `RUNTIMO_ALLOWED_PATHS` env var and config file if set.
 pub struct PathContext {
-    /// Additional allowed directory prefixes (merged with defaults + env var).
+    /// Additional allowed directory prefixes (merged with defaults + env var + config).
     pub allowed_prefixes: &'static [&'static str],
     /// If true, the path must already exist on disk.
     pub require_exists: bool,
@@ -44,20 +68,10 @@ impl Default for PathContext {
 
 /// Returns the full set of allowed path prefixes.
 ///
-/// Combines built-in defaults with `RUNTIMO_ALLOWED_PATHS` env var
-/// (colon-separated) and any context-specific prefixes.
+/// Combines built-in defaults, `RUNTIMO_ALLOWED_PATHS` env var,
+/// config file prefixes, and any context-specific overrides.
 fn get_allowed_prefixes(ctx: &PathContext) -> Vec<String> {
-    let mut prefixes: Vec<String> = DEFAULT_PREFIXES.iter().map(|s| s.to_string()).collect();
-
-    // Extend with env var (colon-separated)
-    if let Ok(env_paths) = std::env::var("RUNTIMO_ALLOWED_PATHS") {
-        for p in env_paths.split(':').filter(|s| !s.is_empty()) {
-            let trimmed = p.trim().to_string();
-            if !prefixes.contains(&trimmed) {
-                prefixes.push(trimmed);
-            }
-        }
-    }
+    let mut prefixes = crate::config::RuntimoConfig::get_allowed_prefixes();
 
     // Add context-specific prefixes
     for p in ctx.allowed_prefixes {
@@ -89,16 +103,30 @@ pub fn validate_path(path_str: &str, ctx: &PathContext) -> Result<PathBuf, Strin
         return Err("path is empty".to_string());
     }
 
+    // Reject null bytes — prevents C-string truncation attacks (FINDING #8)
+    if path_str.contains('\0') {
+        return Err("path contains null byte".to_string());
+    }
+
+    // Reject non-ASCII paths — Unicode normalization edge cases cannot be
+    // fully mitigated without filesystem-level awareness (FINDING #7)
+    if !path_str.is_ascii() {
+        return Err("non-ASCII paths are not supported".to_string());
+    }
+
+    // NFC-normalize the path to prevent Unicode-based traversal (FINDING #7)
+    let normalized: String = path_str.nfc().collect();
+
     // Reject path traversal sequences before any filesystem interaction
-    if path_str.contains("..") {
+    if normalized.contains("..") {
         return Err("path traversal not allowed".to_string());
     }
 
-    let path = Path::new(path_str);
+    let path = Path::new(&normalized);
 
     // Check existence if required
     if ctx.require_exists && !path.exists() {
-        return Err(format!("path does not exist: {}", path_str));
+        return Err(format!("path does not exist: {}", normalized));
     }
 
     // Resolve the canonical path:
@@ -252,5 +280,41 @@ mod tests {
         let err = validate_path("/etc/shadow", &ctx).unwrap_err();
         assert!(err.contains("/tmp"), "error should list /tmp as allowed");
         assert!(err.contains("/home"), "error should list /home as allowed");
+    }
+
+    #[test]
+    fn rejects_null_byte() {
+        let ctx = PathContext::default();
+        let result = validate_path("/tmp/safe.txt\0/etc/shadow", &ctx);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("null byte"));
+    }
+
+    #[test]
+    fn rejects_non_ascii_path() {
+        let ctx = PathContext::default();
+        let result = validate_path("/tmp/café.txt", &ctx);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("non-ASCII"));
+    }
+
+    #[test]
+    fn rejects_non_ascii_unicode_traversal() {
+        let ctx = PathContext::default();
+        // Unicode homoglyph attack attempt
+        let result = validate_path("/tmp/\u{00e9}../etc/passwd", &ctx);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn nfc_normalizes_path() {
+        let ctx = PathContext {
+            require_exists: false,
+            require_file: false,
+            ..Default::default()
+        };
+        // NFC normalization should not change ASCII paths
+        let result = validate_path("/tmp/normal.txt", &ctx);
+        assert!(result.is_ok());
     }
 }

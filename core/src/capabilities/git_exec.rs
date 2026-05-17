@@ -588,6 +588,10 @@ impl Capability for GitExec {
         "GitExec"
     }
 
+    fn description(&self) -> &'static str {
+        "Git operations (clone, pull, commit, revert, clean, status) with state tracking and undo support."
+    }
+
     fn schema(&self) -> Value {
         serde_json::json!({
             "type": "object",

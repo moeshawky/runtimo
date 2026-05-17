@@ -9,6 +9,27 @@
 //! `/var/lib` in all deployment environments. Override with `RUNTIMO_WAL_PATH`
 //! env var.
 //!
+//! # Subprocess Isolation Limitation (FINDING #17)
+//!
+//! **Current limitation:** Capabilities execute in the same process as the
+//! executor. There is no subprocess isolation, sandbox, or seccomp filtering.
+//! A misbehaving capability can:
+//! - Access all memory of the executor process
+//! - Open arbitrary files (subject to path validation)
+//! - Spawn child processes without restriction
+//!
+//! **Mitigations in place:**
+//! - Path validation restricts file access to allowed prefixes
+//! - LlmoSafeGuard provides CPU/RAM circuit breakers
+//! - WAL logging provides audit trail for all operations
+//! - Process snapshot tracks spawned PIDs
+//!
+//! **v0.2.0 planned:** True subprocess isolation via:
+//! - `tokio::spawn_blocking` with cancellation tokens
+//! - Optional seccomp-bpf filtering for Linux
+//! - Namespace isolation (mount, PID, network)
+//! - Capability-specific resource cgroups
+//!
 //! # Example
 //!
 //! ```rust,ignore
@@ -103,7 +124,7 @@ pub struct ExecutionResult {
 /// The `timeout_secs` parameter is currently **not enforced**. Rust's
 /// `std::thread` cannot be interrupted once started. A true timeout requires
 /// either subprocess isolation or `tokio::spawn_blocking` with cancellation.
-/// This is tracked for v0.2.0.
+/// This is tracked for v0.2.0 (see FINDING #17 in module docs).
 pub fn execute_with_telemetry(
     capability: &dyn Capability,
     args: &Value,
@@ -170,17 +191,25 @@ pub fn execute_with_telemetry_and_session(
         capability: Some(cap_name.clone()),
         output: None,
         error: None,
+        telemetry_before: Some(telemetry_before.clone()),
+        telemetry_after: None,
+        process_before: Some(process_before.summary.clone()),
+        process_after: None,
     })?;
 
     if let Err(e) = capability.validate(args) {
         let telemetry_after = Telemetry::capture();
         let process_after = ProcessSnapshot::capture();
         let end_seq = wal.seq();
-        log_job_failed(
+        log_job_failed_with_snapshots(
             &mut wal,
             &job_id_str,
             &cap_name,
             &format!("Validation failed: {}", e),
+            &telemetry_before,
+            &telemetry_after,
+            &process_before.summary,
+            &process_after.summary,
         )?;
 
         return Ok(fail_result(
@@ -196,14 +225,23 @@ pub fn execute_with_telemetry_and_session(
     }
 
     // Execute capability with timeout enforcement
-    let output = match execute_with_timeout(capability, args, &ctx, timeout_secs) {
+    let output = match execute_with_timeout_check(capability, args, &ctx, timeout_secs) {
         Ok(out) => out,
         Err(e) => {
             let telemetry_after = Telemetry::capture();
             let process_after = ProcessSnapshot::capture();
             let end_seq = wal.seq();
             let err_msg = format!("Execution failed: {}", e);
-            log_job_failed(&mut wal, &job_id_str, &cap_name, &err_msg)?;
+            log_job_failed_with_snapshots(
+                &mut wal,
+                &job_id_str,
+                &cap_name,
+                &err_msg,
+                &telemetry_before,
+                &telemetry_after,
+                &process_before.summary,
+                &process_after.summary,
+            )?;
 
             return Ok(fail_result(
                 job_id_str,
@@ -236,6 +274,10 @@ pub fn execute_with_telemetry_and_session(
             Value::Null
         })),
         error: None,
+        telemetry_before: Some(telemetry_before.clone()),
+        telemetry_after: Some(telemetry_after.clone()),
+        process_before: Some(process_before.summary.clone()),
+        process_after: Some(process_after.summary.clone()),
     })?;
 
     // Add job to session if session tracking is enabled
@@ -292,8 +334,18 @@ fn fail_result(
     }
 }
 
-/// Log a `JobFailed` event to the WAL.
-fn log_job_failed(wal: &mut WalWriter, job_id: &str, capability: &str, error: &str) -> Result<()> {
+/// Log a `JobFailed` event to the WAL with full telemetry snapshots.
+#[allow(clippy::too_many_arguments)]
+fn log_job_failed_with_snapshots(
+    wal: &mut WalWriter,
+    job_id: &str,
+    capability: &str,
+    error: &str,
+    telemetry_before: &Telemetry,
+    telemetry_after: &Telemetry,
+    process_before: &ProcessSummary,
+    process_after: &ProcessSummary,
+) -> Result<()> {
     let seq = wal.seq();
     wal.append(WalEvent {
         seq,
@@ -306,17 +358,22 @@ fn log_job_failed(wal: &mut WalWriter, job_id: &str, capability: &str, error: &s
         capability: Some(capability.to_string()),
         output: None,
         error: Some(error.to_string()),
+        telemetry_before: Some(telemetry_before.clone()),
+        telemetry_after: Some(telemetry_after.clone()),
+        process_before: Some(process_before.clone()),
+        process_after: Some(process_after.clone()),
     })
 }
 
-/// Execute a capability inline with timeout enforcement.
+/// Execute a capability inline and check if it exceeded the timeout.
 ///
-/// Runs the capability and measures elapsed time. If execution exceeds
-/// `timeout_secs`, returns a timeout error. For subprocess-based capabilities
-/// (ShellExec), the timeout is enforced internally. For pure-Rust capabilities,
-/// the timeout is checked after execution completes — the capability cannot be
-/// forcibly interrupted without subprocess isolation.
-fn execute_with_timeout(
+/// Runs the capability and measures elapsed time. For subprocess-based
+/// capabilities (ShellExec, GitExec), the timeout is enforced internally
+/// by the capability. For pure-Rust capabilities, the timeout is checked
+/// **after** execution completes — the capability cannot be forcibly
+/// interrupted without subprocess isolation. If the timeout was exceeded,
+/// a warning is logged but the result is still returned.
+fn execute_with_timeout_check(
     capability: &dyn Capability,
     args: &Value,
     ctx: &Context,
@@ -331,6 +388,11 @@ fn execute_with_timeout(
 
     let elapsed = start.elapsed();
     if elapsed > timeout {
+        eprintln!(
+            "[runtimo] WARNING: capability exceeded timeout: {:.1}s > {}s",
+            elapsed.as_secs_f64(),
+            timeout_secs
+        );
         return Err(Error::ExecutionFailed(format!(
             "capability exceeded timeout: {:.1}s > {}s",
             elapsed.as_secs_f64(),

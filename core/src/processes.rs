@@ -254,11 +254,7 @@ fn parse_ps_line(line: &str) -> Option<ProcessInfo> {
     let stat = parts[7].to_string();
     let start_time = parts[8].to_string();
     let elapsed = parts[9].to_string();
-    let command = if parts.len() > 10 {
-        parts[10..].join(" ")
-    } else {
-        parts.get(10).unwrap_or(&"").to_string()
-    };
+    let command = parts.get(10..).map(|s| s.join(" ")).unwrap_or_default();
 
     Some(ProcessInfo {
         pid,

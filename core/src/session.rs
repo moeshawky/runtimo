@@ -5,6 +5,18 @@
 //! - Audit trail per session
 //! - Batch undo/rollback
 //!
+//! # Security Note (FINDING #18)
+//!
+//! Session IDs are used for **audit grouping only**, not for authentication
+//! or authorization. They are not security tokens and should not be treated
+//! as such. The current ID generation uses 16 random bytes from `/dev/urandom`
+//! (via `utils::generate_id()`), which provides sufficient collision resistance
+//! for audit purposes.
+//!
+//! If cryptographic uniqueness is required (e.g., for auth tokens), switch to
+//! UUID v4 via the `uuid` crate. For audit grouping, the current approach is
+//! adequate — P(collision) < 10⁻¹⁵ even at 100 sessions/sec for 1 hour.
+//!
 //! # Example
 //!
 //! ```rust,ignore
@@ -72,7 +84,7 @@ impl SessionManager {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
         let ts = now.as_secs();
-        let id = format!("{:x}{:x}", ts, now.subsec_nanos());
+        let id = crate::utils::generate_id();
 
         let session = Session {
             id: id.clone(),
