@@ -345,43 +345,47 @@ mod tests {
         assert_eq!(state.cpu_alert_count, 5);
     }
 
-    #[test]
-    fn test_ram_alert_uses_ram_counter_not_cpu() {
-        let mut state = HealthState::default();
-        state.last_ram_percent = Some(50.0);
-        // Simulate RAM increasing each check while CPU is normal
-        for i in 0..5 {
-            state.ram_percent = 50.0 + (i as f32 + 1.0); // 51, 52, 53, 54, 55
-            state.cpu_percent = 10.0; // CPU is fine
-            if state.ram_percent > state.last_ram_percent.unwrap() {
-                state.ram_increasing = true;
-                state.ram_alert_count += 1;
-            } else {
-                state.ram_increasing = false;
-                state.ram_alert_count = 0;
-            }
-            state.last_ram_percent = Some(state.ram_percent);
-        }
-        // RAM alert should fire after 5 consecutive increases (independent of CPU)
-        assert_eq!(state.ram_alert_count, 5);
-        assert!(state.ram_increasing);
-    }
-
-    #[test]
-    fn test_ram_alert_resets_when_ram_decreases() {
-        let mut state = HealthState::default();
-        state.last_ram_percent = Some(50.0);
-
-        // RAM increases twice
-        state.ram_percent = 55.0;
-        state.ram_alert_count = 2;
-        state.last_ram_percent = Some(55.0);
-
-        // RAM decreases — counter should reset
-        state.ram_percent = 40.0;
+#[test]
+fn test_ram_alert_uses_ram_counter_not_cpu() {
+    let mut state = HealthState {
+        last_ram_percent: Some(50.0),
+        ..Default::default()
+    };
+    // Simulate RAM increasing each check while CPU is normal
+    for i in 0..5 {
+        state.ram_percent = 50.0 + (i as f32 + 1.0); // 51, 52, 53, 54, 55
+        state.cpu_percent = 10.0; // CPU is fine
         if state.ram_percent > state.last_ram_percent.unwrap() {
             state.ram_increasing = true;
             state.ram_alert_count += 1;
+        } else {
+            state.ram_increasing = false;
+            state.ram_alert_count = 0;
+        }
+        state.last_ram_percent = Some(state.ram_percent);
+    }
+    // RAM alert should fire after 5 consecutive increases (independent of CPU)
+    assert_eq!(state.ram_alert_count, 5);
+    assert!(state.ram_increasing);
+}
+
+#[test]
+fn test_ram_alert_resets_when_ram_decreases() {
+    let mut state = HealthState {
+        last_ram_percent: Some(50.0),
+        ..Default::default()
+    };
+
+    // RAM increases twice
+    state.ram_percent = 55.0;
+    state.ram_alert_count = 2;
+    state.last_ram_percent = Some(55.0);
+
+    // RAM decreases — counter should reset
+    state.ram_percent = 40.0;
+    if state.ram_percent > state.last_ram_percent.unwrap() {
+        state.ram_increasing = true;
+        state.ram_alert_count += 1;
         } else {
             state.ram_increasing = false;
             state.ram_alert_count = 0;

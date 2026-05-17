@@ -178,7 +178,7 @@ mod tests {
         let dir = tmp_dir("creates");
         let mut mgr = SessionManager::new(dir).unwrap();
         let session = mgr.create_session(Some("test")).unwrap();
-        assert!(session.id.len() > 0);
+        assert!(!session.id.is_empty());
         assert_eq!(session.name, Some("test".to_string()));
         assert_eq!(session.job_ids.len(), 0);
     }

@@ -123,6 +123,30 @@ impl WalWriter {
     /// Returns [`Error::WalError`](crate::Error::WalError) if the file cannot
     /// be created or opened.
     pub fn create(path: &Path) -> Result<Self> {
+        // Ensure parent directory exists
+        if let Some(parent) = path.parent() {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    crate::Error::WalError(format!(
+                        "Failed to create WAL directory {}: {}",
+                        parent.display(),
+                        e
+                    ))
+                })?;
+            }
+        }
+
+        // Create the file if it doesn't exist
+        if !path.exists() {
+            std::fs::File::create(path).map_err(|e| {
+                crate::Error::WalError(format!(
+                    "Failed to create WAL file {}: {}",
+                    path.display(),
+                    e
+                ))
+            })?;
+        }
+
         // Recover sequence from existing WAL content to ensure monotonic
         // ordering across process restarts.
         let seq = if path.exists() {

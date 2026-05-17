@@ -197,12 +197,11 @@ mod tests {
         // The undo capability looks for WAL entries to restore files
         let result = cap.execute(&serde_json::json!({"job_id": job_id}), &ctx);
 
-        // Test is lenient - undo might fail if WAL entry not found
-        // This is expected behavior for a real undo scenario
-        if result.is_ok() {
-            let output = result.unwrap();
-            assert!(output.success);
-        }
+// Test is lenient - undo might fail if WAL entry not found
+    // This is expected behavior for a real undo scenario
+    if let Ok(output) = result {
+        assert!(output.success);
+    }
 
         // Clean up
         let _ = fs::remove_dir_all(&tmpdir);

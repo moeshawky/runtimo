@@ -15,6 +15,27 @@ Cargo.lock
 *.log
 *.conversation
 conversation_history*
+# Hive-mind
+.hive_mind/
+hive_mind_*.log
+*.plasmid
+*.pheromone
+# Opencode
+.opencode/
+opencode.log
+*.opencode
+# Cursor
+.cursor/
+*.cursor
+# Claude
+.claude/
+*.claude
+# General AI/agent patterns
+*.ai
+*.cog
+*.thought
+*.reasoning
+*_trace.log
 
 # OS
 .DS_Store
