@@ -23,6 +23,7 @@
 //! - LlmoSafeGuard provides CPU/RAM circuit breakers
 //! - WAL logging provides audit trail for all operations
 //! - Process snapshot tracks spawned PIDs
+//! - Zombie process guard rejects execution if zombie_count > 10
 //!
 //! **v0.2.0 planned:** True subprocess isolation via:
 //! - `tokio::spawn_blocking` with cancellation tokens
@@ -55,13 +56,17 @@ use crate::telemetry::Telemetry;
 use crate::wal::{WalEvent, WalEventType, WalWriter};
 use crate::{Error, LlmoSafeGuard, Result};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// Default timeout for capability execution (seconds).
 ///
-/// **Note:** Timeout is currently advisory only — see [`execute_with_timeout`]
+/// **Note:** Timeout is currently advisory only — see [`execute_with_timeout_check`]
 /// for details on the enforcement limitation.
 const CAPABILITY_TIMEOUT_SECS: u64 = 30;
+
+/// Maximum size of capability arguments in bytes (1MB).
+const MAX_ARGS_SIZE_BYTES: usize = 1_048_576;
 
 /// Result of a telemetry-wrapped capability execution.
 ///
@@ -94,12 +99,15 @@ pub struct ExecutionResult {
 /// # Execution Flow
 ///
 /// 1. Capture hardware telemetry and process snapshot (before)
-/// 2. Check resource limits via `ResourceGuard` (circuit breaker at 80%)
-/// 3. Log `JobStarted` event to WAL
-/// 4. Validate arguments against capability schema
-/// 5. Execute the capability
-/// 6. Capture hardware telemetry and process snapshot (after)
-/// 7. Log `JobCompleted` or `JobFailed` event to WAL
+/// 2. Check resource limits via `LlmoSafeGuard` (circuit breaker at 80%)
+/// 3. Check zombie count (reject if > 10)
+/// 4. Check args size (reject if > 1MB)
+/// 5. Log `JobStarted` event to WAL
+/// 6. Validate arguments against capability schema
+/// 7. Execute the capability
+/// 8. Capture hardware telemetry and process snapshot (after)
+/// 9. Identify spawned PIDs
+/// 10. Log `JobCompleted` or `JobFailed` event to WAL
 ///
 /// # Arguments
 ///
@@ -116,8 +124,9 @@ pub struct ExecutionResult {
 ///
 /// # Errors
 ///
-/// Returns [`Error::ResourceLimitExceeded`] if the `ResourceGuard` circuit breaker
-/// trips before execution begins. WAL write failures also propagate as errors.
+/// Returns [`Error::ResourceLimitExceeded`] if the `LlmoSafeGuard` circuit breaker
+/// trips, zombie count exceeds 10, or args exceed 1MB. WAL write failures also
+/// propagate as errors.
 ///
 /// # Timeout Limitation
 ///
@@ -174,6 +183,26 @@ pub fn execute_with_telemetry_and_session(
     LlmoSafeGuard::new()
         .check()
         .map_err(|e| Error::ResourceLimitExceeded(e.to_string()))?;
+
+    // AGENTS.md mandate: reject if zombie_count > 10
+    if process_before.summary.zombie_count > 10 {
+        return Err(Error::ResourceLimitExceeded(format!(
+            "Zombie processes: {} (limit: 10)",
+            process_before.summary.zombie_count
+        )));
+    }
+
+    // Args size guard: reject oversized arguments (1MB max)
+    let args_bytes = serde_json::to_vec(args).map_err(|e| {
+        Error::ExecutionFailed(format!("Failed to serialize args: {}", e))
+    })?;
+    if args_bytes.len() > MAX_ARGS_SIZE_BYTES {
+        return Err(Error::ResourceLimitExceeded(format!(
+            "Capability args too large: {} bytes (limit: 1MB)",
+            args_bytes.len()
+        )));
+    }
+    drop(args_bytes);
 
     let mut wal = WalWriter::create(wal_path)?;
     let ctx = Context {
@@ -259,6 +288,25 @@ pub fn execute_with_telemetry_and_session(
     let telemetry_after = Telemetry::capture();
     let process_after = ProcessSnapshot::capture();
 
+    // Identify spawned PIDs by comparing before/after process lists
+    let spawned_pids = identify_spawned_pids(&process_before, &process_after);
+    if !spawned_pids.is_empty() {
+        eprintln!(
+            "[runtimo] WARNING: capability '{}' spawned {} process(es): PIDs {:?}",
+            cap_name,
+            spawned_pids.len(),
+            spawned_pids
+        );
+    }
+
+    // Serialize output — return error on failure instead of silently storing Null
+    let output_value = serde_json::to_value(&output).map_err(|e| {
+        Error::WalError(format!(
+            "Failed to serialize capability output for WAL (job {}): {}",
+            job_id_str, e
+        ))
+    })?;
+
     let end_seq = wal.seq();
     wal.append(WalEvent {
         seq: end_seq,
@@ -266,13 +314,7 @@ pub fn execute_with_telemetry_and_session(
         event_type: WalEventType::JobCompleted,
         job_id: job_id_str.clone(),
         capability: Some(cap_name.clone()),
-        output: Some(serde_json::to_value(&output).unwrap_or_else(|e| {
-            eprintln!(
-                "[runtimo] WAL serialization failed for job {}: {}",
-                job_id_str, e
-            );
-            Value::Null
-        })),
+        output: Some(output_value),
         error: None,
         telemetry_before: Some(telemetry_before.clone()),
         telemetry_after: Some(telemetry_after.clone()),
@@ -285,9 +327,17 @@ pub fn execute_with_telemetry_and_session(
         let sessions_dir = std::env::var("RUNTIMO_SESSIONS_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| crate::utils::data_dir().join("sessions"));
-        if let Ok(mut mgr) = SessionManager::new(sessions_dir) {
-            if let Err(e) = mgr.add_job(sid, &job_id_str) {
-                eprintln!("[runtimo] Failed to add job to session '{}': {}", sid, e);
+        match SessionManager::new(sessions_dir) {
+            Ok(mut mgr) => {
+                if let Err(e) = mgr.add_job(sid, &job_id_str) {
+                    eprintln!("[runtimo] Failed to add job to session '{}': {}", sid, e);
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[runtimo] Failed to create SessionManager for session '{}': {}",
+                    sid, e
+                );
             }
         }
     }
@@ -363,6 +413,24 @@ fn log_job_failed_with_snapshots(
         process_before: Some(process_before.clone()),
         process_after: Some(process_after.clone()),
     })
+}
+
+/// Identify PIDs present in `after` but not in `before`.
+///
+/// Compares the process lists from two snapshots and returns the set of
+/// newly appeared PIDs. These are likely spawned by the capability execution.
+///
+/// Note: false positives are possible if unrelated processes started between
+/// the two snapshots. False negatives are possible if a spawned process
+/// exited before the after snapshot was taken.
+fn identify_spawned_pids(before: &ProcessSnapshot, after: &ProcessSnapshot) -> Vec<u32> {
+    let before_pids: HashSet<u32> = before.processes.iter().map(|p| p.pid).collect();
+    after
+        .processes
+        .iter()
+        .filter(|p| !before_pids.contains(&p.pid))
+        .map(|p| p.pid)
+        .collect()
 }
 
 /// Execute a capability inline and check if it exceeded the timeout.

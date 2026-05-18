@@ -21,24 +21,65 @@
 
 use llmosafe::llmosafe_body::ResourceGuard;
 use llmosafe::llmosafe_integration::{EscalationPolicy, SafetyContext};
+use std::fs;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Rolling resource usage tracker for cooldown enforcement (FINDING #16).
+///
+/// Persists the last-check timestamp to disk so that process restarts
+/// cannot bypass the cooldown period.
 struct ResourceHistory {
     measurements: Vec<(Instant, u8)>,
     window_secs: u64,
     cooldown_secs: u64,
     last_check: Option<Instant>,
+    persist_path: Option<PathBuf>,
 }
 
 impl ResourceHistory {
-    fn new(window_secs: u64, cooldown_secs: u64) -> Self {
-        Self {
+    fn new(window_secs: u64, cooldown_secs: u64, persist_path: Option<PathBuf>) -> Self {
+        let mut history = Self {
             measurements: Vec::with_capacity(60),
             window_secs,
             cooldown_secs,
             last_check: None,
+            persist_path,
+        };
+        history.restore_last_check();
+        history
+    }
+
+    /// Restores the last_check timestamp from a persisted file.
+    /// Prevents cooldown bypass via process restart.
+    fn restore_last_check(&mut self) {
+        if let Some(ref path) = self.persist_path {
+            if let Ok(content) = fs::read_to_string(path) {
+                if let Ok(secs) = content.trim().parse::<u64>() {
+                    let now_epoch = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let elapsed_secs = now_epoch.saturating_sub(secs);
+                    if elapsed_secs < self.cooldown_secs {
+                        self.last_check = Some(
+                            Instant::now() - Duration::from_secs(elapsed_secs)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Persists the current timestamp to disk for crash/restart recovery.
+    fn persist_last_check(&self) {
+        if let Some(ref path) = self.persist_path {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let _ = fs::write(path, secs.to_string());
         }
     }
 
@@ -84,10 +125,25 @@ impl ResourceHistory {
 
     fn mark_checked(&mut self) {
         self.last_check = Some(Instant::now());
+        self.persist_last_check();
     }
 }
 
 static RESOURCE_HISTORY: Mutex<Option<ResourceHistory>> = Mutex::new(None);
+
+/// Returns the default path for persisting resource history state.
+fn resource_history_path() -> PathBuf {
+    std::env::var("RUNTIMO_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::var("HOME")
+                .ok()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .join(".runtimo")
+        })
+        .join("resource_history.state")
+}
 
 /// Resource guard wrapping `llmosafe::ResourceGuard` with safety context support.
 ///
@@ -97,6 +153,7 @@ static RESOURCE_HISTORY: Mutex<Option<ResourceHistory>> = Mutex::new(None);
 ///
 /// FINDING #16: Tracks rolling average of resource usage and enforces a cooldown
 /// period between executions to prevent threshold bypass via rapid repeated checks.
+/// Cooldown state is persisted to disk to prevent bypass via process restart.
 pub struct LlmoSafeGuard {
     guard: ResourceGuard,
     policy: EscalationPolicy,
@@ -139,7 +196,7 @@ impl LlmoSafeGuard {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if history.is_none() {
-            *history = Some(ResourceHistory::new(30, 1)); // 30s window, 1s cooldown
+            *history = Some(ResourceHistory::new(30, 1, Some(resource_history_path())));
         }
         let hist = history.as_mut().unwrap();
 
@@ -271,8 +328,7 @@ mod tests {
 
     #[test]
     fn test_resource_history_rolling_average() {
-        // FINDING #16: test rolling average computation
-        let mut hist = ResourceHistory::new(30, 1);
+        let mut hist = ResourceHistory::new(30, 1, None);
         hist.record(50);
         hist.record(60);
         hist.record(70);
@@ -283,8 +339,7 @@ mod tests {
 
     #[test]
     fn test_resource_history_cooldown() {
-        // FINDING #16: test cooldown enforcement
-        let mut hist = ResourceHistory::new(30, 1);
+        let mut hist = ResourceHistory::new(30, 1, None);
         hist.record(90);
         hist.mark_checked();
 

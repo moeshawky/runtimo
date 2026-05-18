@@ -91,8 +91,8 @@ pub enum WalEventType {
 /// Append-only WAL writer.
 ///
 /// Opens (or creates) a file in append mode and writes one JSONL line per
-/// event, using atomic writes (temp file + rename) for crash resistance
-/// (FINDING #13) and file locking for concurrent access safety (FINDING #14).
+/// event, using file locking for concurrent access safety and `fsync` after
+/// each write for durability.
 ///
 /// # Example
 ///
@@ -148,19 +148,23 @@ impl WalWriter {
         }
 
         // Recover sequence from existing WAL content to ensure monotonic
-        // ordering across process restarts.
+        // ordering across process restarts. Acquire lock to prevent reading
+        // during a concurrent write (P2 FIX).
         let seq = if path.exists() {
-            if let Ok(content) = std::fs::read_to_string(path) {
-                content
-                    .lines()
-                    .filter_map(|line| serde_json::from_str::<WalEvent>(line).ok())
-                    .map(|e| e.seq)
-                    .max()
-                    .map(|max| max + 1)
-                    .unwrap_or(0)
-            } else {
-                0
-            }
+            let lock_file = std::fs::File::open(path)
+                .map_err(|e| crate::Error::WalError(format!("open WAL for seq recovery: {}", e)))?;
+            Self::lock_file(&lock_file)?;
+            let content = std::fs::read_to_string(path)
+                .map_err(|e| crate::Error::WalError(format!("read WAL for seq recovery: {}", e)))?;
+            let recovered = content
+                .lines()
+                .filter_map(|line| serde_json::from_str::<WalEvent>(line).ok())
+                .map(|e| e.seq)
+                .max()
+                .map(|max| max + 1)
+                .unwrap_or(0);
+            Self::unlock_file(&lock_file);
+            recovered
         } else {
             0
         };
@@ -204,11 +208,12 @@ impl WalWriter {
     #[cfg(not(unix))]
     fn unlock_file(_file: &std::fs::File) {}
 
-    /// Appends an event to the WAL using atomic write (FINDING #13).
+    /// Appends an event to the WAL using true append mode (P0 FIX).
     ///
-    /// Writes to a temp file, fsyncs, then atomically renames to replace
-    /// the original. This prevents corruption from mid-write crashes.
-    /// Uses file locking for concurrent access safety (FINDING #14).
+    /// Opens the file in append mode, acquires an exclusive lock, writes the
+    /// JSONL line, fsyncs, then releases the lock. This is O(1) per write
+    /// instead of O(N) read-rewrite, and the lock is held during the entire
+    /// write operation preventing concurrent write loss.
     ///
     /// Increments the internal sequence counter after a successful write.
     ///
@@ -221,41 +226,25 @@ impl WalWriter {
         let line =
             serde_json::to_string(&event).map_err(|e| crate::Error::WalError(e.to_string()))?;
 
-        // FINDING #13: Write to temp file, fsync, then atomic rename
-        let temp_path = self.path.with_extension("wal.tmp");
+        // Open in append mode — no read-rewrite, O(1) per write
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|e| crate::Error::WalError(format!("open WAL for append: {}", e)))?;
 
-        // Open existing WAL for reading current content (under lock)
-        let existing_content = if self.path.exists() {
-            let lock_file = std::fs::File::open(&self.path)
-                .map_err(|e| crate::Error::WalError(e.to_string()))?;
-            Self::lock_file(&lock_file)?;
-            let content = std::fs::read_to_string(&self.path)
-                .map_err(|e| crate::Error::WalError(e.to_string()))?;
-            Self::unlock_file(&lock_file);
-            content
-        } else {
-            String::new()
-        };
-
-        // Write combined content to temp file
+        // Hold exclusive lock during entire write
+        Self::lock_file(&file)?;
         {
-            let mut temp_file = std::fs::File::create(&temp_path)
-                .map_err(|e| crate::Error::WalError(e.to_string()))?;
-            writeln!(temp_file, "{}{}", existing_content, line)
-                .map_err(|e| crate::Error::WalError(e.to_string()))?;
-            temp_file
-                .sync_all()
-                .map_err(|e| crate::Error::WalError(e.to_string()))?;
+            let mut buf = std::io::BufWriter::new(&file);
+            writeln!(buf, "{}", line)
+                .map_err(|e| crate::Error::WalError(format!("write WAL line: {}", e)))?;
+            buf.flush()
+                .map_err(|e| crate::Error::WalError(format!("flush WAL: {}", e)))?;
+            file.sync_all()
+                .map_err(|e| crate::Error::WalError(format!("fsync WAL: {}", e)))?;
         }
-
-        // Atomic rename replaces original
-        std::fs::rename(&temp_path, &self.path)
-            .map_err(|e| crate::Error::WalError(format!("atomic rename: {}", e)))?;
-
-        // Sync parent directory to ensure rename is durable
-        if let Ok(dir) = std::fs::File::open(self.path.parent().unwrap_or(Path::new("."))) {
-            let _ = dir.sync_all();
-        }
+        Self::unlock_file(&file);
 
         self.seq += 1;
         Ok(())
@@ -345,6 +334,17 @@ impl WalReader {
 
 /// WAL cleanup and rotation utilities.
 impl WalWriter {
+    /// Returns the rotation path for a given WAL file and rotation index.
+    ///
+    /// For `foo.jsonl` with index `1`, returns `foo.jsonl.1` (preserves the
+    /// original extension instead of replacing it).
+    fn rotation_path(path: &Path, index: usize) -> std::path::PathBuf {
+        let mut s = path.to_string_lossy().into_owned();
+        s.push('.');
+        s.push_str(&index.to_string());
+        std::path::PathBuf::from(s)
+    }
+
     /// Rotates the WAL when it exceeds max_size_bytes.
     ///
     /// Moves the current WAL to `{path}.1` (shifting older rotations),
@@ -360,17 +360,17 @@ impl WalWriter {
             return Ok(());
         }
 
-        // Shift existing rotations
+        // Shift existing rotations (P1 FIX: proper naming preserves extension)
         for i in (1..max_rotations).rev() {
-            let old = path.with_extension(format!("wal.{}", i));
-            let new = path.with_extension(format!("wal.{}", i + 1));
+            let old = Self::rotation_path(path, i);
+            let new = Self::rotation_path(path, i + 1);
             if old.exists() {
                 let _ = std::fs::rename(&old, &new);
             }
         }
 
         // Move current to .1
-        let rotated = path.with_extension("wal.1");
+        let rotated = Self::rotation_path(path, 1);
         std::fs::rename(path, &rotated)
             .map_err(|e| crate::Error::WalError(format!("WAL rotation rename: {}", e)))?;
 
@@ -379,7 +379,7 @@ impl WalWriter {
             .map_err(|e| crate::Error::WalError(format!("WAL rotation create: {}", e)))?;
 
         // Remove oldest rotation if exceeding max
-        let oldest = path.with_extension(format!("wal.{}", max_rotations + 1));
+        let oldest = Self::rotation_path(path, max_rotations + 1);
         if oldest.exists() {
             let _ = std::fs::remove_file(&oldest);
         }
@@ -409,9 +409,12 @@ impl WalWriter {
             .unwrap_or(0)
             .saturating_sub(max_age_secs);
 
-        // Read all events
-        let content =
-            std::fs::read_to_string(path).map_err(|e| crate::Error::WalError(e.to_string()))?;
+        // Read all events under lock to prevent concurrent append loss (P1 FIX)
+        let lock_file = std::fs::File::open(path)
+            .map_err(|e| crate::Error::WalError(format!("open WAL for cleanup: {}", e)))?;
+        Self::lock_file(&lock_file)?;
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| crate::Error::WalError(format!("read WAL for cleanup: {}", e)))?;
 
         let events: Vec<WalEvent> = content
             .lines()
@@ -438,8 +441,7 @@ impl WalWriter {
                 }
 
                 // Re-read the original WAL to catch any events appended during cleanup.
-                // Use the last retained event's seq as the cutoff — anything newer
-                // must have been appended by a concurrent writer.
+                // Lock is still held from above, so no concurrent writer can interleave.
                 let last_seq = retained.last().map(|e| e.seq).unwrap_or(0);
                 let current_content = std::fs::read_to_string(path)
                     .map_err(|e| crate::Error::WalError(format!("re-read WAL during cleanup: {}", e)))?;
@@ -451,10 +453,14 @@ impl WalWriter {
                     }
                 }
             }
+            // Release lock before rename
+            Self::unlock_file(&lock_file);
             // Atomic rename replaces original — no window for lost events
             std::fs::rename(&temp_path, path).map_err(|e| {
                 crate::Error::WalError(format!("atomic rename during cleanup: {}", e))
             })?;
+        } else {
+            Self::unlock_file(&lock_file);
         }
 
         Ok(removed)
@@ -555,12 +561,12 @@ mod tests {
         // Rotate with a threshold smaller than current size
         WalWriter::rotate(&path, size - 1, 3).unwrap();
 
-        assert!(path.with_extension("wal.1").exists());
+        assert!(WalWriter::rotation_path(&path, 1).exists());
         // New WAL should be empty
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
 
         let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(path.with_extension("wal.1"));
+        let _ = std::fs::remove_file(WalWriter::rotation_path(&path, 1));
     }
 
     #[test]

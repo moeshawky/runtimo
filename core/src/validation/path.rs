@@ -169,10 +169,7 @@ pub fn validate_path(path_str: &str, ctx: &PathContext) -> Result<PathBuf, Strin
     // Check allowed prefixes against the resolved path
     let resolved_str = resolved.to_string_lossy();
     let allowed = get_allowed_prefixes(ctx);
-    if !allowed
-        .iter()
-        .any(|prefix| resolved_str.starts_with(prefix.as_str()))
-    {
+    if !allowed.iter().any(|prefix| path_in_prefix(&resolved_str, prefix)) {
         return Err(format!(
             "path outside allowed directories: {} (allowed: {})",
             resolved.display(),
@@ -181,6 +178,14 @@ pub fn validate_path(path_str: &str, ctx: &PathContext) -> Result<PathBuf, Strin
     }
 
     Ok(resolved)
+}
+
+/// Checks if `path` is within `prefix` directory.
+///
+/// Requires either an exact match or the path starts with `prefix/`.
+/// Prevents bypass attacks like `/tmpfoo` matching `/tmp`.
+fn path_in_prefix(path: &str, prefix: &str) -> bool {
+    path == prefix || path.starts_with(&format!("{}/", prefix))
 }
 
 #[cfg(test)]
@@ -316,5 +321,40 @@ mod tests {
         // NFC normalization should not change ASCII paths
         let result = validate_path("/tmp/normal.txt", &ctx);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn rejects_prefix_bypass() {
+        let ctx = PathContext {
+            require_exists: false,
+            require_file: false,
+            ..Default::default()
+        };
+        let result = validate_path("/tmpfoo/bar.txt", &ctx);
+        assert!(result.is_err(), "/tmpfoo should not match /tmp prefix");
+        assert!(result.unwrap_err().contains("outside allowed"));
+    }
+
+    #[test]
+    fn accepts_valid_prefix_subdir() {
+        let ctx = PathContext {
+            require_exists: false,
+            require_file: false,
+            ..Default::default()
+        };
+        let result = validate_path("/tmp/subdir/file.txt", &ctx);
+        assert!(result.is_ok(), "/tmp/subdir should match /tmp prefix");
+    }
+
+    #[test]
+    fn test_path_in_prefix() {
+        assert!(path_in_prefix("/tmp", "/tmp"));
+        assert!(path_in_prefix("/tmp/foo", "/tmp"));
+        assert!(path_in_prefix("/tmp/foo/bar", "/tmp"));
+        assert!(!path_in_prefix("/tmpfoo", "/tmp"));
+        assert!(!path_in_prefix("/tmpfoo/bar", "/tmp"));
+        assert!(!path_in_prefix("/etc/shadow", "/tmp"));
+        assert!(path_in_prefix("/home/user/file", "/home"));
+        assert!(!path_in_prefix("/homeless/file", "/home"));
     }
 }

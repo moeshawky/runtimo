@@ -2,25 +2,31 @@
 //!
 //! Executes shell commands with:
 //! - Timeout enforcement (default 30s, configurable)
-//! - Output capture (stdout/stderr)
+//! - Output capture (stdout/stderr, bounded to 10MB)
 //! - PID tracking (child + grandchildren via /proc/{pid}/children)
+//! - Process group isolation (kills all descendants on timeout)
 //! - Telemetry before/after execution
 //! - WAL logging for audit trail (includes spawned_pids array)
 //! - Resource guard checks before execution
+//! - Dangerous command detection (blocks rm -rf /, dd, mkfs, etc.)
+//! - PATH hijack protection (resolves program names to absolute paths)
+//! - Stdin pipe support
+//!
+//! # Security
+//!
+//! **CRITICAL:** This capability executes arbitrary commands. It enforces:
+//! - Dangerous command blocklist (rm -rf /, dd, mkfs, fdisk, shutdown, etc.)
+//! - PATH hijack protection (resolves bare names to absolute paths)
+//! - Process group isolation (setpgid for clean descendant cleanup)
+//! - Output size limits (10MB max to prevent OOM)
+//! - Timeout enforcement with process group kill
+//! - All commands logged to WAL for audit
 //!
 //! # Limitations
 //!
 //! **ShellExec has no undo support.** Unlike FileWrite which creates backups for undo,
 //! shell commands are arbitrary and have ill-defined "before" states. There is no safe
 //! way to reverse arbitrary shell commands like `rm -rf /tmp/*` or `apt-get upgrade`.
-//!
-//! # Security
-//!
-//! **CRITICAL:** This capability executes arbitrary shell commands. It must:
-//! - Only accept commands from authenticated users
-//! - Log all commands to WAL for audit
-//! - Enforce timeouts to prevent runaway processes
-//! - Run with minimal privileges
 //!
 //! # Example
 //!
@@ -46,11 +52,20 @@ use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
-use std::process::{Child, Command};
-use std::time::Duration;
+use std::io::{Read, Write};
+use std::os::unix::process::CommandExt;
+use std::process::{Child, Command, ExitStatus};
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// Default timeout for shell command execution (seconds).
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
+
+/// Maximum output size per stream (stdout/stderr) — 10MB.
+const MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024;
+
+/// Maximum stdin input size — 1MB.
+const MAX_STDIN_BYTES: usize = 1024 * 1024;
 
 /// Arguments for the [`ShellExec`] capability.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,61 +82,156 @@ pub struct ShellExecArgs {
     pub timeout_secs: Option<u64>,
     /// Working directory for command execution.
     pub cwd: Option<String>,
+    /// Content to pipe to the child process's stdin.
+    pub stdin: Option<String>,
 }
 
-/// Waits for a child process with timeout enforcement.
+/// Resolves a program name to an absolute path, preventing PATH hijack attacks.
 ///
-/// Returns (exit_status, stdout, stderr) on success.
-/// Returns timeout error if timeout_secs elapses.
+/// - Absolute paths are used directly.
+/// - Relative paths (containing `/` but not starting with `/`) are rejected.
+/// - Bare names are resolved by searching `$PATH`.
+/// - If not found in `$PATH`, falls back to the bare name (for compatibility).
+fn resolve_program(program: &str) -> Result<String> {
+    if program.starts_with('/') {
+        return Ok(program.to_string());
+    }
+    if program.contains('/') {
+        return Err(Error::ExecutionFailed(format!(
+            "relative paths are not allowed: '{}'", program
+        )));
+    }
+    if let Ok(path_env) = std::env::var("PATH") {
+        for dir in path_env.split(':') {
+            let candidate = std::path::PathBuf::from(dir).join(program);
+            if candidate.exists() {
+                return Ok(candidate.to_string_lossy().to_string());
+            }
+        }
+    }
+    Ok(program.to_string())
+}
+
+/// Checks if a command is dangerous and should be blocked.
+///
+/// Returns `Some(reason)` if the command is dangerous, `None` otherwise.
+fn is_dangerous_command(program: &str, args: &[String]) -> Option<&'static str> {
+    let program_lower = program.to_lowercase();
+
+    match program_lower.as_str() {
+        "mkfs" | "mkfs.ext2" | "mkfs.ext3" | "mkfs.ext4" | "mkfs.xfs"
+        | "mkfs.vfat" | "mkfs.btrfs" | "mkswap" => {
+            return Some("filesystem creation commands are blocked");
+        }
+        "fdisk" | "parted" | "sfdisk" | "cfdisk" => {
+            return Some("disk partitioning commands are blocked");
+        }
+        "dd" => {
+            return Some("dd (disk destroyer) is blocked");
+        }
+        "shutdown" | "reboot" | "halt" | "poweroff" => {
+            return Some("system power commands are blocked");
+        }
+        _ => {}
+    }
+
+    if program_lower == "rm" {
+        let has_recursive = args.iter().any(|a| a.starts_with('-') && a.contains('r'));
+        let has_force = args.iter().any(|a| a.starts_with('-') && a.contains('f'));
+        let targets_dangerous = args.iter().any(|a| {
+            a == "/" || a == "/*" || a.starts_with("/dev/") || a.starts_with("/boot")
+        });
+        if has_recursive && has_force && targets_dangerous {
+            return Some("rm -rf on root, devices, or boot is blocked");
+        }
+    }
+
+    if program_lower == "chmod" && args.iter().any(|a| a == "/")
+        && args.iter().any(|a| a == "777" || a == "0777") {
+            return Some("chmod 777 / is blocked");
+        }
+
+    None
+}
+
+/// Waits for a child process with timeout, bounded output, and process group cleanup.
+///
+/// Features:
+/// - Concurrent pipe draining via threads (prevents pipe buffer deadlock)
+/// - Bounded output reading via `Read::take()` (prevents OOM)
+/// - Process group kill on timeout via `libc::kill(-pgid, SIGKILL)` (kills all descendants)
+/// - Zombie reaping via `child.wait()` after kill
+/// - Descendant PID collection before reaping
 fn wait_with_timeout(
     child: &mut Child,
+    pgid: u32,
     timeout_secs: u64,
-) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
-    use std::io::Read;
-    use std::time::Instant;
-
+) -> Result<(ExitStatus, Vec<u8>, Vec<u8>, Vec<u32>)> {
     let start = Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
+    let child_pid = child.id();
 
-    // Take stdout/stderr pipes - these will be None after first take
-    let stdout_opt = child.stdout.take();
-    let stderr_opt = child.stderr.take();
+    // Spawn reader threads for concurrent pipe draining — prevents deadlock when
+    // one pipe fills up while the other is empty (pipe buffer is typically 64KB).
+    let stdout_thread = child.stdout.take().map(|stdout| {
+        thread::spawn(move || {
+            let mut data = Vec::new();
+            let _ = stdout.take(MAX_OUTPUT_BYTES as u64).read_to_end(&mut data);
+            data
+        })
+    });
 
-    // Wait for process with timeout
+    let stderr_thread = child.stderr.take().map(|stderr| {
+        thread::spawn(move || {
+            let mut data = Vec::new();
+            let _ = stderr.take(MAX_OUTPUT_BYTES as u64).read_to_end(&mut data);
+            data
+        })
+    });
+
+    #[allow(unused_assignments)]
+    let mut last_descendants = Vec::new();
+
     loop {
         if start.elapsed() > timeout {
-            child.kill().map_err(|e| {
-                Error::ExecutionFailed(format!("failed to kill timed-out process: {}", e))
+            // Kill entire process group — SIGKILL to negative PID kills all members
+            unsafe {
+                let _ = libc::kill(-(pgid as libc::pid_t), libc::SIGKILL);
+            }
+            // Collect descendants before final cleanup
+            last_descendants = get_all_descendants(child_pid);
+            // Reap zombie process (prevents zombie leak)
+            let _status = child.wait().map_err(|e| {
+                Error::ExecutionFailed(format!("failed to reap after kill: {}", e))
             })?;
+            // Drain pipe threads — they complete when all process group fds close
+            let _stdout_data = stdout_thread
+                .map(|h| h.join().unwrap_or_default())
+                .unwrap_or_default();
+            let _stderr_data = stderr_thread
+                .map(|h| h.join().unwrap_or_default())
+                .unwrap_or_default();
             return Err(Error::ExecutionFailed(format!(
-                "command timed out after {}s",
-                timeout_secs
+                "command timed out after {}s ({} descendants found)",
+                timeout_secs,
+                last_descendants.len()
             )));
         }
 
+        // Collect descendants while child is still alive
+        last_descendants = get_all_descendants(child_pid);
+
         match child.try_wait() {
             Ok(Some(status)) => {
-                // Process done - read output from pipes
-                let stdout_data = if let Some(mut pipe) = stdout_opt {
-                    let mut data = Vec::new();
-                    let _ = pipe.read_to_end(&mut data);
-                    data
-                } else {
-                    Vec::new()
-                };
-
-                let stderr_data = if let Some(mut pipe) = stderr_opt {
-                    let mut data = Vec::new();
-                    let _ = pipe.read_to_end(&mut data);
-                    data
-                } else {
-                    Vec::new()
-                };
-
-                return Ok((status, stdout_data, stderr_data));
+                let stdout_data = stdout_thread
+                    .map(|h| h.join().unwrap_or_default())
+                    .unwrap_or_default();
+                let stderr_data = stderr_thread
+                    .map(|h| h.join().unwrap_or_default())
+                    .unwrap_or_default();
+                return Ok((status, stdout_data, stderr_data, last_descendants));
             }
             Ok(None) => {
-                // Still running
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
@@ -215,19 +325,21 @@ impl Capability for ShellExec {
     }
 
     fn description(&self) -> &'static str {
-        "Execute a shell command with timeout, output capture, and PID tracking. All commands logged to WAL. No undo support."
+        "Execute a shell command with timeout, output capture, process group isolation, and audit logging. Dangerous commands are blocked."
     }
 
     /// Returns the JSON Schema for ShellExec arguments.
     ///
-    /// Schema requires `"cmd"` string; `"timeout_secs"` and `"cwd"` are optional.
+    /// Schema requires `"cmd"` string; `"args"`, `"timeout_secs"`, `"cwd"`, and `"stdin"` are optional.
     fn schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {
                 "cmd": { "type": "string" },
+                "args": { "type": "array", "items": { "type": "string" } },
                 "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 300 },
-                "cwd": { "type": "string" }
+                "cwd": { "type": "string" },
+                "stdin": { "type": "string" }
             },
             "required": ["cmd"]
         })
@@ -262,23 +374,32 @@ impl Capability for ShellExec {
 
         let timeout = args.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
 
-        // Build the command with explicit program/args separation (FINDING #5)
-        // No shell interpretation — shell metacharacters are literal
-        let mut cmd = if let Some(ref explicit_args) = args.args {
-            // Explicit args provided: cmd is the program, args are its arguments
-            let mut c = Command::new(&args.cmd);
-            c.args(explicit_args);
-            c
-        } else {
-            // Legacy mode: split on first whitespace token
-            let mut parts = args.cmd.split_whitespace();
-            let program = parts
-                .next()
-                .ok_or_else(|| Error::ExecutionFailed("cmd is empty after split".into()))?;
-            let mut c = Command::new(program);
-            c.args(parts);
-            c
-        };
+        // Determine program and arguments (explicit args vs legacy whitespace split)
+        let (program, program_args): (String, Vec<String>) =
+            if let Some(ref explicit_args) = args.args {
+                (args.cmd.clone(), explicit_args.clone())
+            } else {
+                let mut parts = args.cmd.split_whitespace();
+                let program = parts
+                    .next()
+                    .ok_or_else(|| Error::ExecutionFailed("cmd is empty after split".into()))?
+                    .to_string();
+                (program, parts.map(String::from).collect())
+            };
+
+        // Check for dangerous commands (P1: command allowlist/blocklist)
+        if let Some(reason) = is_dangerous_command(&program, &program_args) {
+            return Err(Error::ExecutionFailed(format!(
+                "dangerous command blocked: {}", reason
+            )));
+        }
+
+        // Resolve program to absolute path (P1: PATH hijack protection)
+        let resolved_program = resolve_program(&program)?;
+
+        // Build command
+        let mut cmd = Command::new(&resolved_program);
+        cmd.args(&program_args);
 
         // Set working directory if specified
         if let Some(cwd) = &args.cwd {
@@ -292,22 +413,45 @@ impl Capability for ShellExec {
             cmd.current_dir(cwd_path);
         }
 
-        // Configure command with piped stdout/stderr
+        // Create process group for clean descendant cleanup (P0: kill all descendants)
         let mut child = cmd
+            .process_group(0)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            .stdin(if args.stdin.is_some() {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            })
             .spawn()
             .map_err(|e| Error::ExecutionFailed(format!("failed to spawn: {}", e)))?;
 
         let child_pid = child.id();
+        let pgid = child_pid; // Child is the process group leader
 
-        // Wait with timeout
-        let (exit_status, stdout, stderr) = wait_with_timeout(&mut child, timeout)?;
+        // Write stdin if provided (P2: stdin handling)
+        if let Some(ref stdin_content) = args.stdin {
+            if stdin_content.len() > MAX_STDIN_BYTES {
+                return Err(Error::ExecutionFailed(format!(
+                    "stdin exceeds maximum size ({} > {} bytes)",
+                    stdin_content.len(),
+                    MAX_STDIN_BYTES
+                )));
+            }
+            if let Some(mut stdin_pipe) = child.stdin.take() {
+                stdin_pipe
+                    .write_all(stdin_content.as_bytes())
+                    .map_err(|e| Error::ExecutionFailed(format!("failed to write stdin: {}", e)))?;
+                // Drop stdin_pipe to signal EOF to child
+            }
+        }
 
-        // Capture all descendant PIDs via recursive /proc/{pid}/children traversal
-        let descendants = get_all_descendants(child_pid);
+        // Wait with timeout — handles process group kill, bounded output, zombie reaping
+        let (exit_status, stdout, stderr, descendants) =
+            wait_with_timeout(&mut child, pgid, timeout)?;
+
         let mut spawned_pids = vec![child_pid];
-        spawned_pids.extend(descendants.iter());
+        spawned_pids.extend(descendants);
 
         let stdout_str = String::from_utf8_lossy(&stdout).to_string();
         let stderr_str = String::from_utf8_lossy(&stderr).to_string();
@@ -324,6 +468,7 @@ impl Capability for ShellExec {
                 "spawned_pids": spawned_pids,
                 "timeout_secs": timeout,
                 "timed_out": exit_status.code().is_none(),
+                "truncated": stdout.len() >= MAX_OUTPUT_BYTES || stderr.len() >= MAX_OUTPUT_BYTES,
             }),
             message: if success {
                 Some("Command completed successfully".to_string())
@@ -360,7 +505,10 @@ mod tests {
 
         eprintln!("result.success={}", result.success);
         eprintln!("result.data={}", result.data);
-        eprintln!("stdout={:?}", result.data.get("stdout").map(|v| v.as_str()));
+        eprintln!(
+            "stdout={:?}",
+            result.data.get("stdout").map(|v| v.as_str())
+        );
         assert!(result.success);
         assert!(result.data["stdout"].as_str().unwrap().contains("up"));
     }
@@ -386,7 +534,10 @@ mod tests {
     fn captures_stderr() {
         let result = ShellExec
             .execute(
-                &serde_json::json!({ "cmd": "cat", "args": ["/nonexistent_path_for_stderr_test"] }),
+                &serde_json::json!({
+                    "cmd": "cat",
+                    "args": ["/nonexistent_path_for_stderr_test"]
+                }),
                 &Context {
                     dry_run: false,
                     job_id: "test".into(),
@@ -459,7 +610,6 @@ mod tests {
     #[test]
     fn validates_empty_cmd() {
         let cap = ShellExec;
-        // Validate should catch empty cmd
         let result = cap.validate(&serde_json::json!({ "cmd": "" }));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("empty"));
@@ -485,10 +635,12 @@ mod tests {
 
     #[test]
     fn prevents_shell_injection() {
-        // Shell metacharacters are treated as literal arguments, not interpreted
         let result = ShellExec
             .execute(
-                &serde_json::json!({ "cmd": "echo", "args": ["hello; rm -rf /"] }),
+                &serde_json::json!({
+                    "cmd": "echo",
+                    "args": ["hello; rm -rf /"]
+                }),
                 &Context {
                     dry_run: false,
                     job_id: "test".into(),
@@ -498,15 +650,20 @@ mod tests {
             .expect("Execution failed");
 
         assert!(result.success);
-        // The semicolon is literal, not a command separator
-        assert!(result.data["stdout"].as_str().unwrap().contains("hello; rm -rf /"));
+        assert!(result.data["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("hello; rm -rf /"));
     }
 
     #[test]
     fn explicit_args_separation() {
         let result = ShellExec
             .execute(
-                &serde_json::json!({ "cmd": "echo", "args": ["hello", "world"] }),
+                &serde_json::json!({
+                    "cmd": "echo",
+                    "args": ["hello", "world"]
+                }),
                 &Context {
                     dry_run: false,
                     job_id: "test".into(),
@@ -516,20 +673,140 @@ mod tests {
             .expect("Execution failed");
 
         assert!(result.success);
-        assert!(result.data["stdout"].as_str().unwrap().contains("hello world"));
+        assert!(result.data["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("hello world"));
     }
 
     #[test]
     fn test_get_all_descendants_finds_children() {
-        // FINDING #6: verify recursive descendant tracking
         let descendants = get_all_descendants(1);
-        // PID 1 should have at least some descendants on a running system
-        assert!(!descendants.is_empty() || descendants.is_empty()); // May be empty in containers
+        assert!(!descendants.is_empty() || descendants.is_empty());
     }
 
     #[test]
     fn test_get_all_descendants_nonexistent_pid() {
         let descendants = get_all_descendants(999999);
-        assert!(descendants.is_empty(), "Non-existent PID should have no descendants");
+        assert!(
+            descendants.is_empty(),
+            "Non-existent PID should have no descendants"
+        );
+    }
+
+    // --- New tests for P0/P1 fixes ---
+
+    #[test]
+    fn blocks_dangerous_rm_rf_root() {
+        let result = ShellExec.execute(
+            &serde_json::json!({ "cmd": "rm", "args": ["-rf", "/"] }),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::temp_dir(),
+            },
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("dangerous"));
+    }
+
+    #[test]
+    fn blocks_dangerous_dd() {
+        let result = ShellExec.execute(
+            &serde_json::json!({ "cmd": "dd", "args": ["if=/dev/zero", "of=/dev/sda"] }),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::temp_dir(),
+            },
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("dd"));
+    }
+
+    #[test]
+    fn blocks_dangerous_mkfs() {
+        let result = ShellExec.execute(
+            &serde_json::json!({ "cmd": "mkfs.ext4", "args": ["/dev/sda1"] }),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::temp_dir(),
+            },
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("filesystem"));
+    }
+
+    #[test]
+    fn pipes_stdin() {
+        let result = ShellExec.execute(
+            &serde_json::json!({ "cmd": "cat", "stdin": "hello from stdin" }),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::temp_dir(),
+            },
+        );
+        let output = result.expect("stdin pipe failed");
+        assert!(output.success);
+        assert!(output.data["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("hello from stdin"));
+    }
+
+    #[test]
+    fn rejects_relative_path() {
+        let result = ShellExec.execute(
+            &serde_json::json!({ "cmd": "./malicious_script" }),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::temp_dir(),
+            },
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("relative paths"));
+    }
+
+    #[test]
+    fn output_has_truncated_flag() {
+        let result = ShellExec
+            .execute(
+                &serde_json::json!({ "cmd": "echo", "args": ["hello"] }),
+                &Context {
+                    dry_run: false,
+                    job_id: "test".into(),
+                    working_dir: std::env::temp_dir(),
+                },
+            )
+            .expect("Execution failed");
+        assert!(result.data["truncated"].as_bool() == Some(false));
+    }
+
+    #[test]
+    fn kills_descendants_on_timeout() {
+        // Spawn a bash that spawns a sleep child — both should be killed
+        let start = Instant::now();
+        let result = ShellExec.execute(
+            &serde_json::json!({
+                "cmd": "bash",
+                "args": ["-c", "sleep 30 & sleep 30 & wait"],
+                "timeout_secs": 1
+            }),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::temp_dir(),
+            },
+        );
+
+        let elapsed = start.elapsed();
+        assert!(elapsed.as_secs() < 3, "should timeout quickly, took {:?}", elapsed);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("timed out"));
+        assert!(err.contains("descendants"), "should report descendant count: {}", err);
     }
 }

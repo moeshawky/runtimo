@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 
 static TELEMETRY_CACHE: Mutex<Option<(Telemetry, std::time::Instant)>> = Mutex::new(None);
-const CACHE_TTL_SECS: u64 = 30;
+const CACHE_TTL_SECS: u64 = 5;
 
 /// Full system telemetry snapshot.
 ///
@@ -63,6 +63,17 @@ pub struct SystemInfo {
     pub uptime: String,
     /// Load average (e.g. `" 0.50,  0.30,  0.20"`).
     pub load_average: String,
+    // --- Numeric fields for agent threshold computation ---
+    /// Total RAM in bytes (machine-readable).
+    pub ram_total_bytes: u64,
+    /// Free RAM in bytes (machine-readable).
+    pub ram_free_bytes: u64,
+    /// Total disk space in bytes (machine-readable).
+    pub disk_total_bytes: u64,
+    /// Free disk space in bytes (machine-readable).
+    pub disk_free_bytes: u64,
+    /// Disk usage percentage as numeric (e.g. `45.0`, no `%` sign).
+    pub disk_used_percent_numeric: f64,
 }
 
 /// Special hardware device information.
@@ -111,13 +122,12 @@ pub struct NetworkInfo {
 impl Telemetry {
     /// Captures a full system telemetry snapshot.
     ///
-    /// Results are cached for 30 seconds to avoid running 15+ shell subprocesses
+    /// Results are cached for 5 seconds to avoid running 15+ shell subprocesses
     /// on repeated calls. Network queries (public_ip, tunnel) are skipped when
     /// returning a cached value.
     pub fn capture() -> Self {
         let now = std::time::Instant::now();
         {
-            // Handle poison error by recovering from the poisoned state
             let cache = TELEMETRY_CACHE.lock().unwrap_or_else(|e| e.into_inner());
             if let Some((cached, instant)) = cache.as_ref() {
                 if now.duration_since(*instant).as_secs() < CACHE_TTL_SECS {
@@ -139,7 +149,6 @@ impl Telemetry {
             network: NetworkInfo::capture(),
         };
 
-        // Handle poison error by recovering from the poisoned state
         let mut cache = TELEMETRY_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         *cache = Some((telemetry.clone(), now));
         telemetry
@@ -223,15 +232,40 @@ impl Telemetry {
 
 impl SystemInfo {
     fn capture() -> Self {
+        let ram_total = run_cmd("free -h | grep Mem | awk '{print $2}'");
+        let ram_free = run_cmd("free -h | grep Mem | awk '{print $4}'");
+        let disk_total = run_cmd("df -h / | tail -1 | awk '{print $2}'");
+        let disk_free = run_cmd("df -h / | tail -1 | awk '{print $4}'");
+        let disk_pct_str = run_cmd("df / | tail -1 | awk '{print $5}'");
+        let disk_used_percent = disk_pct_str.replace('%', "");
+        let disk_used_percent_numeric = disk_used_percent.parse::<f64>().unwrap_or(0.0);
+        let ram_total_bytes = run_cmd("free -b | grep Mem | awk '{print $2}'")
+            .parse()
+            .unwrap_or(0);
+        let ram_free_bytes = run_cmd("free -b | grep Mem | awk '{print $4}'")
+            .parse()
+            .unwrap_or(0);
+        let disk_total_bytes = run_cmd("df --bytes / | tail -1 | awk '{print $2}'")
+            .parse()
+            .unwrap_or(0);
+        let disk_free_bytes = run_cmd("df --bytes / | tail -1 | awk '{print $4}'")
+            .parse()
+            .unwrap_or(0);
+
         Self {
             cpu_model: run_cmd("cat /proc/cpuinfo | grep 'model name' | head -1 | cut -d: -f2"),
-            ram_total: run_cmd("free -h | grep Mem | awk '{print $2}'"),
-            ram_free: run_cmd("free -h | grep Mem | awk '{print $4}'"),
-            disk_total: run_cmd("df -h / | tail -1 | awk '{print $2}'"),
-            disk_free: run_cmd("df -h / | tail -1 | awk '{print $4}'"),
-            disk_used_percent: run_cmd("df -h / | tail -1 | awk '{print $5}'"),
+            ram_total,
+            ram_free,
+            disk_total,
+            disk_free,
+            disk_used_percent,
             uptime: run_cmd("uptime -p"),
             load_average: run_cmd("uptime | awk -F'load average:' '{print $2}'"),
+            ram_total_bytes,
+            ram_free_bytes,
+            disk_total_bytes,
+            disk_free_bytes,
+            disk_used_percent_numeric,
         }
     }
 }
@@ -247,14 +281,14 @@ impl HardwareInfo {
             .unwrap_or(0);
 
         let jax_available =
-            run_cmd("python3 -c 'import jax' 2>/dev/null && echo yes || echo no") == "yes";
+            run_cmd("timeout 10 python3 -c 'import jax' 2>/dev/null && echo yes || echo no") == "yes";
         let jax_version = if jax_available {
-            Some(run_cmd("python3 -c 'import jax; print(jax.__version__)'"))
+            Some(run_cmd("timeout 10 python3 -c 'import jax; print(jax.__version__)'"))
         } else {
             None
         };
         let jax_device_count = if jax_available {
-            run_cmd("python3 -c 'import jax; print(len(jax.devices()))'")
+            run_cmd("timeout 10 python3 -c 'import jax; print(len(jax.devices()))'")
                 .parse()
                 .ok()
         } else {
@@ -273,7 +307,7 @@ impl HardwareInfo {
 
 impl ServiceInfo {
     fn capture() -> Self {
-        let vllm_version = run_cmd("python3 -c 'import vllm; print(vllm.__version__)' 2>/dev/null");
+        let vllm_version = run_cmd("timeout 10 python3 -c 'import vllm; print(vllm.__version__)' 2>/dev/null");
         let vllm_running = !run_cmd("pgrep -fa 'vllm serve'").is_empty();
         let vllm_port_bound =
             !run_cmd("ss -ltn '( sport = :8200 )' 2>/dev/null | grep 8200").is_empty();

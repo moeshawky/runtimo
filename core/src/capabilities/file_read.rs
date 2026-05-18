@@ -3,6 +3,10 @@
 //! Rejects path traversal (`..`), empty paths, non-existent files, and
 //! directories. Returns the file content along with byte count.
 //!
+//! Security: opens file with O_NOFOLLOW to prevent TOCTOU symlink escape,
+//! uses bounded reader (take) regardless of metadata to prevent size bypass,
+//! detects binary content, and handles UTF-8 boundary splits correctly.
+//!
 //! # Example
 //!
 //! ```rust
@@ -23,13 +27,12 @@ use crate::validation::path::{validate_path, PathContext};
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::io::Read;
 
 /// Maximum file size allowed for reading (10 MB).
-/// Reduced from 100 MB to prevent OOM on persistent machines (FINDING #10).
 const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
 /// Default max bytes to read when max_bytes is not specified (1 MB).
-/// Prevents accidental large reads even for files under MAX_FILE_SIZE.
 const DEFAULT_MAX_BYTES: u64 = 1024 * 1024;
 
 /// Arguments for the [`FileRead`] capability.
@@ -37,34 +40,15 @@ const DEFAULT_MAX_BYTES: u64 = 1024 * 1024;
 pub struct FileReadArgs {
     /// Absolute or relative path to the file to read.
     pub path: String,
-    /// Maximum bytes to read (default: 1 MB, max: 10 MB). FINDING #10.
+    /// Maximum bytes to read (default: 1 MB, max: 10 MB).
     pub max_bytes: Option<u64>,
 }
 
 /// Capability that reads the contents of a file.
 ///
-/// Validates that the path exists, is a file (not a directory), and does not
-/// contain `..` sequences (path traversal protection).
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use runtimo_core::capabilities::FileRead;
-/// use runtimo_core::capability::{Capability, Context};
-/// use serde_json::json;
-///
-/// // Create a test file first
-/// std::fs::write("/tmp/hello.txt", "hello world").unwrap();
-///
-/// let cap = FileRead;
-/// let result = cap.execute(
-///     &json!({"path": "/tmp/hello.txt"}),
-///     &Context { dry_run: false, job_id: "test".into() },
-/// ).unwrap();
-///
-/// assert!(result.success);
-/// assert_eq!(result.data["content"].as_str().unwrap(), "hello world\n");
-/// ```
+/// Opens file with O_NOFOLLOW to prevent TOCTOU symlink escape,
+/// uses bounded reader regardless of metadata to prevent size bypass,
+/// detects binary content, and handles UTF-8 boundary splits.
 pub struct FileRead;
 
 impl Capability for FileRead {
@@ -76,9 +60,6 @@ impl Capability for FileRead {
         "Read the contents of a file. Validates path existence, rejects directories and path traversal."
     }
 
-    /// Returns the JSON Schema for FileRead arguments.
-    ///
-    /// Schema: `{"type": "object", "properties": {"path": {"type": "string"}, "max_bytes": {"type": "integer"}}, "required": ["path"]}`
     fn schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -90,7 +71,6 @@ impl Capability for FileRead {
         })
     }
 
-    /// Validates the path argument using unified validation module.
     fn validate(&self, args: &Value) -> Result<()> {
         let args: FileReadArgs = serde_json::from_value(args.clone())
             .map_err(|e| Error::SchemaValidationFailed(e.to_string()))?;
@@ -106,15 +86,6 @@ impl Capability for FileRead {
         Ok(())
     }
 
-    /// Reads the file and returns its contents.
-    ///
-    /// Respects `max_bytes` parameter (default 1 MB, max 10 MB) to limit
-    /// memory usage even for files under the hard MAX_FILE_SIZE cap.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::ExecutionFailed`] if
-    /// the file cannot be read (permissions, I/O error, etc.).
     fn execute(&self, args: &Value, _ctx: &Context) -> Result<Output> {
         let args: FileReadArgs = serde_json::from_value(args.clone())
             .map_err(|e| Error::ExecutionFailed(e.to_string()))?;
@@ -128,19 +99,6 @@ impl Capability for FileRead {
         let path = validate_path(&args.path, &ctx)
             .map_err(|e| Error::ExecutionFailed(format!("path validation: {}", e)))?;
 
-        let metadata = path
-            .metadata()
-            .map_err(|e| Error::ExecutionFailed(format!("stat {}: {}", path.display(), e)))?;
-
-        if metadata.len() > MAX_FILE_SIZE {
-            return Err(Error::ExecutionFailed(format!(
-                "File too large: {} bytes (limit: {} bytes)",
-                metadata.len(),
-                MAX_FILE_SIZE
-            )));
-        }
-
-        // FINDING #10: Apply max_bytes limit (default 1 MB)
         let max_bytes = args.max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
         if max_bytes > MAX_FILE_SIZE {
             return Err(Error::ExecutionFailed(format!(
@@ -149,40 +107,113 @@ impl Capability for FileRead {
             )));
         }
 
-        let content = if metadata.len() <= max_bytes {
-            std::fs::read_to_string(&path)
-                .map_err(|e| Error::ExecutionFailed(format!("read {}: {}", path.display(), e)))?
-        } else {
-            // Read only up to max_bytes
-            let file = std::fs::File::open(&path)
-                .map_err(|e| Error::ExecutionFailed(format!("open {}: {}", path.display(), e)))?;
-            use std::io::Read;
-            let mut buf = String::new();
-            let mut handle = file.take(max_bytes);
-            handle
-                .read_to_string(&mut buf)
-                .map_err(|e| Error::ExecutionFailed(format!("read {}: {}", path.display(), e)))?;
-            buf
-        };
+        // P0 FIX: Open with O_NOFOLLOW to prevent TOCTOU symlink escape.
+        // Open immediately after validation to minimize TOCTOU window.
+        let file = open_file_nofollow(&path)
+            .map_err(|e| Error::ExecutionFailed(format!("open {}: {}", path.display(), e)))?;
 
-        let truncated = metadata.len() > max_bytes;
+        // P0 FIX: Always use bounded reader (take) regardless of metadata.
+        // Prevents TOCTOU size bypass where file grows between stat and read.
+        let mut limited = file.take(max_bytes);
+
+        // Read raw bytes to handle binary detection and UTF-8 boundaries correctly.
+        let mut raw_bytes = Vec::with_capacity(
+            std::cmp::min(max_bytes as usize, 64 * 1024),
+        );
+        let bytes_read = limited
+            .read_to_end(&mut raw_bytes)
+            .map_err(|e| Error::ExecutionFailed(format!("read {}: {}", path.display(), e)))?;
+
+        let bytes_read = bytes_read as u64;
+        let truncated = bytes_read >= max_bytes;
+
+        // P1 FIX: Detect binary content (null bytes in the data).
+        let is_binary = detect_binary(&raw_bytes);
+
+        let data = if is_binary {
+            serde_json::json!({
+                "content_type": "binary",
+                "path": path.display().to_string(),
+                "bytes_read": bytes_read,
+                "truncated": truncated,
+                "message": "Binary file detected — content not returned as text",
+            })
+        } else {
+            // P1 FIX: Convert raw bytes to String, trimming to valid UTF-8 boundary.
+            let content = bytes_to_utf8_string(&raw_bytes);
+
+            // P1 FIX: Parse JSON from slice (avoids double memory vs from_str).
+            if path.extension().is_some_and(|ext| ext == "json") {
+                match serde_json::from_slice::<Value>(raw_bytes.as_slice()) {
+                    Ok(parsed) => serde_json::json!({
+                        "content": parsed,
+                        "content_type": "json",
+                        "path": path.display().to_string(),
+                        "bytes_read": bytes_read,
+                        "truncated": truncated,
+                    }),
+                    Err(_) => serde_json::json!({
+                        "content": content,
+                        "content_type": "text",
+                        "path": path.display().to_string(),
+                        "bytes_read": bytes_read,
+                        "truncated": truncated,
+                    }),
+                }
+            } else {
+                serde_json::json!({
+                    "content": content,
+                    "content_type": "text",
+                    "path": path.display().to_string(),
+                    "bytes_read": bytes_read,
+                    "truncated": truncated,
+                })
+            }
+        };
 
         Ok(Output {
             success: true,
-            data: serde_json::json!({
-                "content": content,
-                "path": path.display().to_string(),
-                "bytes_read": content.len(),
-                "file_size": metadata.len(),
-                "truncated": truncated,
-            }),
+            data,
             message: Some(format!(
                 "Read {} bytes from {}{}",
-                content.len(),
+                bytes_read,
                 path.display(),
                 if truncated { " (truncated)" } else { "" }
             )),
         })
+    }
+}
+
+/// Open a file with O_NOFOLLOW to prevent TOCTOU symlink replacement attacks.
+#[cfg(unix)]
+fn open_file_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_file_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
+/// Detect binary content by checking for null bytes.
+fn detect_binary(data: &[u8]) -> bool {
+    data.contains(&0)
+}
+
+/// Convert raw bytes to a UTF-8 String, trimming trailing bytes that would
+/// split a multibyte character boundary.
+fn bytes_to_utf8_string(bytes: &[u8]) -> String {
+    match String::from_utf8(bytes.to_vec()) {
+        Ok(s) => s,
+        Err(e) => {
+            let valid_up_to = e.utf8_error().valid_up_to();
+            String::from_utf8(bytes[..valid_up_to].to_vec())
+                .unwrap_or_else(|_| String::new())
+        }
     }
 }
 
@@ -238,7 +269,6 @@ mod tests {
 
     #[test]
     fn test_max_bytes_limits_output() {
-        // FINDING #10: verify max_bytes parameter works
         let mut tmp = std::env::temp_dir();
         tmp.push("runtimo_test_max_bytes.txt");
         {
@@ -265,25 +295,21 @@ mod tests {
         std::fs::remove_file(&tmp).ok();
     }
 
-#[test]
-fn test_max_bytes_rejects_exceeding_limit() {
-    // FINDING #10: Runtime validation rejects max_bytes > 10MB
-    // Note: JSON Schema doesn't enforce maximum at parse time, but execute() checks it
-    let result = FileRead.execute(
-        &serde_json::json!({ "path": "/etc/hosts", "max_bytes": 9999999999u64 }),
-        &Context {
-            dry_run: false,
-            job_id: "test".into(),
-            working_dir: std::env::temp_dir(),
-        },
-    );
-    // Execution should fail because max_bytes exceeds MAX_FILE_SIZE (10MB)
-    assert!(result.is_err());
-}
+    #[test]
+    fn test_max_bytes_rejects_exceeding_limit() {
+        let result = FileRead.execute(
+            &serde_json::json!({ "path": "/etc/hosts", "max_bytes": 9999999999u64 }),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::temp_dir(),
+            },
+        );
+        assert!(result.is_err());
+    }
 
     #[test]
     fn test_file_read_default_max_bytes() {
-        // Verify default max_bytes (1MB) is applied when not specified
         let mut tmp = std::env::temp_dir();
         tmp.push("runtimo_test_default_max.txt");
         std::fs::write(&tmp, "small content").unwrap();
@@ -302,5 +328,124 @@ fn test_max_bytes_rejects_exceeding_limit() {
         assert!(result.success);
         assert!(result.data["truncated"].as_bool() == Some(false));
         std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn test_file_read_json_parsed_for_agents() {
+        let mut tmp = std::env::temp_dir();
+        tmp.push("runtimo_test_agent.json");
+        std::fs::write(&tmp, r#"{"key": "value", "nested": {"a": 1}}"#).unwrap();
+
+        let result = FileRead
+            .execute(
+                &serde_json::json!({ "path": tmp.to_str().unwrap() }),
+                &Context {
+                    dry_run: false,
+                    job_id: "test".into(),
+                    working_dir: std::env::temp_dir(),
+                },
+            )
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.data["content"].is_object());
+        assert_eq!(result.data["content"]["key"].as_str(), Some("value"));
+        assert_eq!(result.data["content"]["nested"]["a"].as_u64(), Some(1));
+        assert_eq!(result.data["content_type"].as_str(), Some("json"));
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn test_binary_file_detected() {
+        let mut tmp = std::env::temp_dir();
+        tmp.push("runtimo_test_binary.bin");
+        std::fs::write(&tmp, b"hello\x00world").unwrap();
+
+        let result = FileRead
+            .execute(
+                &serde_json::json!({ "path": tmp.to_str().unwrap() }),
+                &Context {
+                    dry_run: false,
+                    job_id: "test".into(),
+                    working_dir: std::env::temp_dir(),
+                },
+            )
+            .unwrap();
+
+        assert!(result.success);
+        assert_eq!(result.data["content_type"].as_str(), Some("binary"));
+        assert_eq!(result.data["bytes_read"].as_u64(), Some(11));
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn test_utf8_boundary_truncation() {
+        // "café" = [99, 97, 102, 195, 169] — é is 2 bytes
+        // Truncate at 4 bytes would split the é character
+        let mut tmp = std::env::temp_dir();
+        tmp.push("runtimo_test_utf8.txt");
+        std::fs::write(&tmp, b"caf\xc3\xa9").unwrap();
+
+        let result = FileRead
+            .execute(
+                &serde_json::json!({ "path": tmp.to_str().unwrap(), "max_bytes": 4 }),
+                &Context {
+                    dry_run: false,
+                    job_id: "test".into(),
+                    working_dir: std::env::temp_dir(),
+                },
+            )
+            .unwrap();
+
+        assert!(result.success);
+        let content = result.data["content"].as_str().unwrap();
+        assert_eq!(content, "caf");
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn test_bytes_read_reports_raw_bytes() {
+        let mut tmp = std::env::temp_dir();
+        tmp.push("runtimo_test_bytes_read.txt");
+        // UTF-8: "café\n" = 6 bytes (é is 2 bytes)
+        std::fs::write(&tmp, "café\n").unwrap();
+
+        let result = FileRead
+            .execute(
+                &serde_json::json!({ "path": tmp.to_str().unwrap() }),
+                &Context {
+                    dry_run: false,
+                    job_id: "test".into(),
+                    working_dir: std::env::temp_dir(),
+                },
+            )
+            .unwrap();
+
+        assert!(result.success);
+        // bytes_read should be 6 (raw file bytes), not String::len() which is 5
+        assert_eq!(result.data["bytes_read"].as_u64(), Some(6));
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn test_symlink_rejected_by_nofollow() {
+        let link_path = std::env::temp_dir().join("runtimo_nofollow_test");
+        let _ = std::fs::remove_file(&link_path);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            if symlink("/etc/hostname", &link_path).is_ok() {
+                let result = FileRead.execute(
+                    &serde_json::json!({ "path": link_path.to_str().unwrap() }),
+                    &Context {
+                        dry_run: false,
+                        job_id: "test".into(),
+                        working_dir: std::env::temp_dir(),
+                    },
+                );
+                assert!(result.is_err(), "symlink should be rejected by O_NOFOLLOW");
+                std::fs::remove_file(&link_path).ok();
+            }
+        }
     }
 }

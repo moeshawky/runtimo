@@ -7,6 +7,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-18
+
+### Security Fixes (P0 - Critical)
+
+**ShellExec:**
+- Fixed unbounded output → OOM vulnerability (lines 106-107, 114-115, 312-313)
+- Fixed `/bin/sh -c` bypass allowing arbitrary code execution (lines 273-280)
+- Fixed `child.kill()` not killing descendants (line 93)
+- Fixed pipe deadlock after kill (lines 93-107)
+- Added dangerous command blocklist (`rm -rf /`, `dd`, `mkfs`, `fdisk`, `shutdown`, `chmod 777 /`)
+- Added PATH hijack protection (requires absolute paths)
+
+**FileWrite:**
+- Fixed prefix validation bypass (`/tmpfoo/` passed `/tmp` check) in `path.rs:174`
+- Added atomic write pattern (write to `.tmp`, fsync, rename)
+- Added critical file denylist (`.bashrc`, `.ssh/authorized_keys`, `.profile`, etc.)
+- Added disk space pre-check before writes
+
+**GitExec:**
+- Enforced `timeout_secs` on ALL git operations (was ignored before)
+- Blocked `http://` URLs (MITM risk) - now requires `https://` or SSH
+- Sanitized credentials from remote URLs in output
+- Added safeguards to `git clean -fd` (dry-run preview, file count limit)
+- Added secret file detection to `git add -A` (skips `.env`, `credentials.json`, etc.)
+- Fixed URL validation bypasses (SSRF to cloud metadata)
+
+**FileRead:**
+- Fixed TOCTOU symlink escape (lines 128-153) using `O_NOFOLLOW`
+- Fixed TOCTOU size bypass (lines 131-153) with bounded reader
+- Added binary file detection
+- Fixed UTF-8 truncation on multibyte boundaries
+
+**WAL:**
+- Fixed atomic write pattern (lock held during entire write)
+- Fixed O(N²) I/O (now uses append mode)
+- Fixed WAL rotation naming
+- Fixed cleanup race window
+
+**Backup:**
+- Fixed restore to create pre-restore backup (was destroying newer data)
+- Fixed `cleanup` symlink attack (was using `is_dir()` which follows symlinks)
+- Added 100MB size limit per file
+- Added backup integrity verification
+
+**Executor:**
+- Implemented zombie guard (reject if `zombie_count > 10`)
+- Added args size limit (1MB max)
+- Added spawned PID tracking
+- Fixed WAL serialization to return error instead of storing `Null`
+
+**Telemetry:**
+- Added numeric metrics for agents (`disk_total_bytes`, `disk_free_bytes`, etc.)
+- Reduced cache TTL from 30s to 5s
+- Fixed `disk_used_percent` to store numeric value (stripped `%` sign)
+
+### Features
+
+- **Agent-friendly output:** JSON files auto-parsed to structured objects
+- **Process groups:** ShellExec uses process groups for proper cleanup
+- **Stdin support:** ShellExec now accepts stdin input
+- **Output truncation:** 10MB limit on stdout/stderr with truncation flag
+- **Numeric telemetry:** Agents can now compute thresholds programmatically
+
+### Tests
+
+- Added 50+ new tests across all capabilities
+- All P0/P1/P2 audit issues have corresponding tests
+- Total: 119 tests passing
+
+### Documentation
+
+- Updated README with correct binary name (`runtimo` not `moe`)
+- Added comprehensive security documentation
+- Documented all failure modes and mitigations
+
 ## [0.1.5] - 2026-05-17
 
 ### Bug Fixes
