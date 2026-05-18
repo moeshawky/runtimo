@@ -12,7 +12,7 @@ name = "runtimo"
 path = "src/main.rs"
 
 [dependencies]
-runtimo-core = { path = "../core", version = "0.1" }
+runtimo-core = { path = "../core", version = "0.2" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
