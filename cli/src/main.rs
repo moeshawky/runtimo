@@ -17,7 +17,7 @@ use std::path::PathBuf;
         \n\
         Every execution captures hardware telemetry and process snapshots before/after,\n\
         with all events logged to a Write-Ahead Log (WAL) for crash recovery and undo.",
-    after_help = "Quick start:\n  moe list                                    List capabilities\n  moe run -c FileRead -a '{\"path\":\"/etc/hostname\"}'   Read a file\n  moe run -c FileWrite -a '{\"path\":\"/tmp/h.txt\",\"content\":\"hi\"}'  Write a file\n  moe run -c ShellExec -a '{\"cmd\":\"uptime\"}'          Run a command\n  moe logs                                      View history\n  moe telemetry                                 Hardware info\n  moe processes                                 Running processes",
+    after_help = "Quick start:\n  runtimo list                                    List capabilities\n  runtimo run -c FileRead -a '{\"path\":\"/etc/hostname\"}'   Read a file\n  runtimo run -c FileWrite -a '{\"path\":\"/tmp/h.txt\",\"content\":\"hi\"}'  Write a file\n  runtimo run -c ShellExec -a '{\"cmd\":\"uptime\"}'          Run a command\n  runtimo logs                                      View history\n  runtimo telemetry                                 Hardware info\n  runtimo processes                                 Running processes",
     version
 )]
 struct Cli {
@@ -31,7 +31,7 @@ enum Commands {
     #[command(
         about = "Run a capability",
         long_about = "Run a named capability with JSON arguments. Captures telemetry and process snapshots before/after execution.",
-        after_help = "Examples:\n  moe run -c FileRead -a '{\"path\":\"/etc/hostname\"}'\n  moe run -c FileWrite -a '{\"path\":\"/tmp/out.txt\",\"content\":\"hello\"}'\n  moe run -c ShellExec -a '{\"cmd\":\"uptime\"}'\n  moe run -c Kill -a '{\"pid\":12345}'\n  moe run -c FileRead -a '{\"path\":\"/tmp/test.txt\"}' --dry-run",
+        after_help = "Examples:\n  runtimo run -c FileRead -a '{\"path\":\"/etc/hostname\"}'\n  runtimo run -c FileWrite -a '{\"path\":\"/tmp/out.txt\",\"content\":\"hello\"}'\n  runtimo run -c ShellExec -a '{\"cmd\":\"uptime\"}'\n  runtimo run -c Kill -a '{\"pid\":12345}'\n  runtimo run -c FileRead -a '{\"path\":\"/tmp/test.txt\"}' --dry-run",
     )]
     Run {
         /// Capability name (FileRead, FileWrite, ShellExec, Kill, GitExec, Undo)
@@ -105,7 +105,7 @@ enum Commands {
     #[command(
         about = "Undo a completed job",
         long_about = "Restore files to their state before a job executed, using backups from FileWrite or GitExec.",
-        after_help = "Find job IDs with `moe logs` or `moe status`.\nExample: moe undo -j abc123 --dry-run",
+        after_help = "Find job IDs with `runtimo logs` or `runtimo status`.\nExample: runtimo undo -j abc123 --dry-run",
     )]
     Undo {
         /// Job ID to undo
@@ -140,7 +140,7 @@ enum Commands {
     #[command(
         about = "Manage configuration",
         long_about = "Add, remove, or list allowed path prefixes.",
-        after_help = "Examples:\n  moe config allowed-paths add /srv /opt\n  moe config allowed-paths list\n  moe config allowed-paths remove /opt",
+        after_help = "Examples:\n  runtimo config allowed-paths add /srv /opt\n  runtimo config allowed-paths list\n  runtimo config allowed-paths remove /opt",
     )]
     Config {
         #[command(subcommand)]
