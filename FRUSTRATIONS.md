@@ -126,3 +126,43 @@
 - **Impact:** Cannot read large files via docker exec in a single command.
 - **Workaround:** Use `sed -n` to read specific line ranges, or write Python scripts to output sections.
 - **Status:** OPEN
+
+### #16 — ShellExec timeout (30s) too short for complex operations
+- **Severity:** P1
+- **Component:** ShellExec
+- **Description:** `docker logs hive-mind 2>&1 | grep -c "failed"` timed out at 30s because the command was split across shell operator (pipe) and the error was caught late. Also `python3 /tmp/check_db_chains_v2.py` timed out because it waited for container restart.
+- **Impact:** Any operation that takes >30s (container restart, large log scans, DB queries) fails silently.
+- **Workaround:** Use raw SSH for long-running operations.
+- **Status:** OPEN
+
+### #17 — No syntax validation before container restart causes crash loops
+- **Severity:** P1
+- **Component:** Missing capability / workflow
+- **Description:** Applied a Python fix via runtimo → restarted container → SyntaxError in code → container enters restart loop. No way to validate syntax before restart. Had to use raw SSH to fix.
+- **Impact:** Each syntax error causes a crash loop that requires SSH to fix. Wastes 2-3 minutes per iteration.
+- **Workaround:** Validate syntax via `python3 -c "import ast; ast.parse(...)"` before restart (but see #6 — escaping issues).
+- **Status:** OPEN
+
+### #18 — Docker exec from host vs container have different contexts
+- **Severity:** P2
+- **Component:** ShellExec
+- **Description:** `docker exec hive-mind python3 /tmp/db_check.py` fails because the file is on the host, not in the container. Must use `docker cp` first. But `docker cp` also requires shell operators for complex paths.
+- **Impact:** Cannot run scripts inside containers without two-step copy+execute.
+- **Workaround:** Write scripts to container via `docker cp`, then execute.
+- **Status:** OPEN
+
+### #19 — JSON escaping chain makes even simple edits painful
+- **Severity:** P1
+- **Component:** ShellExec + CLI
+- **Description:** To change `log.warning` to `log.debug` in a file: write Python script locally → scp to brain → run via runtimo → verify. A one-line edit requires 4 steps and 3 files. The escaping chain (local shell → SSH → JSON parser → ShellExec) makes inline edits impossible.
+- **Impact:** Simple edits take 5-10x longer than they should. Most time spent on escaping, not on the actual fix.
+- **Workaround:** Write Python edit scripts, scp, execute.
+- **Status:** OPEN
+
+### #20 — Container restart loop from SyntaxError
+- **Severity:** P1
+- **Component:** Missing capability
+- **Description:** After applying a fix with a syntax error, the container enters a restart loop. Cannot stop/restart via runtimo (see #13). Must SSH directly to `docker stop` and fix the file.
+- **Impact:** Breaks the runtimo-only workflow entirely when a fix has a bug.
+- **Workaround:** Use raw SSH for container management.
+- **Status:** OPEN
