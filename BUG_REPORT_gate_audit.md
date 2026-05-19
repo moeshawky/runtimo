@@ -72,17 +72,19 @@ Critical errors found in production logs that were NOT in the original audit:
 - **Fix Applied:** Replaced `hash(trimmed)` with `hashlib.md5(trimmed.encode()).hexdigest()`
 - **Commit:** `b667129`
 
-#### BUG-H: set pruning non-deterministic in conductor [OPEN]
+#### BUG-H: set pruning non-deterministic in conductor [FIXED ✓]
 - **File:** `conductor.py:229`
 - **Root Cause:** `set(list(alerted_ids)[-MAX_ALERTED_IDS:])` — set→list has no guaranteed order.
 - **Impact:** Arbitrary entries kept/dropped, not "most recent" as intended.
-- **Fix:** Use list with insertion order, or OrderedDict.
+- **Fix Applied:** Changed `alerted_ids` from `set` to `list` (preserves insertion order). Pruning uses `alerted_ids[-MAX_ALERTED_IDS:]`. O(1) lookup via `set(alerted_ids)` for membership check.
+- **Commit:** pending
 
-#### BUG-I: persist check fails on LRU eviction [OPEN]
-- **File:** `reasoning/gates.py:430-445`
-- **Root Cause:** EvidenceStore capped at MAX_RECORDS=100. Long chains evict early evidence.
-- **Impact:** REFLECT gate fails spuriously with "PERSIST REQUIRED".
-- **Fix:** Track persist calls in Chain object, not ephemeral EvidenceStore.
+#### BUG-I: persist check fails on LRU eviction [FIXED ✓]
+- **File:** `reasoning/gates.py:550`
+- **Root Cause:** EvidenceStore capped at MAX_RECORDS=100. Long chains evict early evidence including persist calls.
+- **Impact:** REFLECT gate fails spuriously with "PERSIST REQUIRED" for long chains.
+- **Fix Applied:** Added `gate_context.get("persist_count", 0)` check before EvidenceStore lookup. If persist_count > 0, skip EvidenceStore (survives LRU eviction).
+- **Commit:** pending
 
 ### P2 — Quality Issues
 
@@ -106,9 +108,9 @@ Critical errors found in production logs that were NOT in the original audit:
 | Severity | Total | Fixed | Open | False Positive |
 |----------|-------|-------|------|----------------|
 | P0 | 5 | 2 | 3 | 0 |
-| P1 | 4 | 2 | 2 | 0 |
+| P1 | 4 | 4 | 0 | 0 |
 | P2 | 3 | 0 | 2 | 1 |
-| **Total** | **12** | **4** | **7** | **1** |
+| **Total** | **12** | **6** | **5** | **1** |
 
 ---
 
