@@ -38,12 +38,14 @@ Critical errors found in production logs that were NOT in the original audit:
 - **Fix Applied:** Replaced `chain.id[:12]` with `str(chain.id)[:12]` (4 occurrences)
 - **Commit:** `159126b`
 
-#### BUG-C: Grounding gate SID mismatch [OPEN]
+#### BUG-C: Grounding gate SID mismatch [FIXED ✓]
 - **File:** `gates/grounding.py:153`
-- **Root Cause:** `_resolve_sid(None, session_id)` may resolve to a DIFFERENT SID than where evidence was recorded.
-- **Evidence:** `[GROUNDING] sid=unknown, recent=0, counter_threshold=1057` — gate gets sid=unknown, finds no evidence.
-- **Impact:** Grounding gate fails with "EVIDENCE_STALE" even though evidence exists under a different key.
-- **Fix:** Use session_id directly, don't re-resolve.
+- **Root Cause:** `_resolve_sid(None, session_id)` may resolve to "unknown" if session_id is empty, while evidence was recorded under a different SID.
+- **Evidence:** `[GROUNDING] sid=unknown, recent=0` — gate reads from wrong EvidenceStore.
+- **Impact:** Grounding gate fails with EVIDENCE_STALE even though evidence exists. Cross-session contamination if two sessions both resolve to "unknown".
+- **Blast Radius:** 729 entities (codegraph), 11 call sites across 9 files. See `BUG_C_BLAST_RADIUS.md`.
+- **Fix Applied:** Don't re-resolve in grounding gate — use `session_id` directly since chain.py already resolved it properly.
+- **Commit:** pending
 
 #### BUG-D: Gate degradation dead code [FIXED ✓ — log noise]
 - **File:** `reasoning/gates.py:353`
@@ -88,10 +90,11 @@ Critical errors found in production logs that were NOT in the original audit:
 
 ### P2 — Quality Issues
 
-#### BUG-J: CodeGraph trigger file grows unbounded [OPEN]
+#### BUG-J: CodeGraph trigger file grows unbounded [FIXED ✓]
 - **File:** `hooks/hook_post_tool.py:119-121`
-- **Root Cause:** No deduplication, no rotation, no size limit.
-- **Fix:** Use set-based dedup with periodic flush.
+- **Root Cause:** No deduplication, no rotation, no size limit. Every edit appends file path.
+- **Fix Applied:** Set-based dedup + 1000 entry size limit. Only writes unique paths, truncates to last 1000 when exceeded.
+- **Commit:** pending
 
 #### BUG-K: SelfJudgeBuffer silent failure [LOW PRIORITY]
 - **File:** `training_capture.py:632`
@@ -107,10 +110,10 @@ Critical errors found in production logs that were NOT in the original audit:
 
 | Severity | Total | Fixed | Open | False Positive |
 |----------|-------|-------|------|----------------|
-| P0 | 5 | 2 | 3 | 0 |
+| P0 | 5 | 3 | 2 | 0 |
 | P1 | 4 | 4 | 0 | 0 |
-| P2 | 3 | 0 | 2 | 1 |
-| **Total** | **12** | **6** | **5** | **1** |
+| P2 | 3 | 1 | 1 | 1 |
+| **Total** | **12** | **8** | **3** | **1** |
 
 ---
 
