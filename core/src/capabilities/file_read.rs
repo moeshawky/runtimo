@@ -57,7 +57,7 @@ impl Capability for FileRead {
     }
 
     fn description(&self) -> &'static str {
-        "Read the contents of a file. Validates path existence, rejects directories and path traversal."
+        "read file. path validated. no dirs, no traversal."
     }
 
     fn schema(&self) -> Value {

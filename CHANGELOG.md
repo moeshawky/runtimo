@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Error-absorbing command logging (Phase 1)** — New `WalEventType::CommandExecuted` variant
+  records every shell command executed via `ShellExec`, including stdout, stderr, exit code, and
+  (future) auto-correction. Dev-only via `#[cfg(debug_assertions)]` — zero overhead in release builds.
+- **WAL `truncate_to()` helper** — Truncates strings to 1KB at UTF-8 boundaries, preventing WAL bloat
+  from large command output while preserving error messages for pattern analysis.
+
+### Fixed
+
+- **Config test isolation** — `load_returns_defaults_when_no_file` now uses `XDG_CONFIG_HOME` temp dir
+  instead of reading real `~/.config/runtimo/config.toml`.
+- **Flaky dry_run test** — `dry_run_does_not_create_backup` uses unique backup dir to avoid pollution
+  from parallel test execution.
+- **Null byte proptest** — `prop_write_read_roundtrip` regex narrowed to `[^\0]*` — null bytes trigger
+  `FileRead`'s binary detection (no `"content"` key), causing `.unwrap()` panic in test assertion.
+- **Clippy warnings** — Fixed `type_complexity`, `unused_assignments`, `if_collapsible`, `map(f)` → `if let`.
+
+### Changed
+
+- **`failure_log.rs` deleted** — Was a duplicate of WAL infrastructure (R-DRIFT). Error-absorbing
+  logging now extends `wal.rs` instead of creating a separate log source.
+
 ## [0.2.0] - 2026-05-18
 
 ### Security Fixes (P0 - Critical)
@@ -442,35 +465,6 @@ Measured on AMD EPYC 7B13 system:
 ### Upgrade Notes
 
 This is the initial release (v0.1.0-alpha). No upgrade path needed.
-
----
-
-## [Unreleased]
-
-### Planned for v0.2.0
-- [x] Process kill capability
-- [x] ShellExec capability with proper sandboxing
-- [ ] HTTP request capability
-- [ ] Concurrent job execution with worker pool
-- [ ] Daemon JSON-RPC server
-- [ ] Backup cleanup policy
-- [ ] Configurable WAL path persistence
-- [ ] True timeout enforcement (watchdog thread/subprocess)
-- [x] Process lineage tracking (identify spawned PIDs)
-- [x] Alerting on anomalies (zombie threshold, CPU spikes)
-
-### Under Consideration
-- Capability versioning
-- Capability dependencies
-- Job priority queues
-- Scheduled execution
-- Event filtering/aggregation
-- Prometheus metrics export
-- Distributed tracing (OpenTelemetry)
-
----
-
-**Released Versions:**
 - v0.1.3 (2026-05-17) - Bug fixes, audit findings, capability descriptions, CLI help text
 - v0.1.2 (2026-05-16) - Telemetry + process tracking, 8 bug fixes, code audit remediation
 - v0.1.1 (2026-05-16) - Security hardening, daemon auth, Kill/GitExec wiring

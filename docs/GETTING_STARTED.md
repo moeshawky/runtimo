@@ -1,7 +1,7 @@
 # Getting Started with Runtimo
 
-**Version:** 0.1.0-alpha  
-**Last Updated:** 2026-05-16
+**Version:** 0.2.1  
+**Last Updated:** 2026-05-20
 
 This guide walks you through using Runtimo for the first time. By the end, you'll have executed capabilities with full telemetry, process tracking, and crash recovery.
 
@@ -54,6 +54,10 @@ Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.2s
 Available capabilities:
   - FileRead
   - FileWrite
+  - ShellExec
+  - Kill
+  - GitExec
+  - Undo
 ```
 
 ### Step 3: View System Telemetry
@@ -176,6 +180,32 @@ Top Memory: opencode (1.4%)
 2. Content written to `/tmp/hello.txt`
 3. WAL event logged
 
+### Step 6b: Execute a Shell Command
+
+```bash
+./target/debug/moe run -c ShellExec -a '{"cmd":"echo hello && whoami"}'
+```
+
+**Expected output:**
+```json
+{
+  "success": true,
+  "data": {
+    "stdout": "hello\nmoeshawky\n",
+    "stderr": "",
+    "exit_code": 0
+  },
+  ...
+}
+```
+
+**What happened:**
+1. Command validated against dangerous blocklist (safe: passes)
+2. Process group created for isolation
+3. Command executed via `sh -c` (supports pipes, chains, vars)
+4. Stdout/stderr captured (10MB limit)
+5. WAL event logged — in debug builds, CommandExecuted event records full output
+
 ### Step 7: Verify the File
 
 ```bash
@@ -229,8 +259,13 @@ Top Memory: opencode (1.4%)
 [2] JobCompleted: FileRead
 [3] JobStarted: FileWrite
 [4] JobCompleted: FileWrite
+[5] JobStarted: ShellExec
+[6] JobCompleted: ShellExec
 ...
 ```
+
+> **Note:** In debug builds, `CommandExecuted` events appear after each ShellExec completion,
+> recording the command string, truncated stdout/stderr, and exit code for error-pattern analysis.
 
 ### Step 10: Undo a FileWrite
 
@@ -468,7 +503,6 @@ let real_result = execute_with_telemetry(&FileWrite, &args, false, wal_path)?;
 
 ## Getting Help
 
+- **CLI help:** `./target/debug/moe --help` (compiler-error style: `req=` required, `opt=` optional, `blk=` blocked, `ex=` example)
 - **Documentation:** `docs/` directory
 - **Examples:** `core/examples/` directory
-- **Issues:** GitHub issues
-- **Discussions:** GitHub discussions

@@ -1,8 +1,8 @@
 # Runtimo Core API Reference
 
-**Version:** 0.1.0-alpha  
-**Generated:** 2026-05-16  
-**Documentation:** [docs.rs/runtimo-core](https://docs.rs/runtimo-core/0.1.0)
+**Version:** 0.2.1  
+**Generated:** 2026-05-20  
+**Documentation:** [docs.rs/runtimo-core](https://docs.rs/runtimo-core/0.2.1)
 
 ## Quick Links
 
@@ -64,14 +64,15 @@ pub struct Output {
 
 ### FileRead
 
-**Purpose:** Read file contents with validation
+**Purpose:** Read file contents with validation, binary detection, JSON auto-parse
 
 **Schema:**
 ```json
 {
   "type": "object",
   "properties": {
-    "path": { "type": "string" }
+    "path": { "type": "string" },
+    "max_bytes": { "type": "integer" }
   },
   "required": ["path"]
 }
@@ -82,6 +83,10 @@ pub struct Output {
 - Rejects empty paths
 - Rejects directories
 - Rejects non-existent files
+- O_NOFOLLOW on open (prevents TOCTOU symlink escape)
+- Binary content detection (null bytes → `content_type: "binary"`)
+- Bounded reader (max 100 MB)
+- UTF-8 safe truncation on multibyte boundaries
 
 **Example:**
 ```rust
@@ -233,7 +238,7 @@ guard.check()?;  // Returns Err if resources exceeded
 
 ### WalWriter
 
-Append-only log with fsync:
+Append-only log with fsync, file locking, rotation, and cleanup:
 
 ```rust
 use runtimo_core::{WalWriter, WalEvent, WalEventType};
@@ -249,8 +254,45 @@ wal.append(WalEvent {
     capability: Some("FileRead".to_string()),
     output: None,
     error: None,
+    telemetry_before: None,
+    telemetry_after: None,
+    process_before: None,
+    process_after: None,
+    cmd: None,
+    cmd_stdout: None,
+    cmd_stderr: None,
+    cmd_exit_code: None,
+    cmd_corrected: None,
 })?;
 ```
+
+### WalEventType
+
+```rust
+pub enum WalEventType {
+    JobSubmitted,    // Job submitted to system
+    JobValidated,    // Args passed validation
+    JobStarted,      // Execution started
+    JobCompleted,    // Execution succeeded
+    JobFailed,       // Validation or execution failure
+    JobRolledBack,   // Job rolled back via undo
+    CommandExecuted, // Shell command recorded (dev-only, debug builds)
+}
+```
+
+### CommandExecuted Events (Dev-Only)
+
+When `event_type` is `CommandExecuted`, the following fields capture shell command details:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `cmd` | `Option<String>` | Shell command string |
+| `cmd_stdout` | `Option<String>` | Captured stdout (truncated to 1KB) |
+| `cmd_stderr` | `Option<String>` | Captured stderr (truncated to 1KB) |
+| `cmd_exit_code` | `Option<i32>` | Command exit code |
+| `cmd_corrected` | `Option<String>` | Auto-corrected command (Phase 2) |
+
+**Note:** CommandExecuted events are only written in debug builds (`#[cfg(debug_assertions)]`). The variant exists in release builds for reading old WALs but is never produced.
 
 ### WalReader
 
@@ -311,6 +353,7 @@ pub fn execute_with_telemetry(
 7. Capture hardware telemetry (after)
 8. Capture process snapshot (after)
 9. Log `JobCompleted` or `JobFailed` to WAL
+10. (Dev-only) Log `CommandExecuted` to WAL for ShellExec
 
 ### ExecutionResult
 
@@ -462,6 +505,26 @@ Restore from backup:
 moe undo -j <job_id>
 ```
 
+### moe config
+
+Manage allowed path prefixes:
+
+```bash
+moe config allowed-paths add /srv
+moe config allowed-paths list
+moe config allowed-paths remove /srv
+```
+
+### moe session
+
+Create, list, and resume sessions:
+
+```bash
+moe session --create "my-task"
+moe session --list
+moe session --resume <session_id>
+```
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -486,7 +549,7 @@ cargo test -- --nocapture
 
 ## Version
 
-0.1.0-alpha
+0.2.1
 
 ## License
 

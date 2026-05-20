@@ -35,14 +35,21 @@ use std::path::Path;
 ///
 /// Events are appended sequentially and identified by `seq`. The `ts` field
 /// is a Unix timestamp in seconds. Optional fields (`capability`, `output`,
-/// `error`) are skipped during serialization when `None`.
+/// `error`, `cmd_*`) are skipped during serialization when `None`.
+///
+/// # Command Execution Events
+///
+/// When `event_type` is [`WalEventType::CommandExecuted`], the `cmd*` fields
+/// capture the shell command, its output, and any auto-correction applied.
+/// These events are only written in debug builds (`#[cfg(debug_assertions)]`),
+/// but the variant exists in release builds for reading old WALs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalEvent {
     /// Sequence number (monotonically increasing within a writer session).
     pub seq: u64,
     /// Unix timestamp (seconds) when the event occurred.
     pub ts: u64,
-    /// Type of the event (job lifecycle stage).
+    /// Type of the event (job lifecycle stage or command execution).
     #[serde(rename = "type")]
     pub event_type: WalEventType,
     /// The job ID this event relates to.
@@ -68,10 +75,26 @@ pub struct WalEvent {
     /// Process summary after execution.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub process_after: Option<ProcessSummary>,
+    /// Shell command string (CommandExecuted events only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cmd: Option<String>,
+    /// Captured stdout, truncated to 1KB (CommandExecuted events only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cmd_stdout: Option<String>,
+    /// Captured stderr, truncated to 1KB (CommandExecuted events only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cmd_stderr: Option<String>,
+    /// Exit code of the command (CommandExecuted events only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cmd_exit_code: Option<i32>,
+    /// Auto-corrected command, if correction was applied (future Phase 2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cmd_corrected: Option<String>,
 }
 
-/// Types of WAL events, corresponding to job lifecycle stages.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Types of WAL events, corresponding to job lifecycle stages
+/// and command executions.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WalEventType {
     /// Job has been submitted to the system.
@@ -86,6 +109,8 @@ pub enum WalEventType {
     JobFailed,
     /// A completed job was rolled back.
     JobRolledBack,
+    /// Shell command executed (dev-only logging for error absorption).
+    CommandExecuted,
 }
 
 /// Append-only WAL writer.
@@ -467,6 +492,23 @@ impl WalWriter {
     }
 }
 
+/// Truncates a string to at most `max_bytes` bytes, respecting UTF-8 boundaries.
+///
+/// Used to bound command output stored in WAL events. 1KB is sufficient
+/// for error messages and pattern analysis while preventing WAL bloat.
+pub fn truncate_to(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = s[..end].to_string();
+    truncated.push_str("...[truncated]");
+    truncated
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,19 +528,24 @@ mod tests {
             ts: 1715800000,
             event_type: WalEventType::JobStarted,
             job_id: "test-job".into(),
-            capability: Some("FileRead".into()),
-            output: None,
-            error: None,
-            telemetry_before: None,
-            telemetry_after: None,
-            process_before: None,
-            process_after: None,
-        })
-        .unwrap();
+        capability: Some("FileRead".into()),
+        output: None,
+        error: None,
+        telemetry_before: None,
+        telemetry_after: None,
+        process_before: None,
+        process_after: None,
+        cmd: None,
+        cmd_stdout: None,
+        cmd_stderr: None,
+        cmd_exit_code: None,
+        cmd_corrected: None,
+    })
+    .unwrap();
 
-        let reader = WalReader::load(&path).unwrap();
-        assert_eq!(reader.events().len(), 1);
-        assert_eq!(reader.events()[0].job_id, "test-job");
+    let reader = WalReader::load(&path).unwrap();
+    assert_eq!(reader.events().len(), 1);
+    assert_eq!(reader.events()[0].job_id, "test-job");
 
         let _ = std::fs::remove_file(&path);
     }
@@ -521,8 +568,13 @@ mod tests {
             telemetry_before: None,
             telemetry_after: None,
             process_before: None,
-            process_after: None,
-        })
+        process_after: None,
+        cmd: None,
+        cmd_stdout: None,
+        cmd_stderr: None,
+        cmd_exit_code: None,
+        cmd_corrected: None,
+    })
         .unwrap();
         assert_eq!(wal.seq(), 1);
 
@@ -540,21 +592,26 @@ mod tests {
 
         // Write enough data to trigger rotation
         let mut wal = WalWriter::create(&path).unwrap();
-        for i in 0..100 {
-            wal.append(WalEvent {
-                seq: i,
-                ts: 1715800000 + i,
-                event_type: WalEventType::JobStarted,
-                job_id: format!("job-{}", i),
-                capability: None,
-                output: None,
-                error: None,
-                telemetry_before: None,
-                telemetry_after: None,
-                process_before: None,
-                process_after: None,
-            })
-            .unwrap();
+    for i in 0..100 {
+        wal.append(WalEvent {
+            seq: i,
+            ts: 1715800000 + i,
+            event_type: WalEventType::JobStarted,
+            job_id: format!("job-{}", i),
+            capability: None,
+            output: None,
+            error: None,
+            telemetry_before: None,
+            telemetry_after: None,
+            process_before: None,
+            process_after: None,
+            cmd: None,
+            cmd_stdout: None,
+            cmd_stderr: None,
+            cmd_exit_code: None,
+            cmd_corrected: None,
+        })
+        .unwrap();
         }
 
         let size = std::fs::metadata(&path).unwrap().len();
@@ -592,8 +649,13 @@ mod tests {
             telemetry_before: None,
             telemetry_after: None,
             process_before: None,
-            process_after: None,
-        })
+        process_after: None,
+        cmd: None,
+        cmd_stdout: None,
+        cmd_stderr: None,
+        cmd_exit_code: None,
+        cmd_corrected: None,
+    })
         .unwrap();
 
         // Write recent event
@@ -608,8 +670,13 @@ mod tests {
             telemetry_before: None,
             telemetry_after: None,
             process_before: None,
-            process_after: None,
-        })
+        process_after: None,
+        cmd: None,
+        cmd_stdout: None,
+        cmd_stderr: None,
+        cmd_exit_code: None,
+        cmd_corrected: None,
+    })
         .unwrap();
 
         let removed = WalWriter::cleanup(&path, 500).unwrap();
@@ -625,11 +692,43 @@ mod tests {
     #[test]
     fn test_wal_skip_serializing_optional_fields() {
         // FINDING #15: verify optional fields are skipped when None
-        let event = WalEvent {
+    let event = WalEvent {
+        seq: 0,
+        ts: 1715800000,
+        event_type: WalEventType::JobStarted,
+        job_id: "test".into(),
+        capability: None,
+        output: None,
+        error: None,
+        telemetry_before: None,
+        telemetry_after: None,
+        process_before: None,
+        process_after: None,
+        cmd: None,
+        cmd_stdout: None,
+        cmd_stderr: None,
+        cmd_exit_code: None,
+        cmd_corrected: None,
+    };
+
+    let json = serde_json::to_string(&event).unwrap();
+    assert!(!json.contains("capability"));
+    assert!(!json.contains("telemetry_before"));
+    assert!(!json.contains("process_before"));
+    assert!(!json.contains("cmd"));
+    }
+
+    #[test]
+    fn test_command_executed_event() {
+        let path = tmp_wal("cmd_exec");
+        let _ = std::fs::remove_file(&path);
+
+        let mut wal = WalWriter::create(&path).unwrap();
+        wal.append(WalEvent {
             seq: 0,
             ts: 1715800000,
-            event_type: WalEventType::JobStarted,
-            job_id: "test".into(),
+            event_type: WalEventType::CommandExecuted,
+            job_id: "job-cmd".into(),
             capability: None,
             output: None,
             error: None,
@@ -637,11 +736,30 @@ mod tests {
             telemetry_after: None,
             process_before: None,
             process_after: None,
-        };
+            cmd: Some("ls | hed -3".into()),
+            cmd_stdout: None,
+            cmd_stderr: Some("hed: command not found".into()),
+            cmd_exit_code: Some(127),
+            cmd_corrected: None,
+        })
+        .unwrap();
 
-        let json = serde_json::to_string(&event).unwrap();
-        assert!(!json.contains("capability"));
-        assert!(!json.contains("telemetry_before"));
-        assert!(!json.contains("process_before"));
+        let reader = WalReader::load(&path).unwrap();
+        assert_eq!(reader.events().len(), 1);
+        assert_eq!(reader.events()[0].event_type, WalEventType::CommandExecuted);
+        assert_eq!(reader.events()[0].cmd.as_deref(), Some("ls | hed -3"));
+        assert_eq!(reader.events()[0].cmd_exit_code, Some(127));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_truncate_to() {
+        assert_eq!(truncate_to("hello", 1024), "hello");
+        assert_eq!(truncate_to("hello", 3), "hel...[truncated]");
+        let long = "a".repeat(2000);
+        let truncated = truncate_to(&long, 1024);
+        assert!(truncated.len() < 1100);
+        assert!(truncated.ends_with("...[truncated]"));
     }
 }

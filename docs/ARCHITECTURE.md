@@ -1,7 +1,7 @@
 # Runtimo Architecture
 
-**Version:** 0.1.0 (with telemetry)  
-**Last Updated:** 2026-05-16  
+**Version:** 0.2.1  
+**Last Updated:** 2026-05-20  
 **Inspired by:** Kaggle session telemetry pattern (cell_txt.txt)
 
 ---
@@ -90,6 +90,8 @@ if !telemetry.services.vllm_running {
 │  - Append-only JSONL                                            │
 │  - fsync after each event                                       │
 │  - Includes telemetry snapshot per job                          │
+│  - CommandExecuted events (dev-only, `#[cfg(debug_assertions)]`) │
+│    record cmd, stdout/stderr (1KB trunc), exit code, correction │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               ▼

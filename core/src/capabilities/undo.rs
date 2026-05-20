@@ -36,7 +36,7 @@ impl Capability for Undo {
     }
 
     fn description(&self) -> &'static str {
-        "Restore files from a backup created by a previous job. Use `moe logs` to find job IDs."
+        "restore from backup. use `runtimo logs` for job IDs."
     }
 
     fn schema(&self) -> Value {

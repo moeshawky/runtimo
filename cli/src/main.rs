@@ -12,12 +12,10 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(
     name = "runtimo",
-    about = "Agent capability runtime with telemetry, process tracking, and crash recovery",
-    long_about = "Runtimo is a capability-based runtime for AI agents on persistent machines.\n\
-        \n\
-        Every execution captures hardware telemetry and process snapshots before/after,\n\
-        with all events logged to a Write-Ahead Log (WAL) for crash recovery and undo.",
-    after_help = "Quick start:\n  runtimo list                                    List capabilities\n  runtimo run -c FileRead -a '{\"path\":\"/etc/hostname\"}'   Read a file\n  runtimo run -c FileWrite -a '{\"path\":\"/tmp/h.txt\",\"content\":\"hi\"}'  Write a file\n  runtimo run -c ShellExec -a '{\"cmd\":\"uptime\"}'          Run a command\n  runtimo logs                                      View history\n  runtimo telemetry                                 Hardware info\n  runtimo processes                                 Running processes",
+    about = "capability runtime for persistent machines",
+    long_about = "runtimo — capability runtime for persistent machines\n\n\
+Every exec: telemetry + process snapshot + WAL audit",
+    after_help = "USAGE:\n runtimo run -c <Capability> -a '<json>'\n runtimo list\n runtimo logs\n runtimo telemetry\n runtimo processes\n\nCAPABILITIES:\n FileRead Read file. Path validated.\n FileWrite Write file. Auto-backup for undo.\n ShellExec Exec via sh -c. Dangerous cmds blocked.\n GitExec Git ops: clone|pull|commit|revert|clean|status.\n Kill Kill PID. Protected: init, kthreadd, self.\n Undo Restore from backup. Use `runtimo logs` to find job IDs.\n\nQUICKSTART:\n runtimo run -c FileRead -a '{\"path\":\"/etc/hostname\"}'\n runtimo run -c ShellExec -a '{\"cmd\":\"uptime\"}'\n\nCONSTRAINTS:\n ShellExec: sh -c mode. Pipes/chaining/vars ok. Blk: mkfs,fdisk,dd,shutdown,rm -rf /\n GitExec: operation + path required.\n All caps: telemetry + WAL audit mandatory.",
     version
 )]
 struct Cli {
@@ -27,11 +25,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Execute a capability with full telemetry
+    /// exec capability with telemetry
     #[command(
-        about = "Run a capability",
-        long_about = "Run a named capability with JSON arguments. Captures telemetry and process snapshots before/after execution.",
-        after_help = "Examples:\n  runtimo run -c FileRead -a '{\"path\":\"/etc/hostname\"}'\n  runtimo run -c FileWrite -a '{\"path\":\"/tmp/out.txt\",\"content\":\"hello\"}'\n  runtimo run -c ShellExec -a '{\"cmd\":\"uptime\"}'\n  runtimo run -c Kill -a '{\"pid\":12345}'\n  runtimo run -c FileRead -a '{\"path\":\"/tmp/test.txt\"}' --dry-run",
+        about = "exec capability with telemetry",
+        long_about = "runtimo run -c <Capability> -a '<json>'\n\n\
+req: capability (string)\nopt: args (json), dry-run, timeout (30s)\n\n\
+ex: runtimo run -c ShellExec -a '{\"cmd\":\"ls | head\"}'",
+        after_help = "CAPABILITY HELP:\n runtimo run -c <Cap> --schema\n\n\
+EXAMPLES:\n runtimo run -c FileRead -a '{\"path\":\"/etc/hostname\"}'\n runtimo run -c ShellExec -a '{\"cmd\":\"uptime\"}'\n runtimo run -c GitExec -a '{\"operation\":\"status\",\"path\":\"/tmp\"}'",
     )]
     Run {
         /// Capability name (FileRead, FileWrite, ShellExec, Kill, GitExec, Undo)

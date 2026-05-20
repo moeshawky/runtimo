@@ -100,10 +100,15 @@ mod tests {
 
     #[test]
     fn load_returns_defaults_when_no_file() {
-        // If no config file exists, load returns empty allowed_paths
+        let tmp = std::env::temp_dir().join("runtimo_test_config_defaults");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+
         let config = RuntimoConfig::load();
-        // allowed_paths should be empty (defaults are added by get_allowed_prefixes)
         assert!(config.allowed_paths.is_empty());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("XDG_CONFIG_HOME");
     }
 
     #[test]

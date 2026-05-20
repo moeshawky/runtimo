@@ -224,6 +224,11 @@ pub fn execute_with_telemetry_and_session(
         telemetry_after: None,
         process_before: Some(process_before.summary.clone()),
         process_after: None,
+        cmd: None,
+        cmd_stdout: None,
+        cmd_stderr: None,
+        cmd_exit_code: None,
+        cmd_corrected: None,
     })?;
 
     if let Err(e) = capability.validate(args) {
@@ -320,7 +325,46 @@ pub fn execute_with_telemetry_and_session(
         telemetry_after: Some(telemetry_after.clone()),
         process_before: Some(process_before.summary.clone()),
         process_after: Some(process_after.summary.clone()),
+        cmd: None,
+        cmd_stdout: None,
+        cmd_stderr: None,
+        cmd_exit_code: None,
+        cmd_corrected: None,
     })?;
+
+    // Dev-only: log shell command executions separately for error absorption analysis.
+    // This makes it easy to query/filter just command patterns without parsing
+    // the generic output blob. Uses truncate_to to prevent WAL bloat from large output.
+    #[cfg(debug_assertions)]
+    if cap_name == "ShellExec" {
+        let cmd_str = output.data.get("cmd").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let stdout_str = output.data.get("stdout").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let stderr_str = output.data.get("stderr").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let exit_code = output.data.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(-1) as i32;
+        let cmd_seq = wal.seq();
+        let cmd_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let _ = wal.append(WalEvent {
+            seq: cmd_seq,
+            ts: cmd_ts,
+            event_type: WalEventType::CommandExecuted,
+            job_id: job_id_str.clone(),
+            capability: None,
+            output: None,
+            error: None,
+            telemetry_before: None,
+            telemetry_after: None,
+            process_before: None,
+            process_after: None,
+            cmd: Some(cmd_str),
+            cmd_stdout: Some(crate::wal::truncate_to(&stdout_str, 1024)),
+            cmd_stderr: Some(crate::wal::truncate_to(&stderr_str, 1024)),
+            cmd_exit_code: Some(exit_code),
+            cmd_corrected: None,
+        });
+    }
 
     // Add job to session if session tracking is enabled
     if let Some(sid) = session_id {
@@ -412,6 +456,11 @@ fn log_job_failed_with_snapshots(
         telemetry_after: Some(telemetry_after.clone()),
         process_before: Some(process_before.clone()),
         process_after: Some(process_after.clone()),
+        cmd: None,
+        cmd_stdout: None,
+        cmd_stderr: None,
+        cmd_exit_code: None,
+        cmd_corrected: None,
     })
 }
 

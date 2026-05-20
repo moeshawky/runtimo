@@ -682,7 +682,7 @@ mod proptests {
     // Property: Any valid path in /tmp can be written and read back identically
     proptest! {
         #[test]
-        fn prop_write_read_roundtrip(content in ".*") {
+        fn prop_write_read_roundtrip(content in "[^\0]*") {
             let dir = setup();
             let target = dir.join("prop.txt");
 

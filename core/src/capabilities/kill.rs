@@ -171,7 +171,7 @@ impl Capability for Kill {
     }
 
     fn description(&self) -> &'static str {
-        "Terminate a process by PID. Protects critical system processes (init, kthreadd, self). Supports custom signals."
+        "kill PID. Protected: init,kthreadd,self. Custom sig ok."
     }
 
     /// Returns the JSON Schema for Kill arguments.

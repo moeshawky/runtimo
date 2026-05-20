@@ -1,6 +1,6 @@
 # Runtimo Design Decisions
 
-**Date:** 2026-05-16  
+**Date:** 2026-05-16 (updated 2026-05-20)  
 **Status:** Implemented  
 **Core Insight:** Persistent machines require different awareness than ephemeral machines
 
@@ -184,6 +184,21 @@ for event in history {
 - Don't hard-fail on resource pressure
 - Queue, degrade, or warn
 - Let operator decide
+
+### 5. One Log Source, Not Two
+- Extend existing WAL instead of creating separate logs
+- Gets file locking, rotation, cleanup, seq recovery for free
+- Prevents R-DRIFT (duplicate infrastructure)
+
+### 6. Dev-Only for Telemetry, Release for Production
+- Command execution logging via `#[cfg(debug_assertions)]`
+- Zero overhead in release builds
+- WAL events can be read in release (variant exists) but never written
+
+### 7. Token-Efficient Error Absorption
+- Per-typo correction saves ~450 tokens (no debug loop)
+- Logging cost ~50 tokens/cmd
+- 1KB truncation prevents WAL bloat while preserving signal
 
 ## Related Documentation
 

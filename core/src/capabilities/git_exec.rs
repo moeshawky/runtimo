@@ -837,7 +837,7 @@ impl Capability for GitExec {
     }
 
     fn description(&self) -> &'static str {
-        "Git operations (clone, pull, commit, revert, clean, status) with state tracking, timeout enforcement, and undo support."
+        "git ops: clone|pull|commit|revert|clean|status. state tracking, timeout, undo."
     }
 
     fn schema(&self) -> Value {
@@ -963,13 +963,13 @@ impl Capability for GitExec {
         let telemetry_after = Telemetry::capture();
         let process_after = ProcessSnapshot::capture();
 
-        let mut output = result?;
-        output.data.as_object_mut().map(|obj| {
-            obj.insert("telemetry_before".to_string(), serde_json::to_value(&telemetry_before).unwrap_or(Value::Null));
-            obj.insert("telemetry_after".to_string(), serde_json::to_value(&telemetry_after).unwrap_or(Value::Null));
-            obj.insert("process_before".to_string(), serde_json::to_value(&process_before.summary).unwrap_or(Value::Null));
-            obj.insert("process_after".to_string(), serde_json::to_value(&process_after.summary).unwrap_or(Value::Null));
-        });
+    let mut output = result?;
+    if let Some(obj) = output.data.as_object_mut() {
+        obj.insert("telemetry_before".to_string(), serde_json::to_value(&telemetry_before).unwrap_or(Value::Null));
+        obj.insert("telemetry_after".to_string(), serde_json::to_value(&telemetry_after).unwrap_or(Value::Null));
+        obj.insert("process_before".to_string(), serde_json::to_value(&process_before.summary).unwrap_or(Value::Null));
+        obj.insert("process_after".to_string(), serde_json::to_value(&process_after.summary).unwrap_or(Value::Null));
+    }
 
         Ok(output)
     }

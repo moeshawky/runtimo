@@ -16,7 +16,7 @@ Runtimo is a Rust workspace providing a **capability execution engine** designed
 - **Backup/undo** — Files are backed up before mutation, enabling rollback by job ID
 - **Hallucination absorption** — Capabilities validate arguments against JSON schemas before execution
 
-**Version:** 0.1.5
+**Version:** 0.2.1
 **License:** MIT
 **Rust Edition:** 2021
 
@@ -164,7 +164,7 @@ Writes content to a file with automatic backup-before-mutate. If the target file
 
 ### ShellExec
 
-Executes shell commands with full telemetry capture, audit logging, and timeout enforcement. Every command is logged to the WAL for audit purposes.
+Executes shell commands via `sh -c` with full telemetry capture, audit logging, timeout enforcement, and dangerous command blocklist. Every command is logged to the WAL for audit purposes.
 
 **Schema:**
 ```json
@@ -173,7 +173,8 @@ Executes shell commands with full telemetry capture, audit logging, and timeout 
   "properties": {
     "cmd": { "type": "string" },
     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 300 },
-    "cwd": { "type": "string" }
+    "cwd": { "type": "string" },
+    "stdin": { "type": "string" }
   },
   "required": ["cmd"]
 }
@@ -181,16 +182,21 @@ Executes shell commands with full telemetry capture, audit logging, and timeout 
 
 **Example:**
 ```bash
-./target/release/runtimo run -c ShellExec -a '{"cmd":"uptime"}'
-./target/release/runtimo run -c ShellExec -a '{"cmd":"ls -la /tmp"}'
-./target/release/runtimo run -c ShellExec -a '{"cmd":"pwd","timeout_secs":10}'
+runtimo run -c ShellExec -a '{"cmd":"uptime"}'
+runtimo run -c ShellExec -a '{"cmd":"ls -la /tmp"}'
+runtimo run -c ShellExec -a '{"cmd":"pwd","cwd":"/tmp"}'
+# Pipes and chaining work
+runtimo run -c ShellExec -a '{"cmd":"ls | head -3"}'
+runtimo run -c ShellExec -a '{"cmd":"echo hi && whoami"}'
 ```
 
-**Security:** 
-- All commands logged to WAL for audit
-- Timeout enforcement (default 30s, max 300s)
-- Runs with minimal privileges
-- **Warning:** Do not interpolate untrusted input into command strings
+**Security & Guardrails (agent mistake protection, not security):**
+- **Always `sh -c`** — supports pipes, redirects, chaining, variables
+- **Timeout enforcement** — default 30s, max 300s, kills all descendants
+- **Dangerous command blocklist:** `mkfs.*`, `fdisk`, `parted`, `dd`, `shutdown`, `reboot`, `poweroff`, `rm -rf /` (on root/dev/boot), `chmod 777 /`
+- **Process group isolation** — kills entire process tree on timeout
+- **WAL audit trail** — every command logged (dev-only: stdout/stderr/exit code)
+- **Stdin pipe support** — for piping data into commands
 
 ### Undo
 
@@ -358,6 +364,9 @@ All events are written to an append-only JSONL file with `fsync` after each writ
 | `JobCompleted` | After successful execution |
 | `JobFailed` | On validation or execution failure |
 | `JobRolledBack` | On undo (planned) |
+| `CommandExecuted` | (Dev-only) Shell command executed — records cmd, stdout/stderr (1KB trunc), exit code, correction |
+
+**Dev-only note:** `CommandExecuted` events are only written in debug builds (`#[cfg(debug_assertions)]`). The variant exists in release for reading old WALs. This prevents WAL bloat in production while enabling error-pattern analysis during development.
 
 ### Backup/Undo
 
@@ -375,7 +384,7 @@ Measured on AMD EPYC 7B13 system:
 | Telemetry capture | <100ms | 15+ shell subprocesses |
 | Process snapshot | <50ms | ps aux parse |
 | Memory baseline | <50MB | RSS at idle |
-| Test suite (59 tests) | <3.5s | Single-threaded |
+| Test suite (176 tests) | <4s | Single-threaded |
 | Doc build | <4s | No-deps |
 
 ## Project Structure
@@ -406,6 +415,8 @@ runtimo/
 │   │       ├── file_read.rs
 │   │       ├── file_write.rs
 │   │       ├── shell_exec.rs
+│   │       ├── kill.rs
+│   │       ├── git_exec.rs
 │   │       └── undo.rs
 │   └── tests/
 │       └── integration.rs  # Integration tests
@@ -430,7 +441,7 @@ cargo test -p runtimo-core
 cargo test -- --nocapture
 ```
 
-**Test coverage (59+ total tests):**
+**Test coverage (176 total tests):**
 
 | Category | Tests |
 |----------|-------|

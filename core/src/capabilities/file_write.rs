@@ -90,7 +90,7 @@ impl Capability for FileWrite {
     }
 
     fn description(&self) -> &'static str {
-        "Write content to a file. Creates automatic backups of existing files for undo support. Supports append mode."
+        "write file. auto-backup for undo. append ok."
     }
 
     fn schema(&self) -> Value {
@@ -512,7 +512,10 @@ mod tests {
         let target = std::env::temp_dir().join("runtimo_fw_dry_backup.txt");
         std::fs::write(&target, "existing content").ok();
 
-        let cap = FileWrite::new(test_backup_dir()).expect("Failed to create FileWrite");
+        // Use unique backup dir to avoid pollution from parallel tests
+        let backup_dir = std::env::temp_dir().join("runtimo_fw_dry_backup_test");
+        let _ = std::fs::remove_dir_all(&backup_dir);
+        let cap = FileWrite::new(backup_dir.clone()).expect("Failed to create FileWrite");
 
         let result = cap
             .execute(
@@ -534,7 +537,6 @@ mod tests {
             std::fs::read_to_string(&target).unwrap(),
             "existing content"
         );
-        let backup_dir = test_backup_dir();
         if backup_dir.exists() {
             let entries: Vec<_> = std::fs::read_dir(&backup_dir)
                 .map(|d| d.filter_map(|e| e.ok()).collect::<Vec<_>>())
@@ -543,7 +545,7 @@ mod tests {
         }
 
         std::fs::remove_file(&target).ok();
-        std::fs::remove_dir_all(test_backup_dir()).ok();
+        std::fs::remove_dir_all(&backup_dir).ok();
     }
 
     #[test]

@@ -2,8 +2,8 @@
 
 **Purpose:** Guide AI agents implementing Runtimo capabilities  
 **Core Identity:** Capability runtime for **persistent machines** (cannot factory reset)  
-**Last Updated:** 2026-05-16 (telemetry + process tracking added)  
-**Verified:** Scaffold compiles, telemetry + process modules pass tests
+**Last Updated:** 2026-05-20 (dev-only CommandExecuted WAL + error-absorbing logging)  
+**Verified:** 176 tests pass, clippy clean, release build zero warnings
 
 ---
 
@@ -83,13 +83,23 @@ You are a **Rust runtime engineer** specializing in:
 | `core/src/job.rs` | ✅ Done | 90 | Job lifecycle, state machine |
 | `core/src/capability.rs` | ✅ Done | 60 | Capability trait, registry |
 | `core/src/schema.rs` | ✅ Done | 40 | JSON Schema validation |
-| `core/src/wal.rs` | ✅ Done | 80 | WAL writer/reader |
-| `core/src/backup.rs` | ✅ Done | 50 | Backup manager (undo) |
+| `core/src/wal.rs` | ✅ Done | 200+ | WAL writer, reader, rotation, CommandExecuted events |
+| `core/src/backup.rs` | ✅ Done | 100+ | Backup manager (undo, dir backup, permission preserve) |
 | `core/src/llmosafe.rs` | ✅ Done | 50 | Resource guard |
-| **`core/src/telemetry.rs`** | ✅ Done | 200+ | Hardware telemetry (NEW) |
-| **`core/src/processes.rs`** | ✅ Done | 200+ | Process snapshot (NEW) |
-| `daemon/src/main.rs` | ⏳ Placeholder | 20 | Needs capability registration |
-| `cli/src/main.rs` | ✅ Done | 80 | CLI with telemetry + processes commands |
+| `core/src/telemetry.rs` | ✅ Done | 200+ | Hardware telemetry |
+| `core/src/processes.rs` | ✅ Done | 200+ | Process snapshot with PPID tracking |
+| `core/src/executor.rs` | ✅ Done | 100+ | CommandExecuted WAL logging (dev-only) |
+| `core/src/config.rs` | ✅ Done | 50 | Persistent TOML config |
+| `core/src/session.rs` | ✅ Done | 100+ | Session tracking |
+| `core/src/monitor.rs` | ✅ Done | 100+ | Health monitor (snapshots, alerts) |
+| `core/src/capabilities/shell_exec.rs` | ✅ Done | 200+ | ShellExec: sh -c, timeout, blocklist, WAL audit |
+| `core/src/capabilities/kill.rs` | ✅ Done | 100+ | Kill: POSIX signals, PID reuse protection |
+| `core/src/capabilities/git_exec.rs` | ✅ Done | 200+ | Git operations with URL sanitization |
+| `core/src/capabilities/file_read.rs` | ✅ Done | 200+ | FileRead: O_NOFOLLOW, binary detection, JSON parse |
+| `core/src/capabilities/file_write.rs` | ✅ Done | 300+ | FileWrite: atomic write, backup, critical file deny |
+| `core/src/capabilities/undo.rs` | ✅ Done | 50 | Undo: WAL-backed restore |
+| `daemon/src/main.rs` | ⏳ Placeholder | 20 | Needs full JSON-RPC impl |
+| `cli/src/main.rs` | ✅ Done | 200+ | CLI with compiler-error style help |
 
 ### Prior Attempts (Stigmergic Signals)
 **Success Pattern:** FileRead followed Capability trait → clean integration  
@@ -298,7 +308,7 @@ Telemetry → Process Snapshot → Check Thresholds → Execute → Log WAL → 
 ```bash
 ./target/debug/moe telemetry    # Hardware state
 ./target/debug/moe processes    # Running processes
-./target/debug/moe run <cap>    # Execute capability
+./target/debug/moe run -c <cap> -a '{}'  # Execute capability
 ./target/debug/moe logs         # View WAL
 kill <pid>                      # Kill runaway
 ```
