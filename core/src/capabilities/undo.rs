@@ -16,6 +16,7 @@
 //! ).unwrap();
 //! ```
 
+use crate::validation::path::{validate_path, PathContext};
 use crate::{Capability, Context, Output, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -140,6 +141,23 @@ impl Capability for Undo {
                             ))
                         })?;
 
+                    // Re-validate restore target against allowed prefixes
+                    // (WAL data crossed a persistence boundary — must re-check)
+                    let restore_ctx = PathContext {
+                        require_exists: false,
+                        require_file: false,
+                        ..Default::default()
+                    };
+                    let target_path = validate_path(
+                        &target_path.to_string_lossy(),
+                        &restore_ctx,
+                    )
+                    .map_err(|e| {
+                        crate::Error::ExecutionFailed(format!(
+                            "restore target validation: {}", e
+                        ))
+                    })?;
+
                     backup_mgr.restore(&backup_path, &target_path)?;
                     restored.push(format!("{} -> {}", backup_path.display(), target_path.display()));
                 }
@@ -172,7 +190,6 @@ mod tests {
         let test_file = tmpdir.join("test.txt");
         fs::write(&test_file, "original content").unwrap();
 
-        // Create backup manually
         let backup_dir = tmpdir.join("backups");
         let job_id = "test-job-123";
         let job_backup_dir = backup_dir.join(job_id);
@@ -184,7 +201,40 @@ mod tests {
         // Modify original
         fs::write(&test_file, "modified content").unwrap();
 
-        // Set backup dir env
+        // Write a WAL entry so undo can find the backup→original mapping
+        let wal_file = tmpdir.join("test.wal");
+        std::env::set_var("RUNTIMO_WAL_PATH", &wal_file);
+        use crate::wal::{WalEvent, WalEventType, WalWriter};
+        let mut wal = WalWriter::create(&wal_file).unwrap();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        wal.append(WalEvent {
+            seq: 0,
+            ts,
+            event_type: WalEventType::JobCompleted,
+            job_id: job_id.to_string(),
+            capability: Some("FileWrite".into()),
+            output: Some(serde_json::json!({
+                "data": {
+                    "path": test_file.to_str().unwrap(),
+                    "backup_path": backup_path.to_str().unwrap()
+                }
+            })),
+            error: None,
+            telemetry_before: None,
+            telemetry_after: None,
+            process_before: None,
+            process_after: None,
+            cmd: None,
+            cmd_stdout: None,
+            cmd_stderr: None,
+            cmd_exit_code: None,
+            cmd_corrected: None,
+        })
+        .unwrap();
+
         std::env::set_var("RUNTIMO_BACKUP_DIR", &backup_dir);
 
         let cap = Undo;
@@ -193,18 +243,23 @@ mod tests {
             job_id: "undo-test-job".to_string(),
             working_dir: tmpdir.clone(),
         };
-        // Note: This test may fail if WAL doesn't contain the backup entry
-        // The undo capability looks for WAL entries to restore files
         let result = cap.execute(&serde_json::json!({"job_id": job_id}), &ctx);
 
-// Test is lenient - undo might fail if WAL entry not found
-    // This is expected behavior for a real undo scenario
-    if let Ok(output) = result {
-        assert!(output.success);
-    }
+        assert!(result.is_ok(), "undo failed: {:?}", result.err());
+        let output = result.unwrap();
+        assert!(output.success, "undo not successful: {:?}", output.message);
+        assert!(
+            !output.data["restored"].as_array().unwrap().is_empty(),
+            "no files restored"
+        );
+
+        // Verify original content restored
+        let restored_content = fs::read_to_string(&test_file).unwrap();
+        assert_eq!(restored_content, "original content");
 
         // Clean up
         let _ = fs::remove_dir_all(&tmpdir);
+        std::env::remove_var("RUNTIMO_WAL_PATH");
         std::env::remove_var("RUNTIMO_BACKUP_DIR");
     }
 }

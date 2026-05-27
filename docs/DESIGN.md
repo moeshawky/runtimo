@@ -47,8 +47,8 @@ use runtimo_core::ProcessSnapshot;
 
 let snapshot = ProcessSnapshot::capture();
 // Total: 176 processes
-// Top CPU: opencode (65.7%)
-// Top Memory: opencode (493MB)
+// Top CPU: python3 (65.7%)
+// Top Memory: python3 (493MB)
 // Zombies: 0
 // runtimo jobs: tracking...
 ```
@@ -59,8 +59,8 @@ let snapshot = ProcessSnapshot::capture();
 
 ### 1. Detect Resource Hogs
 ```
-Top CPU: opencode (65.7%)
-Top Memory: opencode (493MB)
+Top CPU: python3 (65.7%)
+Top Memory: python3 (493MB)
 ```
 → If a runtimo capability spawns a process that consumes 90% CPU, you need to know.
 

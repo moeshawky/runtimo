@@ -7,12 +7,12 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 authors = ["Moe Shawky"]
 repository = "https://github.com/moeshawky/runtimo"
-description = "Agent-centric capability runtime for persistent machines"
+description = "Agent-centric capability runtime with telemetry, process tracking, and crash recovery"
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }

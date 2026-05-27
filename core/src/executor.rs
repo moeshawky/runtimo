@@ -184,7 +184,7 @@ pub fn execute_with_telemetry_and_session(
         .check()
         .map_err(|e| Error::ResourceLimitExceeded(e.to_string()))?;
 
-    // AGENTS.md mandate: reject if zombie_count > 10
+    // Reject if zombie count > 10
     if process_before.summary.zombie_count > 10 {
         return Err(Error::ResourceLimitExceeded(format!(
             "Zombie processes: {} (limit: 10)",

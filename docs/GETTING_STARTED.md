@@ -1,7 +1,7 @@
 # Getting Started with Runtimo
 
-**Version:** 0.2.1  
-**Last Updated:** 2026-05-20
+**Version:** 0.2.2
+**Last Updated:** 2026-05-28
 
 This guide walks you through using Runtimo for the first time. By the end, you'll have executed capabilities with full telemetry, process tracking, and crash recovery.
 
@@ -112,12 +112,12 @@ Total Processes: 185
 Total CPU: 26.7%
 Total Memory: 7.2%
 Zombies: 0
-Top CPU: opencode (7.6%)
-Top Memory: opencode (1.4%)
+Top CPU: python3 (7.6%)
+Top Memory: python3 (1.4%)
 
 --- TOP 10 BY CPU ---
-1. 80605  moeshaw+  7.6  1.4  73445.4G  453.7G  "Sl+"  opencode
-2. 194444  moeshaw+  7.6  2.0  73908.8G  625.9G  "Sl+"  opencode
+1. 80605  moeshaw+  7.6  1.4  73445.4G  453.7G  "Sl+"  python3
+2. 194444  moeshaw+  7.6  2.0  73908.8G  625.9G  "Sl+"  python3
 ...
 ```
 
@@ -191,7 +191,7 @@ Top Memory: opencode (1.4%)
 {
   "success": true,
   "data": {
-    "stdout": "hello\nmoeshawky\n",
+    "stdout": "hello\nuser\n",
     "stderr": "",
     "exit_code": 0
   },

@@ -1,41 +1,9 @@
 /target/
-Cargo.lock
 
-# Runtime
+# Runtime artifacts
 *.jsonl
 *.bak
 *.backup
-
-# Agent artifacts
-.sniper/
-*.mem
-*.scratch
-*.task
-*.agent
-*.log
-*.conversation
-conversation_history*
-# Hive-mind
-.hive_mind/
-hive_mind_*.log
-*.plasmid
-*.pheromone
-# Opencode
-.opencode/
-opencode.log
-*.opencode
-# Cursor
-.cursor/
-*.cursor
-# Claude
-.claude/
-*.claude
-# General AI/agent patterns
-*.ai
-*.cog
-*.thought
-*.reasoning
-*_trace.log
 
 # OS
 .DS_Store
@@ -55,13 +23,9 @@ __pycache__/
 venv/
 
 # Test artifacts
-core/test.txt
 runtimo_test_*.txt
 runtimo_fw_*.txt
 runtimo_git_test/
 runtimo_test_undo/
 runtimo_test_sessions_*/
 runtimo_symlink_test
-
-# cell_txt.txt (Kaggle session artifacts)
-cell_txt.txt

@@ -1,4 +1,4 @@
-//! Runtimo Core — Agent-centric capability runtime for persistent machines.
+//! Runtimo Core — Agent-centric capability runtime.
 //!
 //! Runtimo provides structured execution, resource limits, crash recovery,
 //! and two-layer telemetry (hardware + process tracking) for machines that
@@ -82,7 +82,6 @@ pub use job::{Job, JobId, JobState};
 pub use llmosafe::LlmoSafeGuard;
 pub use monitor::{HealthAlert, HealthMonitor, HealthState};
 pub use processes::ProcessSnapshot;
-pub use schema::SchemaValidator;
 pub use session::{Session, SessionManager};
 pub use telemetry::Telemetry;
 pub use wal::{WalEvent, WalEventType, WalReader, WalWriter};

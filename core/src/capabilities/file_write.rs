@@ -250,11 +250,28 @@ fn check_disk_space(path: &std::path::Path, content_size: usize) -> std::result:
         .output()
         .map_err(|e| format!("df command failed: {}", e))?;
 
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("df command failed: {}", stderr.trim()));
+    }
+
     let stdout = String::from_utf8_lossy(&output.stdout);
-    if let Some(line) = stdout.lines().nth(1) {
+    let mut lines = stdout.lines();
+
+    let header = match lines.next() {
+        Some(h) => h,
+        None => return Ok(()),
+    };
+    let headers: Vec<&str> = header.split_whitespace().collect();
+    let avail_idx = headers
+        .iter()
+        .position(|&h| h.eq_ignore_ascii_case("Available") || h.eq_ignore_ascii_case("Avail"));
+
+    if let Some(line) = lines.next() {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 4 {
-            if let Ok(available) = parts[3].parse::<u64>() {
+        let idx = avail_idx.unwrap_or(3); // fall back to column 3 (GNU default)
+        if let Some(available_str) = parts.get(idx) {
+            if let Ok(available) = available_str.parse::<u64>() {
                 let required = content_size as u64 + MIN_FREE_DISK_BYTES;
                 if available < required {
                     return Err(format!(
@@ -572,6 +589,110 @@ mod tests {
         assert!(result.data["telemetry_after"].is_object());
         assert!(result.data["process_before_count"].is_u64());
         assert!(result.data["process_after_count"].is_u64());
+
+        std::fs::remove_file(&target).ok();
+        std::fs::remove_dir_all(test_backup_dir()).ok();
+    }
+
+    #[test]
+    fn test_check_disk_space_writable_tmp_is_ok() {
+        let result = check_disk_space(
+            &std::env::temp_dir().join("runtimo_df_test.txt"),
+            100,
+        );
+        assert!(result.is_ok(), "df on /tmp should succeed");
+    }
+
+    #[test]
+    fn test_content_too_large_rejected() {
+        let cap = FileWrite::new(test_backup_dir()).expect("Failed to create FileWrite");
+        let large_content = "x".repeat(101 * 1024 * 1024); // > 100MB
+        let result = cap.execute(
+            &serde_json::json!({
+                "path": "/tmp/runtimo_large_test.txt",
+                "content": large_content
+            }),
+            &Context {
+                dry_run: false,
+                job_id: "t8".into(),
+                working_dir: std::env::temp_dir(),
+            },
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too large"));
+
+        std::fs::remove_dir_all(test_backup_dir()).ok();
+    }
+
+    #[test]
+    fn test_critical_file_ssh_authorized_keys_blocked() {
+        let cap = FileWrite::new(test_backup_dir()).expect("Failed to create FileWrite");
+        let result = cap.execute(
+            &serde_json::json!({
+                "path": "/tmp/.ssh/authorized_keys",
+                "content": "ssh-rsa AAA..."
+            }),
+            &Context {
+                dry_run: false,
+                job_id: "t9".into(),
+                working_dir: std::env::temp_dir(),
+            },
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("critical file"));
+
+        std::fs::remove_dir_all(test_backup_dir()).ok();
+    }
+
+    #[test]
+    fn test_atomic_write_syncs_directory() {
+        let target = std::env::temp_dir().join("runtimo_fw_sync.txt");
+        let cap = FileWrite::new(test_backup_dir()).expect("Failed to create FileWrite");
+
+        let result = cap
+            .execute(
+                &serde_json::json!({
+                    "path": target.to_str().unwrap(),
+                    "content": "sync test"
+                }),
+                &Context {
+                    dry_run: false,
+                    job_id: "t10".into(),
+                    working_dir: std::env::temp_dir(),
+                },
+            )
+            .expect("Execution failed");
+
+        assert!(result.success);
+
+        let tmp = target.parent().unwrap().join(".runtimo_fw_sync.txt.tmp");
+        assert!(!tmp.exists(), "temp file should be cleaned up after atomic rename");
+
+        std::fs::remove_file(&target).ok();
+        std::fs::remove_dir_all(test_backup_dir()).ok();
+    }
+
+    #[test]
+    fn test_append_exceeds_max_size_rejected() {
+        let target = std::env::temp_dir().join("runtimo_fw_append_overflow.txt");
+        std::fs::write(&target, "x".repeat(99 * 1024 * 1024)).ok(); // 99MB existing
+
+        let cap = FileWrite::new(test_backup_dir()).expect("Failed to create FileWrite");
+        let large_append = "y".repeat(2 * 1024 * 1024); // +2MB = 101MB > 100MB
+        let result = cap.execute(
+            &serde_json::json!({
+                "path": target.to_str().unwrap(),
+                "content": large_append,
+                "append": true
+            }),
+            &Context {
+                dry_run: false,
+                job_id: "t11".into(),
+                working_dir: std::env::temp_dir(),
+            },
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("exceed"));
 
         std::fs::remove_file(&target).ok();
         std::fs::remove_dir_all(test_backup_dir()).ok();

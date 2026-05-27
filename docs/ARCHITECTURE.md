@@ -1,202 +1,128 @@
 # Runtimo Architecture
 
-**Version:** 0.2.1  
-**Last Updated:** 2026-05-20  
-**Inspired by:** Kaggle session telemetry pattern (cell_txt.txt)
+**Version:** 0.2.2
+**Last Updated:** 2026-05-28
 
 ---
 
-## The Problem: Environment Amnesia
+## Execution Pipeline
 
-runtimo's original design could execute capabilities but had **zero environment awareness**:
-- No idea what resources are available (CPU, RAM, disk, TPU, GPU)
-- No idea what's running (processes, services like vLLM)
-- No idea about network state (public IP, tunnel status)
-
-This is like a self-driving car that can steer but can't see the road.
-
-**Source:** Kaggle cell_txt.txt pattern — captures full system telemetry before executing agent commands.
-
----
-
-## The Solution: Telemetry-Aware Runtime
-
-runtimo now has **environment awareness** as a core capability:
+Every capability execution follows a 10-step pipeline:
 
 ```rust
-use runtimo_core::telemetry::Telemetry;
+// core/src/executor.rs — execute_with_telemetry_and_session()
 
-// Capture full system telemetry
-let telemetry = Telemetry::capture();
-
-// Print human-readable report
-telemetry.print_report();
-
-// Or access programmatically
-if telemetry.hardware.tpu_devices > 0 {
-    // Use TPU-accelerated capability
-}
-if !telemetry.services.vllm_running {
-    // Start vLLM or fail gracefully
-}
+1. Telemetry::capture()               // hardware + service discovery
+2. ProcessSnapshot::capture()         // process list with PPIDs
+3. LlmoSafeGuard::check()             // /proc/stat, /proc/self/status, 80% ceiling
+4. args size check                    // reject > 1 MB
+5. zombie check                       // reject if > 10 zombies
+6. WalWriter::append(JobStarted)      // fsync'd JSONL
+7. capability.validate()              // schema + path + semantic checks
+8. capability.execute()               // runs the capability
+9. Telemetry::capture()               // after snapshot
+10. ProcessSnapshot::capture()        // after snapshot
+11. WalWriter::append(JobCompleted)   // fsync'd, with output + telemetry
 ```
 
----
-
-## Full Architecture
+## Module Map
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    CLI / Agent Interface                        │
-│  (moe run/status/undo/logs, JSON-RPC, Unix socket, HTTP?)      │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                   API Layer (Daemon)                             │
-│  - Unix socket listener (JSON-RPC protocol)                     │
-│  - Job queue (in-memory, persisted to WAL)                      │
-│  - Telemetry integration (environment-aware execution)          │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│              Validation Layer                                   │
-│  - Capability schema validation (JSON Schema)                   │
-│  - Permission checks                                            │
-│  - Telemetry-based guards (e.g., "don't run if RAM < 1GB")      │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│              LLMOSafe Layer (Resource Limits)                   │
-│  - CPU time limits                                              │
-│  - Memory limits                                                │
-│  - Disk I/O limits                                              │
-│  - Timeout (wall-clock)                                         │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│          Execution Layer (Capabilities)                         │
-│  - FileRead, FileWrite, FileExists                              │
-│  - ShellExec (sandboxed)                                        │
-│  - [Future] Code-aware: UpdateFunction, Refactor (via moegraph) │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│           Logging Layer (WAL - Write-Ahead Log)                 │
-│  - Append-only JSONL                                            │
-│  - fsync after each event                                       │
-│  - Includes telemetry snapshot per job                          │
-│  - CommandExecuted events (dev-only, `#[cfg(debug_assertions)]`) │
-│    record cmd, stdout/stderr (1KB trunc), exit code, correction │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│          Recovery Layer (Backup + Undo)                         │
-│  - Backup before mutations                                      │
-│  - Restore on undo                                              │
-│  - Telemetry-aware rollback (restore to known-good state)       │
-└─────────────────────────────────────────────────────────────────┘
+CLI (cli/src/main.rs)
+  │ clap args → CapabilityRegistry → executor
+  ▼
+Executor (core/src/executor.rs)
+  │ dispatch, guard, WAL logging
+  ▼
+Capability (core/src/capability.rs)
+  │ trait dispatch → validate() → execute()
+  ├── FileRead   (core/src/capabilities/file_read.rs)
+  ├── FileWrite  (core/src/capabilities/file_write.rs)
+  ├── ShellExec  (core/src/capabilities/shell_exec.rs)
+  ├── Kill       (core/src/capabilities/kill.rs)
+  ├── GitExec    (core/src/capabilities/git_exec.rs)
+  └── Undo       (core/src/capabilities/undo.rs)
+  │
+  ├── Path Validation (core/src/validation/path.rs)
+  │     traversal, null byte, symlink, prefix enforcement
+  ├── Backup Manager (core/src/backup.rs)
+  │     backup-before-mutate, integrity verify, restore with pre-restore backup
+  ├── WAL (core/src/wal.rs)
+  │     append-only JSONL, fsync, flock, rotation, cleanup, tail-read seq recovery
+  ├── LlmoSafeGuard (core/src/llmosafe.rs)
+  │     rolling average, cooldown, persisted to disk across restarts
+  ├── Telemetry (core/src/telemetry.rs)
+  │     discovery-based: accelerators, services, system, network
+  ├── Process Snapshot (core/src/processes.rs)
+  │     ps aux parsing, PPID tracking, zombie detection
+  ├── Config (core/src/config.rs)
+  │     TOML at ~/.config/runtimo/config.toml, env var override
+  ├── Session Manager (core/src/session.rs)
+  │     session create/list/add-job, persisted to disk
+  └── Monitor (core/src/monitor.rs)
+        background snapshots, CPU/RAM alert thresholds
 ```
 
----
+## Data Flow: FileWrite
 
-## Telemetry Module (`core/src/telemetry.rs`)
-
-### Structure
-
-```rust
-pub struct Telemetry {
-    pub timestamp: u64,
-    pub system: SystemInfo,      // CPU, RAM, disk, uptime, load
-    pub hardware: HardwareInfo,  // TPU, GPU, JAX
-    pub services: ServiceInfo,   // vLLM version/running/port
-    pub network: NetworkInfo,    // Public IP, tunnel status
-}
+```
+FileWrite.execute()
+  │
+  ├─ Telemetry::capture()              // before snapshot
+  ├─ ProcessSnapshot::capture()        // before processes
+  ├─ validate_path()                   // traversal, null byte, prefix
+  ├─ is_critical_file()                // .bashrc, .ssh/authorized_keys, etc.
+  ├─ check_disk_space()               // df -B1 → header-aware "Available" parse
+  ├─ [if existing] BackupManager.create_backup() → copy_recursive → verify_integrity
+  ├─ atomic_write() / atomic_append()  // write to .tmp → fsync → rename → dir sync
+  ├─ Telemetry::capture()              // after snapshot
+  └─ ProcessSnapshot::capture()        // after processes
 ```
 
-### What It Captures
+## Data Flow: Undo
 
-| Category | Fields | Example Values |
-|----------|--------|----------------|
-| **System** | cpu_model, ram_total/free, disk_total/free/used%, uptime, load | "Intel Xeon", "16G total, 8G free", "256G total, 100G free (61% used)" |
-| **Hardware** | tpu_devices, gpu_devices, jax_available/version/device_count | 2 TPU chips, 4 GPU devices, JAX v0.4.26 (8 devices) |
-| **Services** | vllm_version, vllm_running, vllm_port_bound | v0.3.0, running=true, port_bound=true |
-| **Network** | public_ip, tunnel_running, tunnel_name | "123.45.67.89", running=true, "cloudflared tunnel abc123" |
-
-### Usage in Capabilities
-
-```rust
-// In a capability's execute() method:
-fn execute(&self, args: &Value, ctx: &Context) -> Result<Output> {
-    // Capture telemetry before execution
-    let telemetry = Telemetry::capture();
-    
-    // Check resource availability
-    if telemetry.hardware.gpu_devices == 0 {
-        return Err(Error::ExecutionFailed("GPU required but not available".into()));
-    }
-    
-    // Check service availability
-    if !telemetry.services.vllm_running {
-        return Err(Error::ExecutionFailed("vLLM service not running".into()));
-    }
-    
-    // Execute with confidence
-    // ...
-    
-    // Log telemetry with job for audit trail
-    Ok(Output { success: true, data: json!({}), message: None })
-}
+```
+Undo.execute() / CLI undo
+  │
+  ├─ WalReader.load()                  // read WAL for backup→path mapping
+  ├─ For each backup file:
+  │   ├─ map backup_path → original_path (from WAL)
+  │   ├─ validate_path(original_path)  // re-validate against allowed prefixes
+  │   └─ BackupManager.restore(backup, original)
+  │         ├─ pre-restore backup (current state saved)
+  │         ├─ copy_recursive(backup → target)
+  │         └─ overwrite completes
+  └─ Output: list of restored paths
 ```
 
----
+## Data Flow: ShellExec
 
-## Relationship to moegraph
-
-**moegraph** = Code intelligence (graph analysis, vector search, MCP)  
-**runtimo** = Capability runtime (validation, execution, logging, undo, **telemetry**)  
-**llmosafe** = Shared safety layer (both depend on this)
-
-### Options (awaiting operator decision):
-
-**Option A: Complete Fusion**  
-Merge moegraph + runtimo into one repo.  
-→ Loses standalone value, gains tight integration.
-
-**Option B: Partial Dependence** (Recommended)  
-runtimo optionally depends on moegraph (`features = ["moegraph-integration"]`).  
-→ runtimo stays independent, can use moegraph for code-aware capabilities.
-
-**Option C: Orthogonal + Shared Safety**  
-No direct dependency, both use llmosafe.  
-→ Clean boundaries, no cross-capabilities.
-
----
-
-## Verification Commands
-
-```bash
-# Verify telemetry module compiles
-cd /workspace/runtimo && cargo check
-
-# Capture and print telemetry (when CLI supports it)
-moe telemetry
-
-# Or programmatically
-cargo run --bin runtimo --features telemetry
+```
+ShellExec.execute()
+  │
+  ├─ is_dangerous_command()            // block mkfs, fdisk, dd, shutdown, rm -rf /
+  ├─ Command::new("sh").arg("-c").arg(cmd)
+  │     .stdin(pipe) .stdout(piped) .stderr(piped)
+  ├─ setpgid() → process group isolation
+  ├─ wait_with_timeout(child, pgid, timeout)
+  │     ├─ read stdout/stderr (bounded to 10 MB each)
+  │     ├─ on timeout: kill(-pgid, SIGKILL) → wait
+  │     └─ on child exit: check descendants via /proc/{pid}/children
+  ├─ Telemetry capture (before + after)
+  └─ [debug] WalWriter::append(CommandExecuted) with cmd, stdout, stderr, exit_code
 ```
 
----
+## Safety Boundaries
 
-**Sources:**
-- Kaggle cell_txt.txt pattern (telemetry + dual protocol)
-- moegraph architecture (`/workspace/moegraph/src/lib.rs`)
-- llmosafe patterns (optional features)
-
-**Last Verified:** 2026-05-16 (telemetry module compiles)  
-**Next Review:** After first telemetry-aware capability implementation
+| # | Boundary | Mechanism |
+|---|----------|-----------|
+| 1 | User input → capability | `Capability::validate()` — schema + semantic checks |
+| 2 | User input → filesystem path | `validate_path()` — traversal, null, symlink, prefix |
+| 3 | FileWrite → disk | `check_disk_space()` + atomic write pattern |
+| 4 | Shell command → system | Dangerous command blocklist + timeout + process group kill |
+| 5 | Kill PID → process | Protected PID list + PID reuse detection |
+| 6 | GitExec → network | URL validation (http/https/SSH) + SSRF blocking |
+| 7 | Undo → filesystem | Restore target re-validated against allowed prefixes |
+| 8 | Resource pressure → execution | `LlmoSafeGuard.check()` — 80% ceiling, rolling average |
+| 9 | 1 MB args → memory | Executor pre-check rejects oversized args |
+| 10 | Zombie count → execution | Executor rejects if zombie_count > 10 |

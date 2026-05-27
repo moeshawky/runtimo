@@ -9,24 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Error-absorbing command logging (Phase 1)** — New `WalEventType::CommandExecuted` variant
-  records every shell command executed via `ShellExec`, including stdout, stderr, exit code, and
-  (future) auto-correction. Dev-only via `#[cfg(debug_assertions)]` — zero overhead in release builds.
-- **WAL `truncate_to()` helper** — Truncates strings to 1KB at UTF-8 boundaries, preventing WAL bloat
-  from large command output while preserving error messages for pattern analysis.
+- **Discovery-based accelerator detection** — `HardwareInfo.accelerators: Vec<AcceleratorInfo>` replaces
+  named TPU/GPU fields. Detects NVIDIA (nvidia-smi), AMD (rocm-smi), TPU (/dev/accel*), and generic
+  DRM (/dev/dri/render*) accelerators. Back-compat fields (`tpu_devices`, `gpu_devices`) preserved.
+- **Discovery-based service detection** — `ServiceInfo.detected_services: Vec<DetectedService>` replaces
+  vLLM-only detection. Detects vLLM, nginx, postgres, redis, docker via `pgrep`. Only detected
+  services appear in output — no "not running" noise.
+- **WAL tail-read seq recovery** — `read_last_seq()` reads last 8KB of WAL file to extract max
+  sequence number. Full-scan fallback if tail-read fails. O(1) typical startup instead of O(N).
+- **Undo restore target path validation** — Both `Undo` capability and CLI `undo` command now
+  call `validate_path()` on restore targets to prevent writes outside allowed prefixes.
+- **Telemetry test suite expanded** — 8 tests (capture, cache, back-compat, empty state,
+  serialization roundtrip, old WAL deserialization).
 
 ### Fixed
 
-- **Config test isolation** — `load_returns_defaults_when_no_file` now uses `XDG_CONFIG_HOME` temp dir
-  instead of reading real `~/.config/runtimo/config.toml`.
-- **Flaky dry_run test** — `dry_run_does_not_create_backup` uses unique backup dir to avoid pollution
-  from parallel test execution.
-- **Null byte proptest** — `prop_write_read_roundtrip` regex narrowed to `[^\0]*` — null bytes trigger
-  `FileRead`'s binary detection (no `"content"` key), causing `.unwrap()` panic in test assertion.
-- **Clippy warnings** — Fixed `type_complexity`, `unused_assignments`, `if_collapsible`, `map(f)` → `if let`.
+- **CLI `--timeout` arg forwarding** — Previously parsed but ignored. Now forwarded to
+  `execute_with_telemetry_and_session()`.
+- **`df` disk check hardened** — `check_disk_space()` now checks df exit status and parses
+  header row to find "Available" column by name (platform-portable). Falls back to column 3.
+- **FileWrite test coverage** — Added tests for content size rejection, critical file blocking,
+  append overflow rejection, and atomic write temp file cleanup.
 
 ### Changed
 
+- **Taglines updated** — "for persistent machines" removed from Cargo.toml, CLI help, and module
+  docs. Runtimo works on any machine.
+- **Telemetry: "persistent machines" framing removed** — Telemetry as discovery protocol, not
+  checklist. Only detected hardware/services printed.
+- **`pub use schema::SchemaValidator` removed** — SchemaValidator was dead code not used by
+  any execution path. Each capability implements its own validation.
+- **FileWrite content limit corrected** — 100 MB (was documented as 10 MB in README; actual
+  limit was already 100 MB in code).
+- **FileRead max file size: 10 MB** — Read limit is 10 MB (was documented as 100 MB).
+
+### Removed
+
+- **15 stale documentation files** — Bug reports, audit reports, frustration notes, WD-40
+  reports, milestone markers removed. Root directory now fits on one screen.
+- **`.sniper/` edit history** — 16 files (~300KB) from prior sessions removed (already gitignored).
+- **Stale `.gitignore` entries** — `core/test.txt`, `cell_txt.txt` removed (files already deleted).
+  `Cargo.lock` removed from gitignore (binary workspace should commit lockfile).
 - **`failure_log.rs` deleted** — Was a duplicate of WAL infrastructure (R-DRIFT). Error-absorbing
   logging now extends `wal.rs` instead of creating a separate log source.
 

@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Agent-centric capability runtime with telemetry, process tracking, and crash recovery for persistent machines"
+description = "Agent-centric capability runtime with telemetry, process tracking, and crash recovery"
 keywords = ["agent", "runtime", "telemetry", "capability", "recovery"]
 categories = ["os", "development-tools"]
 

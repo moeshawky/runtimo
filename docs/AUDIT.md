@@ -112,6 +112,6 @@ Both were fixed at the architecture level, not patched individually.
 
 ---
 
-**Audited By:** AI Agent (code-audit-mindset + seshat + productive_reason)  
+**Audited By:** Automated code audit  
 **Date:** 2026-05-16  
 **Next Review:** v0.2.0 release

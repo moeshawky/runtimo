@@ -23,6 +23,7 @@ fn main() {
     println!("Disk free     : {}", telemetry.system.disk_free);
     println!("GPU devices   : {}", telemetry.hardware.gpu_devices);
     println!("TPU devices   : {}", telemetry.hardware.tpu_devices);
+    println!("Accelerators  : {:#?}", telemetry.hardware.accelerators);
     println!("Total procs   : {}", snapshot.summary.total_processes);
     println!("Total CPU %   : {:.1}", snapshot.summary.total_cpu_percent);
     println!("Zombies       : {}", snapshot.summary.zombie_count);

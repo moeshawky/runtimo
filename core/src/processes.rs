@@ -1,7 +1,7 @@
 //! Process Execution Awareness — What's running and consuming resources.
 //!
-//! For persistent machines: track processes, resource consumption, and execution
-//! context. Captures a `ps aux` snapshot, computes summaries (total CPU%, memory%,
+//! Tracks processes, resource consumption, and execution context.
+//! Captures a `ps aux` snapshot, computes summaries (total CPU%, memory%,
 //! zombie count), and identifies top consumers.
 //!
 //! # Example

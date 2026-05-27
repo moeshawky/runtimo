@@ -3,8 +3,9 @@
 use clap::{Parser, Subcommand};
 use runtimo_core::{
     capabilities::{FileRead, FileWrite, GitExec, Kill, ShellExec, Undo},
-    execute_with_telemetry, BackupManager, CapabilityRegistry, ProcessSnapshot, RuntimoConfig,
-    Telemetry, WalReader,
+    execute_with_telemetry_and_session, BackupManager, CapabilityRegistry, ProcessSnapshot,
+    RuntimoConfig, Telemetry, WalReader,
+    validation::path::{validate_path, PathContext},
 };
 use std::error::Error;
 use std::path::PathBuf;
@@ -12,8 +13,8 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(
     name = "runtimo",
-    about = "capability runtime for persistent machines",
-    long_about = "runtimo — capability runtime for persistent machines\n\n\
+    about = "capability runtime with telemetry, WAL, and process tracking",
+    long_about = "runtimo — capability runtime with telemetry, WAL, and process tracking\n\n\
 Every exec: telemetry + process snapshot + WAL audit",
     after_help = "USAGE:\n runtimo run -c <Capability> -a '<json>'\n runtimo list\n runtimo logs\n runtimo telemetry\n runtimo processes\n\nCAPABILITIES:\n FileRead Read file. Path validated.\n FileWrite Write file. Auto-backup for undo.\n ShellExec Exec via sh -c. Dangerous cmds blocked.\n GitExec Git ops: clone|pull|commit|revert|clean|status.\n Kill Kill PID. Protected: init, kthreadd, self.\n Undo Restore from backup. Use `runtimo logs` to find job IDs.\n\nQUICKSTART:\n runtimo run -c FileRead -a '{\"path\":\"/etc/hostname\"}'\n runtimo run -c ShellExec -a '{\"cmd\":\"uptime\"}'\n\nCONSTRAINTS:\n ShellExec: sh -c mode. Pipes/chaining/vars ok. Blk: mkfs,fdisk,dd,shutdown,rm -rf /\n GitExec: operation + path required.\n All caps: telemetry + WAL audit mandatory.",
     version
@@ -204,7 +205,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             json,
             quiet,
             schema,
-            timeout: _,
+            timeout,
         } => {
             let reg = make_registry();
             let cap = reg
@@ -225,7 +226,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 std::fs::create_dir_all(parent)?;
             }
 
-            let result = execute_with_telemetry(cap, &args, dry_run, &wp)?;
+            let result =
+                execute_with_telemetry_and_session(cap, &args, dry_run, &wp, None, timeout)?;
 
             if json {
                 println!(
@@ -525,7 +527,19 @@ fn main() -> Result<(), Box<dyn Error>> {
                 if bp.is_file() {
                     let filename = bp.file_name().and_then(|n| n.to_str()).unwrap_or_default();
                     let target = if let Some(target_path) = target_paths.get(filename) {
-                        std::path::PathBuf::from(target_path)
+                        let candidate = std::path::PathBuf::from(target_path);
+                        let restore_ctx = PathContext {
+                            require_exists: false,
+                            require_file: false,
+                            ..Default::default()
+                        };
+                        validate_path(target_path, &restore_ctx).map_err(|e| {
+                            format!(
+                                "restore target validation failed for {}: {}",
+                                target_path, e
+                            )
+                        })?;
+                        candidate
                     } else {
                         return Err(format!(
                             "Cannot determine original path for backup file {:?}. \

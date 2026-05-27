@@ -31,6 +31,43 @@ use std::path::Path;
 
 
 
+/// Reads the last event's sequence number from a WAL file without loading
+/// the entire file into memory. Reads only the trailing tail_bytes of the
+/// file to find the last valid JSON line.
+///
+/// Falls back gracefully to `None` on any parse error, partial line, or
+/// I/O failure — the caller falls back to full scan.
+fn read_last_seq(path: &Path, tail_bytes: usize) -> Option<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let file_len = file.metadata().ok()?.len();
+    if file_len == 0 {
+        return None;
+    }
+
+    let start = file_len.saturating_sub(tail_bytes as u64);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = vec![0u8; (file_len - start) as usize + 1];
+    let n = file.read(&mut buf).ok()?;
+    buf.truncate(n);
+
+    // Split into lines, find the last non-empty line, trailing newline stripped
+    let lines: Vec<&[u8]> = buf
+        .split(|&b| b == b'\n')
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    for line in lines.iter().rev() {
+        if let Ok(line_str) = std::str::from_utf8(line) {
+            if let Ok(event) = serde_json::from_str::<WalEvent>(line_str.trim()) {
+                return Some(event.seq);
+            }
+        }
+    }
+    None
+}
+
 /// A single WAL event record.
 ///
 /// Events are appended sequentially and identified by `seq`. The `ts` field
@@ -175,19 +212,28 @@ impl WalWriter {
         // Recover sequence from existing WAL content to ensure monotonic
         // ordering across process restarts. Acquire lock to prevent reading
         // during a concurrent write (P2 FIX).
+        //
+        // Optimized: reads only the last 8KB of the WAL file to find the
+        // max seq. Falls back to full read only if tail-read fails.
         let seq = if path.exists() {
             let lock_file = std::fs::File::open(path)
                 .map_err(|e| crate::Error::WalError(format!("open WAL for seq recovery: {}", e)))?;
             Self::lock_file(&lock_file)?;
-            let content = std::fs::read_to_string(path)
-                .map_err(|e| crate::Error::WalError(format!("read WAL for seq recovery: {}", e)))?;
-            let recovered = content
-                .lines()
-                .filter_map(|line| serde_json::from_str::<WalEvent>(line).ok())
-                .map(|e| e.seq)
-                .max()
-                .map(|max| max + 1)
-                .unwrap_or(0);
+            let recovered = match read_last_seq(path, 8192) {
+                Some(last_seq) => last_seq + 1,
+                None => {
+                    // Fall back to full scan if tail-read failed
+                    let content = std::fs::read_to_string(path)
+                        .map_err(|e| crate::Error::WalError(format!("read WAL for seq recovery: {}", e)))?;
+                    content
+                        .lines()
+                        .filter_map(|line| serde_json::from_str::<WalEvent>(line).ok())
+                        .map(|e| e.seq)
+                        .max()
+                        .map(|max| max + 1)
+                        .unwrap_or(0)
+                }
+            };
             Self::unlock_file(&lock_file);
             recovered
         } else {
