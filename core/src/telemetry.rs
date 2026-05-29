@@ -1,13 +1,13 @@
 //! System Telemetry — Discovery-based environment awareness.
 //!
 //! Captures a full snapshot of the host machine: CPU, RAM, disk, accelerators
-//! (any kind — GPU, TPU, NPU), running services (detected, not assumed),
+//! (any kind — GPU, TPU, NPU), running services (detected via listening ports),
 //! and network state (public IP, tunnels).
 //!
 //! The telemetry is a **discovery protocol**: it reports what IS on the machine,
-//! not what the developer expects to find. No hardcoded service names, no
-//! assumed hardware. Empty means nothing was found — not that the field is
-//! irrelevant. Every capability execution records before/after deltas.
+//! not what the developer expects to find. No assumed hardware. Empty means
+//! nothing was found — not that the field is irrelevant.
+//! Every capability execution records before/after deltas.
 //!
 //! # Example
 //!
@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 
 static TELEMETRY_CACHE: Mutex<Option<(Telemetry, std::time::Instant)>> = Mutex::new(None);
-const CACHE_TTL_SECS: u64 = 5;
+const CACHE_TTL_SECS: u64 = 30;
 
 /// Full system telemetry snapshot.
 ///
@@ -121,10 +121,11 @@ pub struct AcceleratorInfo {
     pub model: Option<String>,
 }
 
-/// Service status — discovery-based, not checklist-based.
+/// Service status — port-based detection.
 ///
-/// Scans for known service processes and listening ports, reports what
-/// was actually detected. No service is assumed to exist.
+/// Scans for listening TCP ports and maps well-known ports to service names.
+/// Only services with actively listening ports are reported. No service is
+/// assumed to exist.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceInfo {
     /// Services detected on this machine. Empty vec = no known services found.
@@ -170,7 +171,7 @@ pub struct NetworkInfo {
 impl Telemetry {
     /// Captures a full system telemetry snapshot.
     ///
-    /// Results are cached for 5 seconds to avoid running 15+ shell subprocesses
+    /// Results are cached for 30 seconds to avoid running 15+ shell subprocesses
     /// on repeated calls. Network queries (public_ip, tunnel) are skipped when
     /// returning a cached value.
     pub fn capture() -> Self {
@@ -441,94 +442,110 @@ impl ServiceInfo {
     fn capture() -> Self {
         let mut detected = Vec::new();
 
-        // vLLM
-        let vllm_version =
-            run_cmd("timeout 10 python3 -c 'import vllm; print(vllm.__version__)' 2>/dev/null");
-        let vllm_running = !run_cmd("pgrep -fa 'vllm serve'").is_empty();
-        let vllm_port_bound =
-            !run_cmd("ss -ltn '( sport = :8200 )' 2>/dev/null | grep 8200").is_empty();
-        if vllm_running || !vllm_version.is_empty() {
-            let mut ports = Vec::new();
-            if vllm_port_bound {
-                ports.push(8200);
+        // Scan listening TCP ports and map to known services
+        let listening = parse_listening_ports();
+
+        for &port in &listening {
+            if let Some(svc) = detect_service_for_port(port) {
+                // Avoid duplicates (e.g. nginx on both 80 and 443)
+                if !detected.iter().any(|s: &DetectedService| s.name == svc.name) {
+                    detected.push(svc);
+                }
             }
-            detected.push(DetectedService {
-                name: "vllm".into(),
-                version: if vllm_version.is_empty() {
-                    None
-                } else {
-                    Some(vllm_version.clone())
-                },
-                running: vllm_running,
-                ports,
-            });
         }
 
-        // nginx
-        let nginx_running = !run_cmd("pgrep -x nginx").is_empty();
-        if nginx_running {
-            let nginx_version = run_cmd("nginx -v 2>&1 | grep -oP 'nginx/\\K[0-9.]+'");
-            detected.push(DetectedService {
-                name: "nginx".into(),
-                version: if nginx_version.is_empty() {
-                    None
-                } else {
-                    Some(nginx_version)
-                },
-                running: true,
-                ports: vec![80, 443],
-            });
-        }
-
-        // PostgreSQL
-        let pg_running = !run_cmd("pgrep -x postgres").is_empty();
-        if pg_running {
-            detected.push(DetectedService {
-                name: "postgres".into(),
-                version: None,
-                running: true,
-                ports: vec![5432],
-            });
-        }
-
-        // Redis
-        let redis_running = !run_cmd("pgrep -x redis-server").is_empty();
-        if redis_running {
-            detected.push(DetectedService {
-                name: "redis".into(),
-                version: None,
-                running: true,
-                ports: vec![6379],
-            });
-        }
-
-        // Docker
-        let docker_running = !run_cmd("pgrep -x dockerd").is_empty();
-        if docker_running {
-            let docker_version = run_cmd("docker --version 2>/dev/null | grep -oP '[0-9]+\\.[0-9]+\\.[0-9]+' | head -1");
-            detected.push(DetectedService {
-                name: "docker".into(),
-                version: if docker_version.is_empty() {
-                    None
-                } else {
-                    Some(docker_version)
-                },
-                running: true,
-                ports: Vec::new(),
-            });
-        }
+        // Backwards compat fields
+        let vllm_version_str = detected
+            .iter()
+            .find(|s| s.name == "vllm")
+            .and_then(|s| s.version.clone());
+        let vllm_running = detected.iter().any(|s| s.name == "vllm" && s.running);
+        let vllm_port_bound = detected
+            .iter()
+            .find(|s| s.name == "vllm")
+            .map(|s| s.ports.contains(&8200))
+            .unwrap_or(false);
 
         Self {
             detected_services: detected,
-            vllm_version: if vllm_version.is_empty() {
-                None
-            } else {
-                Some(vllm_version)
-            },
+            vllm_version: vllm_version_str,
             vllm_running,
             vllm_port_bound,
         }
     }
+}
+
+/// Parse `ss -ltnp` output into listening ports.
+fn parse_listening_ports() -> Vec<u16> {
+    let output = run_cmd("ss -ltnp 2>/dev/null");
+    let mut result = Vec::new();
+
+    for line in output.lines().skip(1) {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 5 {
+            continue;
+        }
+
+        let addr_port = parts[4];
+        let port = match addr_port.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        result.push(port);
+    }
+
+    result
+}
+
+/// Well-known port → service name mapping.
+/// Only ports where we can confidently identify the service.
+fn detect_service_for_port(port: u16) -> Option<DetectedService> {
+    match port {
+        22 => Some(DetectedService {
+            name: "ssh".into(),
+            version: run_cmd("sshd -V 2>&1 | head -1").into(),
+            running: true,
+            ports: vec![22],
+        }),
+        80 | 443 => Some(DetectedService {
+            name: "nginx".into(),
+            version: detect_version("nginx -v 2>&1 | grep -oP 'nginx/\\K[0-9.]+'"),
+            running: true,
+            ports: vec![port],
+        }),
+        3306 => Some(DetectedService {
+            name: "mysql".into(),
+            version: detect_version("mysql --version 2>/dev/null | grep -oP '[0-9]+\\.[0-9]+\\.[0-9]+'"),
+            running: true,
+            ports: vec![3306],
+        }),
+        5432 => Some(DetectedService {
+            name: "postgres".into(),
+            version: detect_version("postgres --version 2>/dev/null | grep -oP '[0-9]+\\.[0-9]+'"),
+            running: true,
+            ports: vec![5432],
+        }),
+        6379 => Some(DetectedService {
+            name: "redis".into(),
+            version: detect_version("redis-server --version 2>/dev/null | grep -oP 'v=[0-9]+\\.[0-9]+\\.[0-9]+'"),
+            running: true,
+            ports: vec![6379],
+        }),
+        27017 => Some(DetectedService {
+            name: "mongodb".into(),
+            version: detect_version("mongod --version 2>/dev/null | grep -oP '[0-9]+\\.[0-9]+\\.[0-9]+'"),
+            running: true,
+            ports: vec![27017],
+        }),
+        _ => None,
+    }
+}
+
+/// Run a version-detection command, return the result or empty string.
+fn detect_version(cmd: &str) -> Option<String> {
+    let v = run_cmd(cmd);
+    if v.is_empty() { None } else { Some(v) }
 }
 
 impl NetworkInfo {

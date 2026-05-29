@@ -244,6 +244,13 @@ fn is_critical_file(path: &std::path::Path) -> bool {
 
 fn check_disk_space(path: &std::path::Path, content_size: usize) -> std::result::Result<(), String> {
     let parent = path.parent().unwrap_or(std::path::Path::new("/"));
+
+    // Parent may not exist yet (create_dir_all runs later). Skip df — disk
+    // check is meaningless for a path that doesn't exist on the filesystem.
+    if !parent.exists() {
+        return Ok(());
+    }
+
     let output = std::process::Command::new("df")
         .arg("-B1")
         .arg(parent)

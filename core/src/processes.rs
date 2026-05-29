@@ -1,8 +1,8 @@
 //! Process Execution Awareness — What's running and consuming resources.
 //!
 //! Tracks processes, resource consumption, and execution context.
-//! Captures a `ps aux` snapshot, computes summaries (total CPU%, memory%,
-//! zombie count), and identifies top consumers.
+//! Captures a snapshot via `ps` with explicit format, computes summaries
+//! (total CPU%, memory%, zombie count), and identifies top consumers.
 //!
 //! # Example
 //!
@@ -40,7 +40,7 @@ pub struct ProcessSnapshot {
 
 /// Information about a single running process.
 ///
-/// Parsed from one line of `ps aux` output.
+/// Parsed from one line of `ps -eo` output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessInfo {
     /// Process ID.
@@ -53,9 +53,9 @@ pub struct ProcessInfo {
     pub cpu_percent: f32,
     /// Memory usage percentage.
     pub mem_percent: f32,
-    /// Virtual memory size in bytes.
+    /// Virtual memory size in kilobytes (KB).
     pub vsz: u64,
-    /// Resident set size in bytes.
+    /// Resident set size in kilobytes (KB).
     pub rss: u64,
     /// Process state string (e.g. `"S"`, `"R"`, `"Z"`).
     pub stat: String,
@@ -85,9 +85,9 @@ pub struct ProcessSummary {
 }
 
 impl ProcessSnapshot {
-    /// Captures a full process snapshot via `ps aux`.
+    /// Captures a full process snapshot via `ps` with explicit format.
     ///
-    /// Results are cached for 30 seconds to avoid re-parsing `ps aux` on
+    /// Results are cached for 30 seconds to avoid re-parsing on
     /// repeated calls within the same execution window.
     pub fn capture() -> Self {
         let now = std::time::Instant::now();
@@ -141,7 +141,7 @@ impl ProcessSnapshot {
     }
 
     /// Returns the top `n` processes by CPU usage.
-    pub fn top_by_cpu(&self, n: usize) -> Vec<&ProcessInfo> {
+    pub(crate) fn top_by_cpu(&self, n: usize) -> Vec<&ProcessInfo> {
         let mut procs: Vec<_> = self.processes.iter().collect();
         procs.sort_by(|a, b| {
             b.cpu_percent
@@ -152,7 +152,7 @@ impl ProcessSnapshot {
     }
 
     /// Returns the top `n` processes by memory usage.
-    pub fn top_by_mem(&self, n: usize) -> Vec<&ProcessInfo> {
+    pub(crate) fn top_by_mem(&self, n: usize) -> Vec<&ProcessInfo> {
         let mut procs: Vec<_> = self.processes.iter().collect();
         procs.sort_by(|a, b| {
             b.mem_percent
@@ -262,8 +262,8 @@ fn parse_ps_line(line: &str) -> Option<ProcessInfo> {
         user,
         cpu_percent,
         mem_percent,
-        vsz: vsz * 1024,
-        rss: rss * 1024,
+        vsz,
+        rss,
         stat,
         start_time,
         elapsed,
@@ -315,7 +315,7 @@ fn format_size(kb: u64) -> String {
     } else if kb >= 1024 {
         format!("{:.1}M", kb as f64 / 1024.0)
     } else {
-        format!("{}K", kb / 1024)
+        format!("{}K", kb)
     }
 }
 
@@ -357,5 +357,30 @@ mod tests {
         assert!(result.ends_with("..."));
         // Should not panic and should be valid UTF-8
         assert!(result.is_char_boundary(result.len()));
+    }
+
+    #[test]
+    fn test_format_size() {
+        // format_size expects KB input
+        assert_eq!(format_size(0), "0K");
+        assert_eq!(format_size(512), "512K");
+        assert_eq!(format_size(1024), "1.0M");
+        assert_eq!(format_size(1024 * 1024), "1.0G");
+        assert_eq!(format_size(1024 * 512), "512.0M");
+        assert_eq!(format_size(1024 * 1024 * 2), "2.0G");
+    }
+
+    #[test]
+    fn test_process_vsz_rss_in_kb() {
+        let snap = ProcessSnapshot::capture();
+        // Every process should have vsz/rss as reasonable KB values
+        // (not multiplied by 1024 — that was the old bug)
+        for p in &snap.processes {
+            // vsz can be very large on 64-bit systems (virtual memory is cheap)
+            // but should not exceed 1PB (1024*1024*1024 KB)
+            assert!(p.vsz < 1_000_000_000, "vsz={}KB is unreasonably large for {}", p.vsz, p.command);
+            // rss is physical memory — should be under 100GB for any single process
+            assert!(p.rss < 100_000_000, "rss={}KB is unreasonably large for {}", p.rss, p.command);
+        }
     }
 }

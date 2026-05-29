@@ -244,6 +244,205 @@ fn creates_parent_directories() {
     cleanup(&dir);
 }
 
+// ── G-EDGE: check_disk_space boundary cases ─────────────────────────
+
+/// Nonexistent parent must not block write (C4 fix: parent doesn't exist at df time)
+#[test]
+fn check_disk_space_skips_when_parent_missing() {
+    let dir = setup();
+    let target = dir.join("x/y/z/deep.txt");
+    let result = FileWrite::new(backup_dir(&dir))
+        .expect("Failed to create FileWrite")
+        .execute(
+            &json!({
+                "path": target.to_str().unwrap(),
+                "content": "a"
+            }),
+            &ctx("g_edge_1"),
+        );
+    assert!(result.is_ok(), "Write to nonexistent parent failed: {:?}", result);
+    assert!(target.exists(), "File must exist after write");
+    assert_eq!(fs::read_to_string(&target).unwrap(), "a");
+    cleanup(&dir);
+}
+
+/// Deep nesting (5 levels) — stress the create_dir_all + check_disk_space ordering
+#[test]
+fn check_disk_space_deep_nesting() {
+    let dir = setup();
+    let target = dir.join("a/b/c/d/e/file.txt");
+    FileWrite::new(backup_dir(&dir))
+        .expect("Failed to create FileWrite")
+        .execute(
+            &json!({
+                "path": target.to_str().unwrap(),
+                "content": "deep5"
+            }),
+            &ctx("g_edge_2"),
+        )
+        .unwrap();
+    assert!(target.exists());
+    assert_eq!(fs::read_to_string(&target).unwrap(), "deep5");
+    cleanup(&dir);
+}
+
+/// Single-level new parent
+#[test]
+fn check_disk_space_single_new_parent() {
+    let dir = setup();
+    let target = dir.join("newdir/file.txt");
+    FileWrite::new(backup_dir(&dir))
+        .expect("Failed to create FileWrite")
+        .execute(
+            &json!({
+                "path": target.to_str().unwrap(),
+                "content": "single"
+            }),
+            &ctx("g_edge_3"),
+        )
+        .unwrap();
+    assert!(target.exists());
+    assert_eq!(fs::read_to_string(&target).unwrap(), "single");
+    cleanup(&dir);
+}
+
+/// Existing parent — verify check_disk_space still runs (not skipped when it shouldn't be)
+#[test]
+fn check_disk_space_runs_when_parent_exists() {
+    let dir = setup();
+    make_file(&dir, "existing.txt", "old");
+    let result = FileWrite::new(backup_dir(&dir))
+        .expect("Failed to create FileWrite")
+        .execute(
+            &json!({
+                "path": dir.join("existing.txt").to_str().unwrap(),
+                "content": "new"
+            }),
+            &ctx("g_edge_4"),
+        );
+    assert!(result.is_ok());
+    assert_eq!(fs::read_to_string(dir.join("existing.txt")).unwrap(), "new");
+    cleanup(&dir);
+}
+
+/// Empty content to new parent — edge case: 0-byte write still creates parent
+#[test]
+fn check_disk_space_empty_content_new_parent() {
+    let dir = setup();
+    let target = dir.join("newdir_empty/file.txt");
+    FileWrite::new(backup_dir(&dir))
+        .expect("Failed to create FileWrite")
+        .execute(
+            &json!({
+                "path": target.to_str().unwrap(),
+                "content": ""
+            }),
+            &ctx("g_edge_5"),
+        )
+        .unwrap();
+    assert!(target.exists());
+    assert_eq!(fs::read_to_string(&target).unwrap(), "");
+    cleanup(&dir);
+}
+
+// ── C4: Ordering dependency ─────────────────────────────────────────
+
+/// Multiple writes to different paths under same nonexistent parent — no races
+#[test]
+fn c4_ordering_concurrent_paths_same_parent() {
+    let dir = setup();
+    let parent = dir.join("shared_parent");
+    let paths: Vec<_> = (0..5)
+        .map(|i| parent.join(format!("sub{}/f{}.txt", i, i)))
+        .collect();
+
+    let fw = FileWrite::new(backup_dir(&dir)).expect("Failed to create FileWrite");
+    for (i, path) in paths.iter().enumerate() {
+        fw.execute(
+            &json!({
+                "path": path.to_str().unwrap(),
+                "content": format!("content_{}", i)
+            }),
+            &ctx(format!("c4_{}", i)),
+        )
+        .unwrap();
+    }
+
+    for (i, path) in paths.iter().enumerate() {
+        assert!(path.exists(), "Path {} must exist", path.display());
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            format!("content_{}", i)
+        );
+    }
+    cleanup(&dir);
+}
+
+/// Write after create_dir_all — verify disk check doesn't reject valid parent
+#[test]
+fn c4_ordering_write_after_parent_creation() {
+    let dir = setup();
+    let target = dir.join("order_test/sub/file.txt");
+
+    // Manually create parent first
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+    let result = FileWrite::new(backup_dir(&dir))
+        .expect("Failed to create FileWrite")
+        .execute(
+            &json!({
+                "path": target.to_str().unwrap(),
+                "content": "after_parent"
+            }),
+            &ctx("c4_order"),
+        );
+    assert!(result.is_ok());
+    assert_eq!(fs::read_to_string(&target).unwrap(), "after_parent");
+    cleanup(&dir);
+}
+
+// ── G-SEM: Semantic invariants ──────────────────────────────────────
+
+/// File content must match exactly (no truncation, no corruption)
+#[test]
+fn g_sem_content_identity() {
+    let dir = setup();
+    let target = dir.join("identity.txt");
+    let content = "The quick brown fox jumps over the lazy dog";
+    FileWrite::new(backup_dir(&dir))
+        .expect("Failed to create FileWrite")
+        .execute(
+            &json!({
+                "path": target.to_str().unwrap(),
+                "content": content
+            }),
+            &ctx("sem1"),
+        )
+        .unwrap();
+    assert_eq!(fs::read_to_string(&target).unwrap(), content);
+    cleanup(&dir);
+}
+
+/// Unicode content roundtrip
+#[test]
+fn g_sem_unicode_roundtrip() {
+    let dir = setup();
+    let target = dir.join("unicode.txt");
+    let content = "مرحبا世界🚀";
+    FileWrite::new(backup_dir(&dir))
+        .expect("Failed to create FileWrite")
+        .execute(
+            &json!({
+                "path": target.to_str().unwrap(),
+                "content": content
+            }),
+            &ctx("sem2"),
+        )
+        .unwrap();
+    assert_eq!(fs::read_to_string(&target).unwrap(), content);
+    cleanup(&dir);
+}
+
 // ── error handling ───────────────────────────────────────────────────
 
 #[test]

@@ -7,51 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- **Discovery-based accelerator detection** — `HardwareInfo.accelerators: Vec<AcceleratorInfo>` replaces
-  named TPU/GPU fields. Detects NVIDIA (nvidia-smi), AMD (rocm-smi), TPU (/dev/accel*), and generic
-  DRM (/dev/dri/render*) accelerators. Back-compat fields (`tpu_devices`, `gpu_devices`) preserved.
-- **Discovery-based service detection** — `ServiceInfo.detected_services: Vec<DetectedService>` replaces
-  vLLM-only detection. Detects vLLM, nginx, postgres, redis, docker via `pgrep`. Only detected
-  services appear in output — no "not running" noise.
-- **WAL tail-read seq recovery** — `read_last_seq()` reads last 8KB of WAL file to extract max
-  sequence number. Full-scan fallback if tail-read fails. O(1) typical startup instead of O(N).
-- **Undo restore target path validation** — Both `Undo` capability and CLI `undo` command now
-  call `validate_path()` on restore targets to prevent writes outside allowed prefixes.
-- **Telemetry test suite expanded** — 8 tests (capture, cache, back-compat, empty state,
-  serialization roundtrip, old WAL deserialization).
+## [0.4.0] - 2026-05-29
 
 ### Fixed
 
-- **CLI `--timeout` arg forwarding** — Previously parsed but ignored. Now forwarded to
-  `execute_with_telemetry_and_session()`.
-- **`df` disk check hardened** — `check_disk_space()` now checks df exit status and parses
-  header row to find "Available" column by name (platform-portable). Falls back to column 3.
-- **FileWrite test coverage** — Added tests for content size rejection, critical file blocking,
-  append overflow rejection, and atomic write temp file cleanup.
+- **G-EDGE-1: check_disk_space runs before create_dir_all** — `check_disk_space()` was called
+  before `create_dir_all()` in FileWrite, causing writes to nonexistent parent directories to
+  fail with "No such file or directory" from `df`. Added early return when parent doesn't exist.
+- **format_size double conversion** — `format_size()` else branch divided KB input by 1024,
+  causing a 512KB process to display as "0K". Removed erroneous division.
+- **parse_ps_line vsz/rss multiplied by 1024** — `parse_ps_line()` multiplied VSZ and RSS
+  by 1024 (KB→bytes), but `format_size()` expects KB. A 1GB process displayed as 1024GB.
+  Removed the multiplication.
+- **vllm service hallucination** — `pgrep -f 'vllm serve'` matched the shell command itself,
+  causing vllm to appear in telemetry output even when not running. Replaced process-based
+  detection with port-based discovery.
 
 ### Changed
 
-- **Taglines updated** — "for persistent machines" removed from Cargo.toml, CLI help, and module
-  docs. Runtimo works on any machine.
-- **Telemetry: "persistent machines" framing removed** — Telemetry as discovery protocol, not
-  checklist. Only detected hardware/services printed.
-- **`pub use schema::SchemaValidator` removed** — SchemaValidator was dead code not used by
-  any execution path. Each capability implements its own validation.
-- **FileWrite content limit corrected** — 100 MB (was documented as 10 MB in README; actual
-  limit was already 100 MB in code).
-- **FileRead max file size: 10 MB** — Read limit is 10 MB (was documented as 100 MB).
+- **Telemetry service detection rewritten** — From hardcoded `pgrep` checks to port-based
+  discovery. `ss -ltnp` scans listening TCP ports; ports mapped to known services via lookup
+  table (ssh:22, nginx:80/443, postgres:5432, redis:6379, mysql:3306, mongodb:27017).
+  Unknown ports are ignored. Version detected via service-specific commands.
+- **Telemetry cache TTL increased** — 5s → 30s to accommodate service version detection
+  strategies.
+- **Process snapshot docs corrected** — "ps aux" references updated to "ps with explicit
+  format" (code uses `ps -eo`, not BSD-style `ps aux`).
+- **ServiceInfo docs corrected** — "Scans for known service processes" → "Scans for listening
+  TCP ports". "No hardcoded service names" → "No assumed running services".
 
-### Removed
+### Added
 
-- **15 stale documentation files** — Bug reports, audit reports, frustration notes, WD-40
-  reports, milestone markers removed. Root directory now fits on one screen.
-- **`.sniper/` edit history** — 16 files (~300KB) from prior sessions removed (already gitignored).
-- **Stale `.gitignore` entries** — `core/test.txt`, `cell_txt.txt` removed (files already deleted).
-  `Cargo.lock` removed from gitignore (binary workspace should commit lockfile).
-- **`failure_log.rs` deleted** — Was a duplicate of WAL infrastructure (R-DRIFT). Error-absorbing
-  logging now extends `wal.rs` instead of creating a separate log source.
+- **Enriched test suite (15 new tests)** — G-EDGE boundary tests for check_disk_space
+  (nonexistent parent, deep nesting, single new parent, existing parent, empty content),
+  C4 ordering dependency tests (concurrent paths, write after parent creation), G-SEM
+  semantic invariants (content identity, unicode roundtrip), T-FALSEPASS regression tests
+  (ordering sentinel, exact content check, tight oracle check).
+- **process format_size unit test** — Validates all K/M/G branches.
+- **process vsz/rss range test** — Regression sentinel for the `*1024` bug.
+- **drift_process_vsz_rss_reasonable robust test** — Ensures VSZ/RSS stay in reasonable KB range.
 
 ## [0.2.0] - 2026-05-18
 

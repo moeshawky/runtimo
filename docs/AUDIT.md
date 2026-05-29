@@ -5,6 +5,8 @@
 **Status:** All 30 findings addressed  
 **Tests:** 86 passing (49 unit + 31 integration + 6 doc)
 
+> **Latest audit:** See [`AUDIT_v0.3.0.md`](AUDIT_v0.3.0.md) for the v0.3.0 audit (7 findings, 2026-05-29)
+
 ## Executive Summary
 
 A comprehensive audit using the Ninefold Check methodology (G-HALL through G-DEP) identified **30 findings** across 7 failure modes. All findings have been fixed with code changes, test coverage, and clippy validation.

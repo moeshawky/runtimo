@@ -183,6 +183,79 @@ fn edge_concurrent_writes_different_files() {
     cleanup(&dir);
 }
 
+// ── T-FALSEPASS: verify tests catch the actual bug ──────────────────
+
+/// T-FALSEPASS gate: creates_parent_directories must fail if check_disk_space
+/// runs before create_dir_all. This test documents the expected behavior
+/// and serves as a regression sentinel.
+#[test]
+fn t_falsepass_creates_parent_must_require_disk_check_after_mkdir() {
+    let dir = setup();
+    let deep = dir.join("a/b/c");
+    let target = deep.join("f.txt");
+
+    // The test: write to nonexistent parent must succeed.
+    // If check_disk_space runs BEFORE create_dir_all, this fails with:
+    //   "No such file or directory" (from df) or
+    //   "insufficient disk space" (df on wrong path)
+    let result = FileWrite::new(backup_dir(&dir))
+        .expect("Failed to create FileWrite")
+        .execute(
+            &json!({
+                "path": target.to_str().unwrap(),
+                "content": "t_falsepass"
+            }),
+            &ctx("tfp1"),
+        );
+    assert!(result.is_ok(), "T-FALSEPASS: write to nonexistent parent failed — ordering bug not fixed: {:?}", result);
+    assert_eq!(fs::read_to_string(&target).unwrap(), "t_falsepass");
+    cleanup(&dir);
+}
+
+/// T-FALSEPASS gate: verify file content is correct (not just existence)
+#[test]
+fn t_falsepass_content_not_just_exists() {
+    let dir = setup();
+    let target = dir.join("content_check.txt");
+    let payload = "exact_payload_42";
+    FileWrite::new(backup_dir(&dir))
+        .expect("Failed to create FileWrite")
+        .execute(
+            &json!({
+                "path": target.to_str().unwrap(),
+                "content": payload
+            }),
+            &ctx("tfp2"),
+        )
+        .unwrap();
+    let read_back = fs::read_to_string(&target).unwrap();
+    assert_eq!(read_back, payload, "T-FALSEPASS: content mismatch — file exists but content is wrong");
+    cleanup(&dir);
+}
+
+/// T-WEAKORACLE gate: verify exact content, not just non-empty
+#[test]
+fn t_weakoracle_exact_content_not_substring() {
+    let dir = setup();
+    let target = dir.join("exact.txt");
+    let content = "precise";
+    FileWrite::new(backup_dir(&dir))
+        .expect("Failed to create FileWrite")
+        .execute(
+            &json!({
+                "path": target.to_str().unwrap(),
+                "content": content
+            }),
+            &ctx("two1"),
+        )
+        .unwrap();
+    let read_back = fs::read_to_string(&target).unwrap();
+    // Tight oracle: exact equality, not substring or non-empty
+    assert_eq!(read_back.len(), content.len(), "T-WEAKORACLE: length mismatch");
+    assert_eq!(read_back, content, "T-WEAKORACLE: content not identical");
+    cleanup(&dir);
+}
+
 // ── G-SEC: Security ─────────────────────────────────────────────────
 
 /// Path traversal with encoded sequences
@@ -642,6 +715,29 @@ fn drift_process_snapshot_format_stable() {
     assert!(summary.contains_key("total_cpu_percent"));
     assert!(summary.contains_key("total_mem_percent"));
     assert!(summary.contains_key("zombie_count"));
+}
+
+/// Process vsz/rss are in KB (not bytes) — regression for format_size bug
+#[test]
+fn drift_process_vsz_rss_reasonable() {
+    let snap = ProcessSnapshot::capture();
+    for p in &snap.processes {
+        // After fix: vsz/rss are raw KB from ps, not KB*1024
+        // vsz can be very large on 64-bit (virtual memory is cheap) but < 1PB
+        assert!(
+            p.vsz < 1_000_000_000,
+            "vsz={}KB is unreasonably large (format_size bug regression?) for {}",
+            p.vsz,
+            p.command
+        );
+        // rss is physical memory — should be under 100GB for any single process
+        assert!(
+            p.rss < 100_000_000,
+            "rss={}KB is unreasonably large (format_size bug regression?) for {}",
+            p.rss,
+            p.command
+        );
+    }
 }
 
 /// WAL event format is stable
