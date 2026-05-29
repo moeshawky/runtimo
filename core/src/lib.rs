@@ -63,6 +63,7 @@ pub mod capability;
 pub mod cmd;
 pub mod config;
 pub mod executor;
+pub mod format;
 pub mod job;
 pub mod llmosafe;
 pub mod monitor;

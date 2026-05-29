@@ -141,7 +141,7 @@ impl ProcessSnapshot {
     }
 
     /// Returns the top `n` processes by CPU usage.
-    pub(crate) fn top_by_cpu(&self, n: usize) -> Vec<&ProcessInfo> {
+    pub fn top_by_cpu(&self, n: usize) -> Vec<&ProcessInfo> {
         let mut procs: Vec<_> = self.processes.iter().collect();
         procs.sort_by(|a, b| {
             b.cpu_percent
@@ -152,7 +152,7 @@ impl ProcessSnapshot {
     }
 
     /// Returns the top `n` processes by memory usage.
-    pub(crate) fn top_by_mem(&self, n: usize) -> Vec<&ProcessInfo> {
+    pub fn top_by_mem(&self, n: usize) -> Vec<&ProcessInfo> {
         let mut procs: Vec<_> = self.processes.iter().collect();
         procs.sort_by(|a, b| {
             b.mem_percent

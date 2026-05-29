@@ -1,22 +1,26 @@
-//! runtimo CLI — Agent capability runtime
+//! runtimo CLI — Agent capability runtime with background dispatch
 
 use clap::{Parser, Subcommand};
 use runtimo_core::{
     capabilities::{FileRead, FileWrite, GitExec, Kill, ShellExec, Undo},
-    execute_with_telemetry_and_session, BackupManager, CapabilityRegistry, ProcessSnapshot,
+    CapabilityRegistry, ProcessSnapshot,
     RuntimoConfig, Telemetry, WalReader,
-    validation::path::{validate_path, PathContext},
+    format::wall_to_markdown,
 };
 use std::error::Error;
+use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::os::unix::net::UnixStream;
+use serde_json::Value;
 
 #[derive(Parser)]
 #[command(
     name = "runtimo",
-    about = "capability runtime with telemetry, WAL, and process tracking",
+    about = "capability runtime with telemetry, WAL, process tracking, and background dispatch",
     long_about = "runtimo — capability runtime with telemetry, WAL, and process tracking\n\n\
-Every exec: telemetry + process snapshot + WAL audit",
-    after_help = "USAGE:\n runtimo run -c <Capability> -a '<json>'\n runtimo list\n runtimo logs\n runtimo telemetry\n runtimo processes\n\nCAPABILITIES:\n FileRead Read file. Path validated.\n FileWrite Write file. Auto-backup for undo.\n ShellExec Exec via sh -c. Dangerous cmds blocked.\n GitExec Git ops: clone|pull|commit|revert|clean|status.\n Kill Kill PID. Protected: init, kthreadd, self.\n Undo Restore from backup. Use `runtimo logs` to find job IDs.\n\nQUICKSTART:\n runtimo run -c FileRead -a '{\"path\":\"/etc/hostname\"}'\n runtimo run -c ShellExec -a '{\"cmd\":\"uptime\"}'\n\nCONSTRAINTS:\n ShellExec: sh -c mode. Pipes/chaining/vars ok. Blk: mkfs,fdisk,dd,shutdown,rm -rf /\n GitExec: operation + path required.\n All caps: telemetry + WAL audit mandatory.",
+Every exec: telemetry + process snapshot + WAL audit\n\
+Background: dispatch jobs to daemon, check status later",
+    after_help = "USAGE:\n runtimo run -c <Capability> -a '<json>'\n runtimo dispatch -c <Capability> -a '<json>'\n runtimo jobs\n runtimo wait -j <job_id>\n runtimo list\n runtimo logs\n runtimo telemetry\n runtimo processes\n\nCAPABILITIES:\n FileRead Read file. Path validated.\n FileWrite Write file. Auto-backup for undo.\n ShellExec Exec via sh -c. Dangerous cmds blocked.\n GitExec Git ops: clone|pull|commit|revert|clean|status.\n Kill Kill PID. Protected: init, kthreadd, self.\n Undo Restore from backup. Use `runtimo logs` to find job IDs.",
     version
 )]
 struct Cli {
@@ -26,124 +30,96 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// exec capability with telemetry
-    #[command(
-        about = "exec capability with telemetry",
-        long_about = "runtimo run -c <Capability> -a '<json>'\n\n\
-req: capability (string)\nopt: args (json), dry-run, timeout (30s)\n\n\
-ex: runtimo run -c ShellExec -a '{\"cmd\":\"ls | head\"}'",
-        after_help = "CAPABILITY HELP:\n runtimo run -c <Cap> --schema\n\n\
-EXAMPLES:\n runtimo run -c FileRead -a '{\"path\":\"/etc/hostname\"}'\n runtimo run -c ShellExec -a '{\"cmd\":\"uptime\"}'\n runtimo run -c GitExec -a '{\"operation\":\"status\",\"path\":\"/tmp\"}'",
-    )]
+    #[command(about = "exec capability with telemetry",
+        after_help = "CAPABILITY HELP:\n runtimo run -c <Cap> --schema\n\nEXAMPLES:\n runtimo run -c FileRead -a '{\"path\":\"/etc/hostname\"}'\n runtimo run -c ShellExec -a '{\"cmd\":\"uptime\"}'")]
     Run {
-        /// Capability name (FileRead, FileWrite, ShellExec, Kill, GitExec, Undo)
         #[arg(short = 'c', long)]
         capability: String,
-        /// JSON arguments, e.g. '{"path":"/tmp/test.txt"}' or '{"cmd":"uptime"}'
         #[arg(short = 'a', long, default_value = "{}")]
         args: String,
-        /// Validate without executing
         #[arg(long)]
         dry_run: bool,
-        /// Output as JSON (machine-readable)
         #[arg(short = 'j', long)]
         json: bool,
-        /// Suppress telemetry output (quiet mode)
         #[arg(short = 'q', long)]
         quiet: bool,
-        /// Show capability argument schema and exit
         #[arg(long)]
         schema: bool,
-        /// Execution timeout in seconds (default: 30)
         #[arg(long, default_value = "30")]
         timeout: u64,
     },
-    /// List available capabilities
-    #[command(
-        about = "List capabilities",
-        long_about = "List all registered capabilities with descriptions.",
-        after_help = "Use --schemas to see JSON argument schemas for each capability.\nUse --json for machine-readable output.",
-    )]
-    List {
-        /// Show schemas for each capability
-        #[arg(long)]
-        schemas: bool,
-        /// Output as JSON
-        #[arg(short = 'j', long)]
-        json: bool,
-    },
-    /// Check job status
-    #[command(
-        about = "Check job status",
-        long_about = "Show job status from WAL (Write-Ahead Log) history.",
-        after_help = "Without --job-id, lists all jobs. With --job-id, shows all events for that job.",
-    )]
-    Status {
-        /// Filter by job ID
-        #[arg(short = 'j', long)]
-        job_id: Option<String>,
-        /// Output as JSON
-        #[arg(short = 'o', long)]
-        json: bool,
-    },
-    /// View WAL logs
-    #[command(
-        about = "View WAL logs",
-        long_about = "View the Write-Ahead Log — a sequential record of all capability executions.",
-        after_help = "The WAL records every job start, completion, telemetry snapshot, and error.\nUse --job-id to filter. Use --limit to control output size (default: 10).",
-    )]
-    Logs {
-        /// Filter by job ID
-        #[arg(short = 'j', long)]
-        job_id: Option<String>,
-        /// Number of recent events (default: 10)
-        #[arg(short = 'n', long, default_value = "10")]
-        limit: usize,
-        /// Output as JSON
-        #[arg(short = 'o', long)]
-        json: bool,
-    },
-    /// Undo a completed job
-    #[command(
-        about = "Undo a completed job",
-        long_about = "Restore files to their state before a job executed, using backups from FileWrite or GitExec.",
-        after_help = "Find job IDs with `runtimo logs` or `runtimo status`.\nExample: runtimo undo -j abc123 --dry-run",
-    )]
-    Undo {
-        /// Job ID to undo
-        #[arg(short = 'j', long)]
-        job_id: String,
-        /// Show what will be restored without executing
+    /// Dispatch job to background daemon (returns immediately)
+    #[command(about = "Dispatch job to background daemon",
+        after_help = "EXAMPLES:\n runtimo dispatch -c ShellExec -a '{\"cmd\":\"sleep 30\"}'\n runtimo dispatch -c FileWrite -a '{\"path\":\"/tmp/x.txt\",\"content\":\"bg\"}'\n\nRequires runtimo-daemon to be running.")]
+    Dispatch {
+        #[arg(short = 'c', long)]
+        capability: String,
+        #[arg(short = 'a', long, default_value = "{}")]
+        args: String,
         #[arg(long)]
         dry_run: bool,
     },
-    /// Print system telemetry
-    #[command(
-        about = "Print system telemetry",
-        long_about = "Print hardware info: CPU model, RAM, disk usage, network interfaces, and services.",
-    )]
+    /// Wait for a dispatched job to complete
+    #[command(about = "Wait for a dispatched job",
+        after_help = "EXAMPLES:\n runtimo wait -j abc123\n runtimo wait -j abc123 --timeout 60")]
+    Wait {
+        #[arg(short = 'j', long)]
+        job_id: String,
+        #[arg(long, default_value = "0")]
+        timeout: u64,
+    },
+    #[command(about = "List capabilities",
+        after_help = "Use --schemas to see JSON argument schemas.")]
+    List {
+        #[arg(long)]
+        schemas: bool,
+        #[arg(short = 'j', long)]
+        json: bool,
+    },
+    #[command(about = "Check job status")]
+    Status {
+        #[arg(short = 'j', long)]
+        job_id: Option<String>,
+        #[arg(short = 'o', long)]
+        json: bool,
+    },
+    /// List recent jobs (queriable job history)
+    #[command(about = "List recent jobs",
+        after_help = "EXAMPLES:\n runtimo jobs\n runtimo jobs --limit 5\n runtimo jobs --json")]
+    Jobs {
+        #[arg(short = 'n', long, default_value = "20")]
+        limit: usize,
+        #[arg(short = 'j', long)]
+        json: bool,
+    },
+    #[command(about = "View WAL logs")]
+    Logs {
+        #[arg(short = 'j', long)]
+        job_id: Option<String>,
+        #[arg(short = 'n', long, default_value = "10")]
+        limit: usize,
+        #[arg(short = 'o', long)]
+        json: bool,
+    },
+    #[command(about = "Undo a completed job",
+        after_help = "Find job IDs with `runtimo jobs` or `runtimo logs`.")]
+    Undo {
+        #[arg(short = 'j', long)]
+        job_id: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    #[command(about = "Print system telemetry")]
     Telemetry {
-        /// Output as JSON
         #[arg(short = 'j', long)]
         json: bool,
     },
-    /// Print process snapshot
-    #[command(
-        about = "Print process snapshot",
-        long_about = "Print running processes: total count, zombies, and top CPU/memory consumers.",
-        after_help = "Useful for detecting runaway processes spawned by capabilities.",
-    )]
+    #[command(about = "Print process snapshot")]
     Processes {
-        /// Output as JSON
         #[arg(short = 'j', long)]
         json: bool,
     },
-    /// Manage configuration
-    #[command(
-        about = "Manage configuration",
-        long_about = "Add, remove, or list allowed path prefixes.",
-        after_help = "Examples:\n  runtimo config allowed-paths add /srv /opt\n  runtimo config allowed-paths list\n  runtimo config allowed-paths remove /opt",
-    )]
+    #[command(about = "Manage configuration")]
     Config {
         #[command(subcommand)]
         action: ConfigAction,
@@ -152,7 +128,6 @@ EXAMPLES:\n runtimo run -c FileRead -a '{\"path\":\"/etc/hostname\"}'\n runtimo 
 
 #[derive(Subcommand)]
 enum ConfigAction {
-    /// Manage allowed path prefixes
     AllowedPaths {
         #[command(subcommand)]
         subaction: AllowedPathsAction,
@@ -161,400 +136,400 @@ enum ConfigAction {
 
 #[derive(Subcommand)]
 enum AllowedPathsAction {
-    /// Add path prefixes to config
-    Add {
-        /// Path prefixes to add
-        paths: Vec<String>,
-    },
-    /// Remove path prefixes from config
-    Remove {
-        /// Path prefixes to remove
-        paths: Vec<String>,
-    },
-    /// List configured path prefixes
+    Add { paths: Vec<String> },
+    Remove { paths: Vec<String> },
     List,
 }
 
-fn wal_path() -> PathBuf {
-    runtimo_core::utils::wal_path()
-}
-
-fn backup_dir() -> PathBuf {
-    runtimo_core::utils::backup_dir()
-}
+fn wal_path() -> PathBuf { runtimo_core::utils::wal_path() }
+fn backup_dir() -> PathBuf { runtimo_core::utils::backup_dir() }
 
 fn make_registry() -> CapabilityRegistry {
     let mut reg = CapabilityRegistry::new();
     reg.register(FileRead);
     reg.register(FileWrite::new(backup_dir()).expect("Failed to create FileWrite capability"));
-    reg.register(ShellExec);
-    reg.register(Undo);
-    reg.register(Kill);
     reg.register(GitExec::new(backup_dir()).expect("Failed to create GitExec capability"));
+    reg.register(ShellExec);
+    reg.register(Kill);
+    reg.register(Undo);
     reg
 }
+
+// ── Daemon client ───────────────────────────────────────────────────────────
+
+fn daemon_socket() -> PathBuf {
+    runtimo_core::utils::data_dir().join("runtimo.sock")
+}
+
+fn send_rpc(method: &str, params: Value) -> Result<Value, String> {
+    let sock_path = daemon_socket();
+    let mut stream = UnixStream::connect(&sock_path)
+        .map_err(|e| format!("Cannot connect to daemon at {}: {}. Is `runtimo-daemon` running?", sock_path.display(), e))?;
+
+    let request = serde_json::json!({
+        "method": method,
+        "params": params,
+        "id": 1,
+    });
+    let req_str = serde_json::to_string(&request).map_err(|e| format!("JSON encode: {}", e))?;
+    stream.write_all(req_str.as_bytes()).map_err(|e| format!("Write: {}", e))?;
+    stream.write_all(b"\n").map_err(|e| format!("Write nl: {}", e))?;
+
+    let mut buf = vec![0u8; 65536];
+    let n = stream.read(&mut buf).map_err(|e| format!("Read: {}", e))?;
+    if n == 0 {
+        return Err("Daemon closed connection".into());
+    }
+
+    let resp_str = String::from_utf8_lossy(&buf[..n]);
+    let last_line = resp_str.lines().last().unwrap_or("");
+    let resp: Value = serde_json::from_str(last_line).map_err(|e| format!("JSON parse: {}", e))?;
+
+    if let Some(err) = resp.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
+        return Err(err.to_string());
+    }
+
+    Ok(resp.get("result").cloned().unwrap_or(Value::Null))
+}
+
+// ── Main ────────────────────────────────────────────────────────────────────
 
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Run {
-            capability,
-            args,
-            dry_run,
-            json,
-            quiet,
-            schema,
-            timeout,
-        } => {
+        Commands::Run { capability, args, dry_run, json, quiet, schema, timeout: _ } => {
             let reg = make_registry();
-            let cap = reg
-                .get(&capability)
-                .ok_or_else(|| format!("capability not found: {}", capability))?;
-
             if schema {
-                let schema = cap.schema();
-                println!("{}", serde_json::to_string_pretty(&schema)?);
+                if let Some(cap) = reg.get(&capability) {
+                    println!("{}", cap.schema());
+                } else {
+                    eprintln!("Capability not found: {}", capability);
+                    std::process::exit(1);
+                }
                 return Ok(());
             }
-
-            let args: serde_json::Value =
-                serde_json::from_str(&args).map_err(|e| format!("invalid JSON args: {}", e))?;
-
-            let wp = wal_path();
-            if let Some(parent) = wp.parent() {
-                std::fs::create_dir_all(parent)?;
+            let cap = reg.get(&capability).ok_or_else(|| format!("Capability not found: {}", capability))?;
+            let args_val: Value = serde_json::from_str(&args).map_err(|e| format!("Invalid JSON args: {}", e))?;
+            let ctx = runtimo_core::Context {
+                dry_run,
+                job_id: runtimo_core::utils::generate_id(),
+                working_dir: std::env::current_dir().unwrap_or_default(),
+            };
+            if let Err(e) = cap.validate(&args_val) {
+                eprintln!("Validation failed: {}", e);
+                std::process::exit(1);
             }
-
-            let result =
-                execute_with_telemetry_and_session(cap, &args, dry_run, &wp, None, timeout)?;
-
+            let output = cap.execute(&args_val, &ctx).map_err(|e| format!("{}", e))?;
             if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "success": result.success,
-                        "job_id": result.job_id,
-                        "capability": result.capability,
-                        "output": result.output,
-                        "telemetry_before": result.telemetry_before,
-                        "telemetry_after": result.telemetry_after,
-                        "process_before": result.process_before,
-                        "process_after": result.process_after,
-                        "wal_seq": result.wal_seq,
-                    }))?
-                );
-            } else {
-                println!(
-                    "job: {}  cap: {}  ok: {}",
-                    result.job_id, result.capability, result.success
-                );
-                if let Some(msg) = &result.output.message {
-                    println!("  {}", msg);
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else if !quiet {
+                println!("{}", output.message.as_deref().unwrap_or("ok"));
+                if !output.data.is_null() {
+                    let text = if let Some(s) = output.data.as_str() { s.to_string() } else { output.data.to_string() };
+                    println!("{}", wall_to_markdown(&text));
                 }
-                if !quiet {
-                    println!(
-                        "  cpu: {}  ram: {} free  disk: {}",
-                        result.telemetry_before.system.cpu_model,
-                        result.telemetry_before.system.ram_free,
-                        result.telemetry_before.system.disk_used_percent
-                    );
-                    println!(
-                        "  procs: {}  zombies: {}",
-                        result.process_before.total_processes, result.process_before.zombie_count
-                    );
-                }
-                println!("  {}", serde_json::to_string_pretty(&result.output.data)?);
             }
-            Ok(())
+        }
+
+        Commands::Dispatch { capability, args, dry_run } => {
+            let args_val: Value = serde_json::from_str(&args).map_err(|e| format!("Invalid JSON args: {}", e))?;
+            let params = serde_json::json!({
+                "capability": capability,
+                "args": args_val,
+                "dry_run": dry_run,
+            });
+            match send_rpc("dispatch", params) {
+                Ok(result) => {
+                    let jid = result["job_id"].as_str().unwrap_or("?");
+                    let cap = result["capability"].as_str().unwrap_or("?");
+                    println!("Dispatched job {} (capability: {})", jid, cap);
+                    println!("Check status: runtimo wait -j {}", jid);
+                }
+                Err(e) => {
+                    eprintln!("Dispatch failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Commands::Wait { job_id, timeout } => {
+            let start = std::time::Instant::now();
+            loop {
+                let params = serde_json::json!({ "job_id": &job_id });
+                match send_rpc("status", params) {
+                    Ok(result) => {
+                        let status = result["status"].as_str().unwrap_or("unknown");
+                        match status {
+                            "running" => {
+                                if timeout > 0 && start.elapsed().as_secs() >= timeout {
+                                    println!("Job {} still running (timeout after {}s)", job_id, timeout);
+                                    return Ok(());
+                                }
+                                let elapsed = start.elapsed().as_secs();
+                                if elapsed > 0 && elapsed % 10 == 0 {
+                                    println!("Job {} still running ({}s elapsed)...", job_id, elapsed);
+                                }
+                                std::thread::sleep(std::time::Duration::from_secs(2));
+                            }
+                            "completed" => {
+                                println!("Job {} completed", job_id);
+                                return Ok(());
+                            }
+                            "failed" => {
+                                println!("Job {} failed", job_id);
+                                return Ok(());
+                            }
+                            _ => {
+                                println!("Job {} status: {}", job_id, status);
+                                return Ok(());
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Daemon might not be running; check WAL directly
+                        if let Ok(reader) = WalReader::load(&wal_path()) {
+                            let events = reader.events();
+                            let has_completed = events.iter().any(|e| e.job_id == job_id && matches!(e.event_type, runtimo_core::WalEventType::JobCompleted));
+                            if has_completed {
+                                println!("Job {} completed (checked via WAL)", job_id);
+                                return Ok(());
+                            }
+                            let has_failed = events.iter().any(|e| e.job_id == job_id && matches!(e.event_type, runtimo_core::WalEventType::JobFailed));
+                            if has_failed {
+                                println!("Job {} failed (checked via WAL)", job_id);
+                                return Ok(());
+                            }
+                        }
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                    }
+                }
+                if timeout > 0 && start.elapsed().as_secs() >= timeout {
+                    println!("Job {} still pending (timeout after {}s)", job_id, timeout);
+                    return Ok(());
+                }
+            }
         }
 
         Commands::List { schemas, json } => {
             let reg = make_registry();
-            let caps = reg.list();
-
             if json {
-                if schemas {
-                    let mut list = Vec::new();
-                    for name in &caps {
-                        if let Some(cap) = reg.get(name) {
-                            list.push(serde_json::json!({
-                                "name": name,
-                                "description": cap.description(),
-                                "schema": cap.schema(),
-                            }));
-                        }
-                    }
-                    println!("{}", serde_json::to_string_pretty(&list)?);
-                } else {
-                    let list: Vec<_> = caps.iter().map(|name| {
-                        let desc = reg.get(name).map(|c| c.description()).unwrap_or("");
-                        serde_json::json!({ "name": name, "description": desc })
-                    }).collect();
-                    println!("{}", serde_json::to_string_pretty(&list)?);
-                }
-            } else if schemas {
-                for name in caps {
+                let caps: Vec<Value> = reg.list().iter().map(|name| {
                     if let Some(cap) = reg.get(name) {
-                        println!("{} — {}", name, cap.description());
-                        println!("  {}", serde_json::to_string_pretty(&cap.schema())?);
+                        serde_json::json!({
+                            "name": name,
+                            "description": cap.description(),
+                            "schema": if schemas { Some(cap.schema().to_string()) } else { None },
+                        })
+                    } else {
+                        Value::Null
                     }
-                }
+                }).filter(|v| !v.is_null()).collect();
+                println!("{}", serde_json::to_string_pretty(&caps)?);
             } else {
-                println!("{} capabilities:", caps.len());
-                for c in caps {
-                    if let Some(cap) = reg.get(c) {
-                        println!("  {:<12} {}", c, cap.description());
+                for name in reg.list() {
+                    if let Some(cap) = reg.get(name) {
+                        print!("  {:>12}  {}", name, cap.description());
+                        if schemas {
+                            println!("\n    schema: {}", cap.schema());
+                        } else {
+                            println!();
+                        }
                     }
                 }
             }
-            Ok(())
         }
 
         Commands::Status { job_id, json } => {
-            let wp = wal_path();
-            if !wp.exists() {
-                if json {
-                    println!("{{\"events\": [], \"total\": 0}}");
-                } else {
-                    println!("no jobs yet");
-                }
-                return Ok(());
-            }
-            let reader = WalReader::load(&wp)?;
-            match job_id {
-                Some(id) => {
-                    let events: Vec<_> =
-                        reader.events().iter().filter(|e| e.job_id == id).collect();
+            if let Some(jid) = job_id {
+                // Try daemon RPC first
+                if let Ok(result) = send_rpc("status", serde_json::json!({ "job_id": &jid })) {
                     if json {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "job_id": id,
-                                "events": events,
-                            }))?
-                        );
-                    } else if events.is_empty() {
-                        println!("no events for {}", id);
+                        println!("{}", serde_json::to_string_pretty(&result)?);
                     } else {
-                        println!("job {} ({} events):", id, events.len());
-                        for e in events {
-                            println!(
-                                "  {:?}  cap={}",
-                                e.event_type,
-                                e.capability.as_deref().unwrap_or("-")
-                            );
-                        }
+                        println!("Job: {}  Status: {}  Capability: {}",
+                            result["job_id"].as_str().unwrap_or("?"),
+                            result["status"].as_str().unwrap_or("?"),
+                            result["capability"].as_str().unwrap_or("?"));
                     }
+                    return Ok(());
                 }
-                None => {
+
+                // Fallback to WAL
+                if let Ok(reader) = WalReader::load(&wal_path()) {
                     let events = reader.events();
-                    let mut jobs: std::collections::HashMap<&str, Vec<&runtimo_core::WalEvent>> =
-                        std::collections::HashMap::new();
-                    for e in events {
-                        jobs.entry(&e.job_id).or_default().push(e);
-                    }
-                    if json {
-                        let summary: Vec<_> = jobs
-                            .iter()
-                            .map(|(jid, evts)| {
-                                let last = evts.last().unwrap();
-                                serde_json::json!({
-                                    "job_id": jid,
-                                    "status": last.event_type,
-                                    "capability": last.capability,
-                                    "event_count": evts.len(),
-                                })
-                            })
-                            .collect();
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "total_events": events.len(),
-                                "jobs": summary,
-                            }))?
-                        );
+                    let by_job: Vec<_> = events.iter().filter(|e| e.job_id == jid).collect();
+                    if by_job.is_empty() {
+                        println!("Job not found: {}", jid);
                     } else {
-                        println!("{} events total:", events.len());
-                        for (jid, evts) in &jobs {
-                            let last = evts.last().unwrap();
-                            println!(
-                                "  {}  {:?}  {}",
-                                jid,
-                                last.event_type,
-                                last.capability.as_deref().unwrap_or("-")
-                            );
+                        for e in &by_job {
+                            println!("{:?}  {:>15}  {:?}",
+                                e.event_type,
+                                e.capability.as_deref().unwrap_or("-"),
+                                e.ts);
+                        }
+                    }
+                } else {
+                    println!("Cannot read WAL");
+                }
+            } else {
+                // List all jobs via daemon
+                if let Ok(result) = send_rpc("jobs", serde_json::json!({ "limit": 50 })) {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&result)?);
+                    } else {
+                        let jobs = result["jobs"].as_array().cloned().unwrap_or_default();
+                        for job in &jobs {
+                            println!("  {}  {:>8}  {}",
+                                job["job_id"].as_str().unwrap_or("?"),
+                                job["status"].as_str().unwrap_or("?"),
+                                job["capability"].as_str().unwrap_or("?"));
+                        }
+                    }
+                } else {
+                    // Fallback to WAL
+                    if let Ok(reader) = WalReader::load(&wal_path()) {
+                        let events = reader.events();
+                        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                        for e in events.iter().rev() {
+                            if seen.contains(&e.job_id) { continue; }
+                            seen.insert(e.job_id.clone());
+                            println!("{:?}  {}  {:?}  {}",
+                                e.event_type,
+                                e.job_id,
+                                e.capability.as_deref().unwrap_or("-"),
+                                e.ts);
                         }
                     }
                 }
             }
-            Ok(())
         }
 
-        Commands::Logs {
-            job_id,
-            limit,
-            json,
-        } => {
-            let wp = wal_path();
-            if !wp.exists() {
-                if json {
-                    println!("{{\"events\": [], \"total\": 0}}");
-                } else {
-                    println!("no WAL file");
+        Commands::Jobs { limit, json } => {
+            // Try daemon RPC first
+            let result = send_rpc("jobs", serde_json::json!({ "limit": limit }));
+            match result {
+                Ok(data) => {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&data)?);
+                    } else {
+                        let jobs = data["jobs"].as_array().cloned().unwrap_or_default();
+                        if jobs.is_empty() {
+                            println!("No jobs found.");
+                        } else {
+                            let md_lines: Vec<String> = jobs.iter().map(|j| {
+                                let jid = j["job_id"].as_str().unwrap_or("?");
+                                let cap = j["capability"].as_str().unwrap_or("?");
+                                let status = j["status"].as_str().unwrap_or("?");
+                                let icon = match status {
+                                    "running" => "🔄",
+                                    "completed" => "✅",
+                                    "failed" => "❌",
+                                    _ => "❓",
+                                };
+                                format!("- {} **{}**  {}  {}", icon, jid, cap, status)
+                            }).collect();
+                            println!("## Recent Jobs ({})\n{}", jobs.len(), md_lines.join("\n"));
+                        }
+                    }
                 }
-                return Ok(());
+                Err(_) => {
+                    // Fallback to WAL
+                    if let Ok(reader) = WalReader::load(&wal_path()) {
+                        let events = reader.events();
+                        let mut jobs: Vec<Value> = Vec::new();
+                        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                        for e in events.iter().rev() {
+                            if seen.contains(&e.job_id) { continue; }
+                            if jobs.len() >= limit { break; }
+                            seen.insert(e.job_id.clone());
+                            jobs.push(serde_json::json!({
+                                "job_id": e.job_id,
+                                "capability": e.capability,
+                                "status": match e.event_type {
+                                    runtimo_core::WalEventType::JobStarted => "started",
+                                    runtimo_core::WalEventType::JobCompleted => "completed",
+                                    runtimo_core::WalEventType::JobFailed => "failed",
+                                    _ => "?",
+                                },
+                                "started_at": e.ts,
+                            }));
+                        }
+                        if jobs.is_empty() {
+                            println!("No jobs found.");
+                        } else {
+                            for j in &jobs {
+                                let jid = j["job_id"].as_str().unwrap_or("?");
+                                let cap = j["capability"].as_str().unwrap_or("?");
+                                let status = j["status"].as_str().unwrap_or("?");
+                                let icon = match status {
+                                    "running" | "started" => "🔄",
+                                    "completed" => "✅",
+                                    "failed" => "❌",
+                                    _ => "❓",
+                                };
+                                println!("  {} {}  {:>15}  {}", icon, jid, cap, status);
+                            }
+                        }
+                    } else {
+                        eprintln!("Cannot read WAL. Is the daemon running?");
+                    }
+                }
             }
-            let reader = WalReader::load(&wp)?;
-            let filtered: Vec<_> = match &job_id {
-                Some(id) => reader.events().iter().filter(|e| e.job_id == *id).collect(),
-                None => reader.events().iter().collect(),
-            };
-            let show: Vec<_> = filtered.iter().rev().take(limit).rev().collect();
+        }
 
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "events": show,
-                        "total": filtered.len(),
-                        "showing": show.len(),
-                    }))?
-                );
-            } else {
-                println!("{} events:", show.len());
-                for e in show.iter().rev() {
-                    println!(
-                        "  {:?}  job={}  cap={}",
-                        e.event_type,
-                        e.job_id,
-                        e.capability.as_deref().unwrap_or("-")
-                    );
-                    if let Some(ref tel) = e.telemetry_before {
-                        println!(
-                            "    cpu={}  ram={}  procs={}",
-                            tel.system.cpu_model,
-                            tel.system.ram_free,
-                            e.process_before.as_ref().map(|p| p.total_processes).unwrap_or(0)
-                        );
+        Commands::Logs { job_id, limit, json } => {
+            // Try daemon RPC first
+            let mut params = serde_json::json!({ "limit": limit });
+            if let Some(ref jid) = job_id {
+                params["job_id"] = serde_json::json!(jid);
+            }
+            if let Ok(result) = send_rpc("logs", params) {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                } else {
+                    let events = result["events"].as_array().cloned().unwrap_or_default();
+                    for e in &events {
+                        let ts = e["ts"].as_u64().unwrap_or(0);
+                        let et = e["event_type"].as_str().unwrap_or("?");
+                        let jid = e["job_id"].as_str().unwrap_or("?");
+                        let cap = e["capability"].as_str().unwrap_or("-");
+                        println!("{:?}  {}  {}  {:>15}", et, ts, jid, cap);
                     }
-                    if let Some(ref tel) = e.telemetry_after {
-                        println!(
-                            "    after: ram={}  procs={}",
-                            tel.system.ram_free,
-                            e.process_after.as_ref().map(|p| p.total_processes).unwrap_or(0)
-                        );
-                    }
-                    if let Some(ref out) = e.output {
-                        println!("    {}", out);
-                    }
-                    if let Some(ref err) = e.error {
-                        println!("    err: {}", err);
+                }
+            } else if let Ok(reader) = WalReader::load(&wal_path()) {
+                let events = reader.events();
+                let filtered: Vec<_> = if let Some(ref jid) = job_id {
+                    events.iter().filter(|e| e.job_id == *jid).collect()
+                } else {
+                    events.iter().collect()
+                };
+                let recent: Vec<_> = filtered.iter().rev().take(limit).rev().collect();
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&recent)?);
+                } else {
+                    for e in &recent {
+                        println!("{:?}  {}  {:?}  {}",
+                            e.event_type,
+                            e.job_id,
+                            e.capability.as_deref().unwrap_or("-"),
+                            e.ts);
                     }
                 }
             }
-            Ok(())
         }
 
         Commands::Undo { job_id, dry_run } => {
-            let wp = wal_path();
-            if !wp.exists() {
-                return Err("no WAL file".into());
-            }
-            let reader = WalReader::load(&wp)?;
-            let events: Vec<_> = reader
-                .events()
-                .iter()
-                .filter(|e| e.job_id == job_id)
-                .collect();
-            if events.is_empty() {
-                return Err(format!("no events for job {}", job_id).into());
-            }
-
-            let bd = backup_dir().join(&job_id);
-            if !bd.exists() {
-                return Err(format!("no backup for job {}", job_id).into());
-            }
-
-            let mut target_paths: std::collections::HashMap<String, String> =
-                std::collections::HashMap::new();
-            for event in &events {
-                if let Some(output) = &event.output {
-                    let path = output.get("path").and_then(|p| p.as_str()).or_else(|| {
-                        output
-                            .get("data")
-                            .and_then(|d| d.get("path"))
-                            .and_then(|p| p.as_str())
-                    });
-                    let backup = output
-                        .get("data")
-                        .and_then(|d| d.get("backup_path"))
-                        .and_then(|b| b.as_str());
-                    if let (Some(p), Some(b)) = (path, backup) {
-                        if let Some(filename) =
-                            std::path::Path::new(b).file_name().and_then(|n| n.to_str())
-                        {
-                            target_paths.insert(filename.to_string(), p.to_string());
-                        }
-                    }
-                }
-            }
-
-            if dry_run {
-                println!(
-                    "Would restore {} file(s) for job {}:",
-                    bd.read_dir()?.count(),
-                    job_id
-                );
-                for entry in std::fs::read_dir(&bd)? {
-                    let entry = entry?;
-                    let bp = entry.path();
-                    if bp.is_file() {
-                        if let Some(target) = target_paths.get(&job_id) {
-                            println!("  {} → {}", bp.display(), target);
-                        } else {
-                            println!("  {} (unknown target)", bp.display());
-                        }
-                    }
-                }
-                return Ok(());
-            }
-
-            let mut restored = 0;
-            for entry in std::fs::read_dir(&bd)? {
-                let entry = entry?;
-                let bp = entry.path();
-                if bp.is_file() {
-                    let filename = bp.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-                    let target = if let Some(target_path) = target_paths.get(filename) {
-                        let candidate = std::path::PathBuf::from(target_path);
-                        let restore_ctx = PathContext {
-                            require_exists: false,
-                            require_file: false,
-                            ..Default::default()
-                        };
-                        validate_path(target_path, &restore_ctx).map_err(|e| {
-                            format!(
-                                "restore target validation failed for {}: {}",
-                                target_path, e
-                            )
-                        })?;
-                        candidate
-                    } else {
-                        return Err(format!(
-                            "Cannot determine original path for backup file {:?}. \
-                             WAL does not contain the target path for job {}.",
-                            bp.file_name().unwrap_or_default(),
-                            job_id
-                        )
-                        .into());
-                    };
-                    BackupManager::new(backup_dir())?.restore(&bp, &target)?;
-                    restored += 1;
-                }
-            }
-            println!("restored {} file(s) for job {}", restored, job_id);
-            Ok(())
+            let reg = make_registry();
+            let cap = reg.get("Undo").ok_or("Undo capability not available")?;
+            let args = serde_json::json!({ "job_id": job_id });
+            let ctx = runtimo_core::Context {
+                dry_run,
+                job_id: runtimo_core::utils::generate_id(),
+                working_dir: std::env::current_dir().unwrap_or_default(),
+            };
+            let output = cap.execute(&args, &ctx).map_err(|e| format!("{}", e))?;
+            println!("{}", output.message.as_deref().unwrap_or("undo completed"));
         }
 
         Commands::Telemetry { json } => {
@@ -562,9 +537,24 @@ fn main() -> Result<(), Box<dyn Error>> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&tel)?);
             } else {
-                tel.print_report();
+                let text = format!(
+                    "RUNTIMO TELEMETRY\n\nSystem\nCPU: {}\nRAM: {} total, {} free\nDisk: {} total, {} free ({}% used)\nUptime: {}\nLoad: {}\n\nHardware\nAccelerators: {}\n\nServices\n{}\n\nNetwork\nPublic IP: {}\nTunnel: {}",
+                    tel.system.cpu_model,
+                    tel.system.ram_total, tel.system.ram_free,
+                    tel.system.disk_total, tel.system.disk_free, tel.system.disk_used_percent,
+                    tel.system.uptime,
+                    tel.system.load_average,
+                    if tel.hardware.accelerators.is_empty() { "none".into() } else {
+                        tel.hardware.accelerators.iter().map(|a| format!("{}: {}x", a.kind, a.count)).collect::<Vec<_>>().join(", ")
+                    },
+                    if tel.services.detected_services.is_empty() { "none detected".into() } else {
+                        tel.services.detected_services.iter().map(|s| format!("{}: {} {}", s.name, s.version.as_deref().unwrap_or("?"), if s.running { "running" } else { "stopped" })).collect::<Vec<_>>().join(", ")
+                    },
+                    tel.network.public_ip,
+                    if tel.network.tunnel_running { "running" } else { "not running" },
+                );
+                println!("{}", wall_to_markdown(&text));
             }
-            Ok(())
         }
 
         Commands::Processes { json } => {
@@ -572,53 +562,50 @@ fn main() -> Result<(), Box<dyn Error>> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&snap)?);
             } else {
-                snap.print_report();
+                let text = format!(
+                    "PROCESS SNAPSHOT\n\nSummary\nTotal: {}\nCPU: {:.1}%\nMemory: {:.1}%\nZombies: {}\n\nTop CPU\n{}\n\nTop Memory\n{}",
+                    snap.summary.total_processes,
+                    snap.summary.total_cpu_percent,
+                    snap.summary.total_mem_percent,
+                    snap.summary.zombie_count,
+                    snap.top_by_cpu(5).iter().map(|p| format!("- {} {} {} {}% CPU", p.pid, p.command.chars().take(40).collect::<String>(), p.stat, p.cpu_percent)).collect::<Vec<_>>().join("\n"),
+                    snap.top_by_mem(5).iter().map(|p| format!("- {} {} {} {}% MEM", p.pid, p.command.chars().take(40).collect::<String>(), p.stat, p.mem_percent)).collect::<Vec<_>>().join("\n"),
+                );
+                println!("{}", wall_to_markdown(&text));
             }
-            Ok(())
         }
 
-        Commands::Config { action } => match action {
-            ConfigAction::AllowedPaths { subaction } => match subaction {
-                AllowedPathsAction::Add { paths } => {
+        Commands::Config { action } => {
+            match action {
+                ConfigAction::AllowedPaths { subaction } => {
                     let mut config = RuntimoConfig::load();
-                    for p in &paths {
-                        if !config.allowed_paths.contains(p) {
-                            config.allowed_paths.push(p.clone());
+                    match subaction {
+                        AllowedPathsAction::Add { paths } => {
+                            for p in paths {
+                                if !config.allowed_paths.contains(&p) {
+                                    config.allowed_paths.push(p);
+                                }
+                            }
+                            config.save().map_err(|e| format!("Save failed: {}", e))?;
+                            println!("Prefixes updated: {:?}", config.allowed_paths);
+                        }
+                        AllowedPathsAction::Remove { paths } => {
+                            config.allowed_paths.retain(|p| !paths.contains(p));
+                            config.save().map_err(|e| format!("Save failed: {}", e))?;
+                            println!("Prefixes updated: {:?}", config.allowed_paths);
+                        }
+                        AllowedPathsAction::List => {
+                            let all = RuntimoConfig::get_allowed_prefixes();
+                            println!("Allowed path prefixes:");
+                            for p in all {
+                                println!("  {}", p);
+                            }
                         }
                     }
-                    config.save().map_err(|e| format!("config save failed: {}", e))?;
-                    println!(
-                        "added {} path(s) to {}",
-                        paths.len(),
-                        RuntimoConfig::config_path().display()
-                    );
-                    Ok(())
                 }
-                AllowedPathsAction::Remove { paths } => {
-                    let mut config = RuntimoConfig::load();
-                    config.allowed_paths.retain(|p| !paths.contains(p));
-                    config.save().map_err(|e| format!("config save failed: {}", e))?;
-                    println!(
-                        "removed {} path(s) from {}",
-                        paths.len(),
-                        RuntimoConfig::config_path().display()
-                    );
-                    Ok(())
-                }
-                AllowedPathsAction::List => {
-                    let config = RuntimoConfig::load();
-                    let all = RuntimoConfig::get_allowed_prefixes();
-                    println!("configured paths:");
-                    for p in &config.allowed_paths {
-                        println!("  {}", p);
-                    }
-                    println!("effective paths (defaults + env + config):");
-                    for p in &all {
-                        println!("  {}", p);
-                    }
-                    Ok(())
-                }
-            },
-        },
+            }
+        }
     }
+
+    Ok(())
 }
