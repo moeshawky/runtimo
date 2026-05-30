@@ -908,7 +908,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Reconcile orphaned jobs left from a previous crash/termination
     reconcile_orphaned_jobs(&wal_path);
 
-    let _monitor = runtimo_core::HealthMonitor::start();
+    let _monitor = match runtimo_core::HealthMonitor::start() {
+        Ok(m) => Some(m),
+        Err(e) => {
+            eprintln!("HealthMonitor failed to start: {}", e);
+            None
+        }
+    };
 
     let listener = tokio::net::UnixListener::bind(&args.socket)?;
     println!("Listening on {}", args.socket.display());

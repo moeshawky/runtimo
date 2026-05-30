@@ -11,7 +11,10 @@
 //! The blocklist catches obvious agent hallucinations/bugs.
 //!
 //! **What's blocked:**
-//! - Filesystem destruction: `rm -rf /`, `mkfs.*`, `dd if=/dev/zero`
+//! - Filesystem destruction: `rm -rf /`, `rm -rf` on system dirs (`/home`, `/etc`, `/usr`, `/var`, `/lib`, `/opt`, `/bin`, `/sbin`)
+//! - Shell expansion bypasses: `rm -rf ~` (tilde expansion)
+//! - Filesystem creation: `mkfs.*`, `mkswap`
+//! - Data destruction: `dd if=/dev/zero`
 //! - System commands: `shutdown`, `reboot`, `poweroff`
 //! - Disk operations: `fdisk`, `parted`
 //!
