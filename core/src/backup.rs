@@ -53,7 +53,8 @@ const MAX_BACKUP_SIZE: u64 = 100 * 1024 * 1024;
 /// Returns `Err` if the path is a symlink, even if the symlink target is
 /// a valid directory. This prevents symlink substitution attacks.
 fn verify_real_directory(path: &Path) -> Result<()> {
-    if path.symlink_metadata()
+    if path
+        .symlink_metadata()
         .map_err(|e| crate::Error::BackupError(format!("cannot stat {}: {}", path.display(), e)))?
         .file_type()
         .is_symlink()
@@ -121,16 +122,19 @@ impl BackupManager {
         if meta.file_type().is_symlink() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("symlink detected: {} (symlinks not allowed)", path.display()),
+                format!(
+                    "symlink detected: {} (symlinks not allowed)",
+                    path.display()
+                ),
             ));
         }
         if meta.is_file() {
             Ok(meta.len())
         } else if meta.is_dir() {
-            let mut total = 0;
+            let mut total: u64 = 0;
             for entry in std::fs::read_dir(path)? {
                 let entry = entry?;
-                total += Self::calculate_size(&entry.path())?;
+                total = total.saturating_add(Self::calculate_size(&entry.path())?);
             }
             Ok(total)
         } else {
@@ -159,7 +163,10 @@ impl BackupManager {
         if metadata.file_type().is_symlink() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("symlink detected: {} (symlinks not allowed for security)", src.display()),
+                format!(
+                    "symlink detected: {} (symlinks not allowed for security)",
+                    src.display()
+                ),
             ));
         }
 
@@ -172,11 +179,10 @@ impl BackupManager {
                 Self::copy_recursive(&src_path, &dst_path)?;
             }
             Self::copy_permissions(src, dst)?;
-            Ok(())
         } else {
             std::fs::copy(src, dst)?;
-            Ok(())
         }
+        Ok(())
     }
 
     /// Creates a backup of a file or directory before mutation.
@@ -228,13 +234,14 @@ impl BackupManager {
             if candidate.symlink_metadata().is_err() {
                 candidate
             } else {
-                let mut counter = 1;
+                let mut counter: u32 = 1;
                 loop {
-                    let suffixed = job_dir.join(format!("{}.{}", base_name.to_string_lossy(), counter));
+                    let suffixed =
+                        job_dir.join(format!("{}.{}", base_name.to_string_lossy(), counter));
                     if suffixed.symlink_metadata().is_err() {
                         break suffixed;
                     }
-                    counter += 1;
+                    counter = counter.saturating_add(1);
                 }
             }
         };
@@ -269,8 +276,7 @@ impl BackupManager {
         if target_path.symlink_metadata().is_ok() {
             let pre_restore_dir = target_path
                 .parent()
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| PathBuf::from("."))
+                .map_or_else(|| PathBuf::from("."), |p| p.to_path_buf())
                 .join(".runtimo_pre_restore");
             std::fs::create_dir_all(&pre_restore_dir).map_err(|e| {
                 crate::Error::BackupError(format!("Cannot create pre-restore backup dir: {}", e))
@@ -281,11 +287,12 @@ impl BackupManager {
             let pre_restore_path = pre_restore_dir.join(target_name);
             let _ = std::fs::remove_dir_all(&pre_restore_path);
             let _ = std::fs::remove_file(&pre_restore_path);
-            Self::copy_recursive(target_path, &pre_restore_path)
-                .map_err(|e| crate::Error::BackupError(format!("Pre-restore backup failed: {}", e)))?;
+            Self::copy_recursive(target_path, &pre_restore_path).map_err(|e| {
+                crate::Error::BackupError(format!("Pre-restore backup failed: {}", e))
+            })?;
         }
 
-        BackupManager::copy_recursive(backup_path, target_path)
+        Self::copy_recursive(backup_path, target_path)
             .map_err(|e| crate::Error::BackupError(e.to_string()))?;
 
         Ok(())
@@ -302,6 +309,10 @@ impl BackupManager {
     /// Symlinks are skipped rather than deleted, preventing accidental
     /// deletion of symlink targets (e.g., `remove_dir_all` on a symlink
     /// to `/etc` would be catastrophic).
+    ///
+    /// # Errors
+    /// Returns an error if the cleanup directory cannot be read, or if
+    /// symlink metadata queries fail.
     pub fn cleanup(&self, older_than_secs: u64) -> Result<()> {
         use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -321,7 +332,8 @@ impl BackupManager {
             let entry = entry.map_err(|e| crate::Error::BackupError(e.to_string()))?;
             let path = entry.path();
 
-            let meta = path.symlink_metadata()
+            let meta = path
+                .symlink_metadata()
                 .map_err(|e| crate::Error::BackupError(e.to_string()))?;
             if meta.file_type().is_symlink() {
                 continue;
@@ -348,6 +360,7 @@ impl BackupManager {
 }
 
 #[cfg(test)]
+#[allow(clippy::unused_result_ok, clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -380,7 +393,11 @@ mod tests {
                     "BackupManager should reject symlink backup directory"
                 );
                 let err = result.err().unwrap().to_string();
-                assert!(err.contains("symlink"), "error should mention symlink: {}", err);
+                assert!(
+                    err.contains("symlink"),
+                    "error should mention symlink: {}",
+                    err
+                );
                 std::fs::remove_file(&link).ok();
             }
         }
@@ -453,7 +470,11 @@ mod tests {
                     "should reject directory containing symlinks"
                 );
                 let err = result.err().unwrap().to_string();
-                assert!(err.contains("symlink"), "error should mention symlink: {}", err);
+                assert!(
+                    err.contains("symlink"),
+                    "error should mention symlink: {}",
+                    err
+                );
             }
         }
 
@@ -482,7 +503,11 @@ mod tests {
         let backup_path = backup_result.unwrap();
 
         let restore_result = mgr.restore(&backup_path, &restore_dir);
-        assert!(restore_result.is_ok(), "should restore directory: {:?}", restore_result);
+        assert!(
+            restore_result.is_ok(),
+            "should restore directory: {:?}",
+            restore_result
+        );
         assert!(restore_dir.join("file1.txt").exists());
         assert!(restore_dir.join("file2.txt").exists());
 
@@ -519,7 +544,10 @@ mod tests {
         let backup_path = result.unwrap();
         let backup_script = backup_path.join("script.sh");
         let backup_perms = std::fs::metadata(backup_script).unwrap().permissions();
-        assert!(backup_perms.mode() & 0o111 == 0o111, "executable bit should be preserved");
+        assert!(
+            backup_perms.mode() & 0o111 == 0o111,
+            "executable bit should be preserved"
+        );
 
         std::fs::remove_dir_all(&backup_dir).ok();
         std::fs::remove_dir_all(&source_dir).ok();
@@ -565,12 +593,7 @@ mod tests {
         std::fs::remove_dir_all(&backup_dir).ok();
         std::fs::remove_dir_all(&source_dir).ok();
         std::fs::remove_dir_all(&target_dir).ok();
-        let _ = std::fs::remove_dir_all(
-            target_dir
-                .parent()
-                .unwrap()
-                .join(".runtimo_pre_restore"),
-        );
+        let _ = std::fs::remove_dir_all(target_dir.parent().unwrap().join(".runtimo_pre_restore"));
     }
 
     #[test]
@@ -613,10 +636,7 @@ mod tests {
             if symlink(&real_target, &symlink_path).is_ok() {
                 let mgr = BackupManager::new(backup_dir.clone()).unwrap();
                 let result = mgr.cleanup(0);
-                assert!(
-                    result.is_ok(),
-                    "cleanup should succeed even with symlinks"
-                );
+                assert!(result.is_ok(), "cleanup should succeed even with symlinks");
 
                 assert!(
                     real_target.join("important.txt").exists(),

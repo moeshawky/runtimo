@@ -1,0 +1,7 @@
+# Lint calibration thresholds — raised from defaults where the codebase
+# has legitimately complex functions/files that reflect real architecture,
+# not simple lint violations.
+
+cognitive-complexity-threshold = 30
+too-many-arguments-threshold = 9
+too-many-lines-threshold = 200

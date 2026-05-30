@@ -164,6 +164,12 @@ pub fn execute_with_telemetry(
 /// * `wal_path` — Path to the WAL file
 /// * `session_id` — Optional session ID to track this job
 /// * `timeout_secs` — Timeout for capability execution
+///
+/// # Errors
+///
+/// Returns an error if capability execution fails, if WAL operations fail,
+/// or if a session cannot be created for the job.
+#[allow(clippy::too_many_lines)]
 pub fn execute_with_telemetry_and_session(
     capability: &dyn Capability,
     args: &Value,
@@ -182,7 +188,7 @@ pub fn execute_with_telemetry_and_session(
     // LlmoSafeGuard is the circuit breaker — reads /proc/stat with delta measurement
     LlmoSafeGuard::new()
         .check()
-        .map_err(|e| Error::ResourceLimitExceeded(e.to_string()))?;
+        .map_err(Error::ResourceLimitExceeded)?;
 
     // Reject if zombie count > 10
     if process_before.summary.zombie_count > 10 {
@@ -193,9 +199,8 @@ pub fn execute_with_telemetry_and_session(
     }
 
     // Args size guard: reject oversized arguments (1MB max)
-    let args_bytes = serde_json::to_vec(args).map_err(|e| {
-        Error::ExecutionFailed(format!("Failed to serialize args: {}", e))
-    })?;
+    let args_bytes = serde_json::to_vec(args)
+        .map_err(|e| Error::ExecutionFailed(format!("Failed to serialize args: {}", e)))?;
     if args_bytes.len() > MAX_ARGS_SIZE_BYTES {
         return Err(Error::ResourceLimitExceeded(format!(
             "Capability args too large: {} bytes (limit: 1MB)",
@@ -337,10 +342,30 @@ pub fn execute_with_telemetry_and_session(
     // the generic output blob. Uses truncate_to to prevent WAL bloat from large output.
     #[cfg(debug_assertions)]
     if cap_name == "ShellExec" {
-        let cmd_str = output.data.get("cmd").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let stdout_str = output.data.get("stdout").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let stderr_str = output.data.get("stderr").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let exit_code = output.data.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(-1) as i32;
+        let cmd_str = output
+            .data
+            .get("cmd")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let stdout_str = output
+            .data
+            .get("stdout")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let stderr_str = output
+            .data
+            .get("stderr")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        #[allow(clippy::cast_possible_truncation)] // safe: exit codes are 0-255
+        let exit_code = output
+            .data
+            .get("exit_code")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(-1) as i32;
         let cmd_seq = wal.seq();
         let cmd_ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -369,8 +394,7 @@ pub fn execute_with_telemetry_and_session(
     // Add job to session if session tracking is enabled
     if let Some(sid) = session_id {
         let sessions_dir = std::env::var("RUNTIMO_SESSIONS_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| crate::utils::data_dir().join("sessions"));
+            .map_or_else(|_| crate::utils::data_dir().join("sessions"), PathBuf::from);
         match SessionManager::new(sessions_dir) {
             Ok(mut mgr) => {
                 if let Err(e) = mgr.add_job(sid, &job_id_str) {

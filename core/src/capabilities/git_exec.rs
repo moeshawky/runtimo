@@ -78,15 +78,32 @@ pub struct GitState {
 
 /// Known secret file patterns to exclude from `git add -A`.
 const SECRET_PATTERNS: &[&str] = &[
-    ".env", ".env.local", ".env.production", ".env.staging",
-    "credentials.json", "credentials.yml", "credentials.yaml",
-    "secrets.json", "secrets.yml", "secrets.yaml",
-    ".ssh/id_rsa", ".ssh/id_ed25519", ".ssh/id_dsa",
-    "id_rsa", "id_ed25519", "id_dsa",
-    ".npmrc", ".pypirc", ".docker/config.json",
-    "token", "api_key", "api_secret",
-    ".aws/credentials", ".azure/credentials",
-    "keystore.jks", "keystore.p12",
+    ".env",
+    ".env.local",
+    ".env.production",
+    ".env.staging",
+    "credentials.json",
+    "credentials.yml",
+    "credentials.yaml",
+    "secrets.json",
+    "secrets.yml",
+    "secrets.yaml",
+    ".ssh/id_rsa",
+    ".ssh/id_ed25519",
+    ".ssh/id_dsa",
+    "id_rsa",
+    "id_ed25519",
+    "id_dsa",
+    ".npmrc",
+    ".pypirc",
+    ".docker/config.json",
+    "token",
+    "api_key",
+    "api_secret",
+    ".aws/credentials",
+    ".azure/credentials",
+    "keystore.jks",
+    "keystore.p12",
 ];
 
 /// Maximum number of untracked files allowed for `git clean -fd`.
@@ -193,7 +210,9 @@ impl GitExec {
         }
 
         if is_https {
-            if let Some(host_part) = url.strip_prefix("https://").and_then(|s| s.split('/').next())
+            if let Some(host_part) = url
+                .strip_prefix("https://")
+                .and_then(|s| s.split('/').next())
             {
                 let host = host_part.split(':').next().unwrap_or(host_part);
                 if Self::is_ssrf_host(host) {
@@ -246,7 +265,9 @@ impl GitExec {
             "[::1]",
             "[fe80:",
         ];
-        ssrf_indicators.iter().any(|indicator| lower.contains(indicator))
+        ssrf_indicators
+            .iter()
+            .any(|indicator| lower.contains(indicator))
     }
 
     /// Validates a branch name.
@@ -282,6 +303,7 @@ impl GitExec {
 
     /// Sanitizes credentials from a URL string (redacts user:pass@).
     /// Preserves SSH-style URLs (git@host:path) unchanged.
+    #[allow(clippy::arithmetic_side_effects)]
     fn sanitize_url(url: &str) -> String {
         if url.starts_with("git@") {
             return url.to_string();
@@ -305,7 +327,8 @@ impl GitExec {
             while let Some(c) = chars.next() {
                 if c == ':' && chars.peek() == Some(&'/') && chars.clone().nth(1) == Some('/') {
                     result.push_str("://");
-                    chars.next(); chars.next();
+                    chars.next();
+                    chars.next();
                     let mut user_pass = String::new();
                     let mut found_at = false;
                     for nc in chars.by_ref() {
@@ -330,7 +353,11 @@ impl GitExec {
             result
         };
 
-        output.lines().map(re_pattern).collect::<Vec<_>>().join("\n")
+        output
+            .lines()
+            .map(re_pattern)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Checks if a file path looks like a secret file that should not be committed.
@@ -393,16 +420,25 @@ impl GitExec {
 
     /// Counts untracked files that would be removed by git clean -fd.
     fn count_untracked_files(repo_path: &Path, timeout_secs: u64) -> Result<usize> {
-        let output = Self::run_git_with_timeout(repo_path, &["ls-files", "--others", "--exclude-standard"], timeout_secs)?;
+        let output = Self::run_git_with_timeout(
+            repo_path,
+            &["ls-files", "--others", "--exclude-standard"],
+            timeout_secs,
+        )?;
         Ok(output.lines().filter(|l| !l.is_empty()).count())
     }
 
     /// Sanitizes a commit message (strips control chars, ensures non-empty).
     fn sanitize_commit_message(msg: &str) -> Result<String> {
-        let sanitized: String = msg.chars().filter(|c| !c.is_control() || *c == '\n' || *c == '\t').collect();
+        let sanitized: String = msg
+            .chars()
+            .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+            .collect();
         let trimmed = sanitized.trim();
         if trimmed.is_empty() {
-            return Err(Error::SchemaValidationFailed("Commit message is empty after sanitization".into()));
+            return Err(Error::SchemaValidationFailed(
+                "Commit message is empty after sanitization".into(),
+            ));
         }
         Ok(trimmed.to_string())
     }
@@ -414,21 +450,31 @@ impl GitExec {
 
     /// Captures the current git state for a repository.
     fn capture_state(repo_path: &Path, timeout_secs: u64) -> Result<GitState> {
-        let commit_sha = Self::run_git_with_timeout(repo_path, &["rev-parse", "HEAD"], timeout_secs)
-            .map(|s| s.trim().to_string())
-            .ok();
+        let commit_sha =
+            Self::run_git_with_timeout(repo_path, &["rev-parse", "HEAD"], timeout_secs)
+                .map(|s| s.trim().to_string())
+                .ok();
 
-        let branch = Self::run_git_with_timeout(repo_path, &["rev-parse", "--abbrev-ref", "HEAD"], timeout_secs)
-            .map(|s| s.trim().to_string())
-            .ok();
+        let branch = Self::run_git_with_timeout(
+            repo_path,
+            &["rev-parse", "--abbrev-ref", "HEAD"],
+            timeout_secs,
+        )
+        .map(|s| s.trim().to_string())
+        .ok();
 
-        let remote_url = Self::run_git_with_timeout(repo_path, &["remote", "get-url", "origin"], timeout_secs)
-            .ok()
-            .and_then(|s| {
-                let trimmed = s.trim().to_string();
-                let sanitized = Self::sanitize_url(&trimmed);
-                if sanitized.is_empty() { None } else { Some(sanitized) }
-            });
+        let remote_url =
+            Self::run_git_with_timeout(repo_path, &["remote", "get-url", "origin"], timeout_secs)
+                .ok()
+                .and_then(|s| {
+                    let trimmed = s.trim().to_string();
+                    let sanitized = Self::sanitize_url(&trimmed);
+                    if sanitized.is_empty() {
+                        None
+                    } else {
+                        Some(sanitized)
+                    }
+                });
 
         let is_clean = Self::is_working_tree_clean(repo_path);
 
@@ -443,6 +489,7 @@ impl GitExec {
 
     /// Executes git clone operation.
     fn op_clone(&self, args: &GitExecArgs, ctx: &Context) -> Result<Output> {
+        let _ = self;
         let timeout_secs = args.timeout_secs.unwrap_or(300);
         let url = args
             .url
@@ -463,7 +510,7 @@ impl GitExec {
             )));
         }
 
-        if let Some(free) = Self::disk_free_bytes(path.parent().unwrap_or(Path::new("/"))) {
+        if let Some(free) = Self::disk_free_bytes(path.parent().unwrap_or_else(|| Path::new("/"))) {
             if free < 100 * 1024 * 1024 {
                 return Err(Error::ExecutionFailed(
                     "Insufficient disk space for clone (need at least 100MB)".into(),
@@ -525,13 +572,18 @@ impl GitExec {
                 Err(e) => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(Error::ExecutionFailed(format!("git clone wait error: {}", e)));
+                    return Err(Error::ExecutionFailed(format!(
+                        "git clone wait error: {}",
+                        e
+                    )));
                 }
             }
         };
 
         if !status.success() {
-            return Err(Error::ExecutionFailed("git clone failed (see stderr)".into()));
+            return Err(Error::ExecutionFailed(
+                "git clone failed (see stderr)".into(),
+            ));
         }
 
         let state = Self::capture_state(path, timeout_secs)?;
@@ -546,13 +598,17 @@ impl GitExec {
                 "branch": state.branch,
                 "remote_url": state.remote_url
             }),
-            message: Some(format!("Cloned {} to {}", Self::sanitize_url(url), path.display())),
+            message: Some(format!(
+                "Cloned {} to {}",
+                Self::sanitize_url(url),
+                path.display()
+            )),
         })
     }
 
     /// Executes git pull operation.
-    fn op_pull(&self, _args: &GitExecArgs, ctx: &Context, repo_path: &Path) -> Result<Output> {
-        let timeout_secs = _args.timeout_secs.unwrap_or(300);
+    fn op_pull(&self, args: &GitExecArgs, ctx: &Context, repo_path: &Path) -> Result<Output> {
+        let timeout_secs = args.timeout_secs.unwrap_or(300);
 
         if !repo_path.exists() {
             return Err(Error::ExecutionFailed(format!(
@@ -639,7 +695,11 @@ impl GitExec {
                 let _ = output;
             }
         } else {
-            let untracked = Self::run_git_with_timeout(repo_path, &["ls-files", "--others", "--exclude-standard"], timeout_secs)?;
+            let untracked = Self::run_git_with_timeout(
+                repo_path,
+                &["ls-files", "--others", "--exclude-standard"],
+                timeout_secs,
+            )?;
             for line in untracked.lines() {
                 let file = line.trim();
                 if file.is_empty() {
@@ -649,13 +709,15 @@ impl GitExec {
                     eprintln!("[runtimo] Skipping secret file from git add: {}", file);
                     continue;
                 }
-                Self::run_git_with_timeout(repo_path, &["add", file], timeout_secs)
-                    .map_err(|e| Error::ExecutionFailed(format!("git add {} failed: {}", file, e)))?;
+                Self::run_git_with_timeout(repo_path, &["add", file], timeout_secs).map_err(
+                    |e| Error::ExecutionFailed(format!("git add {} failed: {}", file, e)),
+                )?;
             }
         }
 
-        let output = Self::run_git_with_timeout(repo_path, &["commit", "-m", &message], timeout_secs)
-            .map_err(|e| Error::ExecutionFailed(format!("git commit failed: {}", e)))?;
+        let output =
+            Self::run_git_with_timeout(repo_path, &["commit", "-m", &message], timeout_secs)
+                .map_err(|e| Error::ExecutionFailed(format!("git commit failed: {}", e)))?;
         let _ = output;
 
         let state_after = Self::capture_state(repo_path, timeout_secs)?;
@@ -710,8 +772,12 @@ impl GitExec {
 
         let backup_path = Some(self.backup_before_mutation(repo_path, &ctx.job_id)?);
 
-        let output = Self::run_git_with_timeout(repo_path, &["revert", "--no-edit", commit_sha], timeout_secs)
-            .map_err(|e| Error::ExecutionFailed(format!("git revert failed: {}", e)))?;
+        let output = Self::run_git_with_timeout(
+            repo_path,
+            &["revert", "--no-edit", commit_sha],
+            timeout_secs,
+        )
+        .map_err(|e| Error::ExecutionFailed(format!("git revert failed: {}", e)))?;
         let _ = output;
 
         let state_after = Self::capture_state(repo_path, timeout_secs)?;
@@ -746,9 +812,10 @@ impl GitExec {
 
         if ctx.dry_run {
             let untracked_count = Self::count_untracked_files(repo_path, timeout_secs).unwrap_or(0);
-            let preview = Self::run_git_with_timeout(repo_path, &["clean", "-fd", "--dry-run"], timeout_secs)
-                .map(|s| Self::sanitize_output(&s))
-                .unwrap_or_default();
+            let preview =
+                Self::run_git_with_timeout(repo_path, &["clean", "-fd", "--dry-run"], timeout_secs)
+                    .map(|s| Self::sanitize_output(&s))
+                    .unwrap_or_default();
             return Ok(Output {
                 success: true,
                 data: serde_json::json!({
@@ -758,7 +825,10 @@ impl GitExec {
                     "untracked_count": untracked_count,
                     "preview": preview
                 }),
-                message: Some(format!("DRY RUN: would clean {} untracked files", untracked_count)),
+                message: Some(format!(
+                    "DRY RUN: would clean {} untracked files",
+                    untracked_count
+                )),
             });
         }
 
@@ -793,6 +863,7 @@ impl GitExec {
     }
 
     /// Executes git status operation.
+    #[allow(clippy::unused_self, clippy::used_underscore_binding)]
     fn op_status(&self, _args: &GitExecArgs, _ctx: &Context, repo_path: &Path) -> Result<Output> {
         let timeout_secs = _args.timeout_secs.unwrap_or(300);
 
@@ -806,7 +877,8 @@ impl GitExec {
         let state = Self::capture_state(repo_path, timeout_secs)?;
 
         let status_output =
-            Self::run_git_with_timeout(repo_path, &["status", "--porcelain"], timeout_secs).unwrap_or_default();
+            Self::run_git_with_timeout(repo_path, &["status", "--porcelain"], timeout_secs)
+                .unwrap_or_default();
 
         let branch = state.branch.clone().unwrap_or_default();
         let remote_url = state.remote_url.clone().unwrap_or_default();
@@ -963,13 +1035,25 @@ impl Capability for GitExec {
         let telemetry_after = Telemetry::capture();
         let process_after = ProcessSnapshot::capture();
 
-    let mut output = result?;
-    if let Some(obj) = output.data.as_object_mut() {
-        obj.insert("telemetry_before".to_string(), serde_json::to_value(&telemetry_before).unwrap_or(Value::Null));
-        obj.insert("telemetry_after".to_string(), serde_json::to_value(&telemetry_after).unwrap_or(Value::Null));
-        obj.insert("process_before".to_string(), serde_json::to_value(&process_before.summary).unwrap_or(Value::Null));
-        obj.insert("process_after".to_string(), serde_json::to_value(&process_after.summary).unwrap_or(Value::Null));
-    }
+        let mut output = result?;
+        if let Some(obj) = output.data.as_object_mut() {
+            obj.insert(
+                "telemetry_before".to_string(),
+                serde_json::to_value(&telemetry_before).unwrap_or(Value::Null),
+            );
+            obj.insert(
+                "telemetry_after".to_string(),
+                serde_json::to_value(&telemetry_after).unwrap_or(Value::Null),
+            );
+            obj.insert(
+                "process_before".to_string(),
+                serde_json::to_value(&process_before.summary).unwrap_or(Value::Null),
+            );
+            obj.insert(
+                "process_after".to_string(),
+                serde_json::to_value(&process_after.summary).unwrap_or(Value::Null),
+            );
+        }
 
         Ok(output)
     }
@@ -1058,6 +1142,7 @@ mod tests {
         assert!(GitExec::validate_commit_sha("xyz123").is_err());
     }
 
+    #[allow(clippy::expect_used)]
     #[test]
     fn rejects_path_traversal() {
         let cap = GitExec::new(test_backup_dir()).expect("Failed to create GitExec");
@@ -1074,6 +1159,7 @@ mod tests {
         std::fs::remove_dir_all(test_backup_dir()).ok();
     }
 
+    #[allow(clippy::expect_used)]
     #[test]
     fn rejects_invalid_operation() {
         let cap = GitExec::new(test_backup_dir()).expect("Failed to create GitExec");
@@ -1089,6 +1175,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn status_on_nonexistent_repo() {
         let cap = GitExec::new(test_backup_dir()).expect("Failed to create GitExec");
 
@@ -1122,9 +1209,17 @@ mod tests {
     fn timeout_enforced_on_git_command() {
         let tmp = std::env::temp_dir().join("runtimo_git_timeout_test");
         std::fs::create_dir_all(&tmp).ok();
-        Command::new("git").arg("init").current_dir(&tmp).output().ok();
+        Command::new("git")
+            .arg("init")
+            .current_dir(&tmp)
+            .output()
+            .ok();
 
-        let result = GitExec::run_git_with_timeout(&tmp, &["clone", "https://10.255.255.1/nonexistent.git"], 1);
+        let result = GitExec::run_git_with_timeout(
+            &tmp,
+            &["clone", "https://10.255.255.1/nonexistent.git"],
+            1,
+        );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("timed out"));
 

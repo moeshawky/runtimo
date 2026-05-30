@@ -17,6 +17,7 @@
 /// Detects headings (all-caps lines, `Title:` patterns), bullet/numbered
 /// lists with multi-line continuation, and groups remaining lines into
 /// paragraphs. Empty input or whitespace-only returns `""`.
+#[allow(clippy::indexing_slicing)]
 pub fn wall_to_markdown(text: &str) -> String {
     if text.trim().is_empty() {
         return String::new();
@@ -101,7 +102,10 @@ pub fn wall_to_markdown(text: &str) -> String {
         let stripped = first.trim_start_matches('#').trim();
         if !stripped.is_empty()
             && !first.starts_with('#')
-            && (stripped.ends_with(':') || stripped.chars().all(|c| c.is_uppercase() || c.is_whitespace()))
+            && (stripped.ends_with(':')
+                || stripped
+                    .chars()
+                    .all(|c| c.is_uppercase() || c.is_whitespace()))
             && stripped.len() < 80
         {
             md = format!("# {}\n\n{}", stripped.trim_end_matches(':'), md);
@@ -117,7 +121,9 @@ fn is_heading(line: &str) -> bool {
         return false;
     }
     line.ends_with(':') && line.len() < 90
-        || line.chars().all(|c| c.is_uppercase() || c.is_whitespace() || c.is_ascii_digit())
+        || line
+            .chars()
+            .all(|c| c.is_uppercase() || c.is_whitespace() || c.is_ascii_digit())
             && line.len() > 1
         || starts_with_number_dot(line)
         || is_title_case(line)
@@ -125,7 +131,10 @@ fn is_heading(line: &str) -> bool {
 
 fn heading_line(line: &str) -> String {
     let line = line.trim();
-    let level = if line.chars().all(|c| c.is_uppercase() || c.is_whitespace() || c.is_ascii_digit() || c == '.') {
+    let level = if line
+        .chars()
+        .all(|c| c.is_uppercase() || c.is_whitespace() || c.is_ascii_digit() || c == '.')
+    {
         "#"
     } else {
         "##"
@@ -133,6 +142,7 @@ fn heading_line(line: &str) -> String {
     format!("{} {}", level, line.trim_end_matches(':'))
 }
 
+#[allow(clippy::indexing_slicing)]
 fn starts_with_number_dot(line: &str) -> bool {
     let bytes = line.as_bytes();
     let mut i = 0;
@@ -147,6 +157,7 @@ fn is_title_case(line: &str) -> bool {
     if line.len() < 3 || line.len() > 70 {
         return false;
     }
+    #[allow(clippy::indexing_slicing)] // is_ascii_uppercase needs first byte only
     let bytes = line.as_bytes();
     if !bytes[0].is_ascii_uppercase() {
         return false;
@@ -215,9 +226,7 @@ mod tests {
 
     #[test]
     fn multi_line_list_item() {
-        let md = wall_to_markdown(
-            "- item one\n  continuation\n  more\n- item two",
-        );
+        let md = wall_to_markdown("- item one\n  continuation\n  more\n- item two");
         assert!(md.contains("- item one\n  continuation\n  more"));
         assert!(md.contains("- item two"));
     }

@@ -1,3 +1,4 @@
+#![allow(clippy::expect_used)]
 //! Example 3: Write, Overwrite, and Undo (restore from backup)
 //!
 //! Demonstrates FileWrite's built-in backup-before-mutate mechanism:

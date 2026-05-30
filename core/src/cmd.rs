@@ -29,6 +29,7 @@ use std::process::Command;
 ///
 /// Returns an empty string on failure. Stderr is discarded — callers should
 /// not mix error output with data.
+#[must_use]
 pub fn run_cmd(cmd: &str) -> String {
     // SECURITY: This is safe because all callers use hardcoded command literals.
     // The commands are: "cat /proc/cpuinfo | grep...", "free -h | grep...", etc.

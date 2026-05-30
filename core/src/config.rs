@@ -29,12 +29,17 @@ impl RuntimoConfig {
         std::env::var("XDG_CONFIG_HOME")
             .ok()
             .map(PathBuf::from)
-            .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config")))
+            .or_else(|| {
+                std::env::var("HOME")
+                    .ok()
+                    .map(|h| PathBuf::from(h).join(".config"))
+            })
             .unwrap_or_else(|| PathBuf::from("/tmp"))
             .join("runtimo/config.toml")
     }
 
     /// Loads config from disk, returning defaults if the file doesn't exist or is invalid.
+    #[must_use]
     pub fn load() -> Self {
         let path = Self::config_path();
         if path.exists() {
@@ -46,6 +51,11 @@ impl RuntimoConfig {
     }
 
     /// Saves config to disk, creating parent directories as needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if parent directories cannot be created or if the config
+    /// file cannot be serialized/written to disk.
     pub fn save(&self) -> Result<(), String> {
         let path = Self::config_path();
         if let Some(parent) = path.parent() {
@@ -62,6 +72,7 @@ impl RuntimoConfig {
     /// 1. Built-in defaults
     /// 2. `RUNTIMO_ALLOWED_PATHS` env var
     /// 3. Config file `allowed_paths`
+    #[must_use]
     pub fn get_allowed_prefixes() -> Vec<String> {
         let mut prefixes: Vec<String> = DEFAULT_PREFIXES.iter().map(|s| s.to_string()).collect();
 

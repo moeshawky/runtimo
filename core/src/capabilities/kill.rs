@@ -40,6 +40,7 @@ use std::process::Command;
 /// Returns start time in clock ticks since boot. Used to detect PID reuse:
 /// if a process is killed and a new process reuses the PID, the start time
 /// will differ (FINDING #1).
+#[allow(clippy::arithmetic_side_effects)]
 fn get_process_start_time(pid: u32) -> Option<u64> {
     let stat_path = format!("/proc/{}/stat", pid);
     let content = std::fs::read_to_string(&stat_path).ok()?;
@@ -139,7 +140,7 @@ fn protected_pids() -> Vec<u32> {
         }
     }
 
-    pids.sort();
+    pids.sort_unstable();
     pids.dedup();
     pids
 }
@@ -163,6 +164,9 @@ pub struct KillArgs {
 /// # Security
 ///
 /// All kill operations are logged to WAL for audit purposes.
+// This is a capability marker struct with no fields;
+// additional fields may be added later as needed.
+#[allow(clippy::exhaustive_structs)]
 pub struct Kill;
 
 impl Capability for Kill {
@@ -264,18 +268,21 @@ impl Capability for Kill {
             .map(|p| (p.command.clone(), p.user.clone()));
 
         // Record start time to detect PID reuse (FINDING #1)
-let start_time_before = get_process_start_time_retry(args.pid);
+        let start_time_before = get_process_start_time_retry(args.pid);
 
         // Determine signal — default to SIGTERM (15) for graceful shutdown
         let signal = args.signal.unwrap_or(15);
 
         // Execute kill via libc for reliability (avoids shell/PATH issues)
+        // SAFETY: pid is validated as a valid target; signal is validated to 1-64 range;
+        // pid_t is i32 — pid is u32, cast is safe for all valid PIDs
+        #[allow(clippy::cast_possible_wrap)]
         let kill_result = unsafe { libc::kill(args.pid as libc::pid_t, signal) };
         let success = kill_result == 0;
-        let stderr_str = if !success {
-            std::io::Error::last_os_error().to_string()
-        } else {
+        let stderr_str = if success {
             String::new()
+        } else {
+            std::io::Error::last_os_error().to_string()
         };
 
         // Delay to let process terminate and be removed from process table
@@ -292,12 +299,12 @@ let start_time_before = get_process_start_time_retry(args.pid);
             .processes
             .iter()
             .any(|p| p.pid == args.pid && !p.stat.starts_with('Z'));
-// Verify PID was not reused — check start time matches (FINDING #1)
-let pid_reused = match (start_time_before, get_process_start_time_retry(args.pid)) {
-    (Some(before_time), Some(after_time)) => before_time != after_time,
-    (None, _) => false,
-    (Some(_), None) => true,
-};
+        // Verify PID was not reused — check start time matches (FINDING #1)
+        let pid_reused = match (start_time_before, get_process_start_time_retry(args.pid)) {
+            (Some(before_time), Some(after_time)) => before_time != after_time,
+            (None, _) => false,
+            (Some(_), None) => true,
+        };
 
         let killed_success = success && !process_still_exists && !pid_reused;
 
@@ -322,7 +329,7 @@ let pid_reused = match (start_time_before, get_process_start_time_retry(args.pid
                 "signal": signal,
                 "command": process_info.as_ref().map(|(cmd, _)| cmd),
                 "user": process_info.as_ref().map(|(_, user)| user),
-                "stderr": if !success { stderr_str.clone() } else { String::new() },
+                "stderr": if success { String::new() } else { stderr_str },
                 "pid_reused": pid_reused,
                 "process_before": {
                     "count": process_before.summary.total_processes,
@@ -339,30 +346,34 @@ let pid_reused = match (start_time_before, get_process_start_time_retry(args.pid
 }
 
 #[cfg(test)]
+#[allow(clippy::unnecessary_map_or)]
 mod tests {
     use super::*;
     use crate::capability::Capability;
     use std::thread;
     use std::time::Duration;
 
-#[test]
-fn test_kill_schema() {
-    let cap = Kill;
-    let _schema = cap.schema();
-    // Retry function test
-    // Test retry logic with existing process
-let mut child = Command::new("sleep").arg("60").spawn().unwrap();
-let pid = child.id();
+    #[test]
+    fn test_kill_schema() {
+        let cap = Kill;
+        let _schema = cap.schema();
+        // Retry function test
+        // Test retry logic with existing process
+        let mut child = Command::new("sleep").arg("60").spawn().unwrap();
+        let pid = child.id();
 
-let result = get_process_start_time_retry(pid);
-assert!(result.is_some(), "Should read start time for running process");
+        let result = get_process_start_time_retry(pid);
+        assert!(
+            result.is_some(),
+            "Should read start time for running process"
+        );
 
-child.kill().ok();
-let _ = child.wait();
+        child.kill().ok();
+        let _ = child.wait();
 
-// Non-existent PID should return None after retries
-let result = get_process_start_time_retry(999999);
-assert!(result.is_none(), "Non-existent PID should return None");
+        // Non-existent PID should return None after retries
+        let result = get_process_start_time_retry(999999);
+        assert!(result.is_none(), "Non-existent PID should return None");
     }
 
     #[test]
@@ -492,7 +503,7 @@ assert!(result.is_none(), "Non-existent PID should return None");
 
         // Verify process is fully gone after reaping
         let post_check = Command::new("kill").arg("-0").arg(pid.to_string()).output();
-        let still_alive = post_check.map(|o| o.status.success()).unwrap_or(false);
+        let still_alive = post_check.map_or(false, |o| o.status.success());
         assert!(
             !still_alive,
             "Process {} should be dead after kill and reap",
@@ -578,9 +589,18 @@ assert!(result.is_none(), "Non-existent PID should return None");
 
         assert!(result.success);
         assert!(result.data["dry_run"].as_bool() == Some(true));
-        assert!(result.data.get("command").is_none(), "dry-run must not expose command");
-        assert!(result.data.get("user").is_none(), "dry-run must not expose user");
-        assert!(result.data.get("process_exists").is_none(), "dry-run must not expose process_exists");
+        assert!(
+            result.data.get("command").is_none(),
+            "dry-run must not expose command"
+        );
+        assert!(
+            result.data.get("user").is_none(),
+            "dry-run must not expose user"
+        );
+        assert!(
+            result.data.get("process_exists").is_none(),
+            "dry-run must not expose process_exists"
+        );
     }
 
     #[test]
@@ -589,23 +609,29 @@ assert!(result.is_none(), "Non-existent PID should return None");
         let self_pid = std::process::id();
         assert!(protected.contains(&1), "PID 1 should be protected");
         assert!(protected.contains(&2), "PID 2 should be protected");
-        assert!(protected.contains(&self_pid), "self PID should be protected");
+        assert!(
+            protected.contains(&self_pid),
+            "self PID should be protected"
+        );
     }
 
-#[test]
-fn test_get_process_start_time_retry() {
-    // Test retry logic with existing process
-    let mut child = Command::new("sleep").arg("60").spawn().unwrap();
-    let pid = child.id();
+    #[test]
+    fn test_get_process_start_time_retry() {
+        // Test retry logic with existing process
+        let mut child = Command::new("sleep").arg("60").spawn().unwrap();
+        let pid = child.id();
 
-    let result = get_process_start_time_retry(pid);
-    assert!(result.is_some(), "Should read start time for running process");
+        let result = get_process_start_time_retry(pid);
+        assert!(
+            result.is_some(),
+            "Should read start time for running process"
+        );
 
-    child.kill().ok();
-    let _ = child.wait();
+        child.kill().ok();
+        let _ = child.wait();
 
-    // Non-existent PID should return None after retries
-    let result = get_process_start_time_retry(999999);
-    assert!(result.is_none(), "Non-existent PID should return None");
-}
+        // Non-existent PID should return None after retries
+        let result = get_process_start_time_retry(999999);
+        assert!(result.is_none(), "Non-existent PID should return None");
+    }
 }

@@ -20,6 +20,66 @@ serde_json = "1.0"
 thiserror = "1.0"
 tokio = { version = "1.0", features = ["full"] }
 
+# ── Clippy: curated, not blanket ──────────────────────────────────────────
+# Strategy:
+#   pedantic + nursery as groups (warn), then selectively allow/fixup.
+#   restriction lints are NEVER enabled as a group — individual cherry-picks.
+#   deny  = safety/correctness, blocks `cargo check` in dev and CI.
+#   warn  = quality, shows in dev, blocks CI via `-D warnings`.
+#   allow = explicitly rejected pedantic/nursery lints.
+
+[workspace.lints.clippy]
+# ── Groups (base layer, priority -1 so overrides win) ─────
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
+# ── Deny: safety, correctness =============================================
+# Only lints with zero hits in test code — we can't discriminate
+# #[cfg(test)] modules from production in the same file, so lints
+# that test code uses idiomatically are warn'd instead.
+undocumented_unsafe_blocks = "deny"
+map_err_ignore            = "deny"
+
+# ── Deny-in-CI: warn in dev, -D warnings makes them errors =================
+# (Test code uses unwrap/expect/indexing idiomatically.)
+unwrap_used               = "warn"
+expect_used               = "warn"
+indexing_slicing          = "warn"
+
+# ── Warn: quality regressions =============================================
+arithmetic_side_effects   = "warn"
+cast_possible_truncation  = "warn"
+cast_possible_wrap        = "warn"
+cast_precision_loss       = "warn"
+derive_partial_eq_without_eq = "warn"
+exhaustive_enums          = "warn"
+exhaustive_structs        = "warn"
+float_cmp                 = "warn"
+missing_errors_doc        = "warn"
+missing_panics_doc        = "warn"
+must_use_candidate        = "warn"
+unused_result_ok          = "warn"
+
+# ── Allow: explicitly rejected pedantic ===================================
+cast_lossless                   = "allow"
+doc_markdown                    = "allow"
+doc_paragraphs_missing_punctuation = "allow"
+min_ident_chars                 = "allow"
+missing_const_for_fn            = "allow"
+missing_docs_in_private_items   = "allow"
+missing_inline_in_public_items  = "allow"
+module_name_repetitions         = "allow"
+needless_pass_by_value          = "allow"
+option_if_let_else              = "allow"
+redundant_closure_for_method_calls = "allow"
+similar_names                   = "allow"
+uninlined_format_args           = "allow"
+unreadable_literal              = "allow"
+unnecessary_wraps               = "allow"
+
+# ── Allow: explicitly rejected nursery ====================================
+significant_drop_tightening     = "allow"
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"

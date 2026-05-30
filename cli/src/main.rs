@@ -147,7 +147,8 @@ fn backup_dir() -> PathBuf { runtimo_core::utils::backup_dir() }
 fn make_registry() -> CapabilityRegistry {
     let mut reg = CapabilityRegistry::new();
     reg.register(FileRead);
-    reg.register(FileWrite::new(backup_dir()).expect("Failed to create FileWrite capability"));
+    #[allow(clippy::expect_used)] // BUG-4: make_registry should return Result
+    reg.register(FileWrite::new(backup_dir()).expect("BUG-4: make_registry should return Result, tracked"));
     reg.register(GitExec::new(backup_dir()).expect("Failed to create GitExec capability"));
     reg.register(ShellExec);
     reg.register(Kill);
@@ -181,7 +182,7 @@ fn send_rpc(method: &str, params: Value) -> Result<Value, String> {
         return Err("Daemon closed connection".into());
     }
 
-    let resp_str = String::from_utf8_lossy(&buf[..n]);
+    let resp_str = String::from_utf8_lossy(buf.get(..n).unwrap_or(&[]));
     let last_line = resp_str.lines().last().unwrap_or("");
     let resp: Value = serde_json::from_str(last_line).map_err(|e| format!("JSON parse: {}", e))?;
 
@@ -194,6 +195,7 @@ fn send_rpc(method: &str, params: Value) -> Result<Value, String> {
 
 // ── Main ────────────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_lines)]
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
 
@@ -241,8 +243,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             });
             match send_rpc("dispatch", params) {
                 Ok(result) => {
-                    let jid = result["job_id"].as_str().unwrap_or("?");
-                    let cap = result["capability"].as_str().unwrap_or("?");
+                    let jid = result.get("job_id").and_then(|v| v.as_str()).unwrap_or("?");
+                    let cap = result.get("capability").and_then(|v| v.as_str()).unwrap_or("?");
                     println!("Dispatched job {} (capability: {})", jid, cap);
                     println!("Check status: runtimo wait -j {}", jid);
                 }
@@ -257,9 +259,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             let start = std::time::Instant::now();
             loop {
                 let params = serde_json::json!({ "job_id": &job_id });
+                #[allow(clippy::single_match_else)] // refactoring to if-let-else changes control flow here
                 match send_rpc("status", params) {
                     Ok(result) => {
-                        let status = result["status"].as_str().unwrap_or("unknown");
+                        let status = result.get("status").and_then(|v| v.as_str()).unwrap_or("unknown");
                         match status {
                             "running" => {
                                 if timeout > 0 && start.elapsed().as_secs() >= timeout {
@@ -267,7 +270,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                                     return Ok(());
                                 }
                                 let elapsed = start.elapsed().as_secs();
-                                if elapsed > 0 && elapsed % 10 == 0 {
+                                if elapsed > 0 && elapsed.is_multiple_of(10) {
                                     println!("Job {} still running ({}s elapsed)...", job_id, elapsed);
                                 }
                                 std::thread::sleep(std::time::Duration::from_secs(2));
@@ -348,9 +351,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                         println!("{}", serde_json::to_string_pretty(&result)?);
                     } else {
                         println!("Job: {}  Status: {}  Capability: {}",
-                            result["job_id"].as_str().unwrap_or("?"),
-                            result["status"].as_str().unwrap_or("?"),
-                            result["capability"].as_str().unwrap_or("?"));
+                            result.get("job_id").and_then(|v| v.as_str()).unwrap_or("?"),
+                            result.get("status").and_then(|v| v.as_str()).unwrap_or("?"),
+                            result.get("capability").and_then(|v| v.as_str()).unwrap_or("?"));
                     }
                     return Ok(());
                 }

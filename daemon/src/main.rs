@@ -14,8 +14,8 @@
 
 use runtimo_core::{
     capabilities::{FileRead, FileWrite, GitExec, Kill, ShellExec, Undo},
-    execute_with_telemetry, CapabilityRegistry, WalReader, WalWriter, WalEvent, WalEventType,
-    Context,
+    execute_with_telemetry, CapabilityRegistry, Context, WalEvent, WalEventType, WalReader,
+    WalWriter,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -25,19 +25,23 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
 /// Authenticate a Unix stream connection via SO_PEERCRED.
+#[allow(clippy::borrow_as_ptr)] // FFI: addr_of_mut! + .cast() for getsockopt
 fn authenticate_peer(stream: &tokio::net::UnixStream) -> Result<(), String> {
     use std::os::unix::io::AsRawFd;
 
     let fd = stream.as_raw_fd();
+    // SAFETY: zeroed representation of ucred is valid — kernel fills it via getsockopt
     let mut ucred: libc::ucred = unsafe { std::mem::zeroed() };
+    #[allow(clippy::cast_possible_truncation)] // socklen_t is u32, ucred is 32 bytes
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
 
+    // SAFETY: fd is a valid open socket; getsockopt reads metadata only
     let ret = unsafe {
         libc::getsockopt(
             fd,
             libc::SOL_SOCKET,
             libc::SO_PEERCRED,
-            &mut ucred as *mut _ as *mut _,
+            std::ptr::addr_of_mut!(ucred).cast::<libc::c_void>(),
             &mut len,
         )
     };
@@ -49,6 +53,7 @@ fn authenticate_peer(stream: &tokio::net::UnixStream) -> Result<(), String> {
         ));
     }
 
+    // SAFETY: getuid is always safe — reads caller's real UID with no side effects
     let daemon_uid = unsafe { libc::getuid() };
     if ucred.uid != daemon_uid {
         return Err(format!(
@@ -153,6 +158,15 @@ impl BackgroundJobRegistry {
         self.jobs.read().await.get(job_id).cloned()
     }
 
+    async fn update(&self, job_id: &str, status: &str, result: Option<String>, finished_at: u64) {
+        let mut jobs = self.jobs.write().await;
+        if let Some(job) = jobs.get_mut(job_id) {
+            job.status = status.to_string();
+            job.finished_at = Some(finished_at);
+            job.result = result;
+        }
+    }
+
     async fn list(&self, limit: usize) -> Vec<BackgroundJob> {
         let jobs = self.jobs.read().await;
         let mut v: Vec<_> = jobs.values().cloned().collect();
@@ -182,7 +196,7 @@ impl DaemonState {
             .map_err(|e| format!("Failed to create FileWrite capability: {}", e))?;
         registry.register(file_write);
 
-        let git_exec = GitExec::new(backup_dir.clone())
+        let git_exec = GitExec::new(backup_dir)
             .map_err(|e| format!("Failed to create GitExec capability: {}", e))?;
         registry.register(git_exec);
 
@@ -206,7 +220,7 @@ impl DaemonState {
 
 // ── Request routing ─────────────────────────────────────────────────────────
 
-async fn handle_request(state: &DaemonState, req: JsonRpcRequest) -> JsonRpcResponse {
+async fn handle_request(state: &Arc<DaemonState>, req: JsonRpcRequest) -> JsonRpcResponse {
     match req.method.as_str() {
         "run" => handle_run(state, req.params, req.id).await,
         "dispatch" => handle_dispatch(state, req.params, req.id).await,
@@ -225,7 +239,7 @@ async fn handle_request(state: &DaemonState, req: JsonRpcRequest) -> JsonRpcResp
     }
 }
 
-async fn handle_run(state: &DaemonState, params: Value, id: Value) -> JsonRpcResponse {
+async fn handle_run(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonRpcResponse {
     let run_params: RunParams = match serde_json::from_value(params) {
         Ok(p) => p,
         Err(e) => {
@@ -240,18 +254,16 @@ async fn handle_run(state: &DaemonState, params: Value, id: Value) -> JsonRpcRes
         }
     };
 
-    let capability = match state.registry.get(&run_params.capability) {
-        Some(c) => c,
-        None => {
-            return JsonRpcResponse {
-                result: None,
-                error: Some(JsonRpcError {
-                    code: -32602,
-                    message: format!("Capability not found: {}", run_params.capability),
-                }),
-                id,
-            };
-        }
+    let Some(capability) = state.registry.get(&run_params.capability)
+    else {
+        return JsonRpcResponse {
+            result: None,
+            error: Some(JsonRpcError {
+                code: -32602,
+                message: format!("Capability not found: {}", run_params.capability),
+            }),
+            id,
+        };
     };
 
     let _guard = state.wal_mutex.lock().await;
@@ -283,7 +295,7 @@ async fn handle_run(state: &DaemonState, params: Value, id: Value) -> JsonRpcRes
     }
 }
 
-async fn handle_dispatch(state: &DaemonState, params: Value, id: Value) -> JsonRpcResponse {
+async fn handle_dispatch(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonRpcResponse {
     let run_params: RunParams = match serde_json::from_value(params) {
         Ok(p) => p,
         Err(e) => {
@@ -318,14 +330,17 @@ async fn handle_dispatch(state: &DaemonState, params: Value, id: Value) -> JsonR
         .unwrap_or_default()
         .as_secs();
 
-    state.bg_jobs.insert(BackgroundJob {
-        job_id: job_id.clone(),
-        capability: cap_name.clone(),
-        status: "running".into(),
-        started_at: now,
-        finished_at: None,
-        result: None,
-    }).await;
+    state
+        .bg_jobs
+        .insert(BackgroundJob {
+            job_id: job_id.clone(),
+            capability: cap_name.clone(),
+            status: "running".into(),
+            started_at: now,
+            finished_at: None,
+            result: None,
+        })
+        .await;
 
     // Log JobStarted to WAL
     {
@@ -352,28 +367,92 @@ async fn handle_dispatch(state: &DaemonState, params: Value, id: Value) -> JsonR
         }
     }
 
-    // Spawn background execution in a thread
-    let _wal_clone = state.wal_path.clone();
+    // Spawn background execution with status tracking and WAL completion
+    let state_arc = Arc::clone(state);
+    let tokio_handle = tokio::runtime::Handle::current();
     let jid = job_id.clone();
     let cn = cap_name.clone();
     std::thread::spawn(move || {
-        let backup_dir = runtimo_core::utils::backup_dir();
-        let mut registry = CapabilityRegistry::new();
-        registry.register(FileRead);
-        if let Ok(fw) = FileWrite::new(backup_dir.clone()) { registry.register(fw); }
-        if let Ok(ge) = GitExec::new(backup_dir.clone()) { registry.register(ge); }
-        registry.register(ShellExec);
-        registry.register(Kill);
-        registry.register(Undo);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let backup_dir = runtimo_core::utils::backup_dir();
+            let mut registry = CapabilityRegistry::new();
+            registry.register(FileRead);
+            if let Ok(fw) = FileWrite::new(backup_dir.clone()) {
+                registry.register(fw);
+            }
+            if let Ok(ge) = GitExec::new(backup_dir) {
+                registry.register(ge);
+            }
+            registry.register(ShellExec);
+            registry.register(Kill);
+            registry.register(Undo);
 
-        if let Some(cap) = registry.get(&cn) {
-            let ctx = Context {
-                dry_run: dry,
-                job_id: jid,
-                working_dir: std::env::current_dir().unwrap_or_default(),
-            };
-            let _ = cap.execute(&args, &ctx);
-        }
+            if let Some(cap) = registry.get(&cn) {
+                let ctx = Context {
+                    dry_run: dry,
+                    job_id: jid.clone(),
+                    working_dir: std::env::current_dir().unwrap_or_default(),
+                };
+                cap.execute(&args, &ctx)
+            } else {
+                Err(runtimo_core::Error::ExecutionFailed(format!(
+                    "capability not found in background registry: {}",
+                    cn
+                )))
+            }
+        }));
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let (status, error_msg) = match &result {
+            Ok(Ok(_output)) => ("completed", None),
+            Ok(Err(e)) => ("failed", Some(e.to_string())),
+            Err(panic_info) => {
+                let msg = panic_info
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic_info.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".into());
+                ("failed", Some(msg))
+            }
+        };
+
+        tokio_handle.block_on(async {
+            state_arc
+                .bg_jobs
+                .update(&jid, status, error_msg.clone(), now)
+                .await;
+
+            let _guard = state_arc.wal_mutex.lock().await;
+            if let Ok(mut wal) = WalWriter::create(&state_arc.wal_path) {
+                let event_type = if status == "completed" {
+                    WalEventType::JobCompleted
+                } else {
+                    WalEventType::JobFailed
+                };
+                let _ = wal.append(WalEvent {
+                    seq: wal.seq(),
+                    ts: now,
+                    event_type,
+                    job_id: jid,
+                    capability: Some(cn),
+                    output: None,
+                    error: error_msg,
+                    telemetry_before: None,
+                    telemetry_after: None,
+                    process_before: None,
+                    process_after: None,
+                    cmd: None,
+                    cmd_stdout: None,
+                    cmd_stderr: None,
+                    cmd_exit_code: None,
+                    cmd_corrected: None,
+                });
+            }
+        });
     });
 
     JsonRpcResponse {
@@ -387,7 +466,7 @@ async fn handle_dispatch(state: &DaemonState, params: Value, id: Value) -> JsonR
     }
 }
 
-async fn handle_status(state: &DaemonState, params: Value, id: Value) -> JsonRpcResponse {
+async fn handle_status(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonRpcResponse {
     let jid: String = match params.get("job_id").and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
         None => {
@@ -419,12 +498,24 @@ async fn handle_status(state: &DaemonState, params: Value, id: Value) -> JsonRpc
     // Check WAL
     if let Ok(reader) = WalReader::load(&state.wal_path) {
         let events = reader.events();
-        let started = events.iter().find(|e| e.job_id == jid && matches!(e.event_type, WalEventType::JobStarted));
-        let completed = events.iter().find(|e| e.job_id == jid && matches!(e.event_type, WalEventType::JobCompleted));
-        let failed = events.iter().find(|e| e.job_id == jid && matches!(e.event_type, WalEventType::JobFailed));
+        let started = events
+            .iter()
+            .find(|e| e.job_id == jid && matches!(e.event_type, WalEventType::JobStarted));
+        let completed = events
+            .iter()
+            .find(|e| e.job_id == jid && matches!(e.event_type, WalEventType::JobCompleted));
+        let failed = events
+            .iter()
+            .find(|e| e.job_id == jid && matches!(e.event_type, WalEventType::JobFailed));
 
         if let Some(s) = started {
-            let status = if completed.is_some() { "completed" } else if failed.is_some() { "failed" } else { "unknown" };
+            let status = if completed.is_some() {
+                "completed"
+            } else if failed.is_some() {
+                "failed"
+            } else {
+                "unknown"
+            };
             return JsonRpcResponse {
                 result: Some(serde_json::json!({
                     "job_id": jid,
@@ -448,7 +539,7 @@ async fn handle_status(state: &DaemonState, params: Value, id: Value) -> JsonRpc
     }
 }
 
-fn handle_list(state: &DaemonState, id: Value) -> JsonRpcResponse {
+fn handle_list(state: &Arc<DaemonState>, id: Value) -> JsonRpcResponse {
     let caps: Vec<&str> = state.registry.list();
     JsonRpcResponse {
         result: Some(serde_json::json!({ "capabilities": caps })),
@@ -457,7 +548,7 @@ fn handle_list(state: &DaemonState, id: Value) -> JsonRpcResponse {
     }
 }
 
-fn handle_logs(state: &DaemonState, params: Value, id: Value) -> JsonRpcResponse {
+fn handle_logs(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonRpcResponse {
     let logs_params: LogsParams = match serde_json::from_value(params) {
         Ok(p) => p,
         Err(e) => {
@@ -498,7 +589,8 @@ fn handle_logs(state: &DaemonState, params: Value, id: Value) -> JsonRpcResponse
     }
 }
 
-async fn handle_jobs(state: &DaemonState, params: Value, id: Value) -> JsonRpcResponse {
+async fn handle_jobs(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonRpcResponse {
+    #[allow(clippy::cast_possible_truncation)] // safe: limit is capped in practice
     let limit: usize = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
 
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -528,7 +620,7 @@ async fn handle_jobs(state: &DaemonState, params: Value, id: Value) -> JsonRpcRe
             match e.event_type {
                 WalEventType::JobStarted => {
                     job_entries.entry(e.job_id.clone()).or_default().started = Some(e.ts);
-                    job_entries.entry(e.job_id.clone()).or_default().capability = e.capability.clone();
+                    job_entries.entry(e.job_id.clone()).or_default().capability.clone_from(&e.capability);
                 }
                 WalEventType::JobCompleted | WalEventType::JobFailed => {
                     job_entries.entry(e.job_id.clone()).or_default().finished = Some(e.ts);
@@ -538,9 +630,15 @@ async fn handle_jobs(state: &DaemonState, params: Value, id: Value) -> JsonRpcRe
         }
 
         for (jid, entry) in job_entries {
-            if seen.contains(&jid) { continue; }
+            if seen.contains(&jid) {
+                continue;
+            }
             seen.insert(jid.clone());
-            let status = if entry.finished.is_some() { "completed" } else { "unknown" };
+            let status = if entry.finished.is_some() {
+                "completed"
+            } else {
+                "unknown"
+            };
             jobs_list.push(serde_json::json!({
                 "job_id": jid,
                 "capability": entry.capability,
@@ -550,7 +648,10 @@ async fn handle_jobs(state: &DaemonState, params: Value, id: Value) -> JsonRpcRe
         }
     }
 
-    jobs_list.sort_by_key(|j| -(j["started_at"].as_u64().unwrap_or(0) as i64));
+    jobs_list.sort_by_key(|j| {
+        let ts = j["started_at"].as_u64().unwrap_or(0);
+        std::cmp::Reverse(ts)
+    });
     jobs_list.truncate(limit);
 
     JsonRpcResponse {
@@ -623,19 +724,21 @@ fn parse_args() -> Args {
     let args: Vec<String> = std::env::args().collect();
     let mut socket = default_socket_path();
 
-    let mut i = 1;
+    let mut i: usize = 1;
     while i < args.len() {
-        match args[i].as_str() {
-            "--socket" => {
-                if i + 1 < args.len() {
-                    socket = PathBuf::from(&args[i + 1]);
-                    i += 2;
+        match args.get(i).map(|s| s.as_str()) {
+            Some("--socket") => {
+                if let Some(val) = args.get(i.saturating_add(1)) {
+                    socket = PathBuf::from(val);
+                    i = i.saturating_add(2);
                 } else {
                     eprintln!("--socket requires a path argument");
                     std::process::exit(1);
                 }
             }
-            _ => { i += 1; }
+            _ => {
+                i = i.saturating_add(1);
+            }
         }
     }
 
@@ -675,8 +778,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(async move {
             let peer = addr
                 .as_pathname()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "unknown".to_string());
+                .map_or_else(|| "unknown".to_string(), |p| p.display().to_string());
             if let Err(e) = handle_client(stream, state).await {
                 eprintln!("Client {} error: {}", peer, e);
             }

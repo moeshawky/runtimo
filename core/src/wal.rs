@@ -29,8 +29,6 @@ use crate::Result;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-
-
 /// Reads the last event's sequence number from a WAL file without loading
 /// the entire file into memory. Reads only the trailing tail_bytes of the
 /// file to find the last valid JSON line.
@@ -48,7 +46,7 @@ fn read_last_seq(path: &Path, tail_bytes: usize) -> Option<u64> {
 
     let start = file_len.saturating_sub(tail_bytes as u64);
     file.seek(SeekFrom::Start(start)).ok()?;
-    let mut buf = vec![0u8; (file_len - start) as usize + 1];
+    let mut buf = vec![0u8; usize::try_from(file_len - start).unwrap_or(0).saturating_add(1)];
     let n = file.read(&mut buf).ok()?;
     buf.truncate(n);
 
@@ -131,8 +129,11 @@ pub struct WalEvent {
 
 /// Types of WAL events, corresponding to job lifecycle stages
 /// and command executions.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+// Additional variants may be added in future versions; the enum is
+// intentionally non-exhaustive for forward compatibility.
+#[allow(clippy::exhaustive_enums)]
 pub enum WalEventType {
     /// Job has been submitted to the system.
     JobSubmitted,
@@ -219,20 +220,20 @@ impl WalWriter {
             let lock_file = std::fs::File::open(path)
                 .map_err(|e| crate::Error::WalError(format!("open WAL for seq recovery: {}", e)))?;
             Self::lock_file(&lock_file)?;
-            let recovered = match read_last_seq(path, 8192) {
-                Some(last_seq) => last_seq + 1,
-                None => {
-                    // Fall back to full scan if tail-read failed
-                    let content = std::fs::read_to_string(path)
-                        .map_err(|e| crate::Error::WalError(format!("read WAL for seq recovery: {}", e)))?;
-                    content
-                        .lines()
-                        .filter_map(|line| serde_json::from_str::<WalEvent>(line).ok())
-                        .map(|e| e.seq)
-                        .max()
-                        .map(|max| max + 1)
-                        .unwrap_or(0)
-                }
+            let recovered = if let Some(last_seq) = read_last_seq(path, 8192) {
+                last_seq + 1
+            } else {
+                // Fall back to full scan if tail-read failed
+                let content = std::fs::read_to_string(path).map_err(|e| {
+                    crate::Error::WalError(format!("read WAL for seq recovery: {}", e))
+                })?;
+                content
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<WalEvent>(line).ok())
+                    .map(|e| e.seq)
+                    .max()
+                    .map(|max| max + 1)
+                    .unwrap_or(0)
             };
             Self::unlock_file(&lock_file);
             recovered
@@ -251,6 +252,7 @@ impl WalWriter {
     fn lock_file(file: &std::fs::File) -> Result<()> {
         use std::os::unix::io::AsRawFd;
         let fd = file.as_raw_fd();
+        // SAFETY: fd is a valid open file descriptor; LOCK_EX is a well-defined operation
         let result = unsafe { libc::flock(fd, libc::LOCK_EX) };
         if result != 0 {
             return Err(crate::Error::WalError(format!(
@@ -272,6 +274,7 @@ impl WalWriter {
     fn unlock_file(file: &std::fs::File) {
         use std::os::unix::io::AsRawFd;
         let fd = file.as_raw_fd();
+        // SAFETY: fd is a valid open file descriptor; LOCK_UN is a well-defined operation
         unsafe { libc::flock(fd, libc::LOCK_UN) };
     }
 
@@ -422,9 +425,8 @@ impl WalWriter {
     /// then creates a fresh empty WAL. Keeps at most `max_rotations` old files.
     /// FINDING #15: basic WAL rotation to prevent unbounded growth.
     pub fn rotate(path: &Path, max_size_bytes: u64, max_rotations: usize) -> Result<()> {
-        let metadata = match std::fs::metadata(path) {
-            Ok(m) => m,
-            Err(_) => return Ok(()), // No WAL to rotate
+        let Ok(metadata) = std::fs::metadata(path) else {
+            return Ok(()); // No WAL to rotate
         };
 
         if metadata.len() < max_size_bytes {
@@ -487,18 +489,14 @@ impl WalWriter {
         let content = std::fs::read_to_string(path)
             .map_err(|e| crate::Error::WalError(format!("read WAL for cleanup: {}", e)))?;
 
-        let events: Vec<WalEvent> = content
+        let all_events: Vec<WalEvent> = content
             .lines()
             .filter_map(|line| serde_json::from_str(line).ok())
             .collect();
 
-        // Filter out old events
-        let retained: Vec<_> = events.into_iter().filter(|e| e.ts >= cutoff).collect();
+        let total = all_events.len();
 
-        let total = content
-            .lines()
-            .filter_map(|line| serde_json::from_str::<WalEvent>(line).ok())
-            .count();
+        let retained: Vec<_> = all_events.into_iter().filter(|e| e.ts >= cutoff).collect();
         let removed = total - retained.len();
 
         if removed > 0 {
@@ -514,8 +512,9 @@ impl WalWriter {
                 // Re-read the original WAL to catch any events appended during cleanup.
                 // Lock is still held from above, so no concurrent writer can interleave.
                 let last_seq = retained.last().map(|e| e.seq).unwrap_or(0);
-                let current_content = std::fs::read_to_string(path)
-                    .map_err(|e| crate::Error::WalError(format!("re-read WAL during cleanup: {}", e)))?;
+                let current_content = std::fs::read_to_string(path).map_err(|e| {
+                    crate::Error::WalError(format!("re-read WAL during cleanup: {}", e))
+                })?;
                 for line in current_content.lines() {
                     if let Ok(event) = serde_json::from_str::<WalEvent>(line) {
                         if event.seq > last_seq {
@@ -574,24 +573,24 @@ mod tests {
             ts: 1715800000,
             event_type: WalEventType::JobStarted,
             job_id: "test-job".into(),
-        capability: Some("FileRead".into()),
-        output: None,
-        error: None,
-        telemetry_before: None,
-        telemetry_after: None,
-        process_before: None,
-        process_after: None,
-        cmd: None,
-        cmd_stdout: None,
-        cmd_stderr: None,
-        cmd_exit_code: None,
-        cmd_corrected: None,
-    })
-    .unwrap();
+            capability: Some("FileRead".into()),
+            output: None,
+            error: None,
+            telemetry_before: None,
+            telemetry_after: None,
+            process_before: None,
+            process_after: None,
+            cmd: None,
+            cmd_stdout: None,
+            cmd_stderr: None,
+            cmd_exit_code: None,
+            cmd_corrected: None,
+        })
+        .unwrap();
 
-    let reader = WalReader::load(&path).unwrap();
-    assert_eq!(reader.events().len(), 1);
-    assert_eq!(reader.events()[0].job_id, "test-job");
+        let reader = WalReader::load(&path).unwrap();
+        assert_eq!(reader.events().len(), 1);
+        assert_eq!(reader.events()[0].job_id, "test-job");
 
         let _ = std::fs::remove_file(&path);
     }
@@ -614,13 +613,13 @@ mod tests {
             telemetry_before: None,
             telemetry_after: None,
             process_before: None,
-        process_after: None,
-        cmd: None,
-        cmd_stdout: None,
-        cmd_stderr: None,
-        cmd_exit_code: None,
-        cmd_corrected: None,
-    })
+            process_after: None,
+            cmd: None,
+            cmd_stdout: None,
+            cmd_stderr: None,
+            cmd_exit_code: None,
+            cmd_corrected: None,
+        })
         .unwrap();
         assert_eq!(wal.seq(), 1);
 
@@ -638,26 +637,26 @@ mod tests {
 
         // Write enough data to trigger rotation
         let mut wal = WalWriter::create(&path).unwrap();
-    for i in 0..100 {
-        wal.append(WalEvent {
-            seq: i,
-            ts: 1715800000 + i,
-            event_type: WalEventType::JobStarted,
-            job_id: format!("job-{}", i),
-            capability: None,
-            output: None,
-            error: None,
-            telemetry_before: None,
-            telemetry_after: None,
-            process_before: None,
-            process_after: None,
-            cmd: None,
-            cmd_stdout: None,
-            cmd_stderr: None,
-            cmd_exit_code: None,
-            cmd_corrected: None,
-        })
-        .unwrap();
+        for i in 0..100 {
+            wal.append(WalEvent {
+                seq: i,
+                ts: 1715800000 + i,
+                event_type: WalEventType::JobStarted,
+                job_id: format!("job-{}", i),
+                capability: None,
+                output: None,
+                error: None,
+                telemetry_before: None,
+                telemetry_after: None,
+                process_before: None,
+                process_after: None,
+                cmd: None,
+                cmd_stdout: None,
+                cmd_stderr: None,
+                cmd_exit_code: None,
+                cmd_corrected: None,
+            })
+            .unwrap();
         }
 
         let size = std::fs::metadata(&path).unwrap().len();
@@ -695,13 +694,13 @@ mod tests {
             telemetry_before: None,
             telemetry_after: None,
             process_before: None,
-        process_after: None,
-        cmd: None,
-        cmd_stdout: None,
-        cmd_stderr: None,
-        cmd_exit_code: None,
-        cmd_corrected: None,
-    })
+            process_after: None,
+            cmd: None,
+            cmd_stdout: None,
+            cmd_stderr: None,
+            cmd_exit_code: None,
+            cmd_corrected: None,
+        })
         .unwrap();
 
         // Write recent event
@@ -716,13 +715,13 @@ mod tests {
             telemetry_before: None,
             telemetry_after: None,
             process_before: None,
-        process_after: None,
-        cmd: None,
-        cmd_stdout: None,
-        cmd_stderr: None,
-        cmd_exit_code: None,
-        cmd_corrected: None,
-    })
+            process_after: None,
+            cmd: None,
+            cmd_stdout: None,
+            cmd_stderr: None,
+            cmd_exit_code: None,
+            cmd_corrected: None,
+        })
         .unwrap();
 
         let removed = WalWriter::cleanup(&path, 500).unwrap();
@@ -738,30 +737,30 @@ mod tests {
     #[test]
     fn test_wal_skip_serializing_optional_fields() {
         // FINDING #15: verify optional fields are skipped when None
-    let event = WalEvent {
-        seq: 0,
-        ts: 1715800000,
-        event_type: WalEventType::JobStarted,
-        job_id: "test".into(),
-        capability: None,
-        output: None,
-        error: None,
-        telemetry_before: None,
-        telemetry_after: None,
-        process_before: None,
-        process_after: None,
-        cmd: None,
-        cmd_stdout: None,
-        cmd_stderr: None,
-        cmd_exit_code: None,
-        cmd_corrected: None,
-    };
+        let event = WalEvent {
+            seq: 0,
+            ts: 1715800000,
+            event_type: WalEventType::JobStarted,
+            job_id: "test".into(),
+            capability: None,
+            output: None,
+            error: None,
+            telemetry_before: None,
+            telemetry_after: None,
+            process_before: None,
+            process_after: None,
+            cmd: None,
+            cmd_stdout: None,
+            cmd_stderr: None,
+            cmd_exit_code: None,
+            cmd_corrected: None,
+        };
 
-    let json = serde_json::to_string(&event).unwrap();
-    assert!(!json.contains("capability"));
-    assert!(!json.contains("telemetry_before"));
-    assert!(!json.contains("process_before"));
-    assert!(!json.contains("cmd"));
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(!json.contains("capability"));
+        assert!(!json.contains("telemetry_before"));
+        assert!(!json.contains("process_before"));
+        assert!(!json.contains("cmd"));
     }
 
     #[test]

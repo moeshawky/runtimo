@@ -139,7 +139,7 @@ pub fn validate_path(path_str: &str, ctx: &PathContext) -> Result<PathBuf, Strin
         // For new files: canonicalize the parent to catch symlink tricks,
         // then join the filename. If parent doesn't exist either, use
         // the path as-is (parent directories will be created at execution time).
-        let parent = path.parent().unwrap_or(Path::new("/"));
+        let parent = path.parent().unwrap_or_else(|| Path::new("/"));
         if parent.exists() {
             let canonical_parent = parent
                 .canonicalize()
@@ -169,7 +169,10 @@ pub fn validate_path(path_str: &str, ctx: &PathContext) -> Result<PathBuf, Strin
     // Check allowed prefixes against the resolved path
     let resolved_str = resolved.to_string_lossy();
     let allowed = get_allowed_prefixes(ctx);
-    if !allowed.iter().any(|prefix| path_in_prefix(&resolved_str, prefix)) {
+    if !allowed
+        .iter()
+        .any(|prefix| path_in_prefix(&resolved_str, prefix))
+    {
         return Err(format!(
             "path outside allowed directories: {} (allowed: {})",
             resolved.display(),

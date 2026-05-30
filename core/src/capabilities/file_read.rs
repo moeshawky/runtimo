@@ -49,6 +49,7 @@ pub struct FileReadArgs {
 /// Opens file with O_NOFOLLOW to prevent TOCTOU symlink escape,
 /// uses bounded reader regardless of metadata to prevent size bypass,
 /// detects binary content, and handles UTF-8 boundary splits.
+#[allow(clippy::exhaustive_structs)] // unit struct used as trait-object marker
 pub struct FileRead;
 
 impl Capability for FileRead {
@@ -118,7 +119,7 @@ impl Capability for FileRead {
 
         // Read raw bytes to handle binary detection and UTF-8 boundaries correctly.
         let mut raw_bytes = Vec::with_capacity(
-            std::cmp::min(max_bytes as usize, 64 * 1024),
+            std::cmp::min(usize::try_from(max_bytes).unwrap_or(usize::MAX), 64 * 1024)
         );
         let bytes_read = limited
             .read_to_end(&mut raw_bytes)
@@ -211,8 +212,9 @@ fn bytes_to_utf8_string(bytes: &[u8]) -> String {
         Ok(s) => s,
         Err(e) => {
             let valid_up_to = e.utf8_error().valid_up_to();
-            String::from_utf8(bytes[..valid_up_to].to_vec())
-                .unwrap_or_else(|_| String::new())
+            bytes.get(..valid_up_to)
+                .map(|s| String::from_utf8(s.to_vec()).unwrap_or_default())
+                .unwrap_or_default()
         }
     }
 }
@@ -222,6 +224,7 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    #[allow(clippy::unwrap_used, clippy::unused_result_ok)]
     #[test]
     fn reads_existing_file() {
         let mut tmp = std::env::temp_dir();
@@ -243,13 +246,14 @@ mod tests {
             .unwrap();
 
         assert!(result.success);
-        assert!(result.data["content"]
-            .as_str()
+        assert!(result.data.get("content")
+            .and_then(|v| v.as_str())
             .unwrap()
             .contains("hello world"));
         std::fs::remove_file(&tmp).ok();
     }
 
+    #[allow(clippy::unwrap_used)]
     #[test]
     fn rejects_missing_file() {
         let err = FileRead
@@ -267,7 +271,10 @@ mod tests {
             .is_err());
     }
 
+    #[allow(clippy::indexing_slicing)]
+    #[allow(clippy::unused_result_ok)]
     #[test]
+    #[allow(clippy::unwrap_used, clippy::unused_result_ok)]
     fn test_max_bytes_limits_output() {
         let mut tmp = std::env::temp_dir();
         tmp.push("runtimo_test_max_bytes.txt");
@@ -308,6 +315,7 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[allow(clippy::indexing_slicing)]
     #[test]
     fn test_file_read_default_max_bytes() {
         let mut tmp = std::env::temp_dir();
@@ -331,6 +339,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::indexing_slicing)]
     fn test_file_read_json_parsed_for_agents() {
         let mut tmp = std::env::temp_dir();
         tmp.push("runtimo_test_agent.json");

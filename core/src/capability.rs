@@ -12,6 +12,7 @@ use std::path::PathBuf;
 ///
 /// Carries execution metadata such as dry-run mode, the owning job ID,
 /// and the working directory for relative path resolution.
+#[allow(clippy::exhaustive_structs)] // fields are write-through API contract
 pub struct Context {
     /// If true, the capability should not perform side effects.
     pub dry_run: bool,
@@ -26,6 +27,7 @@ pub struct Context {
 /// Returned by every [`Capability::execute`] call. The `data` field holds
 /// structured JSON output, while `message` provides a human-readable summary.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[allow(clippy::exhaustive_structs)] // fields are write-through API contract
 pub struct Output {
     /// Whether the capability completed successfully.
     pub success: bool,
@@ -127,6 +129,7 @@ pub struct CapabilityRegistry {
 
 impl CapabilityRegistry {
     /// Creates an empty registry.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             capabilities: std::collections::HashMap::new(),
@@ -145,11 +148,13 @@ impl CapabilityRegistry {
     /// Looks up a capability by name.
     ///
     /// Returns `None` if no capability with the given name is registered.
+    #[must_use]
     pub fn get(&self, name: &str) -> Option<&dyn Capability> {
         self.capabilities.get(name).map(|c| c.as_ref())
     }
 
     /// Returns the names of all registered capabilities.
+    #[must_use]
     pub fn list(&self) -> Vec<&str> {
         self.capabilities.keys().map(|s| s.as_str()).collect()
     }

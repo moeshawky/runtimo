@@ -7,6 +7,9 @@ authors.workspace = true
 repository.workspace = true
 description = "CLI for the Runtimo capability runtime — run, list, status, logs, undo, telemetry, processes"
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "runtimo"
 path = "src/main.rs"

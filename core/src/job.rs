@@ -47,6 +47,7 @@ impl Default for JobId {
 /// Pending → Validating → Validated → Executing → Completed → RolledBack
 ///                     ↘ Failed      ↘ Failed
 /// ```
+#[allow(clippy::exhaustive_enums)] // new states are breaking changes regardless
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobState {
@@ -147,7 +148,7 @@ impl Job {
     /// # Errors
     ///
     /// Returns an error string describing the invalid transition.
-    #[allow(clippy::match_like_matches_macro)]
+    #[allow(clippy::match_like_matches_macro, clippy::unnested_or_patterns)]
     pub fn transition_to(&mut self, new_state: JobState) -> Result<(), String> {
         let valid = matches!(
             (self.state, new_state),

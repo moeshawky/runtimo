@@ -358,9 +358,8 @@ impl HardwareInfo {
             .parse()
             .unwrap_or(0);
         if nvidia_gpu_count > 0 {
-            let model = run_cmd(
-                "nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1",
-            );
+            let model =
+                run_cmd("nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1");
             accelerators.push(AcceleratorInfo {
                 kind: "gpu".into(),
                 count: nvidia_gpu_count,
@@ -385,11 +384,9 @@ impl HardwareInfo {
 
         // Generic DRM devices (fallback for any GPU)
         if nvidia_gpu_count == 0 && amd_gpu_count == 0 {
-            let dri_count: usize = run_cmd(
-                "ls /dev/dri/render* 2>/dev/null | wc -l",
-            )
-            .parse()
-            .unwrap_or(0);
+            let dri_count: usize = run_cmd("ls /dev/dri/render* 2>/dev/null | wc -l")
+                .parse()
+                .unwrap_or(0);
             if dri_count > 0 {
                 accelerators.push(AcceleratorInfo {
                     kind: "gpu".into(),
@@ -401,9 +398,12 @@ impl HardwareInfo {
         }
 
         let jax_available =
-            run_cmd("timeout 10 python3 -c 'import jax' 2>/dev/null && echo yes || echo no") == "yes";
+            run_cmd("timeout 10 python3 -c 'import jax' 2>/dev/null && echo yes || echo no")
+                == "yes";
         let jax_version = if jax_available {
-            Some(run_cmd("timeout 10 python3 -c 'import jax; print(jax.__version__)'"))
+            Some(run_cmd(
+                "timeout 10 python3 -c 'import jax; print(jax.__version__)'",
+            ))
         } else {
             None
         };
@@ -448,7 +448,10 @@ impl ServiceInfo {
         for &port in &listening {
             if let Some(svc) = detect_service_for_port(port) {
                 // Avoid duplicates (e.g. nginx on both 80 and 443)
-                if !detected.iter().any(|s: &DetectedService| s.name == svc.name) {
+                if !detected
+                    .iter()
+                    .any(|s: &DetectedService| s.name == svc.name)
+                {
                     detected.push(svc);
                 }
             }
@@ -487,9 +490,12 @@ fn parse_listening_ports() -> Vec<u16> {
         }
 
         let addr_port = parts[4];
-        let port = match addr_port.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) {
-            Some(p) => p,
-            None => continue,
+        let Some(port) = addr_port
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse::<u16>().ok())
+        else {
+            continue;
         };
 
         result.push(port);
@@ -516,7 +522,9 @@ fn detect_service_for_port(port: u16) -> Option<DetectedService> {
         }),
         3306 => Some(DetectedService {
             name: "mysql".into(),
-            version: detect_version("mysql --version 2>/dev/null | grep -oP '[0-9]+\\.[0-9]+\\.[0-9]+'"),
+            version: detect_version(
+                "mysql --version 2>/dev/null | grep -oP '[0-9]+\\.[0-9]+\\.[0-9]+'",
+            ),
             running: true,
             ports: vec![3306],
         }),
@@ -528,13 +536,17 @@ fn detect_service_for_port(port: u16) -> Option<DetectedService> {
         }),
         6379 => Some(DetectedService {
             name: "redis".into(),
-            version: detect_version("redis-server --version 2>/dev/null | grep -oP 'v=[0-9]+\\.[0-9]+\\.[0-9]+'"),
+            version: detect_version(
+                "redis-server --version 2>/dev/null | grep -oP 'v=[0-9]+\\.[0-9]+\\.[0-9]+'",
+            ),
             running: true,
             ports: vec![6379],
         }),
         27017 => Some(DetectedService {
             name: "mongodb".into(),
-            version: detect_version("mongod --version 2>/dev/null | grep -oP '[0-9]+\\.[0-9]+\\.[0-9]+'"),
+            version: detect_version(
+                "mongod --version 2>/dev/null | grep -oP '[0-9]+\\.[0-9]+\\.[0-9]+'",
+            ),
             running: true,
             ports: vec![27017],
         }),
@@ -545,12 +557,18 @@ fn detect_service_for_port(port: u16) -> Option<DetectedService> {
 /// Run a version-detection command, return the result or empty string.
 fn detect_version(cmd: &str) -> Option<String> {
     let v = run_cmd(cmd);
-    if v.is_empty() { None } else { Some(v) }
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
 }
 
 impl NetworkInfo {
     fn capture() -> Self {
-        let public_ip = run_cmd("curl -s --connect-timeout 5 --max-time 5 ifconfig.me 2>/dev/null || echo 'unknown'");
+        let public_ip = run_cmd(
+            "curl -s --connect-timeout 5 --max-time 5 ifconfig.me 2>/dev/null || echo 'unknown'",
+        );
         let tunnel_output = run_cmd("pgrep -fa cloudflared");
         let tunnel_running = !tunnel_output.is_empty();
         let tunnel_name = if tunnel_running {
@@ -606,7 +624,10 @@ mod tests {
     fn test_telemetry_cache_works() {
         let t1 = Telemetry::capture();
         let t2 = Telemetry::capture();
-        assert_eq!(t1.timestamp, t2.timestamp, "cached telemetry should be identical");
+        assert_eq!(
+            t1.timestamp, t2.timestamp,
+            "cached telemetry should be identical"
+        );
     }
 
     #[test]
@@ -702,14 +723,12 @@ mod tests {
     #[test]
     fn test_telemetry_serialization_roundtrip() {
         let hw = HardwareInfo {
-            accelerators: vec![
-                AcceleratorInfo {
-                    kind: "gpu".into(),
-                    count: 2,
-                    vendor: Some("nvidia".into()),
-                    model: Some("H100".into()),
-                },
-            ],
+            accelerators: vec![AcceleratorInfo {
+                kind: "gpu".into(),
+                count: 2,
+                vendor: Some("nvidia".into()),
+                model: Some("H100".into()),
+            }],
             jax_available: true,
             jax_version: Some("0.4.30".into()),
             jax_device_count: Some(2),
@@ -754,8 +773,10 @@ mod tests {
         let parsed: HardwareInfo = serde_json::from_str(old_json).unwrap();
         assert_eq!(parsed.tpu_devices, 8);
         assert_eq!(parsed.gpu_devices, 4);
-        assert!(parsed.accelerators.is_empty(),
-            "old WAL events deserialize with empty accelerators (backwards compat)");
+        assert!(
+            parsed.accelerators.is_empty(),
+            "old WAL events deserialize with empty accelerators (backwards compat)"
+        );
         assert!(parsed.jax_available);
     }
 }

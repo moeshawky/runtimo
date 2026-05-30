@@ -91,6 +91,7 @@ pub use wal::{WalEvent, WalEventType, WalReader, WalWriter};
 ///
 /// Covers all failure modes: state transitions, schema validation,
 /// capability execution, WAL/backup errors, resource limits, and telemetry.
+#[allow(clippy::exhaustive_enums)] // new variants are semver-breaking regardless
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// Invalid job state transition attempted.
@@ -173,7 +174,8 @@ pub mod utils {
             .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut bytes).ok())
             .is_some()
         {
-            bytes.iter().map(|b| format!("{:02x}", b)).collect()
+            #[allow(clippy::format_collect)]
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
         } else {
             // Fallback: timestamp-based (collision possible but rare)
             let ts = std::time::SystemTime::now()

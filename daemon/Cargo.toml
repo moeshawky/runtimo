@@ -7,6 +7,9 @@ authors.workspace = true
 repository.workspace = true
 description = "Daemon for the Runtimo capability runtime (JSON-RPC server, placeholder)"
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "runtimo-daemon"
 path = "src/main.rs"

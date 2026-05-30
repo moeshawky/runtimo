@@ -79,6 +79,7 @@ impl Default for HealthState {
 
 /// Health alert types.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::exhaustive_enums)]
 pub enum HealthAlert {
     /// Zombie process count exceeded threshold.
     ZombieCount { count: usize, threshold: usize },
@@ -91,13 +92,13 @@ pub enum HealthAlert {
 impl std::fmt::Display for HealthAlert {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            HealthAlert::ZombieCount { count, threshold } => {
+            Self::ZombieCount { count, threshold } => {
                 write!(f, "Zombie processes: {} (threshold: {})", count, threshold)
             }
-            HealthAlert::CpuHigh { percent, minutes } => {
+            Self::CpuHigh { percent, minutes } => {
                 write!(f, "CPU usage: {:.1}% for {} minutes", percent, minutes)
             }
-            HealthAlert::MemoryLeak { ram_percent } => {
+            Self::MemoryLeak { ram_percent } => {
                 write!(f, "Memory leak detected: {:.1}% RAM", ram_percent)
             }
         }
@@ -137,6 +138,10 @@ impl HealthMonitor {
     /// # Returns
     ///
     /// `Ok(HealthMonitor)` on success, or error if thread spawn fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(String)` if the background monitoring thread fails to spawn.
     pub fn start() -> Result<Self, String> {
         let state = Arc::new(RwLock::new(HealthState::default()));
         let alerts = Arc::new(RwLock::new(Vec::new()));
@@ -161,11 +166,12 @@ impl HealthMonitor {
                 // Update state
                 current_state.timestamp = telemetry.timestamp;
                 current_state.cpu_percent = processes.summary.total_cpu_percent;
-                current_state.ram_percent = parse_ram_percent(&telemetry.system.ram_total, &telemetry.system.ram_free);
+                current_state.ram_percent =
+                    parse_ram_percent(&telemetry.system.ram_total, &telemetry.system.ram_free);
                 current_state.zombie_count = processes.summary.zombie_count;
                 current_state.process_count = processes.summary.total_processes;
-                current_state.top_cpu_process = processes.summary.top_cpu_consumer.clone();
-                current_state.top_mem_process = processes.summary.top_mem_consumer.clone();
+                current_state.top_cpu_process.clone_from(&processes.summary.top_cpu_consumer);
+                current_state.top_mem_process.clone_from(&processes.summary.top_mem_consumer);
 
                 // Check CPU threshold
                 if current_state.cpu_percent > CPU_THRESHOLD {
@@ -272,6 +278,7 @@ fn parse_size_value(size_str: &str) -> f32 {
     if size_str.ends_with("Gi") {
         size_str.trim_end_matches("Gi").parse().unwrap_or(0.0)
     } else if size_str.ends_with("Mi") {
+        #[allow(clippy::map_unwrap_or)] // parse::<f32>().unwrap_or(0.0) is idiomatic for fallback
         size_str
             .trim_end_matches("Mi")
             .parse::<f32>()
@@ -301,6 +308,7 @@ fn parse_size_value(size_str: &str) -> f32 {
 
 /// Adds an alert to the alert history (max 100 alerts).
 fn add_alert(alerts: &Arc<RwLock<Vec<HealthAlert>>>, alert: HealthAlert) {
+    #[allow(clippy::expect_used)] // lock poisoning is irrecoverable
     let mut alerts_vec = alerts.write().expect("Alerts lock poisoned");
     alerts_vec.push(alert);
     if alerts_vec.len() > 100 {
@@ -309,6 +317,7 @@ fn add_alert(alerts: &Arc<RwLock<Vec<HealthAlert>>>, alert: HealthAlert) {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp, clippy::use_self)]
 mod tests {
     use super::*;
 
@@ -345,47 +354,48 @@ mod tests {
         assert_eq!(state.cpu_alert_count, 5);
     }
 
-#[test]
-fn test_ram_alert_uses_ram_counter_not_cpu() {
-    let mut state = HealthState {
-        last_ram_percent: Some(50.0),
-        ..Default::default()
-    };
-    // Simulate RAM increasing each check while CPU is normal
-    for i in 0..5 {
-        state.ram_percent = 50.0 + (i as f32 + 1.0); // 51, 52, 53, 54, 55
-        state.cpu_percent = 10.0; // CPU is fine
+    #[test]
+    fn test_ram_alert_uses_ram_counter_not_cpu() {
+        let mut state = HealthState {
+            last_ram_percent: Some(50.0),
+            ..Default::default()
+        };
+        // Simulate RAM increasing each check while CPU is normal
+        #[allow(clippy::cast_precision_loss)]
+        for i in 0..5 {
+            state.ram_percent = 50.0 + (i as f32 + 1.0); // 51, 52, 53, 54, 55
+            state.cpu_percent = 10.0; // CPU is fine
+            if state.ram_percent > state.last_ram_percent.unwrap() {
+                state.ram_increasing = true;
+                state.ram_alert_count += 1;
+            } else {
+                state.ram_increasing = false;
+                state.ram_alert_count = 0;
+            }
+            state.last_ram_percent = Some(state.ram_percent);
+        }
+        // RAM alert should fire after 5 consecutive increases (independent of CPU)
+        assert_eq!(state.ram_alert_count, 5);
+        assert!(state.ram_increasing);
+    }
+
+    #[test]
+    fn test_ram_alert_resets_when_ram_decreases() {
+        let mut state = HealthState {
+            last_ram_percent: Some(50.0),
+            ..Default::default()
+        };
+
+        // RAM increases twice
+        state.ram_percent = 55.0;
+        state.ram_alert_count = 2;
+        state.last_ram_percent = Some(55.0);
+
+        // RAM decreases — counter should reset
+        state.ram_percent = 40.0;
         if state.ram_percent > state.last_ram_percent.unwrap() {
             state.ram_increasing = true;
             state.ram_alert_count += 1;
-        } else {
-            state.ram_increasing = false;
-            state.ram_alert_count = 0;
-        }
-        state.last_ram_percent = Some(state.ram_percent);
-    }
-    // RAM alert should fire after 5 consecutive increases (independent of CPU)
-    assert_eq!(state.ram_alert_count, 5);
-    assert!(state.ram_increasing);
-}
-
-#[test]
-fn test_ram_alert_resets_when_ram_decreases() {
-    let mut state = HealthState {
-        last_ram_percent: Some(50.0),
-        ..Default::default()
-    };
-
-    // RAM increases twice
-    state.ram_percent = 55.0;
-    state.ram_alert_count = 2;
-    state.last_ram_percent = Some(55.0);
-
-    // RAM decreases — counter should reset
-    state.ram_percent = 40.0;
-    if state.ram_percent > state.last_ram_percent.unwrap() {
-        state.ram_increasing = true;
-        state.ram_alert_count += 1;
         } else {
             state.ram_increasing = false;
             state.ram_alert_count = 0;

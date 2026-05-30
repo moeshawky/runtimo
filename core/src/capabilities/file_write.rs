@@ -77,6 +77,7 @@ pub struct FileWrite {
 }
 
 impl FileWrite {
+    #[allow(clippy::missing_errors_doc)] // Error path is self-documenting — propagates BackupManager::new
     pub fn new(backup_dir: PathBuf) -> Result<Self> {
         Ok(Self {
             backup_mgr: BackupManager::new(backup_dir)?,
@@ -157,7 +158,7 @@ impl Capability for FileWrite {
 
         if args.append {
             if let Ok(meta) = std::fs::metadata(&path) {
-                let existing = meta.len() as usize;
+                let existing = usize::try_from(meta.len()).unwrap_or(usize::MAX);
                 if existing.saturating_add(args.content.len()) > MAX_APPEND_SIZE {
                     return Err(Error::ExecutionFailed(format!(
                         "append would exceed max file size: {} + {} > {} bytes",
@@ -242,8 +243,11 @@ fn is_critical_file(path: &std::path::Path) -> bool {
     false
 }
 
-fn check_disk_space(path: &std::path::Path, content_size: usize) -> std::result::Result<(), String> {
-    let parent = path.parent().unwrap_or(std::path::Path::new("/"));
+fn check_disk_space(
+    path: &std::path::Path,
+    content_size: usize,
+) -> std::result::Result<(), String> {
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("/"));
 
     // Parent may not exist yet (create_dir_all runs later). Skip df — disk
     // check is meaningless for a path that doesn't exist on the filesystem.
@@ -265,9 +269,8 @@ fn check_disk_space(path: &std::path::Path, content_size: usize) -> std::result:
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut lines = stdout.lines();
 
-    let header = match lines.next() {
-        Some(h) => h,
-        None => return Ok(()),
+    let Some(header) = lines.next() else {
+        return Ok(());
     };
     let headers: Vec<&str> = header.split_whitespace().collect();
     let avail_idx = headers
@@ -279,7 +282,7 @@ fn check_disk_space(path: &std::path::Path, content_size: usize) -> std::result:
         let idx = avail_idx.unwrap_or(3); // fall back to column 3 (GNU default)
         if let Some(available_str) = parts.get(idx) {
             if let Ok(available) = available_str.parse::<u64>() {
-                let required = content_size as u64 + MIN_FREE_DISK_BYTES;
+                let required = (content_size as u64).saturating_add(MIN_FREE_DISK_BYTES);
                 if available < required {
                     return Err(format!(
                         "insufficient disk space: {} bytes available, {} bytes required",
@@ -302,7 +305,10 @@ fn atomic_write(path: &std::path::Path, content: &str) -> Result<usize> {
             .map(|n| n.to_string_lossy())
             .unwrap_or_default()
     );
-    let tmp_path = path.parent().unwrap_or(std::path::Path::new(".")).join(&tmp_name);
+    let tmp_path = path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(&tmp_name);
 
     {
         let mut file = std::fs::File::create(&tmp_path).map_err(|e| {
@@ -318,10 +324,15 @@ fn atomic_write(path: &std::path::Path, content: &str) -> Result<usize> {
 
     std::fs::rename(&tmp_path, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp_path);
-        Error::ExecutionFailed(format!("atomic rename {} -> {}: {}", tmp_path.display(), path.display(), e))
+        Error::ExecutionFailed(format!(
+            "atomic rename {} -> {}: {}",
+            tmp_path.display(),
+            path.display(),
+            e
+        ))
     })?;
 
-    if let Ok(dir) = std::fs::File::open(path.parent().unwrap_or(std::path::Path::new("."))) {
+    if let Ok(dir) = std::fs::File::open(path.parent().unwrap_or_else(|| std::path::Path::new("."))) {
         let _ = dir.sync_all();
     }
 
@@ -353,7 +364,10 @@ fn atomic_append(path: &std::path::Path, content: &str) -> Result<usize> {
             .map(|n| n.to_string_lossy())
             .unwrap_or_default()
     );
-    let tmp_path = path.parent().unwrap_or(std::path::Path::new(".")).join(&tmp_name);
+    let tmp_path = path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(&tmp_name);
 
     {
         let mut file = std::fs::File::create(&tmp_path).map_err(|e| {
@@ -369,10 +383,15 @@ fn atomic_append(path: &std::path::Path, content: &str) -> Result<usize> {
 
     std::fs::rename(&tmp_path, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp_path);
-        Error::ExecutionFailed(format!("atomic rename {} -> {}: {}", tmp_path.display(), path.display(), e))
+        Error::ExecutionFailed(format!(
+            "atomic rename {} -> {}: {}",
+            tmp_path.display(),
+            path.display(),
+            e
+        ))
     })?;
 
-    if let Ok(dir) = std::fs::File::open(path.parent().unwrap_or(std::path::Path::new("."))) {
+    if let Ok(dir) = std::fs::File::open(path.parent().unwrap_or_else(|| std::path::Path::new("."))) {
         let _ = dir.sync_all();
     }
 
@@ -380,6 +399,7 @@ fn atomic_append(path: &std::path::Path, content: &str) -> Result<usize> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -603,10 +623,7 @@ mod tests {
 
     #[test]
     fn test_check_disk_space_writable_tmp_is_ok() {
-        let result = check_disk_space(
-            &std::env::temp_dir().join("runtimo_df_test.txt"),
-            100,
-        );
+        let result = check_disk_space(&std::env::temp_dir().join("runtimo_df_test.txt"), 100);
         assert!(result.is_ok(), "df on /tmp should succeed");
     }
 
@@ -673,7 +690,10 @@ mod tests {
         assert!(result.success);
 
         let tmp = target.parent().unwrap().join(".runtimo_fw_sync.txt.tmp");
-        assert!(!tmp.exists(), "temp file should be cleaned up after atomic rename");
+        assert!(
+            !tmp.exists(),
+            "temp file should be cleaned up after atomic rename"
+        );
 
         std::fs::remove_file(&target).ok();
         std::fs::remove_dir_all(test_backup_dir()).ok();

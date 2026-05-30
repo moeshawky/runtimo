@@ -59,12 +59,12 @@ impl ResourceHistory {
                 if let Ok(secs) = content.trim().parse::<u64>() {
                     let now_epoch = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
+                        .map_or(0, |d| d.as_secs());
                     let elapsed_secs = now_epoch.saturating_sub(secs);
                     if elapsed_secs < self.cooldown_secs {
                         self.last_check = Some(
-                            Instant::now() - Duration::from_secs(elapsed_secs)
+                            Instant::now().checked_sub(Duration::from_secs(elapsed_secs))
+                                .unwrap_or_else(Instant::now)
                         );
                     }
                 }
@@ -77,8 +77,7 @@ impl ResourceHistory {
         if let Some(ref path) = self.persist_path {
             let secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+                .map_or(0, |d| d.as_secs());
             let _ = fs::write(path, secs.to_string());
         }
     }
@@ -86,18 +85,24 @@ impl ResourceHistory {
     /// Records a pressure measurement and returns the rolling average.
     fn record(&mut self, pressure: u8) -> f64 {
         let now = Instant::now();
-        let cutoff = now - Duration::from_secs(self.window_secs);
+        let cutoff = now
+            .checked_sub(Duration::from_secs(self.window_secs))
+            .unwrap_or_else(Instant::now);
         self.measurements.retain(|(t, _)| *t > cutoff);
         self.measurements.push((now, pressure));
 
         if self.measurements.is_empty() {
             return pressure as f64;
         }
-        self.measurements
-            .iter()
-            .map(|(_, p)| *p as f64)
-            .sum::<f64>()
-            / self.measurements.len() as f64
+        #[allow(clippy::cast_precision_loss)]
+        {
+            let count = self.measurements.len() as f64;
+            self.measurements
+                .iter()
+                .map(|(_, p)| *p as f64)
+                .sum::<f64>()
+                / count
+        }
     }
 
     /// Returns the rolling average pressure over the tracking window.
@@ -105,13 +110,17 @@ impl ResourceHistory {
         if self.measurements.is_empty() {
             return None;
         }
-        Some(
-            self.measurements
-                .iter()
-                .map(|(_, p)| *p as f64)
-                .sum::<f64>()
-                / self.measurements.len() as f64,
-        )
+        #[allow(clippy::cast_precision_loss)]
+        {
+            let count = self.measurements.len() as f64;
+            Some(
+                self.measurements
+                    .iter()
+                    .map(|(_, p)| *p as f64)
+                    .sum::<f64>()
+                    / count,
+            )
+        }
     }
 
     /// Checks if we're in a cooldown period after a recent check.
@@ -134,14 +143,15 @@ static RESOURCE_HISTORY: Mutex<Option<ResourceHistory>> = Mutex::new(None);
 /// Returns the default path for persisting resource history state.
 fn resource_history_path() -> PathBuf {
     std::env::var("RUNTIMO_STATE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::var("HOME")
-                .ok()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/tmp"))
-                .join(".runtimo")
-        })
+        .map_or_else(
+            |_| {
+                std::env::var("HOME")
+                    .ok()
+                    .map_or_else(|| PathBuf::from("/tmp"), PathBuf::from)
+                    .join(".runtimo")
+            },
+            PathBuf::from,
+        )
         .join("resource_history.state")
 }
 
@@ -191,14 +201,16 @@ impl LlmoSafeGuard {
     ///
     /// Returns an error string if resource pressure exceeds 80% or the
     /// underlying `ResourceGuard::check()` fails.
+    ///
+    /// # Panics
+    /// Panics if the global resource history mutex is poisoned.
     pub fn check(&self) -> Result<(), String> {
-        let mut history = RESOURCE_HISTORY
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut history = RESOURCE_HISTORY.lock().unwrap_or_else(|e| e.into_inner());
         if history.is_none() {
             *history = Some(ResourceHistory::new(30, 1, Some(resource_history_path())));
         }
-        let hist = history.as_mut().unwrap();
+        #[allow(clippy::expect_used)]
+        let hist = history.as_mut().expect("history always Some after initialization above");
 
         // FINDING #16: Enforce cooldown between checks
         if hist.is_in_cooldown() {
@@ -287,6 +299,7 @@ impl Default for LlmoSafeGuard {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -334,7 +347,11 @@ mod tests {
         hist.record(70);
 
         let avg = hist.rolling_average().unwrap();
-        assert!((avg - 60.0).abs() < 0.1, "Rolling avg should be ~60, got {}", avg);
+        assert!(
+            (avg - 60.0).abs() < 0.1,
+            "Rolling avg should be ~60, got {}",
+            avg
+        );
     }
 
     #[test]
@@ -343,6 +360,9 @@ mod tests {
         hist.record(90);
         hist.mark_checked();
 
-        assert!(hist.is_in_cooldown(), "Should be in cooldown immediately after check");
+        assert!(
+            hist.is_in_cooldown(),
+            "Should be in cooldown immediately after check"
+        );
     }
 }

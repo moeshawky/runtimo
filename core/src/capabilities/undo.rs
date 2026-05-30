@@ -29,6 +29,9 @@ pub struct UndoArgs {
     pub file: Option<String>,
 }
 
+// This struct is intentionally simple — it implements the Capability trait
+// and adding non-pub fields would serve no purpose.
+#[allow(clippy::exhaustive_structs)]
 pub struct Undo;
 
 impl Capability for Undo {
@@ -125,9 +128,7 @@ impl Capability for Undo {
                 if backup_path.is_file() {
                     let backup_path_str = backup_path
                         .to_str()
-                        .ok_or_else(|| {
-                            crate::Error::ExecutionFailed("Invalid backup path".into())
-                        })?
+                        .ok_or_else(|| crate::Error::ExecutionFailed("Invalid backup path".into()))?
                         .to_string();
 
                     // FINDING #12: Look up by full backup path, not just filename
@@ -148,18 +149,17 @@ impl Capability for Undo {
                         require_file: false,
                         ..Default::default()
                     };
-                    let target_path = validate_path(
-                        &target_path.to_string_lossy(),
-                        &restore_ctx,
-                    )
-                    .map_err(|e| {
-                        crate::Error::ExecutionFailed(format!(
-                            "restore target validation: {}", e
-                        ))
+                    let target_path = validate_path(&target_path.to_string_lossy(), &restore_ctx)
+                        .map_err(|e| {
+                        crate::Error::ExecutionFailed(format!("restore target validation: {}", e))
                     })?;
 
                     backup_mgr.restore(&backup_path, &target_path)?;
-                    restored.push(format!("{} -> {}", backup_path.display(), target_path.display()));
+                    restored.push(format!(
+                        "{} -> {}",
+                        backup_path.display(),
+                        target_path.display()
+                    ));
                 }
             }
         }
@@ -176,6 +176,7 @@ impl Capability for Undo {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_statements)]
 mod tests {
     use super::*;
     use crate::capability::Context;

@@ -32,7 +32,7 @@ const CACHE_TTL_SECS: u64 = 30;
 pub struct ProcessSnapshot {
     /// Unix timestamp (seconds) when the snapshot was taken.
     pub timestamp: u64,
-    /// Individual process records parsed from `ps aux`.
+    /// Individual process records parsed from `ps -eo`.
     pub processes: Vec<ProcessInfo>,
     /// Aggregated summary statistics.
     pub summary: ProcessSummary,
@@ -309,6 +309,7 @@ impl ProcessSummary {
 }
 
 /// Formats a size in kilobytes as a human-readable string (K/M/G).
+#[allow(clippy::cast_precision_loss)]
 fn format_size(kb: u64) -> String {
     if kb >= 1024 * 1024 {
         format!("{:.1}G", kb as f64 / (1024.0 * 1024.0))
@@ -378,9 +379,19 @@ mod tests {
         for p in &snap.processes {
             // vsz can be very large on 64-bit systems (virtual memory is cheap)
             // but should not exceed 1PB (1024*1024*1024 KB)
-            assert!(p.vsz < 1_000_000_000, "vsz={}KB is unreasonably large for {}", p.vsz, p.command);
+            assert!(
+                p.vsz < 1_000_000_000,
+                "vsz={}KB is unreasonably large for {}",
+                p.vsz,
+                p.command
+            );
             // rss is physical memory — should be under 100GB for any single process
-            assert!(p.rss < 100_000_000, "rss={}KB is unreasonably large for {}", p.rss, p.command);
+            assert!(
+                p.rss < 100_000_000,
+                "rss={}KB is unreasonably large for {}",
+                p.rss,
+                p.command
+            );
         }
     }
 }

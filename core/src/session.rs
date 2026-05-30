@@ -53,6 +53,7 @@ pub struct Session {
 /// Session lifecycle status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(clippy::exhaustive_enums)]
 pub enum SessionStatus {
     /// Session is active and accepting jobs.
     Active,
@@ -71,6 +72,9 @@ pub struct SessionManager {
 
 impl SessionManager {
     /// Creates a new session manager.
+    ///
+    /// # Errors
+    /// Returns an error if the sessions directory cannot be created.
     pub fn new(sessions_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&sessions_dir).map_err(|e| {
             crate::Error::BackupError(format!("Failed to create sessions dir: {}", e))
@@ -87,7 +91,7 @@ impl SessionManager {
         let id = crate::utils::generate_id();
 
         let session = Session {
-            id: id.clone(),
+            id,
             name: name.map(String::from),
             job_ids: Vec::new(),
             created_at: ts,
@@ -100,10 +104,14 @@ impl SessionManager {
     }
 
     /// Loads a session by ID.
+    /// Loads a session from disk by ID.
+    ///
+    /// # Errors
+    /// Returns `BackupError` if the session file cannot be read or parsed.
     pub fn load_session(&self, session_id: &str) -> Result<Session> {
         let path = self.session_path(session_id);
         let content = std::fs::read_to_string(&path)
-            .map_err(|_| crate::Error::BackupError(format!("Session not found: {}", session_id)))?;
+            .map_err(|e| crate::Error::BackupError(format!("Session not found {}: {}", session_id, e)))?;
         serde_json::from_str(&content)
             .map_err(|e| crate::Error::BackupError(format!("Failed to parse session: {}", e)))
     }
@@ -198,7 +206,7 @@ mod tests {
     #[test]
     fn lists_sessions() {
         let dir = tmp_dir("lists");
-        let mut mgr = SessionManager::new(dir.clone()).unwrap();
+        let mut mgr = SessionManager::new(dir).unwrap();
         let _ = mgr.create_session(Some("first")).unwrap();
         let _ = mgr.create_session(Some("second")).unwrap();
 

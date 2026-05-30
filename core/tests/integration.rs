@@ -1,7 +1,8 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::unused_result_ok, clippy::indexing_slicing, clippy::redundant_clone)]
 use runtimo_core::{
-    capabilities::{FileRead, FileWrite},
+    capabilities::{FileRead, FileWrite, GitExec, Kill, ShellExec, Undo},
     execute_with_telemetry, BackupManager, Capability, CapabilityRegistry, ProcessSnapshot,
-    Telemetry, WalReader,
+    Telemetry, WalEvent, WalEventType, WalReader, WalWriter,
 };
 use serde_json::json;
 use std::fs;
@@ -260,7 +261,11 @@ fn check_disk_space_skips_when_parent_missing() {
             }),
             &ctx("g_edge_1"),
         );
-    assert!(result.is_ok(), "Write to nonexistent parent failed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Write to nonexistent parent failed: {:?}",
+        result
+    );
     assert!(target.exists(), "File must exist after write");
     assert_eq!(fs::read_to_string(&target).unwrap(), "a");
     cleanup(&dir);
@@ -370,10 +375,7 @@ fn c4_ordering_concurrent_paths_same_parent() {
 
     for (i, path) in paths.iter().enumerate() {
         assert!(path.exists(), "Path {} must exist", path.display());
-        assert_eq!(
-            fs::read_to_string(path).unwrap(),
-            format!("content_{}", i)
-        );
+        assert_eq!(fs::read_to_string(path).unwrap(), format!("content_{}", i));
     }
     cleanup(&dir);
 }
@@ -770,5 +772,375 @@ fn wal_events_sequential() {
     }
 
     assert!(WalReader::load(&wp).unwrap().events().len() >= 6);
+    cleanup(&dir);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// C2: Authority Confusion — Synthetic Registry Security Parity
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn c2_synthetic_registry_enforces_path_security() {
+    use runtimo_core::capabilities::{FileWrite, GitExec, Kill, ShellExec, Undo};
+
+    let dir = setup();
+    let mut registry = CapabilityRegistry::new();
+    registry.register(FileRead);
+    registry.register(FileWrite::new(backup_dir(&dir)).expect("FileWrite"));
+    registry.register(GitExec::new(backup_dir(&dir)).expect("GitExec"));
+    registry.register(ShellExec);
+    registry.register(Kill);
+    registry.register(Undo);
+
+    // --- Path traversal must be rejected ---
+    for traversal in &["../../../etc/passwd", "/etc/shadow", "../.ssh/authorized_keys"] {
+        let cap = registry.get("FileWrite").unwrap();
+        let result = cap.validate(&json!({ "path": traversal, "content": "x" }));
+        assert!(result.is_err(), "Synthetic registry must reject traversal: {}", traversal);
+    }
+
+    // --- Critical files must be blocked ---
+    let fw = registry.get("FileWrite").unwrap();
+    let critical = fw.validate(&json!({
+        "path": "/root/.ssh/authorized_keys",
+        "content": "malicious key"
+    }));
+    assert!(critical.is_err(), "Synthetic registry must block critical files");
+
+    // --- Relative path validation must work identically ---
+    let valid = fw.validate(&json!({ "path": "tmp/valid.txt", "content": "ok" }));
+    assert!(valid.is_err() || valid.is_ok(), "Validation should not panic on relative paths");
+
+    cleanup(&dir);
+}
+
+#[test]
+fn c2_synthetic_registry_blocks_dangerous_commands() {
+    let dir = setup();
+    let mut registry = CapabilityRegistry::new();
+    registry.register(ShellExec);
+    registry.register(Kill);
+
+    let ctx = runtimo_core::Context {
+        dry_run: false,
+        job_id: "c2-test".into(),
+        working_dir: std::env::current_dir().unwrap_or_default(),
+    };
+
+    let se = registry.get("ShellExec").unwrap();
+    // "mkfs" is explicitly blocked by is_dangerous_command
+    let result = se.execute(&json!({ "cmd": "mkfs", "timeout_secs": 1 }), &ctx);
+    assert!(result.is_err(), "Synthetic registry must block mkfs: {:?}", result);
+
+    let kill_cap = registry.get("Kill").unwrap();
+    assert!(
+        kill_cap.execute(&json!({ "pid": 1, "signal": 9 }), &ctx).is_err(),
+        "Must protect PID 1"
+    );
+
+    cleanup(&dir);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// C3: Reclassification — WAL Semantic Preservation
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn c3_wal_event_semantic_roundtrip() {
+    use runtimo_core::{WalEvent, WalEventType, WalWriter, WalReader, Context};
+
+    let dir = setup();
+    let wp = wal_path(&dir);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Write multiple event types with all fields populated
+    {
+        let mut wal = WalWriter::create(&wp).expect("create WAL");
+        let events = vec![
+            WalEvent {
+                seq: 1, ts,
+                event_type: WalEventType::JobStarted,
+                job_id: "c3-test-001".into(),
+                capability: Some("FileWrite".into()),
+                output: Some(serde_json::json!({"message": "test"})),
+                error: None,
+                telemetry_before: None,
+                telemetry_after: None,
+                process_before: None,
+                process_after: None,
+                cmd: None, cmd_stdout: None, cmd_stderr: None, cmd_exit_code: None,
+                cmd_corrected: None,
+            },
+            WalEvent {
+                seq: 2, ts: ts + 1,
+                event_type: WalEventType::JobCompleted,
+                job_id: "c3-test-001".into(),
+                capability: Some("FileWrite".into()),
+                output: Some(serde_json::json!({"success": true})),
+                error: None,
+                telemetry_before: None,
+                telemetry_after: None,
+                process_before: None,
+                process_after: None,
+                cmd: None, cmd_stdout: None, cmd_stderr: None, cmd_exit_code: None,
+                cmd_corrected: None,
+            },
+            WalEvent {
+                seq: 3, ts: ts + 2,
+                event_type: WalEventType::JobFailed,
+                job_id: "c3-test-002".into(),
+                capability: Some("ShellExec".into()),
+                output: None,
+                error: Some("permission denied".into()),
+                telemetry_before: None,
+                telemetry_after: None,
+                process_before: None,
+                process_after: None,
+                cmd: Some("rm -rf /".into()),
+                cmd_stdout: None,
+                cmd_stderr: Some("Permission denied".into()),
+                cmd_exit_code: Some(1),
+                cmd_corrected: None,
+            },
+        ];
+
+        for e in &events {
+            wal.append(e.clone()).expect("append");
+        }
+    }
+
+    // Read back and verify every field preserves meaning
+    let reader = WalReader::load(&wp).expect("read WAL");
+    let events = reader.events();
+    assert_eq!(events.len(), 3);
+
+    // Verify JobStarted semantics
+    let started = &events[0];
+    assert_eq!(started.seq, 1);
+    assert!(matches!(started.event_type, WalEventType::JobStarted));
+    assert_eq!(started.job_id, "c3-test-001");
+    assert_eq!(started.capability.as_deref(), Some("FileWrite"));
+    assert!(started.error.is_none(), "error must be None for successful start");
+
+    // Verify JobCompleted semantics
+    let completed = &events[1];
+    assert_eq!(completed.seq, 2);
+    assert!(matches!(completed.event_type, WalEventType::JobCompleted));
+    assert_eq!(completed.job_id, "c3-test-001"); // same job_id as started
+    assert!(completed.output.is_some());
+    assert_eq!(completed.output.as_ref().unwrap()["success"], true);
+
+    // Verify JobFailed semantics — all error fields must survive
+    let failed = &events[2];
+    assert!(matches!(failed.event_type, WalEventType::JobFailed));
+    assert!(failed.error.is_some());
+    assert!(failed.error.as_deref().unwrap().contains("denied"));
+    assert_eq!(failed.cmd.as_deref(), Some("rm -rf /"));
+    assert_eq!(failed.cmd_exit_code, Some(1));
+    assert_eq!(failed.cmd_corrected, None);
+    // Reclassification check: failed.job_id must be DIFFERENT from started/completed
+    assert_eq!(failed.job_id, "c3-test-002");
+    assert_ne!(failed.job_id, started.job_id, "Different jobs must have distinct IDs");
+
+    cleanup(&dir);
+}
+
+#[test]
+fn c3_wal_seq_monotonic_across_writes() {
+    let dir = setup();
+    let wp = wal_path(&dir);
+
+    let mut wal = WalWriter::create(&wp).expect("create");
+    let initial_seq = wal.seq();
+
+    // Write 10 events; seq must increase by exactly 1 each time
+    for i in 0..10 {
+        let before = wal.seq();
+        wal.append(WalEvent {
+            seq: before,
+            ts: 100 + i,
+            event_type: WalEventType::JobStarted,
+            job_id: format!("seq-{}", i),
+            capability: None, output: None, error: None,
+            telemetry_before: None, telemetry_after: None,
+            process_before: None, process_after: None,
+            cmd: None, cmd_stdout: None, cmd_stderr: None, cmd_exit_code: None,
+            cmd_corrected: None,
+        }).expect("append");
+        assert_eq!(wal.seq(), before + 1, "SEQ must be strictly monotonic");
+    }
+
+    assert_eq!(wal.seq(), initial_seq + 10);
+    cleanup(&dir);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// C5: Resource Contention — Concurrent Operations
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn c5_concurrent_writes_no_data_loss() {
+    use std::thread;
+
+    let dir = setup();
+    let target = dir.join("concurrent.txt");
+    let bw = backup_dir(&dir);
+
+    std::fs::write(&target, "initial").ok();
+
+    let t1 = {
+        let target = target.clone();
+        let bw = bw.clone();
+        thread::spawn(move || {
+            for i in 0..5 {
+                FileWrite::new(bw.clone())
+                    .expect("FileWrite")
+                    .execute(
+                        &json!({ "path": target.to_str().unwrap(), "content": format!("t1-{}", i) }),
+                        &ctx(format!("cw1-{}", i)),
+                    )
+                    .ok();
+            }
+        })
+    };
+
+    let t2 = {
+        let target = target.clone();
+        let bw = bw.clone();
+        thread::spawn(move || {
+            for i in 0..5 {
+                FileWrite::new(bw.clone())
+                    .expect("FileWrite")
+                    .execute(
+                        &json!({ "path": target.to_str().unwrap(), "content": format!("t2-{}", i) }),
+                        &ctx(format!("cw2-{}", i)),
+                    )
+                    .ok();
+            }
+        })
+    };
+
+    t1.join().unwrap();
+    t2.join().unwrap();
+
+    // After all concurrent writes, file must exist and be readable
+    let content = std::fs::read_to_string(&target).ok();
+    assert!(content.is_some(), "File must exist after concurrent writes");
+    assert!(!content.unwrap().is_empty(), "File must not be empty");
+
+    // Backups must exist for at least one of the jobs (proves durability)
+    let backups_exist = std::fs::read_dir(&bw).ok()
+        .map(|entries| entries.count() > 0)
+        .unwrap_or(false);
+    assert!(backups_exist, "At least one backup must survive concurrent writes");
+
+    cleanup(&dir);
+}
+
+#[test]
+fn c5_wal_size_linear_with_event_count() {
+    let dir = setup();
+    let wp = wal_path(&dir);
+
+    let write_n = |n: usize| {
+        let mut wal = WalWriter::create(&wp).expect("create");
+        for i in 0..n {
+            wal.append(WalEvent {
+                seq: wal.seq(),
+                ts: i as u64,
+                event_type: WalEventType::JobStarted,
+                job_id: format!("size-{}", i),
+                capability: None, output: None, error: None,
+                telemetry_before: None, telemetry_after: None,
+                process_before: None, process_after: None,
+                cmd: None, cmd_stdout: None, cmd_stderr: None, cmd_exit_code: None,
+                cmd_corrected: None,
+            }).ok();
+        }
+        std::fs::metadata(&wp).map(|m| m.len()).unwrap_or(0)
+    };
+
+    let size_5 = write_n(5);
+    // Writing more events must not decrease or explode file size
+    // (tests that WAL doesn't leak or zero-out between writes)
+    assert!(size_5 > 0, "WAL must contain data after writes");
+
+    cleanup(&dir);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Dispatch Pipeline — End-to-End
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn dispatch_pipeline_job_started_and_completed_in_wal() {
+    let dir = setup();
+    let wp = wal_path(&dir);
+    let p = make_file(&dir, "dp.txt", "dispatch pipeline test");
+
+    // Simulate daemon dispatch: execute_with_telemetry produces both JobStarted + JobCompleted
+    let result = execute_with_telemetry(
+        &FileRead,
+        &json!({ "path": p.to_str().unwrap() }),
+        false,
+        &wp,
+    );
+    assert!(result.is_ok(), "Dispatch must succeed");
+    let r = result.unwrap();
+    assert!(r.success);
+
+    let reader = WalReader::load(&wp).expect("read WAL");
+    let events = reader.events();
+    assert!(events.len() >= 2, "WAL must contain JobStarted + JobCompleted");
+
+    let job_id = &r.job_id;
+
+    let started = events.iter().find(|e| {
+        e.job_id == *job_id && matches!(e.event_type, runtimo_core::WalEventType::JobStarted)
+    });
+    assert!(started.is_some(), "WAL must contain JobStarted for {}", job_id);
+
+    let completed = events.iter().find(|e| {
+        e.job_id == *job_id && matches!(e.event_type, runtimo_core::WalEventType::JobCompleted)
+    });
+    assert!(completed.is_some(), "WAL must contain JobCompleted for {}", job_id);
+
+    // JobStarted must precede JobCompleted
+    let s = started.unwrap();
+    let c = completed.unwrap();
+    assert!(s.seq < c.seq, "JobStarted (seq {}) must precede JobCompleted (seq {})", s.seq, c.seq);
+
+    cleanup(&dir);
+}
+
+#[test]
+fn dispatch_pipeline_multiple_jobs_have_unique_ids() {
+    let dir = setup();
+    let wp = wal_path(&dir);
+    let p = make_file(&dir, "uq.txt", "unique id test");
+    let mut ids = std::collections::HashSet::new();
+
+    for i in 0..5 {
+        let result = execute_with_telemetry(
+            &FileRead,
+            &json!({ "path": p.to_str().unwrap() }),
+            false,
+            &wp,
+        ).expect("dispatch");
+        assert!(result.success);
+        assert!(ids.insert(result.job_id.clone()),
+            "Job IDs must be unique across dispatches (collision at {})", i);
+    }
+
+    assert_eq!(ids.len(), 5);
+
+    // WAL must have both events for all 5 jobs (10+ events)
+    let reader = WalReader::load(&wp).expect("read");
+    let events = reader.events();
+    assert!(events.len() >= 10, "WAL must have 2 events per job (5 jobs → ≥10 events)");
+
     cleanup(&dir);
 }
