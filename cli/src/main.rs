@@ -119,6 +119,13 @@ enum Commands {
         #[arg(short = 'j', long)]
         json: bool,
     },
+    /// List and optionally reap zombie processes
+    #[command(about = "List zombie processes",
+        after_help = "EXAMPLES:\n runtimo zombies\n runtimo zombies --reap\n\nZombies are dead processes whose parents haven't called waitpid(2).\nThey can't be killed directly. --reap kills each zombie's parent process\ninstead, which causes the kernel to clean up the zombie.")]
+    Zombies {
+        #[arg(short = 'r', long, default_value = "false")]
+        reap: bool,
+    },
     #[command(about = "Manage configuration")]
     Config {
         #[command(subcommand)]
@@ -240,6 +247,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "capability": capability,
                 "args": args_val,
                 "dry_run": dry_run,
+                "working_dir": std::env::current_dir().unwrap_or_default().to_string_lossy(),
             });
             match send_rpc("dispatch", params) {
                 Ok(result) => {
@@ -565,16 +573,85 @@ fn main() -> Result<(), Box<dyn Error>> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&snap)?);
             } else {
+                let zombie_lines = {
+                    let zs = snap.zombies();
+                    if zs.is_empty() {
+                        String::new()
+                    } else {
+                        let lines: Vec<String> = zs.iter().map(|p| {
+                            format!("- {} PPID:{} {} {}", p.pid, p.ppid, p.stat, p.command.chars().take(40).collect::<String>())
+                        }).collect();
+                        format!("\n\nZombies ({})\n{}", zs.len(), lines.join("\n"))
+                    }
+                };
                 let text = format!(
-                    "PROCESS SNAPSHOT\n\nSummary\nTotal: {}\nCPU: {:.1}%\nMemory: {:.1}%\nZombies: {}\n\nTop CPU\n{}\n\nTop Memory\n{}",
+                    "PROCESS SNAPSHOT\n\nSummary\nTotal: {}\nCPU: {:.1}%\nMemory: {:.1}%\nZombies: {}{}\n\nTop CPU\n{}\n\nTop Memory\n{}",
                     snap.summary.total_processes,
                     snap.summary.total_cpu_percent,
                     snap.summary.total_mem_percent,
                     snap.summary.zombie_count,
+                    zombie_lines,
                     snap.top_by_cpu(5).iter().map(|p| format!("- {} {} {} {}% CPU", p.pid, p.command.chars().take(40).collect::<String>(), p.stat, p.cpu_percent)).collect::<Vec<_>>().join("\n"),
                     snap.top_by_mem(5).iter().map(|p| format!("- {} {} {} {}% MEM", p.pid, p.command.chars().take(40).collect::<String>(), p.stat, p.mem_percent)).collect::<Vec<_>>().join("\n"),
                 );
                 println!("{}", wall_to_markdown(&text));
+            }
+        }
+
+        Commands::Zombies { reap } => {
+            let snap = ProcessSnapshot::capture();
+            let zombies = snap.zombies();
+            if zombies.is_empty() {
+                println!("No zombie processes.");
+                return Ok(());
+            }
+
+            println!("{} zombie(s) found:\n", zombies.len());
+            for z in &zombies {
+                println!("  {:>8}  PPID:{:>8}  {:>6}  {}",
+                    z.pid, z.ppid, z.stat, z.command);
+            }
+
+            if reap {
+                // Zombies can't be killed — they're already dead. We kill their
+                // parent instead, which causes the kernel to reap the zombie.
+                // Kill capability protects init (PID 1) and self.
+                let reg = make_registry();
+                let killer = reg.get("Kill").ok_or("Kill capability not available")?;
+                let mut unique_parents: std::collections::HashSet<u32> =
+                    zombies.iter().map(|z| z.ppid).filter(|&ppid| ppid > 1).collect();
+                // Never kill our own parent
+                unique_parents.remove(&std::process::id());
+
+                if unique_parents.is_empty() {
+                    println!("\nNo reapable parents (all zombies are children of init or self).");
+                    return Ok(());
+                }
+
+                println!("\nReaping via {} parent(s):", unique_parents.len());
+                for ppid in &unique_parents {
+                    print!("  PID {} → ", ppid);
+                    let ctx = runtimo_core::Context {
+                        dry_run: false,
+                        job_id: format!("reap-{}", ppid),
+                        working_dir: std::env::current_dir().unwrap_or_default(),
+                    };
+                    match killer.execute(&serde_json::json!({"pid": ppid, "signal": 15}), &ctx) {
+                        Ok(o) => println!("{}", o.message.as_deref().unwrap_or("ok")),
+                        Err(e) => println!("blocked: {}", e),
+                    }
+                }
+                // Re-check
+                ProcessSnapshot::clear_cache();
+                let after = ProcessSnapshot::capture();
+                let remaining = after.zombies().len();
+                if remaining == 0 {
+                    println!("\nAll zombies reaped.");
+                } else {
+                    println!("\n{} zombie(s) remain (may need SIGKILL or parent is protected).", remaining);
+                }
+            } else {
+                println!("\nUse `runtimo zombies --reap` to kill zombie parents and clean them up.");
             }
         }
 

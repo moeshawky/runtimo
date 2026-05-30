@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
@@ -115,6 +116,8 @@ struct RunParams {
     args: Value,
     #[serde(default)]
     dry_run: bool,
+    #[serde(default)]
+    working_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,6 +132,8 @@ fn default_limit() -> usize {
 
 // ── Background job tracking ──────────────────────────────────────────────────
 
+const MAX_CONCURRENT_JOBS: u32 = 16;
+
 #[derive(Debug, Clone, Serialize)]
 struct BackgroundJob {
     job_id: String,
@@ -141,13 +146,31 @@ struct BackgroundJob {
 
 struct BackgroundJobRegistry {
     jobs: RwLock<HashMap<String, BackgroundJob>>,
+    running: AtomicU32,
 }
 
 impl BackgroundJobRegistry {
     fn new() -> Self {
         Self {
             jobs: RwLock::new(HashMap::new()),
+            running: AtomicU32::new(0),
         }
+    }
+
+    fn try_reserve(&self) -> bool {
+        self.running
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                if n < MAX_CONCURRENT_JOBS {
+                    Some(n + 1)
+                } else {
+                    None
+                }
+            })
+            .is_ok()
+    }
+
+    fn release(&self) {
+        self.running.fetch_sub(1, Ordering::SeqCst);
     }
 
     async fn insert(&self, job: BackgroundJob) {
@@ -325,10 +348,35 @@ async fn handle_dispatch(state: &Arc<DaemonState>, params: Value, id: Value) -> 
     let cap_name = run_params.capability.clone();
     let dry = run_params.dry_run;
     let args = run_params.args;
+    let working_dir = match run_params.working_dir {
+        Some(ref wd) if !wd.is_empty() => {
+            let ctx = runtimo_core::validation::path::PathContext {
+                require_exists: true,
+                require_file: false,
+                ..Default::default()
+            };
+            runtimo_core::validation::path::validate_path(wd, &ctx).ok()
+        }
+        _ => None,
+    }; 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+
+    if !state.bg_jobs.try_reserve() {
+        return JsonRpcResponse {
+            result: None,
+            error: Some(JsonRpcError {
+                code: -32000,
+                message: format!(
+                    "too many concurrent jobs (max {})",
+                    MAX_CONCURRENT_JOBS
+                ),
+            }),
+            id,
+        };
+    }
 
     state
         .bg_jobs
@@ -372,6 +420,7 @@ async fn handle_dispatch(state: &Arc<DaemonState>, params: Value, id: Value) -> 
     let tokio_handle = tokio::runtime::Handle::current();
     let jid = job_id.clone();
     let cn = cap_name.clone();
+    let wd = working_dir.clone();
     std::thread::spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let backup_dir = runtimo_core::utils::backup_dir();
@@ -388,10 +437,18 @@ async fn handle_dispatch(state: &Arc<DaemonState>, params: Value, id: Value) -> 
             registry.register(Undo);
 
             if let Some(cap) = registry.get(&cn) {
+                let wd_path = wd.clone()
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                if let Err(e) = std::env::set_current_dir(&wd_path) {
+                    return Err(runtimo_core::Error::ExecutionFailed(format!(
+                        "cannot change to working dir {}: {}",
+                        wd_path.display(), e
+                    )));
+                }
                 let ctx = Context {
                     dry_run: dry,
                     job_id: jid.clone(),
-                    working_dir: std::env::current_dir().unwrap_or_default(),
+                    working_dir: wd_path,
                 };
                 cap.execute(&args, &ctx)
             } else {
@@ -453,6 +510,8 @@ async fn handle_dispatch(state: &Arc<DaemonState>, params: Value, id: Value) -> 
                 });
             }
         });
+
+        state_arc.bg_jobs.release();
     });
 
     JsonRpcResponse {
@@ -747,6 +806,84 @@ fn parse_args() -> Args {
 
 // ── Main ────────────────────────────────────────────────────────────────────
 
+/// Reconcile orphaned jobs on daemon startup.
+///
+/// Scans the WAL for `JobStarted` events that have no matching
+/// `JobCompleted` or `JobFailed` terminal event. These are jobs
+/// that were dispatched before the daemon terminated (crash, SIGKILL,
+/// power loss). Each orphaned job is closed with a `JobFailed` event
+/// recording the reason: "daemon terminated before job completion."
+///
+/// This ensures every job has a definitive terminal state in the audit
+/// trail — no permanently "unknown" jobs after recovery.
+fn reconcile_orphaned_jobs(wal_path: &std::path::Path) {
+    let reader = match WalReader::load(wal_path) {
+        Ok(r) => r,
+        Err(_) => return, // No WAL yet — nothing to reconcile
+    };
+
+    let events = reader.events();
+
+    // Collect job_ids that have a JobStarted event
+    let mut started: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut finished: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for e in events {
+        if matches!(e.event_type, WalEventType::JobStarted) {
+            started.entry(e.job_id.clone()).or_insert(e.ts);
+        }
+        if matches!(e.event_type, WalEventType::JobCompleted | WalEventType::JobFailed) {
+            finished.insert(e.job_id.clone());
+        }
+    }
+
+    let orphaned: Vec<String> = started
+        .keys()
+        .filter(|jid| !finished.contains(*jid))
+        .cloned()
+        .collect();
+
+    if orphaned.is_empty() {
+        return;
+    }
+
+    println!(
+        "Reconciling {} orphaned job(s) from previous session",
+        orphaned.len()
+    );
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    if let Ok(mut wal) = WalWriter::create(wal_path) {
+        for jid in &orphaned {
+            let _ = wal.append(WalEvent {
+                seq: wal.seq(),
+                ts: now,
+                event_type: WalEventType::JobFailed,
+                job_id: jid.clone(),
+                capability: None,
+                output: None,
+                error: Some(
+                    "daemon terminated before job completion (reconciled on restart)".into(),
+                ),
+                telemetry_before: None,
+                telemetry_after: None,
+                process_before: None,
+                process_after: None,
+                cmd: None,
+                cmd_stdout: None,
+                cmd_stderr: None,
+                cmd_exit_code: None,
+                cmd_corrected: None,
+            });
+        }
+        println!("Reconciled {} orphaned job(s).", orphaned.len());
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args();
@@ -767,6 +904,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let state = Arc::new(DaemonState::new(&wal_path)?);
+
+    // Reconcile orphaned jobs left from a previous crash/termination
+    reconcile_orphaned_jobs(&wal_path);
+
+    let _monitor = runtimo_core::HealthMonitor::start();
 
     let listener = tokio::net::UnixListener::bind(&args.socket)?;
     println!("Listening on {}", args.socket.display());

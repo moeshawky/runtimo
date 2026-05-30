@@ -94,9 +94,26 @@ fn is_dangerous_command(cmd: &str) -> Option<&'static str> {
         && (cmd_lower.contains(" / ")
             || cmd_lower.contains("/*")
             || cmd_lower.contains("/dev")
-            || cmd_lower.contains("/boot"))
+            || cmd_lower.contains("/boot")
+            || cmd_lower.contains("/home")
+            || cmd_lower.contains("/etc")
+            || cmd_lower.contains("/usr")
+            || cmd_lower.contains("/var")
+            || cmd_lower.contains("/lib")
+            || cmd_lower.contains("/opt")
+            || cmd_lower.contains("/bin")
+            || cmd_lower.contains("/sbin"))
     {
-        return Some("rm -rf on root, devices, or boot is blocked");
+        return Some("rm -rf on system directories is blocked");
+    }
+    if cmd_lower.contains("rm")
+        && (cmd_lower.contains("-rf")
+            || cmd_lower.contains("-fr")
+            || cmd_lower.contains(" -r ")
+            || cmd_lower.contains(" -f "))
+        && cmd_lower.contains('~')
+    {
+        return Some("rm -rf with shell expansions is blocked — use explicit paths");
     }
     if cmd_lower.contains("chmod") && cmd_lower.contains("777") && cmd_lower.contains(" /") {
         return Some("chmod 777 / is blocked");

@@ -132,6 +132,17 @@ impl ProcessSnapshot {
         snapshot
     }
 
+    /// Returns all zombie processes with their PID, command, and PPID.
+    ///
+    /// Zombies are defunct child processes whose parent has not yet called
+    /// `waitpid(2)`. They consume no resources but each occupies a PID slot.
+    pub fn zombies(&self) -> Vec<&ProcessInfo> {
+        self.processes
+            .iter()
+            .filter(|p| p.stat.starts_with('Z'))
+            .collect()
+    }
+
     /// Clears the process snapshot cache.
     ///
     /// Use before capturing an after-kill snapshot to ensure fresh data.

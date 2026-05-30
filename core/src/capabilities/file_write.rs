@@ -298,6 +298,7 @@ fn check_disk_space(
 
 fn atomic_write(path: &std::path::Path, content: &str) -> Result<usize> {
     use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
 
     let tmp_name = format!(
         ".{}.tmp",
@@ -311,7 +312,14 @@ fn atomic_write(path: &std::path::Path, content: &str) -> Result<usize> {
         .join(&tmp_name);
 
     {
-        let mut file = std::fs::File::create(&tmp_path).map_err(|e| {
+        #[allow(clippy::cast_possible_wrap)] // libc::O_NOFOLLOW is i32
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp_path)
+            .map_err(|e| {
             Error::ExecutionFailed(format!("create temp {}: {}", tmp_path.display(), e))
         })?;
         file.write_all(content.as_bytes()).map_err(|e| {
@@ -341,9 +349,15 @@ fn atomic_write(path: &std::path::Path, content: &str) -> Result<usize> {
 
 fn atomic_append(path: &std::path::Path, content: &str) -> Result<usize> {
     use std::io::{Read, Write};
+    use std::os::unix::fs::OpenOptionsExt;
 
     let existing = if path.exists() {
-        let mut file = std::fs::File::open(path).map_err(|e| {
+        #[allow(clippy::cast_possible_wrap)] // libc::O_NOFOLLOW is i32
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|e| {
             Error::ExecutionFailed(format!("open {} for append: {}", path.display(), e))
         })?;
         let mut buf = Vec::new();
@@ -370,7 +384,14 @@ fn atomic_append(path: &std::path::Path, content: &str) -> Result<usize> {
         .join(&tmp_name);
 
     {
-        let mut file = std::fs::File::create(&tmp_path).map_err(|e| {
+        #[allow(clippy::cast_possible_wrap)] // libc::O_NOFOLLOW is i32
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp_path)
+            .map_err(|e| {
             Error::ExecutionFailed(format!("create temp {}: {}", tmp_path.display(), e))
         })?;
         file.write_all(&combined).map_err(|e| {
