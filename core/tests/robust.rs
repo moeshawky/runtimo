@@ -1131,8 +1131,7 @@ fn g_drift_telemetry_schema_stability() {
 
     let system = &json["system"];
     assert!(system.get("cpu_model").and_then(|v| v.as_str()).is_some(), "cpu_model required");
-    assert!(system.get("ram_total_bytes").and_then(|v| v.as_u64()).is_some(), "ram_total_bytes must be u64");
-    assert!(system.get("disk_used_percent_numeric").and_then(|v| v.as_f64()).is_some(), "disk% must be f64");
+    assert!(system.get("ram_total").and_then(|v| v.as_str()).is_some(), "ram_total required");
 
     let hw = &json["hardware"];
     assert!(hw.get("accelerators").and_then(|v| v.as_array()).is_some(), "accelerators must be array");

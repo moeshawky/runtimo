@@ -1,5 +1,13 @@
 /target/
 
+# Agentic dev artifacts
+AGENTS.md
+references/
+*.agent/
+.agents/
+.cursor/
+.claude/
+
 # Runtime artifacts
 *.jsonl
 *.bak

@@ -26,6 +26,11 @@ impl RuntimoConfig {
     /// Returns the config file path following XDG spec.
     ///
     /// Uses `XDG_CONFIG_HOME` if set, otherwise `~/.config/runtimo/config.toml`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if neither `XDG_CONFIG_HOME` nor `HOME` is set.
+    #[allow(clippy::expect_used)]
     pub fn config_path() -> PathBuf {
         std::env::var("XDG_CONFIG_HOME")
             .ok()
@@ -35,7 +40,7 @@ impl RuntimoConfig {
                     .ok()
                     .map(|h| PathBuf::from(h).join(".config"))
             })
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .expect("Cannot determine config path: set XDG_CONFIG_HOME or HOME")
             .join("runtimo/config.toml")
     }
 
@@ -107,7 +112,7 @@ mod tests {
     #[test]
     fn config_path_is_absolute() {
         let path = RuntimoConfig::config_path();
-        assert!(path.is_absolute() || path.to_string_lossy().starts_with("/tmp"));
+        assert!(path.is_absolute());
     }
 
     #[test]

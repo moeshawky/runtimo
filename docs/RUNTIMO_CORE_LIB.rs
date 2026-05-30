@@ -66,6 +66,7 @@ Capabilities are pluggable operations that implement the [`Capability`] trait:
 ```rust
 pub trait Capability {
     fn name(&self) -> &'static str;
+    fn description(&self) -> &'static str;
     fn schema(&self) -> Value;
     fn validate(&self, args: &Value) -> Result<()>;
     fn execute(&self, args: &Value, ctx: &Context) -> Result<Output>;
@@ -75,6 +76,10 @@ pub trait Capability {
 Built-in capabilities:
 - [`FileRead`] - Read file contents with validation
 - [`FileWrite`] - Write content to file with backup
+- [`GitExec`] - Git operations (clone, pull, commit, revert, clean, status)
+- [`Kill`] - Kill PID with protection for critical processes
+- [`ShellExec`] - Execute shell commands with dangerous command blocking
+- [`Undo`] - Restore from backup
 
 ## Telemetry
 
@@ -168,11 +173,7 @@ use std::path::Path;
 let cap = FileRead;
 let args = json!({"path": "/etc/hostname"});
 
-let ctx = Context {
-    dry_run: false,
-    job_id: "my-job-123".to_string(),
-    working_dir: std::env::current_dir()?,
-};
+let ctx = Context::new(false, "my-job-123".to_string());
 
 let result = execute_with_telemetry(&cap, &args, false, Path::new("/tmp/wal.jsonl"))?;
 ```
@@ -206,9 +207,9 @@ assert!(result.is_err());
 Execution is rejected under pressure:
 
 ```rust
-// If CPU > 90% or RAM > 90%, execution fails
+// If rolling average pressure > 80% or zombie count > 10, execution fails
 let result = execute_with_telemetry(&FileRead, &args, false, wal_path);
-// May return: Err(ResourceLimitExceeded("CPU > 90%"))
+// May return: Err(ResourceLimitExceeded("..."))
 ```
 
 # Error Handling
@@ -223,6 +224,7 @@ pub enum Error {
     ExecutionFailed(String),
     WalError(String),
     BackupError(String),
+    SessionError(String),
     ResourceLimitExceeded(String),
     TelemetryError(String),
 }
@@ -275,6 +277,10 @@ mod tests {
 - [`backup`] - Backup manager
 - [`schema`] - JSON Schema validation
 - [`capabilities`] - Built-in capabilities
+- [`session`] - Session tracking
+- [`config`] - Persistent configuration
+- [`cmd`] - Shell command execution
+- [`validation`] - Input validation
 
 # CLI
 
@@ -289,8 +295,8 @@ The `moe` CLI binary provides:
 
 # Version
 
-0.1.0-alpha
+0.4.1
 
 # License
 
-Runtimo-1.0
+MIT

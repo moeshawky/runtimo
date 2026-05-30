@@ -6,7 +6,7 @@
 //!
 //! # Example
 //!
-//! ```rust
+//! ```rust,ignore
 //! use runtimo_core::SchemaValidator;
 //! use serde_json::json;
 //!

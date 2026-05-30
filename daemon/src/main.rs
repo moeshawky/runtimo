@@ -1,11 +1,11 @@
 //! Runtimo Daemon - Unix socket JSON-RPC server for capability execution
 //!
-//! Usage: runtimo [OPTIONS]
+//! Usage: runtimo `[OPTIONS]`
 //!
 //! Options:
-//!   --socket <PATH>    Unix socket path (default: <data>/runtimo.sock)
+//!   --socket `PATH`    Unix socket path (default: `data`/runtimo.sock)
 //!   --http             Enable HTTP listener (placeholder)
-//!   --http-port <PORT> HTTP port (default: 8080)
+//!   --http-port `PORT` HTTP port (default: 8080)
 //!
 //! # Background Mode
 //!
@@ -440,17 +440,7 @@ async fn handle_dispatch(state: &Arc<DaemonState>, params: Value, id: Value) -> 
             if let Some(cap) = registry.get(&cn) {
                 let wd_path = wd.clone()
                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                if let Err(e) = std::env::set_current_dir(&wd_path) {
-                    return Err(runtimo_core::Error::ExecutionFailed(format!(
-                        "cannot change to working dir {}: {}",
-                        wd_path.display(), e
-                    )));
-                }
-                let ctx = Context {
-                    dry_run: dry,
-                    job_id: jid.clone(),
-                    working_dir: wd_path,
-                };
+                let ctx = Context::with_working_dir(dry, jid.clone(), wd_path);
                 cap.execute(&args, &ctx)
             } else {
                 Err(runtimo_core::Error::ExecutionFailed(format!(

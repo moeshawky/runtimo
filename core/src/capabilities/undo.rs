@@ -65,7 +65,7 @@ impl Capability for Undo {
         Ok(())
     }
 
-    fn execute(&self, args: &serde_json::Value, _ctx: &Context) -> Result<Output> {
+    fn execute(&self, args: &serde_json::Value, ctx: &Context) -> Result<Output> {
         let args: UndoArgs = serde_json::from_value(args.clone())
             .map_err(|e| crate::Error::SchemaValidationFailed(e.to_string()))?;
 
@@ -154,12 +154,20 @@ impl Capability for Undo {
                         crate::Error::ExecutionFailed(format!("restore target validation: {}", e))
                     })?;
 
-                    backup_mgr.restore(&backup_path, &target_path)?;
-                    restored.push(format!(
-                        "{} -> {}",
-                        backup_path.display(),
-                        target_path.display()
-                    ));
+                    if ctx.dry_run {
+                        restored.push(format!(
+                            "{} -> {} (dry run)",
+                            backup_path.display(),
+                            target_path.display()
+                        ));
+                    } else {
+                        backup_mgr.restore(&backup_path, &target_path)?;
+                        restored.push(format!(
+                            "{} -> {}",
+                            backup_path.display(),
+                            target_path.display()
+                        ));
+                    }
                 }
             }
         }

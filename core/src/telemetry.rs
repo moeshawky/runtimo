@@ -68,17 +68,6 @@ pub struct SystemInfo {
     pub uptime: String,
     /// Load average (e.g. `" 0.50,  0.30,  0.20"`).
     pub load_average: String,
-    // --- Numeric fields for agent threshold computation ---
-    /// Total RAM in bytes (machine-readable).
-    pub ram_total_bytes: u64,
-    /// Free RAM in bytes (machine-readable).
-    pub ram_free_bytes: u64,
-    /// Total disk space in bytes (machine-readable).
-    pub disk_total_bytes: u64,
-    /// Free disk space in bytes (machine-readable).
-    pub disk_free_bytes: u64,
-    /// Disk usage percentage as numeric (e.g. `45.0`, no `%` sign).
-    pub disk_used_percent_numeric: f64,
 }
 
 /// Special hardware device information.
@@ -101,12 +90,6 @@ pub struct HardwareInfo {
     /// Number of JAX-visible devices, if available.
     #[serde(default)]
     pub jax_device_count: Option<usize>,
-
-    // Backwards compat — computed from accelerators list above
-    #[serde(default)]
-    pub tpu_devices: usize,
-    #[serde(default)]
-    pub gpu_devices: usize,
 }
 
 /// A detected hardware accelerator.
@@ -136,14 +119,6 @@ pub struct ServiceInfo {
     /// Services detected on this machine. Empty vec = no known services found.
     #[serde(default)]
     pub detected_services: Vec<DetectedService>,
-
-    // Backwards compat fields
-    #[serde(default)]
-    pub vllm_version: Option<String>,
-    #[serde(default)]
-    pub vllm_running: bool,
-    #[serde(default)]
-    pub vllm_port_bound: bool,
 }
 
 /// A detected service running on the machine.
@@ -310,19 +285,6 @@ impl SystemInfo {
         let disk_free = run_cmd("df -h / | tail -1 | awk '{print $4}'");
         let disk_pct_str = run_cmd("df / | tail -1 | awk '{print $5}'");
         let disk_used_percent = disk_pct_str.replace('%', "");
-        let disk_used_percent_numeric = disk_used_percent.parse::<f64>().unwrap_or(0.0);
-        let ram_total_bytes = run_cmd("free -b | grep Mem | awk '{print $2}'")
-            .parse()
-            .unwrap_or(0);
-        let ram_free_bytes = run_cmd("free -b | grep Mem | awk '{print $4}'")
-            .parse()
-            .unwrap_or(0);
-        let disk_total_bytes = run_cmd("df --bytes / | tail -1 | awk '{print $2}'")
-            .parse()
-            .unwrap_or(0);
-        let disk_free_bytes = run_cmd("df --bytes / | tail -1 | awk '{print $4}'")
-            .parse()
-            .unwrap_or(0);
 
         Self {
             cpu_model: run_cmd("cat /proc/cpuinfo | grep 'model name' | head -1 | cut -d: -f2"),
@@ -333,11 +295,6 @@ impl SystemInfo {
             disk_used_percent,
             uptime: run_cmd("uptime -p"),
             load_average: run_cmd("uptime | awk -F'load average:' '{print $2}'"),
-            ram_total_bytes,
-            ram_free_bytes,
-            disk_total_bytes,
-            disk_free_bytes,
-            disk_used_percent_numeric,
         }
     }
 }
@@ -421,25 +378,11 @@ impl HardwareInfo {
             None
         };
 
-        // Compute backwards-compat totals
-        let total_tpu = accelerators
-            .iter()
-            .filter(|a| a.kind == "tpu")
-            .map(|a| a.count)
-            .sum();
-        let total_gpu = accelerators
-            .iter()
-            .filter(|a| a.kind == "gpu")
-            .map(|a| a.count)
-            .sum();
-
         Self {
             accelerators,
             jax_available,
             jax_version,
             jax_device_count,
-            tpu_devices: total_tpu,
-            gpu_devices: total_gpu,
         }
     }
 }
@@ -463,22 +406,8 @@ impl ServiceInfo {
             }
         }
 
-        // Backwards compat fields
-        let vllm_version_str = detected
-            .iter()
-            .find(|s| s.name == "vllm")
-            .and_then(|s| s.version.clone());
-        let vllm_running = detected.iter().any(|s| s.name == "vllm" && s.running);
-        let vllm_port_bound = detected
-            .iter()
-            .find(|s| s.name == "vllm")
-            .is_some_and(|s| s.ports.contains(&8200));
-
         Self {
             detected_services: detected,
-            vllm_version: vllm_version_str,
-            vllm_running,
-            vllm_port_bound,
         }
     }
 }
@@ -602,7 +531,6 @@ mod tests {
 
         let s = &telemetry.system;
         assert!(!s.cpu_model.is_empty(), "cpu_model must not be empty");
-        assert!(s.ram_total_bytes > 0, "ram_total_bytes must be > 0");
         assert!(!s.ram_total.is_empty(), "ram_total must not be empty");
         assert!(!s.disk_total.is_empty(), "disk_total must not be empty");
 
@@ -656,8 +584,6 @@ mod tests {
             jax_available: false,
             jax_version: None,
             jax_device_count: None,
-            tpu_devices: 0,
-            gpu_devices: 0,
         };
 
         let total_tpu: usize = hw
@@ -673,8 +599,8 @@ mod tests {
             .map(|a| a.count)
             .sum();
 
-        assert_eq!(total_tpu, 8, "back-compat tpu_devices should be 8");
-        assert_eq!(total_gpu, 4, "back-compat gpu_devices should be 4");
+        assert_eq!(total_tpu, 8, "total tpu should be 8");
+        assert_eq!(total_gpu, 4, "total gpu should be 4");
     }
 
     #[test]
@@ -684,13 +610,9 @@ mod tests {
             jax_available: false,
             jax_version: None,
             jax_device_count: None,
-            tpu_devices: 0,
-            gpu_devices: 0,
         };
 
         assert!(hw.accelerators.is_empty());
-        assert_eq!(hw.tpu_devices, 0);
-        assert_eq!(hw.gpu_devices, 0);
     }
 
     #[test]
@@ -702,9 +624,6 @@ mod tests {
                 running: true,
                 ports: vec![8200],
             }],
-            vllm_version: None,
-            vllm_running: false,
-            vllm_port_bound: false,
         };
 
         let vllm = &svc.detected_services[0];
@@ -718,9 +637,6 @@ mod tests {
     fn test_services_empty_is_valid() {
         let svc = ServiceInfo {
             detected_services: vec![],
-            vllm_version: None,
-            vllm_running: false,
-            vllm_port_bound: false,
         };
 
         assert!(svc.detected_services.is_empty());
@@ -738,8 +654,6 @@ mod tests {
             jax_available: true,
             jax_version: Some("0.4.30".into()),
             jax_device_count: Some(2),
-            tpu_devices: 0,
-            gpu_devices: 2,
         };
 
         let svc = ServiceInfo {
@@ -749,9 +663,6 @@ mod tests {
                 running: true,
                 ports: vec![],
             }],
-            vllm_version: None,
-            vllm_running: false,
-            vllm_port_bound: false,
         };
 
         let json = serde_json::to_string(&hw).unwrap();
@@ -769,19 +680,15 @@ mod tests {
     #[test]
     fn test_telemetry_deserialize_old_wal_event() {
         let old_json = r#"{
-            "tpu_devices": 8,
-            "gpu_devices": 4,
             "jax_available": true,
             "jax_version": "0.4.25",
             "jax_device_count": 8
         }"#;
 
         let parsed: HardwareInfo = serde_json::from_str(old_json).unwrap();
-        assert_eq!(parsed.tpu_devices, 8);
-        assert_eq!(parsed.gpu_devices, 4);
         assert!(
             parsed.accelerators.is_empty(),
-            "old WAL events deserialize with empty accelerators (backwards compat)"
+            "old WAL events deserialize with empty accelerators"
         );
         assert!(parsed.jax_available);
     }

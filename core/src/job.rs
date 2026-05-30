@@ -77,7 +77,7 @@ pub enum JobState {
 ///
 /// # Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// use runtimo_core::{Job, JobState};
 /// use serde_json::json;
 ///

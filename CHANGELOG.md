@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-30
+
+### Security Fixes
+
+- **S-DEFAULT: Eliminated /tmp config fallback** — `config_path()` and `resource_history_path()` no
+  longer fall back to world-writable `/tmp` when `XDG_CONFIG_HOME`/`HOME` are unset. Now panic with
+  a clear message instead of writing persistent config to a shared temp directory (symlink attack
+  vector, TOCTOU race, info leak). (`config.rs`, `llmosafe.rs`)
+
+### Breaking Changes
+
+- **Removed 10 write-only telemetry fields** — `ram_total_bytes`, `ram_free_bytes`,
+  `disk_total_bytes`, `disk_free_bytes`, `disk_used_percent_numeric` (SystemInfo), `tpu_devices`,
+  `gpu_devices` (HardwareInfo), `vllm_version`, `vllm_running`, `vllm_port_bound` (ServiceInfo)
+  removed. Compute from `accelerators` vec or string fields instead. (`telemetry.rs`)
+- **Removed 7 dead public exports** — `Job`, `ExecutionResult`, `HealthAlert`, `HealthState`,
+  `Session`, `SessionManager` removed from `pub use` in lib.rs. Use qualified module paths
+  (`runtimo_core::job::Job`, etc.) for internal access. (`lib.rs`)
+- **Moved `format` module from core to cli** — `wall_to_markdown()` is a CLI presentation concern,
+  not a core library function. Import from `cli/src/format.rs` instead of `runtimo_core::format`.
+  (`core/src/format.rs` deleted, `cli/src/format.rs` created)
+
+### Added
+
+- **`SessionError` variant** — New `Error::SessionError(String)` variant for session-specific
+  failures. `SessionManager` methods now return `SessionError` instead of misusing `BackupError`.
+  (`lib.rs`, `session.rs`)
+- **`rust-toolchain.toml`** — Pins stable toolchain with rustfmt + clippy components.
+- **`cargo-deny` config** — `deny.toml` enforces license allowlist (MIT, Apache-2.0, BSD, ISC,
+  Unicode-DFS-2016, Zlib), bans wildcard versions, audits for advisories.
+- **MSRV CI testing** — `ci.yml` now tests against Rust 1.70.0 (declared MSRV).
+- **`cargo-machete` CI** — Detects unused dependencies.
+- **CI rust-cache** — All CI jobs now use `Swatinem/rust-cache@v2` for faster builds.
+
+### Fixed
+
+- **S-ENTROPY: session.rs BackupError misuse** — All 7 error sites in `SessionManager` now use
+  `SessionError` instead of `BackupError`. Doc comments updated to match. (`session.rs`)
+- **S-ORPHAN: Stale docs** — `RUNTIMO_CORE_LIB.rs` updated: Capability trait now shows
+  `description()` method, built-in capabilities list complete (6 capabilities), Error enum
+  includes `SessionError`, resource limits corrected (80% threshold, zombie count), Context
+  example uses `Context::new()`, module list complete, version updated to 0.4.1. (`docs/`)
+- **Rustdoc warnings** — Fixed 5 unclosed HTML tag warnings in daemon doc comments. (`daemon/src/main.rs`)
+- **Telemetry demo** — Updated `telemetry_demo.rs` to compute GPU/TPU counts from accelerators
+  vec instead of removed fields. (`core/examples/telemetry_demo.rs`)
+
+### Changed
+
+- **CI workflow expanded** — Added `msrv`, `deny`, `machete` jobs. Added `rust-cache` to all
+  existing jobs. (`ci.yml`)
+- **.gitignore hardened** — Added `AGENTS.md`, `references/`, `.cursor/`, `.claude/` to prevent
+  agentic artifact leaks. (`.gitignore`)
+
 ## [0.4.0] - 2026-05-29
 
 ### Fixed

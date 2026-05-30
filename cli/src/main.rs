@@ -1,12 +1,14 @@
 //! runtimo CLI — Agent capability runtime with background dispatch
 
+mod format;
+
 use clap::{Parser, Subcommand};
 use runtimo_core::{
     capabilities::{FileRead, FileWrite, GitExec, Kill, ShellExec, Undo},
-    CapabilityRegistry, ProcessSnapshot,
+    execute_with_telemetry_and_session, CapabilityRegistry, ProcessSnapshot,
     RuntimoConfig, Telemetry, WalReader,
-    format::wall_to_markdown,
 };
+use format::wall_to_markdown;
 use std::error::Error;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -208,7 +210,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Run { capability, args, dry_run, json, quiet, schema, timeout: _ } => {
+        Commands::Run { capability, args, dry_run, json, quiet, schema, timeout } => {
             let reg = make_registry();
             if schema {
                 if let Some(cap) = reg.get(&capability) {
@@ -221,16 +223,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             let cap = reg.get(&capability).ok_or_else(|| format!("Capability not found: {}", capability))?;
             let args_val: Value = serde_json::from_str(&args).map_err(|e| format!("Invalid JSON args: {}", e))?;
-            let ctx = runtimo_core::Context {
-                dry_run,
-                job_id: runtimo_core::utils::generate_id(),
-                working_dir: std::env::current_dir().unwrap_or_default(),
-            };
             if let Err(e) = cap.validate(&args_val) {
                 eprintln!("Validation failed: {}", e);
                 std::process::exit(1);
             }
-            let output = cap.execute(&args_val, &ctx).map_err(|e| format!("{}", e))?;
+            let result = execute_with_telemetry_and_session(
+                cap, &args_val, dry_run, &wal_path(), None, timeout,
+            ).map_err(|e| format!("{}", e))?;
+            let output = result.output;
             if json {
                 println!("{}", serde_json::to_string_pretty(&output)?);
             } else if !quiet {

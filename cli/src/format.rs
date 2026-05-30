@@ -8,14 +8,6 @@
 //! and safe in this context.
 
 #![allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
-//! # Example
-//!
-//! ```rust,ignore
-//! use runtimo_core::format::wall_to_markdown;
-//!
-//! let md = wall_to_markdown("SYSTEM:\ncpu: amd\nram: 16G");
-//! assert!(md.contains("# SYSTEM"));
-//! ```
 
 /// Convert raw wall-of-text into Markdown.
 ///

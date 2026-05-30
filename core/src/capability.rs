@@ -12,6 +12,9 @@ use std::path::PathBuf;
 ///
 /// Carries execution metadata such as dry-run mode, the owning job ID,
 /// and the working directory for relative path resolution.
+///
+/// Use [`Context::new`] to create instances — this ensures consistent
+/// field initialization across CLI, executor, and daemon code paths.
 #[allow(clippy::exhaustive_structs)] // fields are write-through API contract
 pub struct Context {
     /// If true, the capability should not perform side effects.
@@ -20,6 +23,32 @@ pub struct Context {
     pub job_id: String,
     /// Working directory for relative path resolution.
     pub working_dir: PathBuf,
+}
+
+impl Context {
+    /// Creates a new execution context.
+    ///
+    /// Uses `std::env::current_dir()` as the default working directory.
+    /// The caller should override `working_dir` if an explicit directory
+    /// is known (e.g., from daemon dispatch parameters).
+    #[must_use]
+    pub fn new(dry_run: bool, job_id: String) -> Self {
+        Self {
+            dry_run,
+            job_id,
+            working_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+        }
+    }
+
+    /// Creates a new execution context with an explicit working directory.
+    #[must_use]
+    pub fn with_working_dir(dry_run: bool, job_id: String, working_dir: PathBuf) -> Self {
+        Self {
+            dry_run,
+            job_id,
+            working_dir,
+        }
+    }
 }
 
 /// Output from capability execution.

@@ -76,10 +76,10 @@ impl SessionManager {
     /// Creates a new session manager.
     ///
     /// # Errors
-    /// Returns an error if the sessions directory cannot be created.
+    /// Returns `SessionError` if the sessions directory cannot be created.
     pub fn new(sessions_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&sessions_dir).map_err(|e| {
-            crate::Error::BackupError(format!("Failed to create sessions dir: {}", e))
+            crate::Error::SessionError(format!("Failed to create sessions dir: {}", e))
         })?;
         Ok(Self { sessions_dir })
     }
@@ -87,7 +87,7 @@ impl SessionManager {
     /// Creates a new session with optional name.
     ///
     /// # Errors
-    /// Returns `BackupError` if the session file cannot be written.
+    /// Returns `SessionError` if the session file cannot be written.
     pub fn create_session(&mut self, name: Option<&str>) -> Result<Session> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -112,19 +112,19 @@ impl SessionManager {
     /// Loads a session from disk by ID.
     ///
     /// # Errors
-    /// Returns `BackupError` if the session file cannot be read or parsed.
+    /// Returns `SessionError` if the session file cannot be read or parsed.
     pub fn load_session(&self, session_id: &str) -> Result<Session> {
         let path = self.session_path(session_id);
         let content = std::fs::read_to_string(&path)
-            .map_err(|e| crate::Error::BackupError(format!("Session not found {}: {}", session_id, e)))?;
+            .map_err(|e| crate::Error::SessionError(format!("Session not found {}: {}", session_id, e)))?;
         serde_json::from_str(&content)
-            .map_err(|e| crate::Error::BackupError(format!("Failed to parse session: {}", e)))
+            .map_err(|e| crate::Error::SessionError(format!("Failed to parse session: {}", e)))
     }
 
     /// Adds a job to a session.
     ///
     /// # Errors
-    /// Returns `BackupError` if the session cannot be loaded or saved.
+    /// Returns `SessionError` if the session cannot be loaded or saved.
     pub fn add_job(&mut self, session_id: &str, job_id: &str) -> Result<()> {
         let mut session = self.load_session(session_id)?;
         session.job_ids.push(job_id.to_string());
@@ -138,7 +138,7 @@ impl SessionManager {
     /// Lists all sessions.
     ///
     /// # Errors
-    /// Returns `BackupError` if the sessions directory cannot be read
+    /// Returns `SessionError` if the sessions directory cannot be read
     /// or a session file cannot be parsed.
     pub fn list_sessions(&self) -> Result<Vec<Session>> {
         let mut sessions = Vec::new();
@@ -147,10 +147,10 @@ impl SessionManager {
         }
 
         for entry in std::fs::read_dir(&self.sessions_dir)
-            .map_err(|e| crate::Error::BackupError(format!("Failed to read sessions: {}", e)))?
+            .map_err(|e| crate::Error::SessionError(format!("Failed to read sessions: {}", e)))?
         {
             let entry = entry
-                .map_err(|e| crate::Error::BackupError(format!("Failed to read entry: {}", e)))?;
+                .map_err(|e| crate::Error::SessionError(format!("Failed to read entry: {}", e)))?;
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "json") {
                 if let Ok(content) = std::fs::read_to_string(&path) {
@@ -173,10 +173,10 @@ impl SessionManager {
     fn save_session(&self, session: &Session) -> Result<()> {
         let path = self.session_path(&session.id);
         let content = serde_json::to_string_pretty(session).map_err(|e| {
-            crate::Error::BackupError(format!("Failed to serialize session: {}", e))
+            crate::Error::SessionError(format!("Failed to serialize session: {}", e))
         })?;
         std::fs::write(&path, content)
-            .map_err(|e| crate::Error::BackupError(format!("Failed to write session: {}", e)))?;
+            .map_err(|e| crate::Error::SessionError(format!("Failed to write session: {}", e)))?;
         Ok(())
     }
 }

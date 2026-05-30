@@ -147,11 +147,14 @@ fn resource_history_path() -> PathBuf {
             |_| {
                 std::env::var("HOME")
                     .ok()
-                    .map_or_else(|| PathBuf::from("/tmp"), PathBuf::from)
-                    .join(".runtimo")
+                    .unwrap_or_else(|| {
+                        panic!("Cannot determine state dir: set RUNTIMO_STATE_DIR or HOME")
+                    })
+                    .into()
             },
             PathBuf::from,
         )
+        .join(".runtimo")
         .join("resource_history.state")
 }
 

@@ -8,7 +8,7 @@
 //! # Architecture
 //!
 //! - **Capabilities** — Pluggable operations implementing the [`Capability`] trait
-//! - **Jobs** — Lifecycle-tracked execution units ([`Job`], [`JobState`])
+//! - **Jobs** — Lifecycle-tracked execution units (Job, [`JobState`])
 //! - **Telemetry** — Hardware awareness ([`Telemetry`])
 //! - **Process Snapshot** — Running process awareness ([`ProcessSnapshot`])
 //! - **WAL** — Append-only crash recovery log ([`WalWriter`]/[`WalReader`])
@@ -63,7 +63,6 @@ pub mod capability;
 pub mod cmd;
 pub mod config;
 pub mod executor;
-pub mod format;
 pub mod job;
 pub mod llmosafe;
 pub mod monitor;
@@ -78,12 +77,11 @@ pub use backup::BackupManager;
 pub use capabilities::{FileRead, FileWrite, GitExec, Kill, ShellExec, Undo};
 pub use capability::{Capability, CapabilityRegistry, Context, Output};
 pub use config::RuntimoConfig;
-pub use executor::{execute_with_telemetry, execute_with_telemetry_and_session, ExecutionResult};
-pub use job::{Job, JobId, JobState};
+pub use executor::{execute_with_telemetry, execute_with_telemetry_and_session};
+pub use job::{JobId, JobState};
 pub use llmosafe::LlmoSafeGuard;
-pub use monitor::{HealthAlert, HealthMonitor, HealthState};
+pub use monitor::HealthMonitor;
 pub use processes::ProcessSnapshot;
-pub use session::{Session, SessionManager};
 pub use telemetry::Telemetry;
 pub use wal::{WalEvent, WalEventType, WalReader, WalWriter};
 
@@ -117,6 +115,10 @@ pub enum Error {
     /// Backup/restore operation failed.
     #[error("Backup error: {0}")]
     BackupError(String),
+
+    /// Session operation failed (create, load, save, list).
+    #[error("Session error: {0}")]
+    SessionError(String),
 
     /// System resource limit exceeded (CPU, RAM, or zombie count).
     #[error("Resource limit exceeded: {0}")]
