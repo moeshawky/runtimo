@@ -73,6 +73,7 @@ const MAX_ARGS_SIZE_BYTES: usize = 1_048_576;
 /// Contains before/after snapshots of hardware telemetry and process state,
 /// plus the WAL sequence number for crash recovery correlation.
 #[derive(Debug, serde::Serialize)]
+#[allow(clippy::exhaustive_structs)]
 pub struct ExecutionResult {
     /// Unique job identifier.
     pub job_id: String,

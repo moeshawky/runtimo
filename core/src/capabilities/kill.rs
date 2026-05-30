@@ -49,6 +49,7 @@ fn get_process_start_time(pid: u32) -> Option<u64> {
     fields.get(19)?.parse::<u64>().ok()
 }
 fn get_process_start_time_retry(pid: u32) -> Option<u64> {
+    #[allow(clippy::arithmetic_side_effects)] // bit shift in retry backoff: 1 << attempt
     for attempt in 0..3 {
         if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_millis(10 * (1 << attempt)));

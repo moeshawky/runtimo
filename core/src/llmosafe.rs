@@ -171,6 +171,7 @@ pub struct LlmoSafeGuard {
 
 impl LlmoSafeGuard {
     /// Creates a guard with the default memory ceiling (80% of system memory).
+    #[must_use] 
     pub fn new() -> Self {
         let guard = ResourceGuard::auto(0.8);
         Self {
@@ -180,6 +181,7 @@ impl LlmoSafeGuard {
     }
 
     /// Creates a guard with an explicit memory ceiling in bytes.
+    #[must_use] 
     pub fn with_memory_ceiling_bytes(memory_ceiling_bytes: usize) -> Self {
         Self {
             guard: ResourceGuard::new(memory_ceiling_bytes),
@@ -262,31 +264,37 @@ impl LlmoSafeGuard {
     }
 
     /// Current RSS in bytes (from `/proc/self/status`).
+    #[must_use] 
     pub fn current_rss_bytes(&self) -> usize {
         ResourceGuard::current_rss_bytes()
     }
 
     /// Total system memory in bytes.
+    #[must_use] 
     pub fn system_memory_bytes(&self) -> usize {
         ResourceGuard::system_memory_bytes()
     }
 
     /// CPU load 0-100 via delta measurement on `/proc/stat`.
+    #[must_use] 
     pub fn system_cpu_load(&self) -> u8 {
         ResourceGuard::system_cpu_load()
     }
 
     /// Raw entropy score 0-1000 (weighted: RSS 50%, IO wait 25%, load 25%).
+    #[must_use] 
     pub fn raw_entropy(&self) -> u16 {
         self.guard.raw_entropy()
     }
 
     /// Pressure as percentage of memory ceiling (0-100).
+    #[must_use] 
     pub fn pressure(&self) -> u8 {
         self.guard.pressure()
     }
 
     /// Creates a safety context for tracking decisions across an execution.
+    #[must_use] 
     pub fn safety_context(&self) -> SafetyContext {
         SafetyContext::new(self.policy.clone())
     }

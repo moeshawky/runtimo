@@ -29,6 +29,7 @@ const CACHE_TTL_SECS: u64 = 30;
 ///
 /// Contains the raw process list, a computed summary, and a timestamp.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::exhaustive_structs)]
 pub struct ProcessSnapshot {
     /// Unix timestamp (seconds) when the snapshot was taken.
     pub timestamp: u64,
@@ -42,6 +43,7 @@ pub struct ProcessSnapshot {
 ///
 /// Parsed from one line of `ps -eo` output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::exhaustive_structs)]
 pub struct ProcessInfo {
     /// Process ID.
     pub pid: u32,
@@ -69,6 +71,7 @@ pub struct ProcessInfo {
 
 /// Aggregated summary of a process snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::exhaustive_structs)]
 pub struct ProcessSummary {
     /// Total number of processes.
     pub total_processes: usize,
@@ -103,8 +106,7 @@ impl ProcessSnapshot {
 
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
 
         let mut processes = Vec::new();
         // Use ps with explicit format to get PPID: PID,PPID,USER,CPU,MEM,VSZ,RSS,STAT,START,TIME,COMMAND
@@ -136,6 +138,7 @@ impl ProcessSnapshot {
     ///
     /// Zombies are defunct child processes whose parent has not yet called
     /// `waitpid(2)`. They consume no resources but each occupies a PID slot.
+    #[must_use] 
     pub fn zombies(&self) -> Vec<&ProcessInfo> {
         self.processes
             .iter()
@@ -152,6 +155,7 @@ impl ProcessSnapshot {
     }
 
     /// Returns the top `n` processes by CPU usage.
+    #[must_use] 
     pub fn top_by_cpu(&self, n: usize) -> Vec<&ProcessInfo> {
         let mut procs: Vec<_> = self.processes.iter().collect();
         procs.sort_by(|a, b| {
@@ -163,6 +167,7 @@ impl ProcessSnapshot {
     }
 
     /// Returns the top `n` processes by memory usage.
+    #[must_use] 
     pub fn top_by_mem(&self, n: usize) -> Vec<&ProcessInfo> {
         let mut procs: Vec<_> = self.processes.iter().collect();
         procs.sort_by(|a, b| {
@@ -174,6 +179,7 @@ impl ProcessSnapshot {
     }
 
     /// Prints a human-readable process report to stdout.
+    #[allow(clippy::arithmetic_side_effects)] // i+1 for human-readable display numbering
     pub fn print_report(&self) {
         println!("\n{}", "=".repeat(80));
         println!(" PROCESS SNAPSHOT [{}]", self.timestamp);
@@ -192,8 +198,7 @@ impl ProcessSnapshot {
                 self.processes
                     .iter()
                     .find(|p| p.command == *top_cpu)
-                    .map(|p| p.cpu_percent)
-                    .unwrap_or(0.0)
+                    .map_or(0.0, |p| p.cpu_percent)
             );
         }
 
@@ -204,8 +209,7 @@ impl ProcessSnapshot {
                 self.processes
                     .iter()
                     .find(|p| p.command == *top_mem)
-                    .map(|p| p.mem_percent)
-                    .unwrap_or(0.0)
+                    .map_or(0.0, |p| p.mem_percent)
             );
         }
 
@@ -249,6 +253,7 @@ impl ProcessSnapshot {
 ///
 /// Expected format: PID PPID USER %CPU %MEM VSZ RSS STAT START TIME COMMAND
 /// Returns `None` if the line has fewer than 10 whitespace-separated fields.
+#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 fn parse_ps_line(line: &str) -> Option<ProcessInfo> {
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() < 10 {
@@ -338,7 +343,7 @@ fn format_size(kb: u64) -> String {
 fn truncate(s: &str, max_len: usize) -> String {
     if s.chars().count() > max_len {
         let end = max_len.saturating_sub(3);
-        let byte_end = s.char_indices().nth(end).map(|(i, _)| i).unwrap_or(s.len());
+        let byte_end = s.char_indices().nth(end).map_or(s.len(), |(i, _)| i);
         format!("{}...", &s[..byte_end])
     } else {
         s.to_string()

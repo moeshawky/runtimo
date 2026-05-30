@@ -124,6 +124,7 @@ fn is_dangerous_command(cmd: &str) -> Option<&'static str> {
     None
 }
 
+#[allow(clippy::arithmetic_side_effects)] // -(pgid) negation is safe for valid PIDs
 fn wait_with_timeout(child: &mut Child, pgid: u32, timeout_secs: u64) -> WaitResult {
     let start = Instant::now();
     let timeout = Duration::from_secs(timeout_secs);

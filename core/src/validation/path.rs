@@ -47,6 +47,7 @@ use unicode_normalization::UnicodeNormalization;
 /// Controls which checks are applied. [`Default`] enables all checks
 /// with built-in prefixes (`/tmp`, `/var/tmp`, `/home`), extended by
 /// `RUNTIMO_ALLOWED_PATHS` env var and config file if set.
+#[allow(clippy::exhaustive_structs)]
 pub struct PathContext {
     /// Additional allowed directory prefixes (merged with defaults + env var + config).
     pub allowed_prefixes: &'static [&'static str],
@@ -97,6 +98,11 @@ fn get_allowed_prefixes(ctx: &PathContext) -> Vec<String> {
 /// # Returns
 /// * `Ok(PathBuf)` - Resolved path (canonical if possible)
 /// * `Err(String)` - Validation error message
+///
+/// # Errors
+/// Returns an error string if the path is empty, contains null bytes,
+/// is non-ASCII, traverses parent directories, does not exist (when required),
+/// is not a regular file (when required), or is outside allowed directories.
 pub fn validate_path(path_str: &str, ctx: &PathContext) -> Result<PathBuf, String> {
     // Reject empty paths
     if path_str.is_empty() {

@@ -4,6 +4,11 @@
 //! each write to guarantee durability. The WAL enables crash recovery by
 //! replaying events to reconstruct system state.
 //!
+//! Sequence numbers and rotation indices use explicit arithmetic — these
+//! are intentional, increment-by-one operations with known-safe ranges.
+
+#![allow(clippy::arithmetic_side_effects)]
+//!
 //! # Example
 //!
 //! ```rust,ignore
@@ -79,6 +84,7 @@ fn read_last_seq(path: &Path, tail_bytes: usize) -> Option<u64> {
 /// These events are only written in debug builds (`#[cfg(debug_assertions)]`),
 /// but the variant exists in release builds for reading old WALs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::exhaustive_structs)]
 pub struct WalEvent {
     /// Sequence number (monotonically increasing within a writer session).
     pub seq: u64,
@@ -171,6 +177,7 @@ pub enum WalEventType {
 ///     capability: None, output: None, error: None,
 /// }).unwrap();
 /// ```
+#[allow(clippy::exhaustive_structs)]
 pub struct WalWriter {
     path: std::path::PathBuf,
     seq: u64,
@@ -232,8 +239,7 @@ impl WalWriter {
                     .filter_map(|line| serde_json::from_str::<WalEvent>(line).ok())
                     .map(|e| e.seq)
                     .max()
-                    .map(|max| max + 1)
-                    .unwrap_or(0)
+                    .map_or(0, |max| max + 1)
             };
             Self::unlock_file(&lock_file);
             recovered
@@ -325,6 +331,7 @@ impl WalWriter {
     }
 
     /// Returns the current sequence number (next event will use this value).
+    #[must_use] 
     pub fn seq(&self) -> u64 {
         self.seq
     }
@@ -346,6 +353,7 @@ impl WalWriter {
 ///     println!("Event: {:?} for job {}", event.event_type, event.job_id);
 /// }
 /// ```
+#[allow(clippy::exhaustive_structs)]
 pub struct WalReader {
     events: Vec<WalEvent>,
 }
@@ -370,6 +378,7 @@ impl WalReader {
     }
 
     /// Returns a slice of all parsed events.
+    #[must_use] 
     pub fn events(&self) -> &[WalEvent] {
         &self.events
     }
@@ -424,6 +433,9 @@ impl WalWriter {
     /// Moves the current WAL to `{path}.1` (shifting older rotations),
     /// then creates a fresh empty WAL. Keeps at most `max_rotations` old files.
     /// FINDING #15: basic WAL rotation to prevent unbounded growth.
+    ///
+    /// # Errors
+    /// Returns `IoError` or `BackupError` if WAL file operations fail.
     pub fn rotate(path: &Path, max_size_bytes: u64, max_rotations: usize) -> Result<()> {
         let Ok(metadata) = std::fs::metadata(path) else {
             return Ok(()); // No WAL to rotate
@@ -472,14 +484,16 @@ impl WalWriter {
     ///
     /// # Returns
     /// * `Ok(usize)` - Number of entries removed
-    /// * `Err(Error)` - Cleanup failure
+    ///
+    /// # Errors
+    /// Returns `IoError` if the WAL file cannot be read, the temp file cannot
+    /// be written, or the atomic rename fails.
     pub fn cleanup(path: &Path, max_age_secs: u64) -> Result<usize> {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let cutoff = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
+            .map_or(0, |d| d.as_secs())
             .saturating_sub(max_age_secs);
 
         // Read all events under lock to prevent concurrent append loss (P1 FIX)
@@ -504,14 +518,14 @@ impl WalWriter {
             // by concurrent writers during this cleanup window, then atomic rename.
             let temp_path = path.with_extension("wal.tmp");
             {
-                let mut new_wal = WalWriter::create(&temp_path)?;
+                let mut new_wal = Self::create(&temp_path)?;
                 for event in &retained {
                     new_wal.append(event.clone())?;
                 }
 
                 // Re-read the original WAL to catch any events appended during cleanup.
                 // Lock is still held from above, so no concurrent writer can interleave.
-                let last_seq = retained.last().map(|e| e.seq).unwrap_or(0);
+                let last_seq = retained.last().map_or(0, |e| e.seq);
                 let current_content = std::fs::read_to_string(path).map_err(|e| {
                     crate::Error::WalError(format!("re-read WAL during cleanup: {}", e))
                 })?;
@@ -541,6 +555,7 @@ impl WalWriter {
 ///
 /// Used to bound command output stored in WAL events. 1KB is sufficient
 /// for error messages and pattern analysis while preventing WAL bloat.
+#[must_use] 
 pub fn truncate_to(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();

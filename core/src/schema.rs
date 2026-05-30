@@ -24,12 +24,14 @@ use serde_json::Value;
 ///
 /// Currently performs basic type checking. Future versions may use the
 /// `jsonschema` crate for full draft-07 validation.
+#[allow(clippy::exhaustive_structs)]
 pub struct SchemaValidator {
     // Could use jsonschema crate for full JSON Schema validation
 }
 
 impl SchemaValidator {
     /// Creates a new (stateless) schema validator.
+    #[must_use] 
     pub fn new() -> Self {
         Self {}
     }

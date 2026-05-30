@@ -156,6 +156,7 @@ fn make_registry() -> CapabilityRegistry {
     reg.register(FileRead);
     #[allow(clippy::expect_used)] // BUG-4: make_registry should return Result
     reg.register(FileWrite::new(backup_dir()).expect("BUG-4: make_registry should return Result, tracked"));
+    #[allow(clippy::expect_used)] // GitExec construction failure should be propagated
     reg.register(GitExec::new(backup_dir()).expect("Failed to create GitExec capability"));
     reg.register(ShellExec);
     reg.register(Kill);
@@ -202,7 +203,7 @@ fn send_rpc(method: &str, params: Value) -> Result<Value, String> {
 
 // ── Main ────────────────────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::indexing_slicing)] // JSON Value indexing is intentional
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
 

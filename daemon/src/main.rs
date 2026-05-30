@@ -158,6 +158,7 @@ impl BackgroundJobRegistry {
     }
 
     fn try_reserve(&self) -> bool {
+        #[allow(clippy::arithmetic_side_effects)] // n+1 only when n < MAX, bounded
         self.running
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                 if n < MAX_CONCURRENT_JOBS {
@@ -817,9 +818,8 @@ fn parse_args() -> Args {
 /// This ensures every job has a definitive terminal state in the audit
 /// trail — no permanently "unknown" jobs after recovery.
 fn reconcile_orphaned_jobs(wal_path: &std::path::Path) {
-    let reader = match WalReader::load(wal_path) {
-        Ok(r) => r,
-        Err(_) => return, // No WAL yet — nothing to reconcile
+    let Ok(reader) = WalReader::load(wal_path) else {
+        return; // No WAL yet — nothing to reconcile
     };
 
     let events = reader.events();

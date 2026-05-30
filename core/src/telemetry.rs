@@ -34,6 +34,7 @@ const CACHE_TTL_SECS: u64 = 30;
 /// Contains four sub-structures: [`SystemInfo`], [`HardwareInfo`],
 /// [`ServiceInfo`], and [`NetworkInfo`], plus a Unix timestamp.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::exhaustive_structs)]
 pub struct Telemetry {
     /// Unix timestamp (seconds) when the snapshot was taken.
     pub timestamp: u64,
@@ -49,6 +50,7 @@ pub struct Telemetry {
 
 /// Basic system information from `/proc` and shell commands.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::exhaustive_structs)]
 pub struct SystemInfo {
     /// CPU model string (from `/proc/cpuinfo`).
     pub cpu_model: String,
@@ -85,6 +87,7 @@ pub struct SystemInfo {
 /// TPUs (/dev/accel*), and JAX availability. Reports what exists, not what
 /// was expected.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::exhaustive_structs)]
 pub struct HardwareInfo {
     /// Detected accelerator devices (any kind). Empty vec = no accelerators found.
     #[serde(default)]
@@ -108,6 +111,7 @@ pub struct HardwareInfo {
 
 /// A detected hardware accelerator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::exhaustive_structs)]
 pub struct AcceleratorInfo {
     /// Accelerator kind: "gpu", "tpu", "npu".
     pub kind: String,
@@ -127,6 +131,7 @@ pub struct AcceleratorInfo {
 /// Only services with actively listening ports are reported. No service is
 /// assumed to exist.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::exhaustive_structs)]
 pub struct ServiceInfo {
     /// Services detected on this machine. Empty vec = no known services found.
     #[serde(default)]
@@ -143,6 +148,7 @@ pub struct ServiceInfo {
 
 /// A detected service running on the machine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::exhaustive_structs)]
 pub struct DetectedService {
     /// Service name (e.g. "vllm", "nginx", "postgres").
     pub name: String,
@@ -159,6 +165,7 @@ pub struct DetectedService {
 
 /// Network state information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::exhaustive_structs)]
 pub struct NetworkInfo {
     /// Public IP address (from `ifconfig.me`), or `"unknown"`.
     pub public_ip: String,
@@ -187,8 +194,7 @@ impl Telemetry {
 
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
 
         let telemetry = Self {
             timestamp,
@@ -466,8 +472,7 @@ impl ServiceInfo {
         let vllm_port_bound = detected
             .iter()
             .find(|s| s.name == "vllm")
-            .map(|s| s.ports.contains(&8200))
-            .unwrap_or(false);
+            .is_some_and(|s| s.ports.contains(&8200));
 
         Self {
             detected_services: detected,
@@ -479,6 +484,7 @@ impl ServiceInfo {
 }
 
 /// Parse `ss -ltnp` output into listening ports.
+#[allow(clippy::indexing_slicing)] // ss output has fixed column format
 fn parse_listening_ports() -> Vec<u16> {
     let output = run_cmd("ss -ltnp 2>/dev/null");
     let mut result = Vec::new();

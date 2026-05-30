@@ -34,6 +34,7 @@ const CHECK_INTERVAL_SECS: u64 = 60;
 
 /// Current health state snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::exhaustive_structs)]
 pub struct HealthState {
     /// Unix timestamp of last check.
     pub timestamp: u64,
@@ -109,6 +110,7 @@ impl std::fmt::Display for HealthAlert {
 ///
 /// Captures snapshots every 60 seconds and alerts on threshold violations.
 /// Thread-safe state access via RwLock.
+#[allow(clippy::exhaustive_structs)]
 pub struct HealthMonitor {
     /// Shared health state.
     state: Arc<RwLock<HealthState>>,
@@ -142,6 +144,7 @@ impl HealthMonitor {
     /// # Errors
     ///
     /// Returns `Err(String)` if the background monitoring thread fails to spawn.
+    #[allow(clippy::arithmetic_side_effects)] // alert counters are intentional increments
     pub fn start() -> Result<Self, String> {
         let state = Arc::new(RwLock::new(HealthState::default()));
         let alerts = Arc::new(RwLock::new(Vec::new()));
@@ -234,11 +237,13 @@ impl HealthMonitor {
     }
 
     /// Returns the current health state snapshot.
+    #[must_use] 
     pub fn health(&self) -> HealthState {
         self.state.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Returns recent health alerts (up to 100).
+    #[must_use] 
     pub fn alerts(&self) -> Vec<HealthAlert> {
         self.alerts
             .read()
@@ -252,6 +257,7 @@ impl HealthMonitor {
     }
 
     /// Returns whether the monitor is still running.
+    #[must_use] 
     pub fn is_running(&self) -> bool {
         !self.stop_flag.load(Ordering::Relaxed)
     }
@@ -288,14 +294,12 @@ fn parse_size_value(size_str: &str) -> f32 {
         size_str
             .trim_end_matches("Ki")
             .parse::<f32>()
-            .map(|v| v / (1024.0 * 1024.0))
-            .unwrap_or(0.0)
+            .map_or(0.0, |v| v / (1024.0 * 1024.0))
     } else if size_str.ends_with("MB") {
         size_str
             .trim_end_matches("MB")
             .parse::<f32>()
-            .map(|v| v / 1000.0)
-            .unwrap_or(0.0)
+            .map_or(0.0, |v| v / 1000.0)
     } else if size_str.ends_with("GB") {
         size_str
             .trim_end_matches("GB")

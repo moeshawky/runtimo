@@ -15,6 +15,7 @@ const DEFAULT_PREFIXES: &[&str] = &["/tmp", "/var/tmp", "/home"];
 
 /// Runtimo persistent configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[allow(clippy::exhaustive_structs)]
 pub struct RuntimoConfig {
     /// Additional allowed path prefixes (merged with defaults + env var).
     #[serde(default)]

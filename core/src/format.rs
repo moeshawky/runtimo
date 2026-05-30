@@ -3,6 +3,11 @@
 //! Transforms raw terminal output into structured Markdown. Handles heading
 //! detection, list continuation, paragraph grouping, and whitespace cleanup.
 //!
+//! This module operates on byte slices with bounds-checked indexing and
+//! explicit arithmetic for position tracking — both patterns are intentional
+//! and safe in this context.
+
+#![allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
 //! # Example
 //!
 //! ```rust,ignore
@@ -18,6 +23,7 @@
 /// lists with multi-line continuation, and groups remaining lines into
 /// paragraphs. Empty input or whitespace-only returns `""`.
 #[allow(clippy::indexing_slicing)]
+#[must_use] 
 pub fn wall_to_markdown(text: &str) -> String {
     if text.trim().is_empty() {
         return String::new();

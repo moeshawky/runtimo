@@ -20,15 +20,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// assert!(!id.as_str().is_empty());
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[allow(clippy::exhaustive_structs)]
 pub struct JobId(String);
 
 impl JobId {
     /// Creates a new job ID from 16 random bytes (32 hex chars).
+    #[must_use] 
     pub fn new() -> Self {
         Self(crate::utils::generate_id())
     }
 
     /// Returns the job ID as a string slice.
+    #[must_use] 
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -85,6 +88,7 @@ pub enum JobState {
 /// assert_eq!(job.state, JobState::Validating);
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::exhaustive_structs)]
 pub struct Job {
     /// Unique job identifier.
     pub id: JobId,
@@ -114,6 +118,7 @@ impl Job {
     /// * `capability` — Name of the capability to execute
     /// * `args` — Serialized capability arguments
     /// * `dry_run` — If true, skip side effects
+    #[must_use] 
     pub fn new(capability: String, args: serde_json::Value, dry_run: bool) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)

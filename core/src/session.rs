@@ -35,6 +35,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A session groups related jobs for audit and recovery.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::exhaustive_structs)]
 pub struct Session {
     /// Unique session identifier.
     pub id: String,
@@ -66,6 +67,7 @@ pub enum SessionStatus {
 }
 
 /// Manages session persistence and retrieval.
+#[allow(clippy::exhaustive_structs)]
 pub struct SessionManager {
     sessions_dir: PathBuf,
 }
@@ -83,6 +85,9 @@ impl SessionManager {
     }
 
     /// Creates a new session with optional name.
+    ///
+    /// # Errors
+    /// Returns `BackupError` if the session file cannot be written.
     pub fn create_session(&mut self, name: Option<&str>) -> Result<Session> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -117,6 +122,9 @@ impl SessionManager {
     }
 
     /// Adds a job to a session.
+    ///
+    /// # Errors
+    /// Returns `BackupError` if the session cannot be loaded or saved.
     pub fn add_job(&mut self, session_id: &str, job_id: &str) -> Result<()> {
         let mut session = self.load_session(session_id)?;
         session.job_ids.push(job_id.to_string());
@@ -128,6 +136,10 @@ impl SessionManager {
     }
 
     /// Lists all sessions.
+    ///
+    /// # Errors
+    /// Returns `BackupError` if the sessions directory cannot be read
+    /// or a session file cannot be parsed.
     pub fn list_sessions(&self) -> Result<Vec<Session>> {
         let mut sessions = Vec::new();
         if !self.sessions_dir.exists() {
