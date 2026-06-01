@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security Fixes
+
+- **CBP-1: Dispatch path bypassed safety checks** — `handle_dispatch` created a separate
+  `CapabilityRegistry` and called `capability.execute()` directly, bypassing all 6 safety
+  guards that `handle_run` provides via `execute_with_telemetry()` (LlmoSafeGuard resource
+  check, zombie count check, args size check, telemetry capture, spawned PID tracking,
+  timeout enforcement). Fixed by routing dispatch through `execute_with_telemetry()` with
+  the daemon's canonical registry, removing the duplicated execution path. This eliminates
+  compound symptoms: dual CapabilityRegistry (registry mismatch), working_dir silent drop
+  (lost context), and TOCTOU window on working_dir validation.
+  (`daemon/src/main.rs`)
+
 ## [0.5.0] - 2026-05-30
 
 ### Security Fixes

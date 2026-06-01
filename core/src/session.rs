@@ -115,8 +115,9 @@ impl SessionManager {
     /// Returns `SessionError` if the session file cannot be read or parsed.
     pub fn load_session(&self, session_id: &str) -> Result<Session> {
         let path = self.session_path(session_id);
-        let content = std::fs::read_to_string(&path)
-            .map_err(|e| crate::Error::SessionError(format!("Session not found {}: {}", session_id, e)))?;
+        let content = std::fs::read_to_string(&path).map_err(|e| {
+            crate::Error::SessionError(format!("Session not found {}: {}", session_id, e))
+        })?;
         serde_json::from_str(&content)
             .map_err(|e| crate::Error::SessionError(format!("Failed to parse session: {}", e)))
     }

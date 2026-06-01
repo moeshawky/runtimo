@@ -31,7 +31,7 @@ pub struct SchemaValidator {
 
 impl SchemaValidator {
     /// Creates a new (stateless) schema validator.
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self {}
     }

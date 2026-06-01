@@ -21,8 +21,20 @@ fn main() {
     println!("CPU model     : {}", telemetry.system.cpu_model);
     println!("RAM free      : {}", telemetry.system.ram_free);
     println!("Disk free     : {}", telemetry.system.disk_free);
-    let gpu_count: usize = telemetry.hardware.accelerators.iter().filter(|a| a.kind == "gpu").map(|a| a.count).sum();
-    let tpu_count: usize = telemetry.hardware.accelerators.iter().filter(|a| a.kind == "tpu").map(|a| a.count).sum();
+    let gpu_count: usize = telemetry
+        .hardware
+        .accelerators
+        .iter()
+        .filter(|a| a.kind == "gpu")
+        .map(|a| a.count)
+        .sum();
+    let tpu_count: usize = telemetry
+        .hardware
+        .accelerators
+        .iter()
+        .filter(|a| a.kind == "tpu")
+        .map(|a| a.count)
+        .sum();
     println!("GPU devices   : {}", gpu_count);
     println!("TPU devices   : {}", tpu_count);
     println!("Accelerators  : {:#?}", telemetry.hardware.accelerators);

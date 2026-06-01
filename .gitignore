@@ -7,6 +7,8 @@ references/
 .agents/
 .cursor/
 .claude/
+.pi/
+*_WORKPAPER.md
 
 # Runtime artifacts
 *.jsonl

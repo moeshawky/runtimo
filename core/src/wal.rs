@@ -51,7 +51,12 @@ fn read_last_seq(path: &Path, tail_bytes: usize) -> Option<u64> {
 
     let start = file_len.saturating_sub(tail_bytes as u64);
     file.seek(SeekFrom::Start(start)).ok()?;
-    let mut buf = vec![0u8; usize::try_from(file_len - start).unwrap_or(0).saturating_add(1)];
+    let mut buf = vec![
+        0u8;
+        usize::try_from(file_len - start)
+            .unwrap_or(0)
+            .saturating_add(1)
+    ];
     let n = file.read(&mut buf).ok()?;
     buf.truncate(n);
 
@@ -331,7 +336,7 @@ impl WalWriter {
     }
 
     /// Returns the current sequence number (next event will use this value).
-    #[must_use] 
+    #[must_use]
     pub fn seq(&self) -> u64 {
         self.seq
     }
@@ -378,7 +383,7 @@ impl WalReader {
     }
 
     /// Returns a slice of all parsed events.
-    #[must_use] 
+    #[must_use]
     pub fn events(&self) -> &[WalEvent] {
         &self.events
     }
@@ -555,7 +560,7 @@ impl WalWriter {
 ///
 /// Used to bound command output stored in WAL events. 1KB is sufficient
 /// for error messages and pattern analysis while preventing WAL bloat.
-#[must_use] 
+#[must_use]
 pub fn truncate_to(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();

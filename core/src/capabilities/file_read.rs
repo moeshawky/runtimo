@@ -118,9 +118,10 @@ impl Capability for FileRead {
         let mut limited = file.take(max_bytes);
 
         // Read raw bytes to handle binary detection and UTF-8 boundaries correctly.
-        let mut raw_bytes = Vec::with_capacity(
-            std::cmp::min(usize::try_from(max_bytes).unwrap_or(usize::MAX), 64 * 1024)
-        );
+        let mut raw_bytes = Vec::with_capacity(std::cmp::min(
+            usize::try_from(max_bytes).unwrap_or(usize::MAX),
+            64 * 1024,
+        ));
         let bytes_read = limited
             .read_to_end(&mut raw_bytes)
             .map_err(|e| Error::ExecutionFailed(format!("read {}: {}", path.display(), e)))?;
@@ -212,7 +213,8 @@ fn bytes_to_utf8_string(bytes: &[u8]) -> String {
         Ok(s) => s,
         Err(e) => {
             let valid_up_to = e.utf8_error().valid_up_to();
-            bytes.get(..valid_up_to)
+            bytes
+                .get(..valid_up_to)
                 .map(|s| String::from_utf8(s.to_vec()).unwrap_or_default())
                 .unwrap_or_default()
         }
@@ -246,7 +248,9 @@ mod tests {
             .unwrap();
 
         assert!(result.success);
-        assert!(result.data.get("content")
+        assert!(result
+            .data
+            .get("content")
             .and_then(|v| v.as_str())
             .unwrap()
             .contains("hello world"));

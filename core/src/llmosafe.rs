@@ -63,8 +63,9 @@ impl ResourceHistory {
                     let elapsed_secs = now_epoch.saturating_sub(secs);
                     if elapsed_secs < self.cooldown_secs {
                         self.last_check = Some(
-                            Instant::now().checked_sub(Duration::from_secs(elapsed_secs))
-                                .unwrap_or_else(Instant::now)
+                            Instant::now()
+                                .checked_sub(Duration::from_secs(elapsed_secs))
+                                .unwrap_or_else(Instant::now),
                         );
                     }
                 }
@@ -174,7 +175,7 @@ pub struct LlmoSafeGuard {
 
 impl LlmoSafeGuard {
     /// Creates a guard with the default memory ceiling (80% of system memory).
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         let guard = ResourceGuard::auto(0.8);
         Self {
@@ -184,7 +185,7 @@ impl LlmoSafeGuard {
     }
 
     /// Creates a guard with an explicit memory ceiling in bytes.
-    #[must_use] 
+    #[must_use]
     pub fn with_memory_ceiling_bytes(memory_ceiling_bytes: usize) -> Self {
         Self {
             guard: ResourceGuard::new(memory_ceiling_bytes),
@@ -215,7 +216,9 @@ impl LlmoSafeGuard {
             *history = Some(ResourceHistory::new(30, 1, Some(resource_history_path())));
         }
         #[allow(clippy::expect_used)]
-        let hist = history.as_mut().expect("history always Some after initialization above");
+        let hist = history
+            .as_mut()
+            .expect("history always Some after initialization above");
 
         // FINDING #16: Enforce cooldown between checks
         if hist.is_in_cooldown() {
@@ -267,37 +270,37 @@ impl LlmoSafeGuard {
     }
 
     /// Current RSS in bytes (from `/proc/self/status`).
-    #[must_use] 
+    #[must_use]
     pub fn current_rss_bytes(&self) -> usize {
         ResourceGuard::current_rss_bytes()
     }
 
     /// Total system memory in bytes.
-    #[must_use] 
+    #[must_use]
     pub fn system_memory_bytes(&self) -> usize {
         ResourceGuard::system_memory_bytes()
     }
 
     /// CPU load 0-100 via delta measurement on `/proc/stat`.
-    #[must_use] 
+    #[must_use]
     pub fn system_cpu_load(&self) -> u8 {
         ResourceGuard::system_cpu_load()
     }
 
     /// Raw entropy score 0-1000 (weighted: RSS 50%, IO wait 25%, load 25%).
-    #[must_use] 
+    #[must_use]
     pub fn raw_entropy(&self) -> u16 {
         self.guard.raw_entropy()
     }
 
     /// Pressure as percentage of memory ceiling (0-100).
-    #[must_use] 
+    #[must_use]
     pub fn pressure(&self) -> u8 {
         self.guard.pressure()
     }
 
     /// Creates a safety context for tracking decisions across an execution.
-    #[must_use] 
+    #[must_use]
     pub fn safety_context(&self) -> SafetyContext {
         SafetyContext::new(self.policy.clone())
     }

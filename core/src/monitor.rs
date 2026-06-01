@@ -173,8 +173,12 @@ impl HealthMonitor {
                     parse_ram_percent(&telemetry.system.ram_total, &telemetry.system.ram_free);
                 current_state.zombie_count = processes.summary.zombie_count;
                 current_state.process_count = processes.summary.total_processes;
-                current_state.top_cpu_process.clone_from(&processes.summary.top_cpu_consumer);
-                current_state.top_mem_process.clone_from(&processes.summary.top_mem_consumer);
+                current_state
+                    .top_cpu_process
+                    .clone_from(&processes.summary.top_cpu_consumer);
+                current_state
+                    .top_mem_process
+                    .clone_from(&processes.summary.top_mem_consumer);
 
                 // Check CPU threshold
                 if current_state.cpu_percent > CPU_THRESHOLD {
@@ -237,13 +241,13 @@ impl HealthMonitor {
     }
 
     /// Returns the current health state snapshot.
-    #[must_use] 
+    #[must_use]
     pub fn health(&self) -> HealthState {
         self.state.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Returns recent health alerts (up to 100).
-    #[must_use] 
+    #[must_use]
     pub fn alerts(&self) -> Vec<HealthAlert> {
         self.alerts
             .read()
@@ -257,7 +261,7 @@ impl HealthMonitor {
     }
 
     /// Returns whether the monitor is still running.
-    #[must_use] 
+    #[must_use]
     pub fn is_running(&self) -> bool {
         !self.stop_flag.load(Ordering::Relaxed)
     }

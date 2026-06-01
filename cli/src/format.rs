@@ -15,7 +15,7 @@
 /// lists with multi-line continuation, and groups remaining lines into
 /// paragraphs. Empty input or whitespace-only returns `""`.
 #[allow(clippy::indexing_slicing)]
-#[must_use] 
+#[must_use]
 pub fn wall_to_markdown(text: &str) -> String {
     if text.trim().is_empty() {
         return String::new();

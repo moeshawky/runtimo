@@ -320,8 +320,8 @@ fn atomic_write(path: &std::path::Path, content: &str) -> Result<usize> {
             .custom_flags(libc::O_NOFOLLOW)
             .open(&tmp_path)
             .map_err(|e| {
-            Error::ExecutionFailed(format!("create temp {}: {}", tmp_path.display(), e))
-        })?;
+                Error::ExecutionFailed(format!("create temp {}: {}", tmp_path.display(), e))
+            })?;
         file.write_all(content.as_bytes()).map_err(|e| {
             Error::ExecutionFailed(format!("write temp {}: {}", tmp_path.display(), e))
         })?;
@@ -340,7 +340,8 @@ fn atomic_write(path: &std::path::Path, content: &str) -> Result<usize> {
         ))
     })?;
 
-    if let Ok(dir) = std::fs::File::open(path.parent().unwrap_or_else(|| std::path::Path::new("."))) {
+    if let Ok(dir) = std::fs::File::open(path.parent().unwrap_or_else(|| std::path::Path::new(".")))
+    {
         let _ = dir.sync_all();
     }
 
@@ -358,8 +359,8 @@ fn atomic_append(path: &std::path::Path, content: &str) -> Result<usize> {
             .custom_flags(libc::O_NOFOLLOW)
             .open(path)
             .map_err(|e| {
-            Error::ExecutionFailed(format!("open {} for append: {}", path.display(), e))
-        })?;
+                Error::ExecutionFailed(format!("open {} for append: {}", path.display(), e))
+            })?;
         let mut buf = Vec::new();
         file.read_to_end(&mut buf).map_err(|e| {
             Error::ExecutionFailed(format!("read {} for append: {}", path.display(), e))
@@ -392,8 +393,8 @@ fn atomic_append(path: &std::path::Path, content: &str) -> Result<usize> {
             .custom_flags(libc::O_NOFOLLOW)
             .open(&tmp_path)
             .map_err(|e| {
-            Error::ExecutionFailed(format!("create temp {}: {}", tmp_path.display(), e))
-        })?;
+                Error::ExecutionFailed(format!("create temp {}: {}", tmp_path.display(), e))
+            })?;
         file.write_all(&combined).map_err(|e| {
             Error::ExecutionFailed(format!("write temp {}: {}", tmp_path.display(), e))
         })?;
@@ -412,7 +413,8 @@ fn atomic_append(path: &std::path::Path, content: &str) -> Result<usize> {
         ))
     })?;
 
-    if let Ok(dir) = std::fs::File::open(path.parent().unwrap_or_else(|| std::path::Path::new("."))) {
+    if let Ok(dir) = std::fs::File::open(path.parent().unwrap_or_else(|| std::path::Path::new(".")))
+    {
         let _ = dir.sync_all();
     }
 

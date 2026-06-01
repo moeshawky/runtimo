@@ -138,7 +138,7 @@ impl ProcessSnapshot {
     ///
     /// Zombies are defunct child processes whose parent has not yet called
     /// `waitpid(2)`. They consume no resources but each occupies a PID slot.
-    #[must_use] 
+    #[must_use]
     pub fn zombies(&self) -> Vec<&ProcessInfo> {
         self.processes
             .iter()
@@ -155,7 +155,7 @@ impl ProcessSnapshot {
     }
 
     /// Returns the top `n` processes by CPU usage.
-    #[must_use] 
+    #[must_use]
     pub fn top_by_cpu(&self, n: usize) -> Vec<&ProcessInfo> {
         let mut procs: Vec<_> = self.processes.iter().collect();
         procs.sort_by(|a, b| {
@@ -167,7 +167,7 @@ impl ProcessSnapshot {
     }
 
     /// Returns the top `n` processes by memory usage.
-    #[must_use] 
+    #[must_use]
     pub fn top_by_mem(&self, n: usize) -> Vec<&ProcessInfo> {
         let mut procs: Vec<_> = self.processes.iter().collect();
         procs.sort_by(|a, b| {

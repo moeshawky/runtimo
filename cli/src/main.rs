@@ -3,17 +3,17 @@
 mod format;
 
 use clap::{Parser, Subcommand};
+use format::wall_to_markdown;
 use runtimo_core::{
     capabilities::{FileRead, FileWrite, GitExec, Kill, ShellExec, Undo},
-    execute_with_telemetry_and_session, CapabilityRegistry, ProcessSnapshot,
-    RuntimoConfig, Telemetry, WalReader,
+    execute_with_telemetry_and_session, CapabilityRegistry, ProcessSnapshot, RuntimoConfig,
+    Telemetry, WalReader,
 };
-use format::wall_to_markdown;
+use serde_json::Value;
 use std::error::Error;
 use std::io::{Read, Write};
-use std::path::PathBuf;
 use std::os::unix::net::UnixStream;
-use serde_json::Value;
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
@@ -32,8 +32,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    #[command(about = "exec capability with telemetry",
-        after_help = "CAPABILITY HELP:\n runtimo run -c <Cap> --schema\n\nEXAMPLES:\n runtimo run -c FileRead -a '{\"path\":\"/etc/hostname\"}'\n runtimo run -c ShellExec -a '{\"cmd\":\"uptime\"}'")]
+    #[command(
+        about = "exec capability with telemetry",
+        after_help = "CAPABILITY HELP:\n runtimo run -c <Cap> --schema\n\nEXAMPLES:\n runtimo run -c FileRead -a '{\"path\":\"/etc/hostname\"}'\n runtimo run -c ShellExec -a '{\"cmd\":\"uptime\"}'"
+    )]
     Run {
         #[arg(short = 'c', long)]
         capability: String,
@@ -51,8 +53,10 @@ enum Commands {
         timeout: u64,
     },
     /// Dispatch job to background daemon (returns immediately)
-    #[command(about = "Dispatch job to background daemon",
-        after_help = "EXAMPLES:\n runtimo dispatch -c ShellExec -a '{\"cmd\":\"sleep 30\"}'\n runtimo dispatch -c FileWrite -a '{\"path\":\"/tmp/x.txt\",\"content\":\"bg\"}'\n\nRequires runtimo-daemon to be running.")]
+    #[command(
+        about = "Dispatch job to background daemon",
+        after_help = "EXAMPLES:\n runtimo dispatch -c ShellExec -a '{\"cmd\":\"sleep 30\"}'\n runtimo dispatch -c FileWrite -a '{\"path\":\"/tmp/x.txt\",\"content\":\"bg\"}'\n\nRequires runtimo-daemon to be running."
+    )]
     Dispatch {
         #[arg(short = 'c', long)]
         capability: String,
@@ -62,16 +66,20 @@ enum Commands {
         dry_run: bool,
     },
     /// Wait for a dispatched job to complete
-    #[command(about = "Wait for a dispatched job",
-        after_help = "EXAMPLES:\n runtimo wait -j abc123\n runtimo wait -j abc123 --timeout 60")]
+    #[command(
+        about = "Wait for a dispatched job",
+        after_help = "EXAMPLES:\n runtimo wait -j abc123\n runtimo wait -j abc123 --timeout 60"
+    )]
     Wait {
         #[arg(short = 'j', long)]
         job_id: String,
         #[arg(long, default_value = "0")]
         timeout: u64,
     },
-    #[command(about = "List capabilities",
-        after_help = "Use --schemas to see JSON argument schemas.")]
+    #[command(
+        about = "List capabilities",
+        after_help = "Use --schemas to see JSON argument schemas."
+    )]
     List {
         #[arg(long)]
         schemas: bool,
@@ -86,8 +94,10 @@ enum Commands {
         json: bool,
     },
     /// List recent jobs (queriable job history)
-    #[command(about = "List recent jobs",
-        after_help = "EXAMPLES:\n runtimo jobs\n runtimo jobs --limit 5\n runtimo jobs --json")]
+    #[command(
+        about = "List recent jobs",
+        after_help = "EXAMPLES:\n runtimo jobs\n runtimo jobs --limit 5\n runtimo jobs --json"
+    )]
     Jobs {
         #[arg(short = 'n', long, default_value = "20")]
         limit: usize,
@@ -103,8 +113,10 @@ enum Commands {
         #[arg(short = 'o', long)]
         json: bool,
     },
-    #[command(about = "Undo a completed job",
-        after_help = "Find job IDs with `runtimo jobs` or `runtimo logs`.")]
+    #[command(
+        about = "Undo a completed job",
+        after_help = "Find job IDs with `runtimo jobs` or `runtimo logs`."
+    )]
     Undo {
         #[arg(short = 'j', long)]
         job_id: String,
@@ -122,8 +134,10 @@ enum Commands {
         json: bool,
     },
     /// List and optionally reap zombie processes
-    #[command(about = "List zombie processes",
-        after_help = "EXAMPLES:\n runtimo zombies\n runtimo zombies --reap\n\nZombies are dead processes whose parents haven't called waitpid(2).\nThey can't be killed directly. --reap kills each zombie's parent process\ninstead, which causes the kernel to clean up the zombie.")]
+    #[command(
+        about = "List zombie processes",
+        after_help = "EXAMPLES:\n runtimo zombies\n runtimo zombies --reap\n\nZombies are dead processes whose parents haven't called waitpid(2).\nThey can't be killed directly. --reap kills each zombie's parent process\ninstead, which causes the kernel to clean up the zombie."
+    )]
     Zombies {
         #[arg(short = 'r', long, default_value = "false")]
         reap: bool,
@@ -150,14 +164,20 @@ enum AllowedPathsAction {
     List,
 }
 
-fn wal_path() -> PathBuf { runtimo_core::utils::wal_path() }
-fn backup_dir() -> PathBuf { runtimo_core::utils::backup_dir() }
+fn wal_path() -> PathBuf {
+    runtimo_core::utils::wal_path()
+}
+fn backup_dir() -> PathBuf {
+    runtimo_core::utils::backup_dir()
+}
 
 fn make_registry() -> CapabilityRegistry {
     let mut reg = CapabilityRegistry::new();
     reg.register(FileRead);
     #[allow(clippy::expect_used)] // BUG-4: make_registry should return Result
-    reg.register(FileWrite::new(backup_dir()).expect("BUG-4: make_registry should return Result, tracked"));
+    reg.register(
+        FileWrite::new(backup_dir()).expect("BUG-4: make_registry should return Result, tracked"),
+    );
     #[allow(clippy::expect_used)] // GitExec construction failure should be propagated
     reg.register(GitExec::new(backup_dir()).expect("Failed to create GitExec capability"));
     reg.register(ShellExec);
@@ -174,8 +194,13 @@ fn daemon_socket() -> PathBuf {
 
 fn send_rpc(method: &str, params: Value) -> Result<Value, String> {
     let sock_path = daemon_socket();
-    let mut stream = UnixStream::connect(&sock_path)
-        .map_err(|e| format!("Cannot connect to daemon at {}: {}. Is `runtimo-daemon` running?", sock_path.display(), e))?;
+    let mut stream = UnixStream::connect(&sock_path).map_err(|e| {
+        format!(
+            "Cannot connect to daemon at {}: {}. Is `runtimo-daemon` running?",
+            sock_path.display(),
+            e
+        )
+    })?;
 
     let request = serde_json::json!({
         "method": method,
@@ -183,8 +208,12 @@ fn send_rpc(method: &str, params: Value) -> Result<Value, String> {
         "id": 1,
     });
     let req_str = serde_json::to_string(&request).map_err(|e| format!("JSON encode: {}", e))?;
-    stream.write_all(req_str.as_bytes()).map_err(|e| format!("Write: {}", e))?;
-    stream.write_all(b"\n").map_err(|e| format!("Write nl: {}", e))?;
+    stream
+        .write_all(req_str.as_bytes())
+        .map_err(|e| format!("Write: {}", e))?;
+    stream
+        .write_all(b"\n")
+        .map_err(|e| format!("Write nl: {}", e))?;
 
     let mut buf = vec![0u8; 65536];
     let n = stream.read(&mut buf).map_err(|e| format!("Read: {}", e))?;
@@ -196,7 +225,11 @@ fn send_rpc(method: &str, params: Value) -> Result<Value, String> {
     let last_line = resp_str.lines().last().unwrap_or("");
     let resp: Value = serde_json::from_str(last_line).map_err(|e| format!("JSON parse: {}", e))?;
 
-    if let Some(err) = resp.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
+    if let Some(err) = resp
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+    {
         return Err(err.to_string());
     }
 
@@ -210,7 +243,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Run { capability, args, dry_run, json, quiet, schema, timeout } => {
+        Commands::Run {
+            capability,
+            args,
+            dry_run,
+            json,
+            quiet,
+            schema,
+            timeout,
+        } => {
             let reg = make_registry();
             if schema {
                 if let Some(cap) = reg.get(&capability) {
@@ -221,29 +262,47 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
                 return Ok(());
             }
-            let cap = reg.get(&capability).ok_or_else(|| format!("Capability not found: {}", capability))?;
-            let args_val: Value = serde_json::from_str(&args).map_err(|e| format!("Invalid JSON args: {}", e))?;
+            let cap = reg
+                .get(&capability)
+                .ok_or_else(|| format!("Capability not found: {}", capability))?;
+            let args_val: Value =
+                serde_json::from_str(&args).map_err(|e| format!("Invalid JSON args: {}", e))?;
             if let Err(e) = cap.validate(&args_val) {
                 eprintln!("Validation failed: {}", e);
                 std::process::exit(1);
             }
             let result = execute_with_telemetry_and_session(
-                cap, &args_val, dry_run, &wal_path(), None, timeout,
-            ).map_err(|e| format!("{}", e))?;
+                cap,
+                &args_val,
+                dry_run,
+                &wal_path(),
+                None,
+                timeout,
+            )
+            .map_err(|e| format!("{}", e))?;
             let output = result.output;
             if json {
                 println!("{}", serde_json::to_string_pretty(&output)?);
             } else if !quiet {
                 println!("{}", output.message.as_deref().unwrap_or("ok"));
                 if !output.data.is_null() {
-                    let text = if let Some(s) = output.data.as_str() { s.to_string() } else { output.data.to_string() };
+                    let text = if let Some(s) = output.data.as_str() {
+                        s.to_string()
+                    } else {
+                        output.data.to_string()
+                    };
                     println!("{}", wall_to_markdown(&text));
                 }
             }
         }
 
-        Commands::Dispatch { capability, args, dry_run } => {
-            let args_val: Value = serde_json::from_str(&args).map_err(|e| format!("Invalid JSON args: {}", e))?;
+        Commands::Dispatch {
+            capability,
+            args,
+            dry_run,
+        } => {
+            let args_val: Value =
+                serde_json::from_str(&args).map_err(|e| format!("Invalid JSON args: {}", e))?;
             let params = serde_json::json!({
                 "capability": capability,
                 "args": args_val,
@@ -253,7 +312,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             match send_rpc("dispatch", params) {
                 Ok(result) => {
                     let jid = result.get("job_id").and_then(|v| v.as_str()).unwrap_or("?");
-                    let cap = result.get("capability").and_then(|v| v.as_str()).unwrap_or("?");
+                    let cap = result
+                        .get("capability")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?");
                     println!("Dispatched job {} (capability: {})", jid, cap);
                     println!("Check status: runtimo wait -j {}", jid);
                 }
@@ -268,19 +330,29 @@ fn main() -> Result<(), Box<dyn Error>> {
             let start = std::time::Instant::now();
             loop {
                 let params = serde_json::json!({ "job_id": &job_id });
-                #[allow(clippy::single_match_else)] // refactoring to if-let-else changes control flow here
+                #[allow(clippy::single_match_else)]
+                // refactoring to if-let-else changes control flow here
                 match send_rpc("status", params) {
                     Ok(result) => {
-                        let status = result.get("status").and_then(|v| v.as_str()).unwrap_or("unknown");
+                        let status = result
+                            .get("status")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
                         match status {
                             "running" => {
                                 if timeout > 0 && start.elapsed().as_secs() >= timeout {
-                                    println!("Job {} still running (timeout after {}s)", job_id, timeout);
+                                    println!(
+                                        "Job {} still running (timeout after {}s)",
+                                        job_id, timeout
+                                    );
                                     return Ok(());
                                 }
                                 let elapsed = start.elapsed().as_secs();
                                 if elapsed > 0 && elapsed.is_multiple_of(10) {
-                                    println!("Job {} still running ({}s elapsed)...", job_id, elapsed);
+                                    println!(
+                                        "Job {} still running ({}s elapsed)...",
+                                        job_id, elapsed
+                                    );
                                 }
                                 std::thread::sleep(std::time::Duration::from_secs(2));
                             }
@@ -302,12 +374,21 @@ fn main() -> Result<(), Box<dyn Error>> {
                         // Daemon might not be running; check WAL directly
                         if let Ok(reader) = WalReader::load(&wal_path()) {
                             let events = reader.events();
-                            let has_completed = events.iter().any(|e| e.job_id == job_id && matches!(e.event_type, runtimo_core::WalEventType::JobCompleted));
+                            let has_completed = events.iter().any(|e| {
+                                e.job_id == job_id
+                                    && matches!(
+                                        e.event_type,
+                                        runtimo_core::WalEventType::JobCompleted
+                                    )
+                            });
                             if has_completed {
                                 println!("Job {} completed (checked via WAL)", job_id);
                                 return Ok(());
                             }
-                            let has_failed = events.iter().any(|e| e.job_id == job_id && matches!(e.event_type, runtimo_core::WalEventType::JobFailed));
+                            let has_failed = events.iter().any(|e| {
+                                e.job_id == job_id
+                                    && matches!(e.event_type, runtimo_core::WalEventType::JobFailed)
+                            });
                             if has_failed {
                                 println!("Job {} failed (checked via WAL)", job_id);
                                 return Ok(());
@@ -359,10 +440,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&result)?);
                     } else {
-                        println!("Job: {}  Status: {}  Capability: {}",
+                        println!(
+                            "Job: {}  Status: {}  Capability: {}",
                             result.get("job_id").and_then(|v| v.as_str()).unwrap_or("?"),
                             result.get("status").and_then(|v| v.as_str()).unwrap_or("?"),
-                            result.get("capability").and_then(|v| v.as_str()).unwrap_or("?"));
+                            result
+                                .get("capability")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("?")
+                        );
                     }
                     return Ok(());
                 }
@@ -375,10 +461,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                         println!("Job not found: {}", jid);
                     } else {
                         for e in &by_job {
-                            println!("{:?}  {:>15}  {:?}",
+                            println!(
+                                "{:?}  {:>15}  {:?}",
                                 e.event_type,
                                 e.capability.as_deref().unwrap_or("-"),
-                                e.ts);
+                                e.ts
+                            );
                         }
                     }
                 } else {
@@ -392,25 +480,32 @@ fn main() -> Result<(), Box<dyn Error>> {
                     } else {
                         let jobs = result["jobs"].as_array().cloned().unwrap_or_default();
                         for job in &jobs {
-                            println!("  {}  {:>8}  {}",
+                            println!(
+                                "  {}  {:>8}  {}",
                                 job["job_id"].as_str().unwrap_or("?"),
                                 job["status"].as_str().unwrap_or("?"),
-                                job["capability"].as_str().unwrap_or("?"));
+                                job["capability"].as_str().unwrap_or("?")
+                            );
                         }
                     }
                 } else {
                     // Fallback to WAL
                     if let Ok(reader) = WalReader::load(&wal_path()) {
                         let events = reader.events();
-                        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                        let mut seen: std::collections::HashSet<String> =
+                            std::collections::HashSet::new();
                         for e in events.iter().rev() {
-                            if seen.contains(&e.job_id) { continue; }
+                            if seen.contains(&e.job_id) {
+                                continue;
+                            }
                             seen.insert(e.job_id.clone());
-                            println!("{:?}  {}  {:?}  {}",
+                            println!(
+                                "{:?}  {}  {:?}  {}",
                                 e.event_type,
                                 e.job_id,
                                 e.capability.as_deref().unwrap_or("-"),
-                                e.ts);
+                                e.ts
+                            );
                         }
                     }
                 }
@@ -429,18 +524,21 @@ fn main() -> Result<(), Box<dyn Error>> {
                         if jobs.is_empty() {
                             println!("No jobs found.");
                         } else {
-                            let md_lines: Vec<String> = jobs.iter().map(|j| {
-                                let jid = j["job_id"].as_str().unwrap_or("?");
-                                let cap = j["capability"].as_str().unwrap_or("?");
-                                let status = j["status"].as_str().unwrap_or("?");
-                                let icon = match status {
-                                    "running" => "🔄",
-                                    "completed" => "✅",
-                                    "failed" => "❌",
-                                    _ => "❓",
-                                };
-                                format!("- {} **{}**  {}  {}", icon, jid, cap, status)
-                            }).collect();
+                            let md_lines: Vec<String> = jobs
+                                .iter()
+                                .map(|j| {
+                                    let jid = j["job_id"].as_str().unwrap_or("?");
+                                    let cap = j["capability"].as_str().unwrap_or("?");
+                                    let status = j["status"].as_str().unwrap_or("?");
+                                    let icon = match status {
+                                        "running" => "🔄",
+                                        "completed" => "✅",
+                                        "failed" => "❌",
+                                        _ => "❓",
+                                    };
+                                    format!("- {} **{}**  {}  {}", icon, jid, cap, status)
+                                })
+                                .collect();
                             println!("## Recent Jobs ({})\n{}", jobs.len(), md_lines.join("\n"));
                         }
                     }
@@ -450,10 +548,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                     if let Ok(reader) = WalReader::load(&wal_path()) {
                         let events = reader.events();
                         let mut jobs: Vec<Value> = Vec::new();
-                        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                        let mut seen: std::collections::HashSet<String> =
+                            std::collections::HashSet::new();
                         for e in events.iter().rev() {
-                            if seen.contains(&e.job_id) { continue; }
-                            if jobs.len() >= limit { break; }
+                            if seen.contains(&e.job_id) {
+                                continue;
+                            }
+                            if jobs.len() >= limit {
+                                break;
+                            }
                             seen.insert(e.job_id.clone());
                             jobs.push(serde_json::json!({
                                 "job_id": e.job_id,
@@ -490,7 +593,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
-        Commands::Logs { job_id, limit, json } => {
+        Commands::Logs {
+            job_id,
+            limit,
+            json,
+        } => {
             // Try daemon RPC first
             let mut params = serde_json::json!({ "limit": limit });
             if let Some(ref jid) = job_id {
@@ -521,11 +628,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                     println!("{}", serde_json::to_string_pretty(&recent)?);
                 } else {
                     for e in &recent {
-                        println!("{:?}  {}  {:?}  {}",
+                        println!(
+                            "{:?}  {}  {:?}  {}",
                             e.event_type,
                             e.job_id,
                             e.capability.as_deref().unwrap_or("-"),
-                            e.ts);
+                            e.ts
+                        );
                     }
                 }
             }
@@ -579,9 +688,18 @@ fn main() -> Result<(), Box<dyn Error>> {
                     if zs.is_empty() {
                         String::new()
                     } else {
-                        let lines: Vec<String> = zs.iter().map(|p| {
-                            format!("- {} PPID:{} {} {}", p.pid, p.ppid, p.stat, p.command.chars().take(40).collect::<String>())
-                        }).collect();
+                        let lines: Vec<String> = zs
+                            .iter()
+                            .map(|p| {
+                                format!(
+                                    "- {} PPID:{} {} {}",
+                                    p.pid,
+                                    p.ppid,
+                                    p.stat,
+                                    p.command.chars().take(40).collect::<String>()
+                                )
+                            })
+                            .collect();
                         format!("\n\nZombies ({})\n{}", zs.len(), lines.join("\n"))
                     }
                 };
@@ -609,8 +727,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             println!("{} zombie(s) found:\n", zombies.len());
             for z in &zombies {
-                println!("  {:>8}  PPID:{:>8}  {:>6}  {}",
-                    z.pid, z.ppid, z.stat, z.command);
+                println!(
+                    "  {:>8}  PPID:{:>8}  {:>6}  {}",
+                    z.pid, z.ppid, z.stat, z.command
+                );
             }
 
             if reap {
@@ -619,8 +739,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                 // Kill capability protects init (PID 1) and self.
                 let reg = make_registry();
                 let killer = reg.get("Kill").ok_or("Kill capability not available")?;
-                let mut unique_parents: std::collections::HashSet<u32> =
-                    zombies.iter().map(|z| z.ppid).filter(|&ppid| ppid > 1).collect();
+                let mut unique_parents: std::collections::HashSet<u32> = zombies
+                    .iter()
+                    .map(|z| z.ppid)
+                    .filter(|&ppid| ppid > 1)
+                    .collect();
                 // Never kill our own parent
                 unique_parents.remove(&std::process::id());
 
@@ -649,43 +772,46 @@ fn main() -> Result<(), Box<dyn Error>> {
                 if remaining == 0 {
                     println!("\nAll zombies reaped.");
                 } else {
-                    println!("\n{} zombie(s) remain (may need SIGKILL or parent is protected).", remaining);
+                    println!(
+                        "\n{} zombie(s) remain (may need SIGKILL or parent is protected).",
+                        remaining
+                    );
                 }
             } else {
-                println!("\nUse `runtimo zombies --reap` to kill zombie parents and clean them up.");
+                println!(
+                    "\nUse `runtimo zombies --reap` to kill zombie parents and clean them up."
+                );
             }
         }
 
-        Commands::Config { action } => {
-            match action {
-                ConfigAction::AllowedPaths { subaction } => {
-                    let mut config = RuntimoConfig::load();
-                    match subaction {
-                        AllowedPathsAction::Add { paths } => {
-                            for p in paths {
-                                if !config.allowed_paths.contains(&p) {
-                                    config.allowed_paths.push(p);
-                                }
+        Commands::Config { action } => match action {
+            ConfigAction::AllowedPaths { subaction } => {
+                let mut config = RuntimoConfig::load();
+                match subaction {
+                    AllowedPathsAction::Add { paths } => {
+                        for p in paths {
+                            if !config.allowed_paths.contains(&p) {
+                                config.allowed_paths.push(p);
                             }
-                            config.save().map_err(|e| format!("Save failed: {}", e))?;
-                            println!("Prefixes updated: {:?}", config.allowed_paths);
                         }
-                        AllowedPathsAction::Remove { paths } => {
-                            config.allowed_paths.retain(|p| !paths.contains(p));
-                            config.save().map_err(|e| format!("Save failed: {}", e))?;
-                            println!("Prefixes updated: {:?}", config.allowed_paths);
-                        }
-                        AllowedPathsAction::List => {
-                            let all = RuntimoConfig::get_allowed_prefixes();
-                            println!("Allowed path prefixes:");
-                            for p in all {
-                                println!("  {}", p);
-                            }
+                        config.save().map_err(|e| format!("Save failed: {}", e))?;
+                        println!("Prefixes updated: {:?}", config.allowed_paths);
+                    }
+                    AllowedPathsAction::Remove { paths } => {
+                        config.allowed_paths.retain(|p| !paths.contains(p));
+                        config.save().map_err(|e| format!("Save failed: {}", e))?;
+                        println!("Prefixes updated: {:?}", config.allowed_paths);
+                    }
+                    AllowedPathsAction::List => {
+                        let all = RuntimoConfig::get_allowed_prefixes();
+                        println!("Allowed path prefixes:");
+                        for p in all {
+                            println!("  {}", p);
                         }
                     }
                 }
             }
-        }
+        },
     }
 
     Ok(())

@@ -25,13 +25,13 @@ pub struct JobId(String);
 
 impl JobId {
     /// Creates a new job ID from 16 random bytes (32 hex chars).
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self(crate::utils::generate_id())
     }
 
     /// Returns the job ID as a string slice.
-    #[must_use] 
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -118,7 +118,7 @@ impl Job {
     /// * `capability` — Name of the capability to execute
     /// * `args` — Serialized capability arguments
     /// * `dry_run` — If true, skip side effects
-    #[must_use] 
+    #[must_use]
     pub fn new(capability: String, args: serde_json::Value, dry_run: bool) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)

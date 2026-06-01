@@ -152,12 +152,14 @@ pub mod utils {
 
     /// Returns the WAL path (env override or default).
     pub fn wal_path() -> PathBuf {
-        std::env::var("RUNTIMO_WAL_PATH").map_or_else(|_| data_dir().join("wal.jsonl"), PathBuf::from)
+        std::env::var("RUNTIMO_WAL_PATH")
+            .map_or_else(|_| data_dir().join("wal.jsonl"), PathBuf::from)
     }
 
     /// Returns the backup directory (env override or default).
     pub fn backup_dir() -> PathBuf {
-        std::env::var("RUNTIMO_BACKUP_DIR").map_or_else(|_| data_dir().join("backups"), PathBuf::from)
+        std::env::var("RUNTIMO_BACKUP_DIR")
+            .map_or_else(|_| data_dir().join("backups"), PathBuf::from)
     }
 
     /// Generates a unique ID from 16 random bytes (32 hex chars).
@@ -165,7 +167,7 @@ pub mod utils {
     /// Uses `/dev/urandom` for collision resistance — P(collision) < 10⁻¹⁵
     /// even at 100 IDs/sec for 1 hour. Falls back to timestamp if urandom
     /// is unavailable (e.g., non-Linux platforms).
-    #[must_use] 
+    #[must_use]
     pub fn generate_id() -> String {
         let mut bytes = [0u8; 16];
         if std::fs::File::open("/dev/urandom")

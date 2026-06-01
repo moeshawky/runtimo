@@ -14,8 +14,7 @@
 
 use runtimo_core::{
     capabilities::{FileRead, FileWrite, GitExec, Kill, ShellExec, Undo},
-    execute_with_telemetry, CapabilityRegistry, Context, WalEvent, WalEventType, WalReader,
-    WalWriter,
+    execute_with_telemetry, CapabilityRegistry, WalEvent, WalEventType, WalReader, WalWriter,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -278,8 +277,7 @@ async fn handle_run(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonR
         }
     };
 
-    let Some(capability) = state.registry.get(&run_params.capability)
-    else {
+    let Some(capability) = state.registry.get(&run_params.capability) else {
         return JsonRpcResponse {
             result: None,
             error: Some(JsonRpcError {
@@ -359,7 +357,7 @@ async fn handle_dispatch(state: &Arc<DaemonState>, params: Value, id: Value) -> 
             runtimo_core::validation::path::validate_path(wd, &ctx).ok()
         }
         _ => None,
-    }; 
+    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -370,10 +368,7 @@ async fn handle_dispatch(state: &Arc<DaemonState>, params: Value, id: Value) -> 
             result: None,
             error: Some(JsonRpcError {
                 code: -32000,
-                message: format!(
-                    "too many concurrent jobs (max {})",
-                    MAX_CONCURRENT_JOBS
-                ),
+                message: format!("too many concurrent jobs (max {})", MAX_CONCURRENT_JOBS),
             }),
             id,
         };
@@ -391,63 +386,27 @@ async fn handle_dispatch(state: &Arc<DaemonState>, params: Value, id: Value) -> 
         })
         .await;
 
-    // Log JobStarted to WAL
-    {
-        let _guard = state.wal_mutex.lock().await;
-        if let Ok(mut wal) = WalWriter::create(&state.wal_path) {
-            let _ = wal.append(WalEvent {
-                seq: wal.seq(),
-                ts: now,
-                event_type: WalEventType::JobStarted,
-                job_id: job_id.clone(),
-                capability: Some(cap_name.clone()),
-                output: None,
-                error: None,
-                telemetry_before: None,
-                telemetry_after: None,
-                process_before: None,
-                process_after: None,
-                cmd: None,
-                cmd_stdout: None,
-                cmd_stderr: None,
-                cmd_exit_code: None,
-                cmd_corrected: None,
-            });
-        }
-    }
-
-    // Spawn background execution with status tracking and WAL completion
+    // Spawn background execution routed through execute_with_telemetry
+    // (parity with handle_run — full safety checks, WAL, and telemetry)
     let state_arc = Arc::clone(state);
     let tokio_handle = tokio::runtime::Handle::current();
     let jid = job_id.clone();
     let cn = cap_name.clone();
     let wd = working_dir.clone();
     std::thread::spawn(move || {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let backup_dir = runtimo_core::utils::backup_dir();
-            let mut registry = CapabilityRegistry::new();
-            registry.register(FileRead);
-            if let Ok(fw) = FileWrite::new(backup_dir.clone()) {
-                registry.register(fw);
-            }
-            if let Ok(ge) = GitExec::new(backup_dir) {
-                registry.register(ge);
-            }
-            registry.register(ShellExec);
-            registry.register(Kill);
-            registry.register(Undo);
+        // Set working_dir before execute_with_telemetry creates its Context
+        if let Some(ref wd_path) = wd {
+            let _ = std::env::set_current_dir(wd_path);
+        }
 
-            if let Some(cap) = registry.get(&cn) {
-                let wd_path = wd.clone()
-                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                let ctx = Context::with_working_dir(dry, jid.clone(), wd_path);
-                cap.execute(&args, &ctx)
-            } else {
-                Err(runtimo_core::Error::ExecutionFailed(format!(
-                    "capability not found in background registry: {}",
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let cap = state_arc.registry.get(&cn).ok_or_else(|| {
+                runtimo_core::Error::ExecutionFailed(format!(
+                    "capability not found in registry: {}",
                     cn
-                )))
-            }
+                ))
+            })?;
+            execute_with_telemetry(cap, &args, dry, &state_arc.wal_path)
         }));
 
         let now = std::time::SystemTime::now()
@@ -456,7 +415,8 @@ async fn handle_dispatch(state: &Arc<DaemonState>, params: Value, id: Value) -> 
             .as_secs();
 
         let (status, error_msg) = match &result {
-            Ok(Ok(_output)) => ("completed", None),
+            Ok(Ok(exec_result)) if exec_result.success => ("completed", None),
+            Ok(Ok(_exec_result)) => ("failed", Some("execution reported failure".into())),
             Ok(Err(e)) => ("failed", Some(e.to_string())),
             Err(panic_info) => {
                 let msg = panic_info
@@ -469,37 +429,7 @@ async fn handle_dispatch(state: &Arc<DaemonState>, params: Value, id: Value) -> 
         };
 
         tokio_handle.block_on(async {
-            state_arc
-                .bg_jobs
-                .update(&jid, status, error_msg.clone(), now)
-                .await;
-
-            let _guard = state_arc.wal_mutex.lock().await;
-            if let Ok(mut wal) = WalWriter::create(&state_arc.wal_path) {
-                let event_type = if status == "completed" {
-                    WalEventType::JobCompleted
-                } else {
-                    WalEventType::JobFailed
-                };
-                let _ = wal.append(WalEvent {
-                    seq: wal.seq(),
-                    ts: now,
-                    event_type,
-                    job_id: jid,
-                    capability: Some(cn),
-                    output: None,
-                    error: error_msg,
-                    telemetry_before: None,
-                    telemetry_after: None,
-                    process_before: None,
-                    process_after: None,
-                    cmd: None,
-                    cmd_stdout: None,
-                    cmd_stderr: None,
-                    cmd_exit_code: None,
-                    cmd_corrected: None,
-                });
-            }
+            state_arc.bg_jobs.update(&jid, status, error_msg, now).await;
         });
 
         state_arc.bg_jobs.release();
@@ -670,7 +600,11 @@ async fn handle_jobs(state: &Arc<DaemonState>, params: Value, id: Value) -> Json
             match e.event_type {
                 WalEventType::JobStarted => {
                     job_entries.entry(e.job_id.clone()).or_default().started = Some(e.ts);
-                    job_entries.entry(e.job_id.clone()).or_default().capability.clone_from(&e.capability);
+                    job_entries
+                        .entry(e.job_id.clone())
+                        .or_default()
+                        .capability
+                        .clone_from(&e.capability);
                 }
                 WalEventType::JobCompleted | WalEventType::JobFailed => {
                     job_entries.entry(e.job_id.clone()).or_default().finished = Some(e.ts);
@@ -822,7 +756,10 @@ fn reconcile_orphaned_jobs(wal_path: &std::path::Path) {
         if matches!(e.event_type, WalEventType::JobStarted) {
             started.entry(e.job_id.clone()).or_insert(e.ts);
         }
-        if matches!(e.event_type, WalEventType::JobCompleted | WalEventType::JobFailed) {
+        if matches!(
+            e.event_type,
+            WalEventType::JobCompleted | WalEventType::JobFailed
+        ) {
             finished.insert(e.job_id.clone());
         }
     }

@@ -1,4 +1,11 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::unused_result_ok, clippy::indexing_slicing, clippy::redundant_clone, clippy::items_after_statements)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::unused_result_ok,
+    clippy::indexing_slicing,
+    clippy::redundant_clone,
+    clippy::items_after_statements
+)]
 //! Robust tests for LLM-generated code following the 9 failure mode categories.
 //!
 //! Test layers:
@@ -947,17 +954,21 @@ fn t_layergap_backup_boundary_content_preserved() {
 
     // First write creates the file (no backup for new files)
     let cap = FileWrite::new(bw.clone()).expect("FileWrite");
-    let result = cap.execute(
-        &json!({ "path": target.to_str().unwrap(), "content": "initial" }),
-        &ctx("layer_job"),
-    ).expect("first write");
+    let result = cap
+        .execute(
+            &json!({ "path": target.to_str().unwrap(), "content": "initial" }),
+            &ctx("layer_job"),
+        )
+        .expect("first write");
     assert!(result.success);
 
     // Second write triggers backup (file already exists)
-    let result = cap.execute(
-        &json!({ "path": target.to_str().unwrap(), "content": content }),
-        &ctx("layer_job"),
-    ).expect("second write");
+    let result = cap
+        .execute(
+            &json!({ "path": target.to_str().unwrap(), "content": content }),
+            &ctx("layer_job"),
+        )
+        .expect("second write");
     assert!(result.success);
 
     // Read backup directly (bypass FileWrite, cross BackupManager→filesystem boundary)
@@ -972,16 +983,24 @@ fn t_layergap_backup_boundary_content_preserved() {
     // Verify backup content matches the pre-overwrite state (original file content)
     let backup_content = std::fs::read_to_string(&job_backups[0].path()).ok();
     assert!(backup_content.is_some(), "Backup file must be readable");
-    assert_eq!(backup_content.unwrap(), "initial",
-        "T-LAYERGAP: backup must contain pre-overwrite content (original)");
+    assert_eq!(
+        backup_content.unwrap(),
+        "initial",
+        "T-LAYERGAP: backup must contain pre-overwrite content (original)"
+    );
 
     // Verify FileRead can consume FileWrite's output (C1 contract check)
     let read_result = FileRead
-        .execute(&json!({ "path": target.to_str().unwrap() }), &ctx("layer_read"))
+        .execute(
+            &json!({ "path": target.to_str().unwrap() }),
+            &ctx("layer_read"),
+        )
         .expect("read");
     let read_content = read_result.data["content"].as_str().unwrap();
-    assert_eq!(read_content, content,
-        "C1: FileRead must consume FileWrite output with same content");
+    assert_eq!(
+        read_content, content,
+        "C1: FileRead must consume FileWrite output with same content"
+    );
 
     cleanup(&dir);
 }
@@ -990,7 +1009,7 @@ fn t_layergap_backup_boundary_content_preserved() {
 /// This bridges the gap between unit-level WAL tests and end-to-end pipeline tests.
 #[test]
 fn t_layergap_wal_boundary_structural_integrity() {
-    use runtimo_core::{WalEvent, WalEventType, WalWriter, WalReader};
+    use runtimo_core::{WalEvent, WalEventType, WalReader, WalWriter};
 
     let dir = setup();
     let wp = wal_path(&dir);
@@ -1004,7 +1023,8 @@ fn t_layergap_wal_boundary_structural_integrity() {
     {
         let mut wal = WalWriter::create(&wp).expect("create");
         wal.append(WalEvent {
-            seq: wal.seq(), ts,
+            seq: wal.seq(),
+            ts,
             event_type: WalEventType::JobCompleted,
             job_id: "layer-j-1".into(),
             capability: Some("ShellExec".into()),
@@ -1019,7 +1039,8 @@ fn t_layergap_wal_boundary_structural_integrity() {
             cmd_stderr: Some("".into()),
             cmd_exit_code: Some(0),
             cmd_corrected: None,
-        }).expect("append");
+        })
+        .expect("append");
     }
 
     // Read back and verify every structural field exists
@@ -1033,8 +1054,14 @@ fn t_layergap_wal_boundary_structural_integrity() {
     assert!(e.ts > 0, "timestamp must be populated");
     assert_eq!(e.job_id, "layer-j-1");
     assert_eq!(e.event_type, WalEventType::JobCompleted);
-    assert!(e.telemetry_before.is_none(), "not populated in this unit test (use execute_with_telemetry for full coverage)");
-    assert!(e.telemetry_after.is_none(), "not populated in this unit test");
+    assert!(
+        e.telemetry_before.is_none(),
+        "not populated in this unit test (use execute_with_telemetry for full coverage)"
+    );
+    assert!(
+        e.telemetry_after.is_none(),
+        "not populated in this unit test"
+    );
     assert!(e.output.is_some(), "output field must survive boundary");
     assert_eq!(e.cmd.as_deref(), Some("echo hello"));
     assert_eq!(e.cmd_exit_code, Some(0));
@@ -1047,8 +1074,14 @@ fn t_layergap_wal_boundary_structural_integrity() {
 
     // Verify C3: telemetry_before and telemetry_after are stored independently
     // (populated via execute_with_telemetry in integration tests)
-    assert!(e.telemetry_before.is_none(), "not populated in this unit test");
-    assert!(e.telemetry_after.is_none(), "not populated in this unit test");
+    assert!(
+        e.telemetry_before.is_none(),
+        "not populated in this unit test"
+    );
+    assert!(
+        e.telemetry_after.is_none(),
+        "not populated in this unit test"
+    );
 
     cleanup(&dir);
 }
@@ -1070,51 +1103,77 @@ fn g_drift_wal_event_json_schema_stability() {
     {
         let mut wal = WalWriter::create(&wp).expect("create");
         wal.append(WalEvent {
-            seq: 1, ts,
+            seq: 1,
+            ts,
             event_type: WalEventType::JobStarted,
             job_id: "golden".into(),
             capability: Some("FileWrite".into()),
-            output: None, error: None,
-            telemetry_before: None, telemetry_after: None,
-            process_before: None, process_after: None,
-            cmd: None, cmd_stdout: None, cmd_stderr: None, cmd_exit_code: None,
+            output: None,
+            error: None,
+            telemetry_before: None,
+            telemetry_after: None,
+            process_before: None,
+            process_after: None,
+            cmd: None,
+            cmd_stdout: None,
+            cmd_stderr: None,
+            cmd_exit_code: None,
             cmd_corrected: None,
-        }).expect("append");
+        })
+        .expect("append");
     }
 
     let raw = std::fs::read_to_string(&wp).expect("read raw WAL");
     let parsed: serde_json::Value = serde_json::from_str(raw.trim()).expect("parse WAL line");
 
     // Golden schema: every field must exist with expected type
-    assert!(parsed.get("seq").and_then(|v| v.as_u64()).is_some(), "seq must be u64");
+    assert!(
+        parsed.get("seq").and_then(|v| v.as_u64()).is_some(),
+        "seq must be u64"
+    );
     assert_eq!(parsed["seq"], 1);
 
-    assert!(parsed.get("ts").and_then(|v| v.as_u64()).is_some(), "ts must be u64");
+    assert!(
+        parsed.get("ts").and_then(|v| v.as_u64()).is_some(),
+        "ts must be u64"
+    );
     assert_eq!(parsed["ts"], ts);
 
-    assert!(parsed.get("type").and_then(|v| v.as_str()).is_some(), "type must be string (serde rename)");
+    assert!(
+        parsed.get("type").and_then(|v| v.as_str()).is_some(),
+        "type must be string (serde rename)"
+    );
     assert_eq!(parsed["type"], "job_started");
 
-    assert!(parsed.get("job_id").and_then(|v| v.as_str()).is_some(), "job_id must be string");
+    assert!(
+        parsed.get("job_id").and_then(|v| v.as_str()).is_some(),
+        "job_id must be string"
+    );
     assert_eq!(parsed["job_id"], "golden");
 
     assert_eq!(parsed["capability"], "FileWrite");
 
     // Null fields must be serialized as explicit null or absent — not empty strings
     let output = &parsed["output"];
-    assert!(output.is_null() || output.as_str().is_none(),
-        "output must be null or absent, not empty string");
+    assert!(
+        output.is_null() || output.as_str().is_none(),
+        "output must be null or absent, not empty string"
+    );
 
     let error = &parsed["error"];
-    assert!(error.is_null() || error.as_str().is_none(),
-        "error must be null or absent when no error");
+    assert!(
+        error.is_null() || error.as_str().is_none(),
+        "error must be null or absent when no error"
+    );
 
     // C3 check: command-related fields must NOT appear in non-command events
     // (or must be null) — prevents reclassification of cmd fields from
     // a previous command event into the wrong event type
     let has_cmd = parsed.get("cmd").and_then(|v| v.as_str());
-    assert!(has_cmd.is_none() || has_cmd == Some(""),
-        "cmd field should not leak into non-command JobStarted events");
+    assert!(
+        has_cmd.is_none() || has_cmd == Some(""),
+        "cmd field should not leak into non-command JobStarted events"
+    );
 
     cleanup(&dir);
 }
@@ -1127,20 +1186,40 @@ fn g_drift_telemetry_schema_stability() {
     let json = serde_json::to_value(&tel).expect("serialize");
 
     // Verify required top-level fields exist
-    assert!(json.get("timestamp").and_then(|v| v.as_u64()).is_some(), "timestamp must be u64");
+    assert!(
+        json.get("timestamp").and_then(|v| v.as_u64()).is_some(),
+        "timestamp must be u64"
+    );
 
     let system = &json["system"];
-    assert!(system.get("cpu_model").and_then(|v| v.as_str()).is_some(), "cpu_model required");
-    assert!(system.get("ram_total").and_then(|v| v.as_str()).is_some(), "ram_total required");
+    assert!(
+        system.get("cpu_model").and_then(|v| v.as_str()).is_some(),
+        "cpu_model required"
+    );
+    assert!(
+        system.get("ram_total").and_then(|v| v.as_str()).is_some(),
+        "ram_total required"
+    );
 
     let hw = &json["hardware"];
-    assert!(hw.get("accelerators").and_then(|v| v.as_array()).is_some(), "accelerators must be array");
+    assert!(
+        hw.get("accelerators").and_then(|v| v.as_array()).is_some(),
+        "accelerators must be array"
+    );
 
     let svc = &json["services"];
-    assert!(svc.get("detected_services").and_then(|v| v.as_array()).is_some(), "services must be array");
+    assert!(
+        svc.get("detected_services")
+            .and_then(|v| v.as_array())
+            .is_some(),
+        "services must be array"
+    );
 
     let net = &json["network"];
-    assert!(net.get("public_ip").and_then(|v| v.as_str()).is_some(), "public_ip must be string");
+    assert!(
+        net.get("public_ip").and_then(|v| v.as_str()).is_some(),
+        "public_ip must be string"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1167,7 +1246,10 @@ fn g_perf_write_read_near_linear() {
             )
             .expect("write");
         FileRead
-            .execute(&json!({ "path": target.to_str().unwrap() }), &ctx("perf_read"))
+            .execute(
+                &json!({ "path": target.to_str().unwrap() }),
+                &ctx("perf_read"),
+            )
             .expect("read");
 
         start.elapsed()
@@ -1179,9 +1261,13 @@ fn g_perf_write_read_near_linear() {
     // Large (100KB) should be somewhat slower than small (100B),
     // but not 10,000× slower (would indicate O(n²) or worse)
     let ratio = t_large.as_micros() as f64 / t_small.as_micros().max(1) as f64;
-    assert!(ratio < 5000.0,
+    assert!(
+        ratio < 5000.0,
         "Write+read of 100KB ({:?}) should not be >5000× slower than 100B ({:?}), got ratio {:.0}",
-        t_large, t_small, ratio);
+        t_large,
+        t_small,
+        ratio
+    );
 
     cleanup(&dir);
 }
