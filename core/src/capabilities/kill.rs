@@ -271,6 +271,25 @@ impl Capability for Kill {
         // Record start time to detect PID reuse (FINDING #1)
         let start_time_before = get_process_start_time_retry(args.pid);
 
+        // Double-check: re-read start time to narrow TOCTOU window.
+        // If the PID was recycled between these reads, abort the kill.
+        let start_time_before_confirm = get_process_start_time_retry(args.pid);
+        if start_time_before != start_time_before_confirm {
+            return Ok(Output {
+                success: false,
+                data: serde_json::json!({
+                    "pid": args.pid,
+                    "killed": false,
+                    "reason": "PID reused between safety checks",
+                    "pid_reused": true,
+                }),
+                message: Some(format!(
+                    "PID {} was reused by a different process (start time changed before kill)",
+                    args.pid
+                )),
+            });
+        }
+
         // Determine signal — default to SIGTERM (15) for graceful shutdown
         let signal = args.signal.unwrap_or(15);
 

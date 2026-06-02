@@ -14,7 +14,8 @@
 
 use runtimo_core::{
     capabilities::{FileRead, FileWrite, GitExec, Kill, ShellExec, Undo},
-    execute_with_telemetry, CapabilityRegistry, WalEvent, WalEventType, WalReader, WalWriter,
+    execute_with_telemetry, BackupManager, CapabilityRegistry, WalEvent, WalEventType, WalReader,
+    WalWriter,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -834,6 +835,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Reconcile orphaned jobs left from a previous crash/termination
     reconcile_orphaned_jobs(&wal_path);
+
+    // Spawn periodic background maintenance tasks
+    let wal_path_bg = wal_path.clone();
+    let backup_dir = runtimo_core::utils::backup_dir();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600));
+        loop {
+            interval.tick().await;
+            let _ = BackupManager::new(backup_dir.clone())
+                .map(|mgr| mgr.cleanup(86400 * 7));
+            let _ = WalWriter::cleanup(&wal_path_bg, 86400 * 7);
+            let _ = WalWriter::rotate(&wal_path_bg, 10 * 1024 * 1024, 5);
+        }
+    });
 
     let _monitor = match runtimo_core::HealthMonitor::start() {
         Ok(m) => Some(m),

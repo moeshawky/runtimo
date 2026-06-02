@@ -14,6 +14,8 @@ use std::error::Error;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(
@@ -22,7 +24,7 @@ use std::path::PathBuf;
     long_about = "runtimo — capability runtime with telemetry, WAL, and process tracking\n\n\
 Every exec: telemetry + process snapshot + WAL audit\n\
 Background: dispatch jobs to daemon, check status later",
-    after_help = "USAGE:\n runtimo run -c <Capability> -a '<json>'\n runtimo dispatch -c <Capability> -a '<json>'\n runtimo jobs\n runtimo wait -j <job_id>\n runtimo list\n runtimo logs\n runtimo telemetry\n runtimo processes\n\nCAPABILITIES:\n FileRead Read file. Path validated.\n FileWrite Write file. Auto-backup for undo.\n ShellExec Exec via sh -c. Dangerous cmds blocked.\n GitExec Git ops: clone|pull|commit|revert|clean|status.\n Kill Kill PID. Protected: init, kthreadd, self.\n Undo Restore from backup. Use `runtimo logs` to find job IDs.",
+    after_help = "USAGE:\n runtimo run -c <Capability> -a '<json>'\n runtimo dispatch -c <Capability> -a '<json>'\n runtimo jobs\n runtimo wait -j <job_id>\n runtimo list\n runtimo logs\n runtimo telemetry\n runtimo processes\n\nCAPABILITIES:\n FileRead Read file. Path validated.\n FileWrite Write file. Auto-backup for undo.\n ShellExec Exec via sh -c. Dangerous cmds blocked.\n GitExec Git ops: clone|pull|commit|revert|clean|status.\n Kill Kill PID. Protected: init, kthreadd, self.\n Undo Restore from backup. Use `runtimo logs` to find job IDs.\n\nDaemon auto-starts on first dispatch.",
     version
 )]
 struct Cli {
@@ -54,8 +56,8 @@ enum Commands {
     },
     /// Dispatch job to background daemon (returns immediately)
     #[command(
-        about = "Dispatch job to background daemon",
-        after_help = "EXAMPLES:\n runtimo dispatch -c ShellExec -a '{\"cmd\":\"sleep 30\"}'\n runtimo dispatch -c FileWrite -a '{\"path\":\"/tmp/x.txt\",\"content\":\"bg\"}'\n\nRequires runtimo-daemon to be running."
+        about = "Dispatch job to background daemon (starts daemon automatically if needed)",
+        after_help = "EXAMPLES:\n runtimo dispatch -c ShellExec -a '{\"cmd\":\"sleep 30\"}'\n runtimo dispatch -c FileWrite -a '{\"path\":\"/tmp/x.txt\",\"content\":\"bg\"}'"
     )]
     Dispatch {
         #[arg(short = 'c', long)]
@@ -192,6 +194,52 @@ fn daemon_socket() -> PathBuf {
     runtimo_core::utils::data_dir().join("runtimo.sock")
 }
 
+fn find_daemon_binary() -> Option<PathBuf> {
+    let cli_path = std::env::current_exe().ok()?;
+    let dir = cli_path.parent()?;
+    let daemon_path = dir.join("runtimo-daemon");
+    if daemon_path.exists() {
+        return Some(daemon_path);
+    }
+    dir.join(format!("runtimo-daemon{}", std::env::consts::EXE_SUFFIX))
+        .exists()
+        .then_some(daemon_path)
+}
+
+fn daemon_is_running() -> bool {
+    UnixStream::connect(daemon_socket()).is_ok()
+}
+
+fn ensure_daemon_running() -> Result<(), String> {
+    if daemon_is_running() {
+        return Ok(());
+    }
+
+    let daemon_bin = find_daemon_binary()
+        .ok_or_else(|| "runtimo-daemon binary not found alongside runtimo. Is it installed?".to_string())?;
+
+    Command::new(&daemon_bin)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to start daemon ({}): {}", daemon_bin.display(), e))?;
+
+    #[allow(clippy::arithmetic_side_effects)]
+    let deadline = std::time::Instant::now()
+        .checked_add(Duration::from_secs(10))
+        .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(10));
+    loop {
+        if daemon_is_running() {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("Daemon started but did not become ready within 10s".into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn send_rpc(method: &str, params: Value) -> Result<Value, String> {
     let sock_path = daemon_socket();
     let mut stream = UnixStream::connect(&sock_path).map_err(|e| {
@@ -301,6 +349,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             args,
             dry_run,
         } => {
+            if let Err(e) = ensure_daemon_running() {
+                eprintln!("Cannot dispatch: {}", e);
+                std::process::exit(1);
+            }
             let args_val: Value =
                 serde_json::from_str(&args).map_err(|e| format!("Invalid JSON args: {}", e))?;
             let params = serde_json::json!({

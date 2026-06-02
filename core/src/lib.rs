@@ -67,7 +67,7 @@ pub mod job;
 pub mod llmosafe;
 pub mod monitor;
 pub mod processes;
-pub mod schema;
+mod schema;
 pub mod session;
 pub mod telemetry;
 pub mod validation;

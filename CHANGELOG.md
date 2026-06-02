@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Daemon auto-start on dispatch** — `runtimo dispatch` now detects whether the daemon is running
+  and starts it automatically if needed. The daemon binary is located relative to the CLI. No manual
+  daemon management required. (`cli/src/main.rs`)
+- **Daemon periodic maintenance** — background task (1-hour interval) now wires previously uncalled
+  infrastructure: `WalWriter::cleanup()`, `WalWriter::rotate()`, and `BackupManager::cleanup()`.
+  Prevents unbounded WAL and backup directory growth in long-running deployments.
+  (`daemon/src/main.rs`)
+
+### Fixed
+
+- **Kill PID reuse race window** — start-time is now re-read and compared before sending the signal,
+  narrowing the TOCTOU window where a recycled PID could receive a signal intended for a different
+  process. (`core/src/capabilities/kill.rs`)
+
+### Changed
+
+- **SchemaValidator made private** — `pub mod schema` reduced to `mod schema`. The module is
+  preserved for future wiring into the capability validation pipeline. (`core/src/lib.rs`,
+  `core/src/schema.rs`)
+
 ### Security Fixes
 
 - **CBP-1: Dispatch path bypassed safety checks** — `handle_dispatch` created a separate
