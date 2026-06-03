@@ -174,12 +174,21 @@ impl CapabilityRegistry {
         self.capabilities.insert(name, Box::new(capability));
     }
 
-    /// Looks up a capability by name.
+    /// Looks up a capability by name (case-insensitive).
     ///
     /// Returns `None` if no capability with the given name is registered.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&dyn Capability> {
-        self.capabilities.get(name).map(|c| c.as_ref())
+        if let Some(cap) = self.capabilities.get(name) {
+            return Some(cap.as_ref());
+        }
+        let name_lower = name.to_lowercase();
+        for (key, cap) in &self.capabilities {
+            if key.to_lowercase() == name_lower {
+                return Some(cap.as_ref());
+            }
+        }
+        None
     }
 
     /// Returns the names of all registered capabilities.

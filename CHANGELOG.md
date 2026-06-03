@@ -43,6 +43,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`command` field alias for ShellExec** — agents naturally use `command` instead of `cmd`;
+  both field names are now accepted via serde alias. (`shell_exec.rs`)
+- **Case-insensitive capability names** — `runtimo run -c shellexec` works; lookup
+  falls back to case-insensitive match. (`capability.rs`)
+- **Daemon startup diagnostics** — when auto-start fails, the daemon's stderr is
+  captured and shown; PATH search fallback if binary not found next to CLI.
+  (`cli/src/main.rs`)
+
 ## [0.5.0] - 2026-05-30
 
 ### Security Fixes

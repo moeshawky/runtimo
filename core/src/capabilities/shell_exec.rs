@@ -66,6 +66,7 @@ const MAX_STDIN_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShellExecArgs {
+    #[serde(alias = "command")]
     pub cmd: String,
     pub timeout_secs: Option<u64>,
     pub cwd: Option<String>,

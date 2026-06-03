@@ -206,6 +206,23 @@ fn find_daemon_binary() -> Option<PathBuf> {
         .then_some(daemon_path)
 }
 
+fn find_daemon_in_path() -> Option<PathBuf> {
+    let output = Command::new("which")
+        .arg("runtimo-daemon")
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path.is_empty() {
+            return Some(PathBuf::from(path));
+        }
+    }
+    // Fallback: check standard cargo install directory
+    let home = std::env::var("HOME").ok()?;
+    let cargo_bin = PathBuf::from(home).join(".cargo/bin/runtimo-daemon");
+    cargo_bin.exists().then_some(cargo_bin)
+}
+
 fn daemon_is_running() -> bool {
     UnixStream::connect(daemon_socket()).is_ok()
 }
@@ -216,12 +233,13 @@ fn ensure_daemon_running() -> Result<(), String> {
     }
 
     let daemon_bin = find_daemon_binary()
-        .ok_or_else(|| "runtimo-daemon binary not found alongside runtimo. Is it installed?".to_string())?;
+        .or_else(find_daemon_in_path)
+        .ok_or_else(|| "runtimo-daemon binary not found. Is runtimo-daemon installed?".to_string())?;
 
-    Command::new(&daemon_bin)
+    let mut child = Command::new(&daemon_bin)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Failed to start daemon ({}): {}", daemon_bin.display(), e))?;
 
@@ -234,7 +252,41 @@ fn ensure_daemon_running() -> Result<(), String> {
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
-            return Err("Daemon started but did not become ready within 10s".into());
+            let err_msg = if let Ok(Some(status)) = child.try_wait() {
+                let mut stderr = String::new();
+                if let Some(ref mut pipe) = child.stderr {
+                    let _ = pipe.read_to_string(&mut stderr);
+                }
+                if stderr.is_empty() {
+                    format!(
+                        "Daemon exited with status {} before becoming ready. No error output.",
+                        status
+                    )
+                } else {
+                    format!(
+                        "Daemon exited with status {}: {}",
+                        status,
+                        stderr.trim()
+                    )
+                }
+            } else {
+                "Daemon started but did not become ready within 10s".into()
+            };
+            let _ = child.kill();
+            return Err(err_msg);
+        }
+        // Check if daemon exited early
+        if let Ok(Some(status)) = child.try_wait() {
+            let mut stderr = String::new();
+            if let Some(ref mut pipe) = child.stderr {
+                let _ = pipe.read_to_string(&mut stderr);
+            }
+            let msg = if stderr.is_empty() {
+                format!("Daemon exited early with status {}", status)
+            } else {
+                format!("Daemon exited early: {}", stderr.trim())
+            };
+            return Err(msg);
         }
         std::thread::sleep(Duration::from_millis(100));
     }
