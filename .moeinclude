@@ -1,0 +1,4 @@
+# runtimo source whitelist for moegraph scanner
+core/src/
+daemon/src/
+cli/src/
