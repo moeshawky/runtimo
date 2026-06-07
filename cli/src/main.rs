@@ -207,10 +207,7 @@ fn find_daemon_binary() -> Option<PathBuf> {
 }
 
 fn find_daemon_in_path() -> Option<PathBuf> {
-    let output = Command::new("which")
-        .arg("runtimo-daemon")
-        .output()
-        .ok()?;
+    let output = Command::new("which").arg("runtimo-daemon").output().ok()?;
     if output.status.success() {
         let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if !path.is_empty() {
@@ -234,7 +231,9 @@ fn ensure_daemon_running() -> Result<(), String> {
 
     let daemon_bin = find_daemon_binary()
         .or_else(find_daemon_in_path)
-        .ok_or_else(|| "runtimo-daemon binary not found. Is runtimo-daemon installed?".to_string())?;
+        .ok_or_else(|| {
+            "runtimo-daemon binary not found. Is runtimo-daemon installed?".to_string()
+        })?;
 
     let mut child = Command::new(&daemon_bin)
         .stdin(Stdio::null())
@@ -263,11 +262,7 @@ fn ensure_daemon_running() -> Result<(), String> {
                         status
                     )
                 } else {
-                    format!(
-                        "Daemon exited with status {}: {}",
-                        status,
-                        stderr.trim()
-                    )
+                    format!("Daemon exited with status {}: {}", status, stderr.trim())
                 }
             } else {
                 "Daemon started but did not become ready within 10s".into()

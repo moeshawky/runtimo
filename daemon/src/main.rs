@@ -843,8 +843,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600));
         loop {
             interval.tick().await;
-            let _ = BackupManager::new(backup_dir.clone())
-                .map(|mgr| mgr.cleanup(86400 * 7));
+            let _ = BackupManager::new(backup_dir.clone()).map(|mgr| mgr.cleanup(86400 * 7));
             let _ = WalWriter::cleanup(&wal_path_bg, 86400 * 7);
             let _ = WalWriter::rotate(&wal_path_bg, 10 * 1024 * 1024, 5);
         }
