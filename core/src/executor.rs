@@ -147,6 +147,7 @@ pub fn execute_with_telemetry(
         dry_run,
         wal_path,
         None,
+        None,
         CAPABILITY_TIMEOUT_SECS,
     )
 }
@@ -164,6 +165,7 @@ pub fn execute_with_telemetry(
 /// * `dry_run` — If true, the capability may skip side effects
 /// * `wal_path` — Path to the WAL file
 /// * `session_id` — Optional session ID to track this job
+/// * `working_dir` — Optional working directory for relative path resolution
 /// * `timeout_secs` — Timeout for capability execution
 ///
 /// # Errors
@@ -177,6 +179,7 @@ pub fn execute_with_telemetry_and_session(
     dry_run: bool,
     wal_path: &Path,
     session_id: Option<&str>,
+    working_dir: Option<PathBuf>,
     timeout_secs: u64,
 ) -> Result<ExecutionResult> {
     let job_id = JobId::new();
@@ -212,11 +215,11 @@ pub fn execute_with_telemetry_and_session(
     drop(args_bytes);
 
     let mut wal = WalWriter::create(wal_path)?;
-    let ctx = Context {
+    let ctx = Context::with_working_dir(
         dry_run,
-        job_id: job_id_str.clone(),
-        working_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
-    };
+        job_id_str.clone(),
+        working_dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))),
+    );
 
     let start_seq = wal.seq();
     wal.append(WalEvent {

@@ -14,7 +14,7 @@
 
 use runtimo_core::{
     capabilities::{FileRead, FileWrite, GitExec, Kill, ShellExec, Undo},
-    execute_with_telemetry, BackupManager, CapabilityRegistry, WalEvent, WalEventType, WalReader,
+    execute_with_telemetry_and_session, BackupManager, CapabilityRegistry, WalEvent, WalEventType, WalReader,
     WalWriter,
 };
 use serde::{Deserialize, Serialize};
@@ -291,11 +291,14 @@ async fn handle_run(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonR
 
     let _guard = state.wal_mutex.lock().await;
 
-    match execute_with_telemetry(
+    match execute_with_telemetry_and_session(
         capability,
         &run_params.args,
         run_params.dry_run,
         &state.wal_path,
+        None,
+        run_params.working_dir.clone().map(PathBuf::from),
+        30,
     ) {
         Ok(result) => JsonRpcResponse {
             result: Some(serde_json::json!({
@@ -395,11 +398,6 @@ async fn handle_dispatch(state: &Arc<DaemonState>, params: Value, id: Value) -> 
     let cn = cap_name.clone();
     let wd = working_dir.clone();
     std::thread::spawn(move || {
-        // Set working_dir before execute_with_telemetry creates its Context
-        if let Some(ref wd_path) = wd {
-            let _ = std::env::set_current_dir(wd_path);
-        }
-
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let cap = state_arc.registry.get(&cn).ok_or_else(|| {
                 runtimo_core::Error::ExecutionFailed(format!(
@@ -407,7 +405,10 @@ async fn handle_dispatch(state: &Arc<DaemonState>, params: Value, id: Value) -> 
                     cn
                 ))
             })?;
-            execute_with_telemetry(cap, &args, dry, &state_arc.wal_path)
+            // working_dir is Option<String> from RunParams, convert to Option<PathBuf>
+            #[allow(clippy::useless_conversion)]
+            let wd_path = wd.map(PathBuf::from);
+            execute_with_telemetry_and_session(cap, &args, dry, &state_arc.wal_path, None, wd_path, 30)
         }));
 
         let now = std::time::SystemTime::now()

@@ -5,6 +5,15 @@ All notable changes to Runtimo are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.2] - 2026-06-07
+
+### Fixed
+
+- **Daemon spawn race condition (SWP-1)** — file-based lock (`flock` on `$XDG_DATA_HOME/runtimo/daemon.lock`) prevents two concurrent `runtimo dispatch` calls from spawning duplicate daemon processes. (`cli/src/main.rs`)
+- **WAL rotation data loss (SWP-2)** — `WalWriter::rotate()` now acquires exclusive flock before renaming, preventing concurrent appends from writing to stale file inodes. (`core/src/wal.rs`)
+- **Concurrent dispatch working directory corruption (SWP-3)** — removed global `std::env::set_current_dir()`; per-dispatch `working_dir` passed via `Context::with_working_dir()` to avoid cross-thread cwd races. (`daemon/src/main.rs`, `core/src/executor.rs`)
+- **CLI run concurrency limit asymmetry (SWP-4)** — `runtimo run` now enforces same 16-job limit as daemon `dispatch` via atomic counter. (`cli/src/main.rs`)
+
 ## [0.6.1] - 2026-06-03
 
 ### Fixed

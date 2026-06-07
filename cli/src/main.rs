@@ -11,10 +11,13 @@ use runtimo_core::{
 };
 use serde_json::Value;
 use std::error::Error;
+use std::fs::File;
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -191,6 +194,23 @@ fn make_registry() -> CapabilityRegistry {
     reg
 }
 
+// Concurrency control for CLI run — mirrors daemon's MAX_CONCURRENT_JOBS = 16
+const MAX_CLI_CONCURRENT: usize = 16;
+static CLI_ACTIVE_JOBS: AtomicUsize = AtomicUsize::new(0);
+
+fn acquire_cli_slot() -> bool {
+    let current = CLI_ACTIVE_JOBS.fetch_add(1, Ordering::AcqRel);
+    if current >= MAX_CLI_CONCURRENT {
+        CLI_ACTIVE_JOBS.fetch_sub(1, Ordering::AcqRel);
+        return false;
+    }
+    true
+}
+
+fn release_cli_slot() {
+    CLI_ACTIVE_JOBS.fetch_sub(1, Ordering::AcqRel);
+}
+
 // ── Daemon client ───────────────────────────────────────────────────────────
 
 fn daemon_socket() -> PathBuf {
@@ -226,11 +246,40 @@ fn find_daemon_in_path() -> Option<PathBuf> {
     cargo_bin.exists().then_some(cargo_bin)
 }
 
+fn daemon_lock_path() -> PathBuf {
+    runtimo_core::utils::data_dir().join("daemon.lock")
+}
+
+fn acquire_daemon_lock() -> Result<File, String> {
+    use libc::flock;
+    let lock_path = daemon_lock_path();
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create lock dir: {}", e))?;
+    }
+    let file = File::create(&lock_path).map_err(|e| format!("Failed to create lock file: {}", e))?;
+    // Try to acquire exclusive non-blocking lock using flock
+    let fd = file.as_raw_fd();
+    // SAFETY: fd is a valid file descriptor from File::create; LOCK_EX | LOCK_NB are valid flock flags
+    let result = unsafe { flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    if result != 0 {
+        return Err("Another process is starting the daemon".to_string());
+    }
+    Ok(file)
+}
+
 fn daemon_is_running() -> bool {
     UnixStream::connect(daemon_socket()).is_ok()
 }
 
 fn ensure_daemon_running() -> Result<(), String> {
+    if daemon_is_running() {
+        return Ok(());
+    }
+
+    // Acquire lock before spawning daemon to prevent race condition
+    let _lock = acquire_daemon_lock()?;
+
+    // Double-check after acquiring lock
     if daemon_is_running() {
         return Ok(());
     }
@@ -374,15 +423,23 @@ fn main() -> Result<(), Box<dyn Error>> {
                 eprintln!("Validation failed: {}", e);
                 std::process::exit(1);
             }
+            // Acquire concurrency slot (mirrors daemon's MAX_CONCURRENT_JOBS)
+            if !acquire_cli_slot() {
+                eprintln!("Too many concurrent CLI runs (max {}). Try again later.", MAX_CLI_CONCURRENT);
+                std::process::exit(1);
+            }
             let result = execute_with_telemetry_and_session(
                 cap,
                 &args_val,
                 dry_run,
                 &wal_path(),
                 None,
+                None,
                 timeout,
             )
-            .map_err(|e| format!("{}", e))?;
+            .map_err(|e| format!("{}", e));
+            release_cli_slot();
+            let result = result?;
             let output = result.output;
             if json {
                 println!("{}", serde_json::to_string_pretty(&output)?);

@@ -445,6 +445,7 @@ impl WalWriter {
     /// Moves the current WAL to `{path}.1` (shifting older rotations),
     /// then creates a fresh empty WAL. Keeps at most `max_rotations` old files.
     /// FINDING #15: basic WAL rotation to prevent unbounded growth.
+    /// P1 FIX: Acquires exclusive lock to prevent concurrent append loss during rotation.
     ///
     /// # Errors
     /// Returns `IoError` or `BackupError` if WAL file operations fail.
@@ -456,6 +457,11 @@ impl WalWriter {
         if metadata.len() < max_size_bytes {
             return Ok(());
         }
+
+        // Acquire lock to prevent concurrent append during rotation
+        let lock_file = std::fs::File::open(path)
+            .map_err(|e| crate::Error::WalError(format!("open WAL for rotation: {}", e)))?;
+        Self::lock_file(&lock_file)?;
 
         // Shift existing rotations (P1 FIX: proper naming preserves extension)
         for i in (1..max_rotations).rev() {
@@ -481,6 +487,7 @@ impl WalWriter {
             let _ = std::fs::remove_file(&oldest);
         }
 
+        Self::unlock_file(&lock_file);
         Ok(())
     }
 
