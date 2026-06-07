@@ -9,7 +9,7 @@
 //!
 //! ## Null Byte Rejection (FINDING #8)
 //! Paths containing `\0` (null byte) are rejected immediately. Null bytes
-//! can truncate C-string path arguments in syscalls, enabling path truncation
+//! can truncate C-string path arguments in syscalls, causing path truncation
 //! attacks (e.g., `/tmp/safe.txt\0/etc/shadow` becomes `/tmp/safe.txt`).
 //!
 //! ## Unicode Normalization (FINDING #7)
@@ -44,7 +44,7 @@ use unicode_normalization::UnicodeNormalization;
 
 /// Context for path validation.
 ///
-/// Controls which checks are applied. [`Default`] enables all checks
+/// Controls which checks are applied. [`Default`] performs all checks
 /// with built-in prefixes (`/tmp`, `/var/tmp`, `/home`), extended by
 /// `RUNTIMO_ALLOWED_PATHS` env var and config file if set.
 #[allow(clippy::exhaustive_structs)]

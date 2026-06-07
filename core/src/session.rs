@@ -1,6 +1,6 @@
 //! Session tracking for reliable SSH.
 //!
-//! Sessions group related job executions together, enabling:
+//! Sessions group related job executions together, supporting:
 //! - Session resume after disconnect
 //! - Audit trail per session
 //! - Batch undo/rollback
@@ -66,7 +66,10 @@ pub enum SessionStatus {
     Terminated,
 }
 
-/// Manages session persistence and retrieval.
+/// Persistent session store backed by the filesystem.
+///
+/// Sessions are stored as individual JSON files under a `sessions/` directory.
+/// Each session tracks its associated job IDs, status, and creation timestamps.
 #[allow(clippy::exhaustive_structs)]
 pub struct SessionManager {
     sessions_dir: PathBuf,
@@ -108,7 +111,6 @@ impl SessionManager {
         Ok(session)
     }
 
-    /// Loads a session by ID.
     /// Loads a session from disk by ID.
     ///
     /// # Errors

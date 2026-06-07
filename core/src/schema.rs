@@ -10,11 +10,10 @@
 //! use runtimo_core::SchemaValidator;
 //! use serde_json::json;
 //!
-//! let validator = SchemaValidator::new();
 //! let schema = json!({"type": "object"});
 //! let args = json!({"path": "/tmp/test.txt"});
 //!
-//! assert!(validator.validate(&args, &schema).is_ok());
+//! assert!(SchemaValidator::validate(&args, &schema).is_ok());
 //! ```
 
 use crate::Result;
@@ -53,7 +52,7 @@ impl SchemaValidator {
     ///
     /// Returns [`Error::SchemaValidationFailed`](crate::Error::SchemaValidationFailed)
     /// if the value's type does not match the schema's `"type"` field.
-    pub fn validate(&self, args: &Value, schema: &Value) -> Result<()> {
+    pub fn validate(args: &Value, schema: &Value) -> Result<()> {
         if let Some(expected_type) = schema.get("type").and_then(|t| t.as_str()) {
             let actual_type = if args.is_string() {
                 "string"

@@ -19,9 +19,14 @@
 //! })?;
 //! ```
 
-use llmosafe::llmosafe_body::ResourceGuard;
-use llmosafe::llmosafe_integration::{EscalationPolicy, SafetyContext};
+use llmosafe::{
+    EscalationPolicy, ResourceGuard, SafetyContext, Synapse,
+    CognitivePipeline, PipelineConfig, PipelineResult, MemoryStats, PidState,
+    SafetyDecision, EscalationReason,
+};
 use std::fs;
+
+pub use llmosafe::DesignAssuranceLevel;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -159,18 +164,36 @@ fn resource_history_path() -> PathBuf {
         .join("resource_history.state")
 }
 
-/// Resource guard wrapping `llmosafe::ResourceGuard` with safety context support.
-///
-/// Monitors RSS memory, CPU load, and IO wait from `/proc`. Acts as a circuit
-/// breaker: if resource pressure exceeds the ceiling (default 80%), execution
-/// is rejected.
-///
-/// FINDING #16: Tracks rolling average of resource usage and enforces a cooldown
-/// period between executions to prevent threshold bypass via rapid repeated checks.
-/// Cooldown state is persisted to disk to prevent bypass via process restart.
 pub struct LlmoSafeGuard {
     guard: ResourceGuard,
     policy: EscalationPolicy,
+}
+
+fn apply_dal_to_decision(dal: DesignAssuranceLevel, decision: SafetyDecision) -> SafetyDecision {
+    match dal {
+        DesignAssuranceLevel::A => decision,
+        DesignAssuranceLevel::B => match decision {
+            SafetyDecision::Halt(_, cooldown_ms) => SafetyDecision::Escalate {
+                entropy: 0,
+                reason: EscalationReason::Custom("DAL B: Halt downgraded"),
+                cooldown_ms,
+            },
+            other => other,
+        },
+        DesignAssuranceLevel::C => match decision {
+            SafetyDecision::Halt(..) | SafetyDecision::Escalate { .. } => {
+                SafetyDecision::Warn("DAL C: Escalation downgraded")
+            }
+            other => other,
+        },
+        DesignAssuranceLevel::D => match decision {
+            SafetyDecision::Proceed | SafetyDecision::Warn(_) => decision,
+            SafetyDecision::Escalate { .. }
+            | SafetyDecision::Halt(..)
+            | SafetyDecision::Exit(_) => SafetyDecision::Warn("DAL D: Capped at Warn"),
+        },
+        DesignAssuranceLevel::E => SafetyDecision::Proceed,
+    }
 }
 
 impl LlmoSafeGuard {
@@ -178,18 +201,38 @@ impl LlmoSafeGuard {
     #[must_use]
     pub fn new() -> Self {
         let guard = ResourceGuard::auto(0.8);
+        let dal = match std::env::var("RUNTIMO_DAL")
+            .map(|s| s.to_uppercase())
+            .as_deref()
+        {
+            Ok("B") => DesignAssuranceLevel::B,
+            Ok("C") => DesignAssuranceLevel::C,
+            Ok("D") => DesignAssuranceLevel::D,
+            Ok("E") => DesignAssuranceLevel::E,
+            _ => DesignAssuranceLevel::A,
+        };
         Self {
             guard,
-            policy: EscalationPolicy::default(),
+            policy: EscalationPolicy::default().with_dal(dal),
         }
     }
 
     /// Creates a guard with an explicit memory ceiling in bytes.
     #[must_use]
     pub fn with_memory_ceiling_bytes(memory_ceiling_bytes: usize) -> Self {
+        let dal = match std::env::var("RUNTIMO_DAL")
+            .map(|s| s.to_uppercase())
+            .as_deref()
+        {
+            Ok("B") => DesignAssuranceLevel::B,
+            Ok("C") => DesignAssuranceLevel::C,
+            Ok("D") => DesignAssuranceLevel::D,
+            Ok("E") => DesignAssuranceLevel::E,
+            _ => DesignAssuranceLevel::A,
+        };
         Self {
             guard: ResourceGuard::new(memory_ceiling_bytes),
-            policy: EscalationPolicy::default(),
+            policy: EscalationPolicy::default().with_dal(dal),
         }
     }
 
@@ -304,6 +347,83 @@ impl LlmoSafeGuard {
     pub fn safety_context(&self) -> SafetyContext {
         SafetyContext::new(self.policy.clone())
     }
+
+    /// Set the Design Assurance Level (DAL) for runtime decision gating.
+    #[must_use]
+    pub fn with_dal(mut self, dal: DesignAssuranceLevel) -> Self {
+        self.policy = self.policy.with_dal(dal);
+        self
+    }
+
+    /// Returns the active Design Assurance Level (DAL).
+    #[must_use]
+    pub fn dal(&self) -> DesignAssuranceLevel {
+        self.policy.dal
+    }
+
+    /// Processes an observation through a CognitivePipeline under the current guard's resource policy.
+    ///
+    /// This integrates the 5-stage CognitivePipeline with the physical ResourceGuard.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if configuring or executing the cognitive safety pipeline fails.
+    pub fn check_cognitive_pipeline(
+        &self,
+        objective: &str,
+        observation: &str,
+    ) -> Result<PipelineResult, String> {
+        let config = PipelineConfig {
+            policy: self.policy.clone(),
+            use_detection_gate: true,
+            ..PipelineConfig::default()
+        };
+
+        let mut pipeline = CognitivePipeline::<64, 10>::with_config(objective, config)
+            .map_err(|e| format!("Failed to configure CognitivePipeline: {}", e))?;
+
+        let mut result = pipeline
+            .process_safe(observation, &self.guard)
+            .map_err(|e| format!("Cognitive safety pipeline execution failed: {:?}", e))?;
+        result.decision = apply_dal_to_decision(self.policy.dal, result.decision);
+        Ok(result)
+    }
+
+    /// Returns the combined risk bits from a synapse (OOV ratio and detection flags).
+    #[must_use]
+    pub fn combined_risk_bits(&self, synapse: &Synapse) -> u16 {
+        synapse.combined_risk_bits()
+    }
+
+    /// Helper to get the OOV ratio from a synapse.
+    #[must_use]
+    pub fn oov_ratio(&self, synapse: &Synapse) -> u8 {
+        synapse.oov_ratio()
+    }
+
+    /// Helper to get the detection flags from a synapse.
+    #[must_use]
+    pub fn detection_flags(&self, synapse: &Synapse) -> u8 {
+        synapse.detection_flags()
+    }
+
+    /// Helper to get MemoryStats from a pipeline.
+    #[must_use]
+    pub fn pipeline_memory_stats<const M: usize, const S: usize>(
+        &self,
+        pipeline: &CognitivePipeline<'_, M, S>,
+    ) -> MemoryStats {
+        pipeline.memory_stats()
+    }
+
+    /// Helper to get PidState from a pipeline.
+    #[must_use]
+    pub fn pipeline_pid_state<'a, const M: usize, const S: usize>(
+        &self,
+        pipeline: &'a CognitivePipeline<'_, M, S>,
+    ) -> &'a PidState {
+        pipeline.pid_state()
+    }
 }
 
 impl Default for LlmoSafeGuard {
@@ -378,5 +498,41 @@ mod tests {
             hist.is_in_cooldown(),
             "Should be in cooldown immediately after check"
         );
+    }
+
+    #[test]
+    fn test_dal_config() {
+        let guard = LlmoSafeGuard::new().with_dal(DesignAssuranceLevel::C);
+        assert_eq!(guard.dal(), DesignAssuranceLevel::C);
+    }
+
+    #[test]
+    fn test_cognitive_pipeline_integration() {
+        // Under default DAL A, the decision is escalated/halted due to low confidence on short input
+        let guard_strict = LlmoSafeGuard::new();
+        let res_strict = guard_strict.check_cognitive_pipeline("Hello world", "Hello world");
+        assert!(res_strict.is_ok());
+        let result_strict = res_strict.unwrap();
+        println!("DEBUG STRICT DECISION: {:?}", result_strict.decision);
+        assert!(matches!(result_strict.decision, SafetyDecision::Halt(..) | SafetyDecision::Escalate { .. }));
+        assert!(!result_strict.is_safe());
+
+        // Under DAL E, all decisions are Proceed
+        let guard_permissive = LlmoSafeGuard::new().with_dal(DesignAssuranceLevel::E);
+        let res_permissive = guard_permissive.check_cognitive_pipeline("Hello world", "Hello world");
+        assert!(res_permissive.is_ok());
+        let result_permissive = res_permissive.unwrap();
+        println!("DEBUG PERMISSIVE DECISION: {:?}", result_permissive.decision);
+        assert!(matches!(result_permissive.decision, SafetyDecision::Proceed));
+        assert!(result_permissive.is_safe());
+
+        // Check exposure layer accessors/stats
+        let mut synapse = result_permissive.synapse;
+        synapse.set_detection_flags(result_permissive.detection_flags);
+
+        let bits = guard_permissive.combined_risk_bits(&synapse);
+        assert_eq!(guard_permissive.oov_ratio(&synapse), result_permissive.oov_ratio);
+        assert_eq!(guard_permissive.detection_flags(&synapse), result_permissive.detection_flags);
+        assert_eq!(bits, ((result_permissive.oov_ratio as u16) << 6) | (result_permissive.detection_flags as u16));
     }
 }

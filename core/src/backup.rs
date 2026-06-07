@@ -1,7 +1,7 @@
 //! Backup manager for undo/rollback functionality.
 //!
 //! Creates timestamped backups of files and directories before mutation,
-//! enabling restoration to the pre-mutation state. Backups are organized
+//! allowing restoration to the pre-mutation state. Backups are organized
 //! under a root directory with subdirectories per job ID.
 //!
 //! # Security

@@ -62,21 +62,32 @@ const CRITICAL_FILES: &[&str] = &[
     "id_ed25519",
 ];
 
-/// Arguments for the [`FileWrite`] capability.
+/// Input parameters for [`FileWrite::execute`].
+///
+/// The target file is backed up before any write occurs, making the
+/// operation reversible through the undo system.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileWriteArgs {
+    /// Absolute path to the file to write.
     pub path: String,
+    /// Content to write (overwrites existing content unless `append` is set).
     pub content: String,
+    /// When true, append to the file instead of overwriting.
     #[serde(default)]
     pub append: bool,
 }
 
 /// Capability that writes file contents with backup-before-mutate.
+///
+/// Every write creates a timestamped backup via [`BackupManager`], enabling
+/// rollback through the undo system. The backup is created *before* the
+/// mutation, so a failed write still leaves a recoverable state.
 pub struct FileWrite {
     backup_mgr: BackupManager,
 }
 
 impl FileWrite {
+    /// Create a new `FileWrite` capability backed by the given backup directory.
     #[allow(clippy::missing_errors_doc)] // Error path is self-documenting — propagates BackupManager::new
     pub fn new(backup_dir: PathBuf) -> Result<Self> {
         Ok(Self {

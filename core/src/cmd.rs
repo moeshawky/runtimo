@@ -9,7 +9,7 @@
 //! into command strings — only hardcoded, trusted commands should be used.
 //! All commands in this codebase are static literals with no user data interpolation.
 //!
-//! Violating this rule enables shell injection attacks. Use [`std::process::Command`]
+//! Violating this rule causes shell injection attacks. Use [`std::process::Command`]
 //! directly with `.arg()` for user-provided values.
 
 use std::process::Command;
@@ -20,7 +20,7 @@ use std::process::Command;
 ///
 /// **CRITICAL:** Only use with hardcoded, trusted command strings.
 /// Never interpolate user input, file paths, or any external data into `cmd`.
-/// This function uses `sh -c` which enables shell injection if user data is included.
+/// This function uses `sh -c` which is vulnerable to shell injection if user data is included.
 ///
 /// For user-provided values, use [`std::process::Command`] directly:
 /// ```rust,ignore

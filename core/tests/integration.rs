@@ -6,7 +6,7 @@
     clippy::redundant_clone
 )]
 use runtimo_core::{
-    capabilities::{FileRead, FileWrite, GitExec, Kill, ShellExec, Undo},
+    capabilities::{FileRead, FileWrite, Kill, ShellExec},
     execute_with_telemetry, BackupManager, Capability, CapabilityRegistry, ProcessSnapshot,
     Telemetry, WalEvent, WalEventType, WalReader, WalWriter,
 };
@@ -873,7 +873,7 @@ fn c2_synthetic_registry_blocks_dangerous_commands() {
 
 #[test]
 fn c3_wal_event_semantic_roundtrip() {
-    use runtimo_core::{Context, WalEvent, WalEventType, WalReader, WalWriter};
+    use runtimo_core::{WalEvent, WalEventType, WalReader, WalWriter};
 
     let dir = setup();
     let wp = wal_path(&dir);
@@ -903,6 +903,7 @@ fn c3_wal_event_semantic_roundtrip() {
                 cmd_stderr: None,
                 cmd_exit_code: None,
                 cmd_corrected: None,
+                ..Default::default()
             },
             WalEvent {
                 seq: 2,
@@ -921,6 +922,7 @@ fn c3_wal_event_semantic_roundtrip() {
                 cmd_stderr: None,
                 cmd_exit_code: None,
                 cmd_corrected: None,
+                ..Default::default()
             },
             WalEvent {
                 seq: 3,
@@ -939,6 +941,7 @@ fn c3_wal_event_semantic_roundtrip() {
                 cmd_stderr: Some("Permission denied".into()),
                 cmd_exit_code: Some(1),
                 cmd_corrected: None,
+                ..Default::default()
             },
         ];
 
@@ -1017,6 +1020,7 @@ fn c3_wal_seq_monotonic_across_writes() {
             cmd_stderr: None,
             cmd_exit_code: None,
             cmd_corrected: None,
+            ..Default::default()
         })
         .expect("append");
         assert_eq!(wal.seq(), before + 1, "SEQ must be strictly monotonic");
@@ -1083,8 +1087,7 @@ fn c5_concurrent_writes_no_data_loss() {
     // Backups must exist for at least one of the jobs (proves durability)
     let backups_exist = std::fs::read_dir(&bw)
         .ok()
-        .map(|entries| entries.count() > 0)
-        .unwrap_or(false);
+        .is_some_and(|entries| entries.count() > 0);
     assert!(
         backups_exist,
         "At least one backup must survive concurrent writes"
@@ -1118,10 +1121,11 @@ fn c5_wal_size_linear_with_event_count() {
                 cmd_stderr: None,
                 cmd_exit_code: None,
                 cmd_corrected: None,
+                ..Default::default()
             })
             .ok();
         }
-        std::fs::metadata(&wp).map(|m| m.len()).unwrap_or(0)
+        std::fs::metadata(&wp).map_or(0, |m| m.len())
     };
 
     let size_5 = write_n(5);
@@ -1225,6 +1229,76 @@ fn dispatch_pipeline_multiple_jobs_have_unique_ids() {
         events.len() >= 10,
         "WAL must have 2 events per job (5 jobs → ≥10 events)"
     );
+
+    cleanup(&dir);
+}
+
+#[test]
+fn test_dal_e_permissive_mode() {
+    let dir = setup();
+    let wp = wal_path(&dir);
+    let p = make_file(&dir, "suspicious.txt", "very unstable input with random words");
+
+    // Set env var RUNTIMO_DAL=E
+    std::env::set_var("RUNTIMO_DAL", "E");
+
+    // Execution should pass even with suspicious input
+    let result = execute_with_telemetry(
+        &FileRead,
+        &json!({ "path": p.to_str().unwrap() }),
+        false,
+        &wp,
+    );
+    
+    // Cleanup env var to avoid pollution
+    std::env::remove_var("RUNTIMO_DAL");
+
+    assert!(result.is_ok());
+    let exec_res = result.unwrap();
+    assert!(exec_res.success);
+
+    cleanup(&dir);
+}
+
+#[test]
+fn test_dal_a_high_risk_rejection() {
+    let dir = setup();
+    let wp = wal_path(&dir);
+    let p = make_file(&dir, "risk.txt", "short");
+
+    // Set env var RUNTIMO_DAL=A
+    std::env::set_var("RUNTIMO_DAL", "A");
+
+    // Execution should fail with CognitiveSafetyViolation
+    let result = execute_with_telemetry(
+        &FileRead,
+        &json!({ "path": p.to_str().unwrap() }),
+        false,
+        &wp,
+    );
+
+    std::env::remove_var("RUNTIMO_DAL");
+
+    assert!(result.is_err());
+    let err = result.err().unwrap();
+    assert!(
+        matches!(err, runtimo_core::Error::CognitiveSafetyViolation(_)),
+        "Expected CognitiveSafetyViolation error, got {:?}",
+        err
+    );
+
+    // Verify WAL has logged oov_ratio and detection_flags in the JobFailed event
+    let reader = WalReader::load(&wp).expect("read");
+    let events = reader.events();
+    
+    // Find the JobFailed event
+    let failed_event = events
+        .iter()
+        .find(|e| matches!(e.event_type, WalEventType::JobFailed))
+        .expect("Should find JobFailed event in WAL");
+
+    assert!(failed_event.oov_ratio.is_some(), "oov_ratio must be logged");
+    assert!(failed_event.detection_flags.is_some(), "detection_flags must be logged");
 
     cleanup(&dir);
 }

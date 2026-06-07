@@ -976,12 +976,12 @@ fn t_layergap_backup_boundary_content_preserved() {
     let job_backups: Vec<_> = std::fs::read_dir(bw.join("layer_job"))
         .into_iter()
         .flatten()
-        .flat_map(|d| d.ok())
+        .filter_map(|d| d.ok())
         .collect();
     assert!(!job_backups.is_empty(), "Backup must exist for the job");
 
     // Verify backup content matches the pre-overwrite state (original file content)
-    let backup_content = std::fs::read_to_string(&job_backups[0].path()).ok();
+    let backup_content = std::fs::read_to_string(job_backups[0].path()).ok();
     assert!(backup_content.is_some(), "Backup file must be readable");
     assert_eq!(
         backup_content.unwrap(),
@@ -1036,9 +1036,10 @@ fn t_layergap_wal_boundary_structural_integrity() {
             process_after: None,
             cmd: Some("echo hello".into()),
             cmd_stdout: Some("hello\n".into()),
-            cmd_stderr: Some("".into()),
+            cmd_stderr: Some(String::new()),
             cmd_exit_code: Some(0),
             cmd_corrected: None,
+            ..Default::default()
         })
         .expect("append");
     }
@@ -1050,7 +1051,7 @@ fn t_layergap_wal_boundary_structural_integrity() {
 
     let e = &events[0];
     // T-LAYERGAP: verify all field groups are present
-    assert!(e.seq >= 0, "seq must be populated");
+    assert_eq!(e.seq, 0, "seq must be 0");
     assert!(e.ts > 0, "timestamp must be populated");
     assert_eq!(e.job_id, "layer-j-1");
     assert_eq!(e.event_type, WalEventType::JobCompleted);
@@ -1119,6 +1120,7 @@ fn g_drift_wal_event_json_schema_stability() {
             cmd_stderr: None,
             cmd_exit_code: None,
             cmd_corrected: None,
+            ..Default::default()
         })
         .expect("append");
     }
@@ -1260,7 +1262,7 @@ fn g_perf_write_read_near_linear() {
 
     // Large (100KB) should be somewhat slower than small (100B),
     // but not 10,000× slower (would indicate O(n²) or worse)
-    let ratio = t_large.as_micros() as f64 / t_small.as_micros().max(1) as f64;
+    let ratio = t_large.as_secs_f64() / t_small.as_secs_f64().max(1e-9);
     assert!(
         ratio < 5000.0,
         "Write+read of 100KB ({:?}) should not be >5000× slower than 100B ({:?}), got ratio {:.0}",

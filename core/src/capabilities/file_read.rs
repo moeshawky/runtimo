@@ -35,7 +35,10 @@ const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 /// Default max bytes to read when max_bytes is not specified (1 MB).
 const DEFAULT_MAX_BYTES: u64 = 1024 * 1024;
 
-/// Arguments for the [`FileRead`] capability.
+/// Input parameters for [`FileRead::execute`].
+///
+/// Accepts a file path and an optional byte limit. The path is validated
+/// against the configured allowed-prefix list before any I/O occurs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileReadArgs {
     /// Absolute or relative path to the file to read.
@@ -278,7 +281,7 @@ mod tests {
     #[allow(clippy::indexing_slicing)]
     #[allow(clippy::unused_result_ok)]
     #[test]
-    #[allow(clippy::unwrap_used, clippy::unused_result_ok)]
+    #[allow(clippy::unwrap_used)]
     fn test_max_bytes_limits_output() {
         let mut tmp = std::env::temp_dir();
         tmp.push("runtimo_test_max_bytes.txt");

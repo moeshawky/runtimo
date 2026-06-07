@@ -1,7 +1,7 @@
 //! Write-Ahead Log (WAL) — Append-only, crash-resistant event log.
 //!
 //! Events are written as JSONL (one JSON object per line) with `fsync` after
-//! each write to guarantee durability. The WAL enables crash recovery by
+//! each write to guarantee durability. The WAL supports crash recovery by
 //! replaying events to reconstruct system state.
 //!
 //! Sequence numbers and rotation indices use explicit arithmetic — these
@@ -88,7 +88,7 @@ fn read_last_seq(path: &Path, tail_bytes: usize) -> Option<u64> {
 /// capture the shell command, its output, and any auto-correction applied.
 /// These events are only written in debug builds (`#[cfg(debug_assertions)]`),
 /// but the variant exists in release builds for reading old WALs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[allow(clippy::exhaustive_structs)]
 pub struct WalEvent {
     /// Sequence number (monotonically increasing within a writer session).
@@ -136,17 +136,24 @@ pub struct WalEvent {
     /// Auto-corrected command, if correction was applied (future Phase 2).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cmd_corrected: Option<String>,
+    /// OOV ratio from LLMOSafe (for CognitiveSafetyViolation).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oov_ratio: Option<u8>,
+    /// Detection flags from LLMOSafe (for CognitiveSafetyViolation).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detection_flags: Option<u8>,
 }
 
 /// Types of WAL events, corresponding to job lifecycle stages
 /// and command executions.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 // Additional variants may be added in future versions; the enum is
 // intentionally non-exhaustive for forward compatibility.
 #[allow(clippy::exhaustive_enums)]
 pub enum WalEventType {
     /// Job has been submitted to the system.
+    #[default]
     JobSubmitted,
     /// Job arguments passed validation.
     JobValidated,
@@ -575,6 +582,8 @@ pub fn truncate_to(s: &str, max_bytes: usize) -> String {
 }
 
 #[cfg(test)]
+// Allow unwrap_used and indexing_slicing in tests as panicking on failure is desired test behavior.
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
 
@@ -605,6 +614,7 @@ mod tests {
             cmd_stderr: None,
             cmd_exit_code: None,
             cmd_corrected: None,
+            ..Default::default()
         })
         .unwrap();
 
@@ -639,6 +649,7 @@ mod tests {
             cmd_stderr: None,
             cmd_exit_code: None,
             cmd_corrected: None,
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(wal.seq(), 1);
@@ -675,6 +686,7 @@ mod tests {
                 cmd_stderr: None,
                 cmd_exit_code: None,
                 cmd_corrected: None,
+                ..Default::default()
             })
             .unwrap();
         }
@@ -720,6 +732,7 @@ mod tests {
             cmd_stderr: None,
             cmd_exit_code: None,
             cmd_corrected: None,
+            ..Default::default()
         })
         .unwrap();
 
@@ -741,6 +754,7 @@ mod tests {
             cmd_stderr: None,
             cmd_exit_code: None,
             cmd_corrected: None,
+            ..Default::default()
         })
         .unwrap();
 
@@ -774,6 +788,7 @@ mod tests {
             cmd_stderr: None,
             cmd_exit_code: None,
             cmd_corrected: None,
+            ..Default::default()
         };
 
         let json = serde_json::to_string(&event).unwrap();
@@ -806,6 +821,7 @@ mod tests {
             cmd_stderr: Some("hed: command not found".into()),
             cmd_exit_code: Some(127),
             cmd_corrected: None,
+            ..Default::default()
         })
         .unwrap();
 

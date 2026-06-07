@@ -20,7 +20,7 @@ workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-llmosafe = "0.6.2"
+llmosafe = "0.7.2"
 libc = "0.2"
 toml = "0.8"
 unicode-normalization = "0.1"
@@ -40,3 +40,7 @@ path = "examples/telemetry_demo.rs"
 [[example]]
 name = "write_and_undo"
 path = "examples/write_and_undo.rs"
+
+[[example]]
+name = "sift_test"
+path = "examples/sift_test.rs"

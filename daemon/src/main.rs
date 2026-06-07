@@ -806,6 +806,7 @@ fn reconcile_orphaned_jobs(wal_path: &std::path::Path) {
                 cmd_stderr: None,
                 cmd_exit_code: None,
                 cmd_corrected: None,
+                ..Default::default()
             });
         }
         println!("Reconciled {} orphaned job(s).", orphaned.len());
@@ -840,7 +841,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let wal_path_bg = wal_path.clone();
     let backup_dir = runtimo_core::utils::backup_dir();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600));
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_hours(1));
         loop {
             interval.tick().await;
             let _ = BackupManager::new(backup_dir.clone())

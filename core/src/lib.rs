@@ -3,7 +3,7 @@
 //! Runtimo provides structured execution, resource limits, crash recovery,
 //! and two-layer telemetry (hardware + process tracking) for machines that
 //! cannot be factory-reset. Every capability execution captures before/after
-//! snapshots, enabling full audit trails and undo support.
+//! snapshots, with full audit trails and undo support.
 //!
 //! # Architecture
 //!
@@ -57,20 +57,44 @@
 //!
 //! No optional features currently. All functionality is included by default.
 
+// Allow idiomatic test lints in test mode as panic/unwrap/indexing are standard in tests.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::unused_result_ok
+    )
+)]
+
 pub mod backup;
+/// Pluggable capability implementations (file I/O, shell, git, etc.).
 pub mod capabilities;
+/// Core trait and registry for pluggable operations.
 pub mod capability;
+/// Shell command execution helper.
 pub mod cmd;
+/// Global configuration and path resolution.
 pub mod config;
+/// Capability executor with telemetry and safety guards.
 pub mod executor;
+/// Job identity, state machine, and WAL event types.
 pub mod job;
+/// LLM safety guard — CPU/RAM circuit breakers and entropy source.
 pub mod llmosafe;
+/// Health monitoring with alerting.
 pub mod monitor;
+/// Process snapshot, zombie detection, and top-N queries.
 pub mod processes;
 mod schema;
+/// Session tracking for reliable SSH.
 pub mod session;
+/// System telemetry capture and reporting.
 pub mod telemetry;
+/// Path validation against allowed-prefix lists.
 pub mod validation;
+/// Write-ahead log for crash recovery.
 pub mod wal;
 
 pub use backup::BackupManager;
@@ -78,7 +102,7 @@ pub use capabilities::{FileRead, FileWrite, GitExec, Kill, ShellExec, Undo};
 pub use capability::{Capability, CapabilityRegistry, Context, Output};
 pub use config::RuntimoConfig;
 pub use executor::{execute_with_telemetry, execute_with_telemetry_and_session};
-pub use job::{JobId, JobState};
+pub use job::{Job, JobId, JobState};
 pub use llmosafe::LlmoSafeGuard;
 pub use monitor::HealthMonitor;
 pub use processes::ProcessSnapshot;
@@ -127,6 +151,10 @@ pub enum Error {
     /// Telemetry capture failed.
     #[error("Telemetry error: {0}")]
     TelemetryError(String),
+
+    /// Cognitive safety violation detected by LLMOSafe.
+    #[error("Cognitive safety violation: {0}")]
+    CognitiveSafetyViolation(String),
 }
 
 /// Result alias for runtimo-core operations.

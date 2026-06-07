@@ -21,7 +21,7 @@
 //! **What protects you:**
 //! - Dangerous command blocklist
 //! - Resource limits (timeout, process isolation)
-//! - WAL audit trail (enables undo/recovery)
+//! - WAL audit trail (supports undo/recovery)
 //!
 //! # Features
 //!
@@ -64,12 +64,20 @@ const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024;
 const MAX_STDIN_BYTES: usize = 1024 * 1024;
 
+/// Input parameters for [`ShellExec::execute`].
+///
+/// Runs a shell command with an optional timeout and working directory.
+/// Dangerous commands (rm -rf /, dd, fork bombs) are rejected before execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShellExecArgs {
+    /// Shell command to execute (e.g. `"ls -la"`, `"cargo build"`).
     #[serde(alias = "command")]
     pub cmd: String,
+    /// Maximum seconds before the process is killed (default: 30).
     pub timeout_secs: Option<u64>,
+    /// Working directory for the command (default: executor CWD).
     pub cwd: Option<String>,
+    /// Data piped to the command's stdin.
     pub stdin: Option<String>,
 }
 
@@ -233,6 +241,11 @@ fn get_all_descendants(pid: u32) -> Vec<u32> {
     descendants
 }
 
+/// Capability that executes shell commands with safety guards.
+///
+/// Commands are run in the executor's process group with a configurable
+/// timeout. A blocklist rejects destructive commands (e.g. `rm -rf /`,
+/// `dd if=/dev/zero of=/dev/sda`). All executions are logged to the WAL.
 #[allow(clippy::exhaustive_structs)]
 pub struct ShellExec;
 

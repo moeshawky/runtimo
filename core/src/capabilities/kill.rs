@@ -146,7 +146,7 @@ fn protected_pids() -> Vec<u32> {
     pids
 }
 
-/// Arguments for the [`Kill`] capability.
+/// Input parameters for [`Kill::execute`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KillArgs {
     /// Process ID to kill.
@@ -157,16 +157,8 @@ pub struct KillArgs {
 
 /// Capability that terminates a process by PID with full audit logging.
 ///
-/// # Safety
-///
-/// This capability includes guards to prevent killing critical system processes.
-/// Protected PIDs include: 1 (init), 2 (kthreadd).
-///
-/// # Security
-///
-/// All kill operations are logged to WAL for audit purposes.
-// This is a capability marker struct with no fields;
-// additional fields may be added later as needed.
+/// Protected PIDs (init, kthreadd) are refused before the syscall.
+/// All kill operations are logged to the WAL for forensic review.
 #[allow(clippy::exhaustive_structs)]
 pub struct Kill;
 

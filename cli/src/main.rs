@@ -34,6 +34,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Execute a capability with telemetry
     #[command(
         about = "exec capability with telemetry",
         after_help = "CAPABILITY HELP:\n runtimo run -c <Cap> --schema\n\nEXAMPLES:\n runtimo run -c FileRead -a '{\"path\":\"/etc/hostname\"}'\n runtimo run -c ShellExec -a '{\"cmd\":\"uptime\"}'"
@@ -78,6 +79,7 @@ enum Commands {
         #[arg(long, default_value = "0")]
         timeout: u64,
     },
+    /// List available capabilities
     #[command(
         about = "List capabilities",
         after_help = "Use --schemas to see JSON argument schemas."
@@ -88,6 +90,7 @@ enum Commands {
         #[arg(short = 'j', long)]
         json: bool,
     },
+    /// Check job status
     #[command(about = "Check job status")]
     Status {
         #[arg(short = 'j', long)]

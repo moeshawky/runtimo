@@ -21,6 +21,7 @@ use crate::{Capability, Context, Output, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Input parameters for [`Undo::execute`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UndoArgs {
     /// Job ID to undo (restores backup from that job).
@@ -29,6 +30,10 @@ pub struct UndoArgs {
     pub file: Option<String>,
 }
 
+/// Capability that restores files from backup.
+///
+/// Each undo reverses the file mutations made by a specific job,
+/// restoring the pre-mutation state captured by [`FileWrite`](crate::capabilities::FileWrite).
 // This struct is intentionally simple — it implements the Capability trait
 // and adding non-pub fields would serve no purpose.
 #[allow(clippy::exhaustive_structs)]
@@ -241,6 +246,7 @@ mod tests {
             cmd_stderr: None,
             cmd_exit_code: None,
             cmd_corrected: None,
+            ..Default::default()
         })
         .unwrap();
 
