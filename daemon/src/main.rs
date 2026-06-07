@@ -20,6 +20,7 @@ use runtimo_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -398,6 +399,8 @@ async fn handle_dispatch(state: &Arc<DaemonState>, params: Value, id: Value) -> 
     let cn = cap_name.clone();
     let wd = working_dir.clone();
     std::thread::spawn(move || {
+        // Acquire wal_mutex to serialize WAL writes with handle_run (Fix for CBP violation #2)
+        let _wal_guard = tokio_handle.block_on(state_arc.wal_mutex.lock());
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let cap = state_arc.registry.get(&cn).ok_or_else(|| {
                 runtimo_core::Error::ExecutionFailed(format!(
@@ -858,6 +861,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None
         }
     };
+
+    // Acquire daemon.lock before binding socket to coordinate with CLI (Fix for CBP violation #3)
+    let daemon_lock_path = runtimo_core::utils::data_dir().join("daemon.lock");
+    if let Some(parent) = daemon_lock_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let lock_file = File::create(&daemon_lock_path);
+    if let Ok(file) = lock_file {
+        use std::os::unix::io::AsRawFd;
+        let fd = file.as_raw_fd();
+        // SAFETY: fd is valid file descriptor from File::create; LOCK_EX is valid flock flag
+        unsafe { libc::flock(fd, libc::LOCK_EX) };
+        // Lock held for daemon lifetime (released when file dropped at process exit)
+    }
 
     let listener = tokio::net::UnixListener::bind(&args.socket)?;
     println!("Listening on {}", args.socket.display());

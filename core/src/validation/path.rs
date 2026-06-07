@@ -20,12 +20,13 @@
 //!
 //! ## Symlink TOCTOU Limitation (FINDING #9)
 //! This module canonicalizes paths via `std::fs::canonicalize()` which
-//! resolves symlinks. However, a TOCTOU window exists between validation
-//! and use: an attacker could replace a validated path with a symlink
-//! between the two operations. Mitigations:
-//! - Use `O_NOFOLLOW` flag when opening files (where possible)
-//! - Minimize time between validation and use
-//! - Full mitigation requires filesystem-level atomicity (not available in std)
+//! resolves symlinks. A TOCTOU window exists between validation and use:
+//! an attacker could replace a validated path with a symlink between the
+//! two operations. **Mitigation status**: All file-opening capabilities
+//! (`FileRead`, `FileWrite`) use `O_NOFOLLOW` flag to prevent symlink
+//! attacks at open time. Remaining risk: non-file capabilities (e.g.,
+//! `GitExec`, `ShellExec`) may not use `O_NOFOLLOW`. Full mitigation
+//! requires filesystem-level atomicity (not available in std).
 //!
 //! # Configuration
 //!

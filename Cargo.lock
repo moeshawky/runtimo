@@ -612,9 +612,10 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "runtimo-cli"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "clap 4.6.1",
+ "libc",
  "runtimo-core",
  "serde",
  "serde_json",
@@ -623,7 +624,7 @@ dependencies = [
 
 [[package]]
 name = "runtimo-core"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "libc",
@@ -638,7 +639,7 @@ dependencies = [
 
 [[package]]
 name = "runtimo-daemon"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "libc",
  "runtimo-core",
