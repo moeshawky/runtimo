@@ -364,9 +364,9 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "llmosafe"
-version = "0.7.2"
+version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ba65ff6a248d5cdc9bd53b2d202e06e3b16432305f6d939df20820d5600f6f1"
+checksum = "51454f92594b65faa1a3d83d9ac875679c469ee3a0f2ff0ba5b09bfaa7f3c76c"
 dependencies = [
  "cbindgen",
  "libc",
@@ -615,7 +615,6 @@ name = "runtimo-cli"
 version = "0.6.1"
 dependencies = [
  "clap 4.6.1",
- "libc",
  "runtimo-core",
  "serde",
  "serde_json",
