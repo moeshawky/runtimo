@@ -20,6 +20,9 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+/// Maximum seconds to wait for daemon to become ready after spawning.
+const DAEMON_STARTUP_TIMEOUT_SECS: u64 = 30;
+
 #[derive(Parser)]
 #[command(
     name = "runtimo",
@@ -296,8 +299,8 @@ fn ensure_daemon_running() -> Result<(), String> {
 
     #[allow(clippy::arithmetic_side_effects)]
     let deadline = std::time::Instant::now()
-        .checked_add(Duration::from_secs(10))
-        .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(10));
+        .checked_add(Duration::from_secs(DAEMON_STARTUP_TIMEOUT_SECS))
+        .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(DAEMON_STARTUP_TIMEOUT_SECS));
     loop {
         if daemon_is_running() {
             return Ok(());
@@ -317,7 +320,10 @@ fn ensure_daemon_running() -> Result<(), String> {
                     format!("Daemon exited with status {}: {}", status, stderr.trim())
                 }
             } else {
-                "Daemon started but did not become ready within 10s".into()
+                format!(
+                    "Daemon started but did not become ready within {}s",
+                    DAEMON_STARTUP_TIMEOUT_SECS
+                )
             };
             let _ = child.kill();
             return Err(err_msg);

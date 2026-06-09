@@ -5,6 +5,18 @@ All notable changes to Runtimo are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.4] - 2026-06-09
+
+### Changed
+
+- **Single-binary deployment** — `cargo install runtimo-cli` now installs BOTH `runtimo` (CLI) and `runtimo-daemon`. No separate `cargo install runtimo-daemon` required. Daemon is bundled as a second binary target in the CLI crate, using `runtimo-daemon` as a library dependency. (`cli/Cargo.toml`, `cli/src/daemon_bin.rs`, `daemon/src/lib.rs`, `daemon/src/engine.rs`)
+- **Daemon refactored into library** — daemon logic extracted to `engine.rs` with `pub fn run()`, exposed via `daemon/src/lib.rs`. The standalone daemon binary (`daemon/src/main.rs`) is now a thin wrapper. Both CLI and standalone daemon use the same library. (`daemon/src/lib.rs`, `daemon/src/engine.rs`)
+
+### Fixed
+
+- **Daemon auto-start lock deadlock** — daemon now uses non-blocking `flock(LOCK_NB)` for `daemon.lock`, so it doesn't deadlock when CLI already holds the lock during auto-start. (`daemon/src/engine.rs`)
+- **Daemon startup timeout increased** — `ensure_daemon_running()` timeout raised from 10s to 30s for slow systems. (`cli/src/main.rs`)
+
 ## [0.6.3] - 2026-06-08
 
 ### Fixed

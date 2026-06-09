@@ -10,6 +10,10 @@ description = "Daemon for the Runtimo capability runtime (JSON-RPC server, place
 [lints]
 workspace = true
 
+[lib]
+name = "runtimo_daemon"
+path = "src/lib.rs"
+
 [[bin]]
 name = "runtimo-daemon"
 path = "src/main.rs"
