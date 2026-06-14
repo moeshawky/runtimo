@@ -275,7 +275,26 @@ impl GitExec {
         if branch.is_empty() {
             return Err(Error::SchemaValidationFailed("Branch name is empty".into()));
         }
-        if branch.contains("..") || branch.contains("@{") {
+
+        // Prevent option injection
+        if branch.starts_with('-') {
+            return Err(Error::SchemaValidationFailed(format!(
+                "Branch name cannot start with '-': {}",
+                branch
+            )));
+        }
+
+        // Prevent ref injection / dangerous characters
+        // Based on git check-ref-format rules
+        let invalid_chars = [':', '~', '^', '?', '*', '[', '\\'];
+        #[allow(clippy::case_sensitive_file_extension_comparisons)]
+        if branch.contains(&invalid_chars[..])
+            || branch.contains("..")
+            || branch.contains("@{")
+            || branch.ends_with('/')
+            || branch.ends_with(".lock")
+            || branch.chars().any(|c| c.is_control() || c.is_whitespace())
+        {
             return Err(Error::SchemaValidationFailed(format!(
                 "Invalid branch name: {}",
                 branch
@@ -1122,13 +1141,32 @@ mod tests {
 
     #[test]
     fn validates_branch_name() {
+        // Valid branches
         assert!(GitExec::validate_branch_name("main").is_ok());
         assert!(GitExec::validate_branch_name("feature/my-branch").is_ok());
         assert!(GitExec::validate_branch_name("v1.0").is_ok());
 
+        // Invalid branches
         assert!(GitExec::validate_branch_name("").is_err());
         assert!(GitExec::validate_branch_name("bad..name").is_err());
         assert!(GitExec::validate_branch_name("@{..}").is_err());
+
+        // Malicious branches / option injection
+        assert!(GitExec::validate_branch_name("-c").is_err());
+        assert!(GitExec::validate_branch_name("--upload-pack=x").is_err());
+
+        // Other dangerous ref names
+        assert!(GitExec::validate_branch_name("branch.lock").is_err());
+        assert!(GitExec::validate_branch_name("branch/").is_err());
+        assert!(GitExec::validate_branch_name("my branch").is_err());
+        assert!(GitExec::validate_branch_name("branch\nname").is_err());
+        assert!(GitExec::validate_branch_name("branch:name").is_err());
+        assert!(GitExec::validate_branch_name("branch?").is_err());
+        assert!(GitExec::validate_branch_name("branch*").is_err());
+        assert!(GitExec::validate_branch_name("~branch").is_err());
+        assert!(GitExec::validate_branch_name("^branch").is_err());
+        assert!(GitExec::validate_branch_name("branch[x]").is_err());
+        assert!(GitExec::validate_branch_name("branch\\").is_err());
     }
 
     #[test]

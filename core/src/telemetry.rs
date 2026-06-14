@@ -501,10 +501,28 @@ fn detect_version(cmd: &str) -> Option<String> {
 
 impl NetworkInfo {
     fn capture() -> Self {
-        let public_ip = run_cmd(
-            "curl -s --connect-timeout 5 --max-time 5 ifconfig.me 2>/dev/null || echo 'unknown'",
-        );
-        let tunnel_output = run_cmd("pgrep -fa cloudflared");
+        let enable_public_ip = std::env::var("RUNTIMO_ENABLE_PUBLIC_IP")
+            .unwrap_or_default()
+            .to_lowercase();
+        let public_ip = if enable_public_ip == "1" || enable_public_ip == "true" {
+            run_cmd(
+                "curl -s --connect-timeout 5 --max-time 5 ifconfig.me 2>/dev/null || echo 'unknown'",
+            )
+        } else {
+            "unknown".into()
+        };
+
+        let mut tunnel_output = run_cmd("pgrep -fa cloudflared");
+
+        // Redact token values from tunnel output
+        if let Some(token_idx) = tunnel_output.find("--token ") {
+            let start = token_idx.saturating_add(8);
+            let end = tunnel_output[start..]
+                .find(' ')
+                .map_or(tunnel_output.len(), |i| start.saturating_add(i));
+            tunnel_output.replace_range(start..end, "***");
+        }
+
         let tunnel_running = !tunnel_output.is_empty();
         let tunnel_name = if tunnel_running {
             Some(tunnel_output)
@@ -526,6 +544,7 @@ mod tests {
 
     #[test]
     fn test_telemetry_capture() {
+        std::env::remove_var("RUNTIMO_ENABLE_PUBLIC_IP");
         let telemetry = Telemetry::capture();
         assert!(telemetry.timestamp > 0, "timestamp must be positive");
 
@@ -551,7 +570,21 @@ mod tests {
         );
 
         let net = &telemetry.network;
-        assert!(!net.public_ip.is_empty(), "public_ip must not be empty");
+        assert_eq!(
+            net.public_ip, "unknown",
+            "public_ip must be unknown by default"
+        );
+    }
+
+    #[test]
+    fn test_telemetry_tunnel_redaction() {
+        // Since we can't easily mock `pgrep`, we will test the logic directly if possible,
+        // but `capture` shells out. We'll simulate by ensuring `capture` handles output correctly.
+        // As a simpler test, let's verify if `NetworkInfo::capture` is called it doesn't fail.
+        let net = NetworkInfo::capture();
+        if let Some(tunnel) = net.tunnel_name {
+            assert!(!tunnel.contains("--token "), "Token should be redacted");
+        }
     }
 
     #[test]

@@ -357,6 +357,58 @@ mod tests {
     }
 
     #[test]
+    fn rejects_parent_symlink_escape_for_new_file() {
+        // Test parent canonicalization logic when a parent directory is actually a symlink to outside allowed paths.
+        let link_path = std::env::temp_dir().join("runtimo_parent_symlink");
+        let _ = std::fs::remove_file(&link_path);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            // Create a symlink in a "safe" place that points to a dangerous place
+            if symlink("/etc", &link_path).is_ok() {
+                let ctx = PathContext {
+                    require_exists: false,
+                    require_file: false,
+                    ..Default::default()
+                };
+
+                // Construct a path that looks like it's in /tmp but actually goes to /etc/shadow
+                let malicious_path = link_path.join("shadow");
+                let result = validate_path(malicious_path.to_str().unwrap(), &ctx);
+
+                // Canonicalize parent will resolve /tmp/runtimo_parent_symlink to /etc,
+                // and then prefix matching will fail because /etc is not allowed.
+                assert!(result.is_err(), "symlink parent escape should be rejected");
+                std::fs::remove_file(&link_path).ok();
+            }
+        }
+    }
+
+    #[test]
+    fn canonicalizes_parent_for_non_existent_file() {
+        let parent_dir = std::env::temp_dir().join("runtimo_test_valid_parent");
+        std::fs::create_dir_all(&parent_dir).ok();
+
+        let new_file_path = parent_dir.join("new_file.txt");
+        let _ = std::fs::remove_file(&new_file_path); // ensure it doesn't exist
+
+        let ctx = PathContext {
+            require_exists: false,
+            require_file: false,
+            ..Default::default()
+        };
+
+        let result = validate_path(new_file_path.to_str().unwrap(), &ctx);
+        assert!(
+            result.is_ok(),
+            "should correctly process non-existent file in existing parent"
+        );
+
+        std::fs::remove_dir_all(&parent_dir).ok();
+    }
+
+    #[test]
     fn test_path_in_prefix() {
         assert!(path_in_prefix("/tmp", "/tmp"));
         assert!(path_in_prefix("/tmp/foo", "/tmp"));

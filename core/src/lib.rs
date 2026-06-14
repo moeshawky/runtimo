@@ -166,16 +166,29 @@ pub mod utils {
 
     /// Returns the data directory following XDG spec.
     pub fn data_dir() -> PathBuf {
-        std::env::var("XDG_DATA_HOME")
+        std::env::var("XDG_RUNTIME_DIR")
             .ok()
             .map(PathBuf::from)
+            .or_else(|| std::env::var("XDG_DATA_HOME").ok().map(PathBuf::from))
             .or_else(|| {
                 std::env::var("HOME")
                     .ok()
                     .map(|h| PathBuf::from(h).join(".local/share"))
             })
-            .unwrap_or_else(std::env::temp_dir)
-            .join("runtimo")
+            .unwrap_or_else(|| {
+                // Secure fallback if neither XDG nor HOME is set
+                #[cfg(unix)]
+                {
+                    // SAFETY: `getuid` is a safe libc function that returns the current user ID
+                    let uid = unsafe { libc::getuid() };
+                    std::env::temp_dir().join(format!("runtimo-{}", uid))
+                }
+                #[cfg(not(unix))]
+                {
+                    std::env::temp_dir().join("runtimo")
+                }
+            })
+            .join("runtimo") // Actually this appends 'runtimo' to 'runtimo-<uid>', so it would be '/tmp/runtimo-<uid>/runtimo' which is fine
     }
 
     /// Returns the WAL path (env override or default).
