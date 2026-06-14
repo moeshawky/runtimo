@@ -256,7 +256,8 @@ fn acquire_daemon_lock() -> Result<File, String> {
     if let Some(parent) = lock_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create lock dir: {}", e))?;
     }
-    let file = File::create(&lock_path).map_err(|e| format!("Failed to create lock file: {}", e))?;
+    let file =
+        File::create(&lock_path).map_err(|e| format!("Failed to create lock file: {}", e))?;
     // Try to acquire exclusive non-blocking lock using flock
     let fd = file.as_raw_fd();
     // SAFETY: fd is a valid file descriptor from File::create; LOCK_EX | LOCK_NB are valid flock flags
@@ -300,7 +301,9 @@ fn ensure_daemon_running() -> Result<(), String> {
     #[allow(clippy::arithmetic_side_effects)]
     let deadline = std::time::Instant::now()
         .checked_add(Duration::from_secs(DAEMON_STARTUP_TIMEOUT_SECS))
-        .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(DAEMON_STARTUP_TIMEOUT_SECS));
+        .unwrap_or_else(|| {
+            std::time::Instant::now() + Duration::from_secs(DAEMON_STARTUP_TIMEOUT_SECS)
+        });
     loop {
         if daemon_is_running() {
             return Ok(());
@@ -426,7 +429,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             // Acquire concurrency slot (mirrors daemon's MAX_CONCURRENT_JOBS)
             if !acquire_cli_slot() {
-                eprintln!("Too many concurrent CLI runs (max {}). Try again later.", MAX_CLI_CONCURRENT);
+                eprintln!(
+                    "Too many concurrent CLI runs (max {}). Try again later.",
+                    MAX_CLI_CONCURRENT
+                );
                 std::process::exit(1);
             }
             let result = execute_with_telemetry_and_session(

@@ -179,12 +179,6 @@ impl GitExec {
         }
     }
 
-    /// Runs a git command (backwards-compatible, uses default timeout).
-    #[allow(dead_code)]
-    fn run_git(repo_path: &Path, args: &[&str]) -> Result<String> {
-        Self::run_git_with_timeout(repo_path, args, 300)
-    }
-
     /// Checks if the working tree is clean (no uncommitted changes).
     fn is_working_tree_clean(repo_path: &Path) -> bool {
         let output = Command::new("git")

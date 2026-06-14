@@ -87,7 +87,6 @@ pub mod llmosafe;
 pub mod monitor;
 /// Process snapshot, zombie detection, and top-N queries.
 pub mod processes;
-mod schema;
 /// Session tracking for reliable SSH.
 pub mod session;
 /// System telemetry capture and reporting.

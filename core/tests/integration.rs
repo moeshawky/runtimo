@@ -501,7 +501,7 @@ fn test_executor_resource_limit_failure_shape() {
     // Since we cannot mock LlmoSafeGuard within execute_with_telemetry easily, we will directly check the
     // error type mapped in executor.rs when the guard fails.
 
-    use runtimo_core::{LlmoSafeGuard, Error};
+    use runtimo_core::{Error, LlmoSafeGuard};
     let guard = LlmoSafeGuard::with_memory_ceiling_bytes(1); // impossible ceiling
 
     // Test the specific mapping behavior from executor.rs
@@ -1256,7 +1256,11 @@ fn dispatch_pipeline_multiple_jobs_have_unique_ids() {
 fn test_dal_e_permissive_mode() {
     let dir = setup();
     let wp = wal_path(&dir);
-    let p = make_file(&dir, "suspicious.txt", "very unstable input with random words");
+    let p = make_file(
+        &dir,
+        "suspicious.txt",
+        "very unstable input with random words",
+    );
 
     // Set env var RUNTIMO_DAL=E
     std::env::set_var("RUNTIMO_DAL", "E");
@@ -1268,7 +1272,7 @@ fn test_dal_e_permissive_mode() {
         false,
         &wp,
     );
-    
+
     // Cleanup env var to avoid pollution
     std::env::remove_var("RUNTIMO_DAL");
 
@@ -1309,7 +1313,7 @@ fn test_dal_a_high_risk_rejection() {
     // Verify WAL has logged oov_ratio and detection_flags in the JobFailed event
     let reader = WalReader::load(&wp).expect("read");
     let events = reader.events();
-    
+
     // Find the JobFailed event
     let failed_event = events
         .iter()
@@ -1317,7 +1321,10 @@ fn test_dal_a_high_risk_rejection() {
         .expect("Should find JobFailed event in WAL");
 
     assert!(failed_event.oov_ratio.is_some(), "oov_ratio must be logged");
-    assert!(failed_event.detection_flags.is_some(), "detection_flags must be logged");
+    assert!(
+        failed_event.detection_flags.is_some(),
+        "detection_flags must be logged"
+    );
 
     cleanup(&dir);
 }
