@@ -214,4 +214,35 @@ pub mod utils {
             format!("{:x}", ts)
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::collections::HashSet;
+
+        #[test]
+        fn test_generate_id_invariants() {
+            let id = generate_id();
+
+            // Invariant 1: non-empty
+            assert!(!id.is_empty(), "Generated ID must not be empty");
+
+            // Invariant 2: format is hex-alphanumeric
+            assert!(
+                id.chars().all(|c| c.is_ascii_hexdigit()),
+                "Generated ID must be valid hex, got: {}",
+                id
+            );
+
+            // Invariant 3: deterministic uniqueness in a small sample
+            let mut seen = HashSet::new();
+            for _ in 0..100 {
+                let new_id = generate_id();
+                assert!(
+                    seen.insert(new_id),
+                    "Collision detected in a small sample: ID generation is not sufficiently unique"
+                );
+            }
+        }
+    }
 }

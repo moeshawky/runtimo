@@ -191,9 +191,7 @@ pub fn execute_with_telemetry_and_session(
 
     // LlmoSafeGuard is the circuit breaker — reads /proc/stat with delta measurement
     let guard = LlmoSafeGuard::new();
-    guard
-        .check()
-        .map_err(Error::ResourceLimitExceeded)?;
+    guard.check().map_err(Error::ResourceLimitExceeded)?;
 
     // Reject if zombie count > 10
     if process_before.summary.zombie_count > 10 {
@@ -218,7 +216,8 @@ pub fn execute_with_telemetry_and_session(
     let ctx = Context::with_working_dir(
         dry_run,
         job_id_str.clone(),
-        working_dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))),
+        working_dir
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))),
     );
 
     let start_seq = wal.seq();
@@ -245,7 +244,10 @@ pub fn execute_with_telemetry_and_session(
 
     // Cognitive safety check (GAP-01)
     let pipeline_result = guard
-        .check_cognitive_pipeline(capability.description(), &sift_observation(capability.description(), args))
+        .check_cognitive_pipeline(
+            capability.description(),
+            &sift_observation(capability.description(), args),
+        )
         .map_err(|e| Error::ExecutionFailed(format!("Cognitive safety check failed: {}", e)))?;
 
     if !pipeline_result.decision.can_proceed() {
