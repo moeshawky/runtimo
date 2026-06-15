@@ -53,6 +53,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MemAvailable` was 23Gi. Both values now shown.
 - **#4: Load average without CPU context** — load line now shows CPU count.
 - **#5: Uptime human-only** — `uptime_seconds: u64` field added, machine-parseable.
+- **#6: Silent shell command failures** — `run_cmd()` returned empty string on failure,
+  indistinguishable from successful empty output. All telemetry callers treated empty as
+  valid data, causing false reports (0 GPUs, 0% RAM, 0 processes) when shell infrastructure
+  was absent. Added `run_cmd_result() -> io::Result<String>` with error propagation; existing
+  `run_cmd()` preserved with `eprintln!` warning before defaulting.
+  (CBP Chain 1 — cmd→telemetry boundary. `core/src/cmd.rs`)
+- **#7: Config corruption silently reverts to defaults** — `config::load()` used
+  `.unwrap_or_default()` on both file read and TOML parse, meaning corrupt config files
+  silently produced empty configs with no user notification. Added `load_result()` that
+  propagates I/O and parse errors; existing `load()` preserved with `eprintln!` warning.
+  (CBP Chain 2 — config→capability boundary. `core/src/config.rs`)
+- **#8: /proc read failures silently return empty** — `read_proc_file()` used
+  `unwrap_or_default()`, making `/proc` mount failures indistinguishable from empty files.
+  Changed to `io::Result<String>`. (`core/src/telemetry.rs`)
+- **#9: Unparseable RAM metrics silently become 0.0** — `parse_size_value()` returned 0.0
+  on parse failures. Changed to `Option<f32>` so callers can distinguish "zero" from
+  "unreadable." (`core/src/monitor.rs`)
+- **#10: LlmoSafeGuard panic on missing HOME** — `resource_history_path()` panicked
+  when both `RUNTIMO_STATE_DIR` and `HOME` were unset (common in minimal containers).
+  Changed to `Option<PathBuf>` — `None` means in-memory-only resource tracking.
+  (CBP Chain 3 — llmosafe→executor panic path. `core/src/llmosafe.rs`)
+- **#11: CLI panics on missing HOME** — `make_registry()`, `data_dir()`, and
+  `config_path()` all panicked via `expect()` when environment variables were unset.
+  Changed to graceful fallback (`/tmp/runtimo`) with `eprintln!` warning.
+  (CBP Chain 4 — CLI panic surface. `core/src/lib.rs`, `core/src/config.rs`,
+  `cli/src/main.rs`)
+- **#12: file_write.rs doesn't compile on non-Unix** — unconditional
+  `use std::os::unix::fs::OpenOptionsExt` prevented compilation on Windows/WASI
+  despite cross-platform claims. Added `#[cfg(unix)]` / `#[cfg(not(unix))]`
+  helper functions with documented platform behavior.
+  (CBP Chain 5 — platform lie. `core/src/capabilities/file_write.rs`)
 
 ### Security
 
