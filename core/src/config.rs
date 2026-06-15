@@ -27,32 +27,74 @@ impl RuntimoConfig {
     ///
     /// Uses `XDG_CONFIG_HOME` if set, otherwise `~/.config/runtimo/config.toml`.
     ///
-    /// # Panics
-    ///
-    /// Panics if neither `XDG_CONFIG_HOME` nor `HOME` is set.
-    #[allow(clippy::expect_used)]
+    /// Falls back to `/tmp/runtimo/config.toml` with a stderr warning when
+    /// neither `XDG_CONFIG_HOME` nor `HOME` is set. Configuration in `/tmp`
+    /// is not persistent across reboots.
     pub fn config_path() -> PathBuf {
-        std::env::var("XDG_CONFIG_HOME")
+        let base = std::env::var("XDG_CONFIG_HOME")
             .ok()
             .map(PathBuf::from)
             .or_else(|| {
                 std::env::var("HOME")
                     .ok()
                     .map(|h| PathBuf::from(h).join(".config"))
-            })
-            .expect("Cannot determine config path: set XDG_CONFIG_HOME or HOME")
-            .join("runtimo/config.toml")
+            });
+        if let Some(dir) = base {
+            dir.join("runtimo/config.toml")
+        } else {
+            eprintln!(
+                "[runtimo] Warning: XDG_CONFIG_HOME and HOME unset — using /tmp/runtimo \
+                 (config will not survive reboot)"
+            );
+            PathBuf::from("/tmp/runtimo/config.toml")
+        }
     }
 
     /// Loads config from disk, returning defaults if the file doesn't exist or is invalid.
+    ///
+    /// Logs a warning to stderr when the file exists but cannot be read or parsed.
+    /// Prefer [`load_result`] for new code — it propagates errors so callers can
+    /// distinguish "file doesn't exist" from "file is corrupt."
     #[must_use]
     pub fn load() -> Self {
+        match Self::load_result() {
+            Ok(config) => config,
+            Err(e) => {
+                eprintln!("[runtimo] Config load failed (using defaults): {}", e);
+                Self::default()
+            }
+        }
+    }
+
+    /// Loads config from disk, propagating read and parse errors.
+    ///
+    /// # Input
+    ///
+    /// Reads from the path returned by [`config_path`] if it exists.
+    ///
+    /// # Output
+    ///
+    /// `Ok(RuntimoConfig)` — Successfully deserialized config, or default if file doesn't exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(String)` when the config file:
+    /// - Exists but cannot be opened (permission denied, filesystem error)
+    /// - Can be opened but contains invalid TOML syntax
+    /// - Contains TOML that deserializes to a different type (schema mismatch)
+    ///
+    /// Returns `Ok(Self::default())` when:
+    /// - The config file does not exist (first run / clean install)
+    /// - The config file is empty (no config needed)
+    pub fn load_result() -> Result<Self, String> {
         let path = Self::config_path();
         if path.exists() {
-            let content = std::fs::read_to_string(&path).unwrap_or_default();
-            toml::from_str(&content).unwrap_or_default()
+            let content = std::fs::read_to_string(&path)
+                .map_err(|e| format!("Cannot read config file '{}': {}", path.display(), e))?;
+            toml::from_str(&content)
+                .map_err(|e| format!("Cannot parse config file '{}': {}", path.display(), e))
         } else {
-            Self::default()
+            Ok(Self::default())
         }
     }
 

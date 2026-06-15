@@ -167,24 +167,28 @@ pub mod utils {
     ///
     /// Uses `XDG_DATA_HOME` if set, otherwise `~/.local/share/runtimo`.
     ///
-    /// # Panics
-    ///
-    /// Panics if neither `XDG_DATA_HOME` nor `HOME` is set. A fallback
-    /// to `/tmp` is intentionally NOT provided — data written to `/tmp`
-    /// is not persistent, which would violate the WAL/backup durability
-    /// guarantee.
-    #[allow(clippy::expect_used)]
+    /// Falls back to `/tmp/runtimo` with a stderr warning when neither
+    /// `XDG_DATA_HOME` nor `HOME` is set. Data in `/tmp` is not persistent
+    /// across reboots — WAL and backup durability guarantees are degraded
+    /// in this fallback mode.
     pub fn data_dir() -> PathBuf {
-        std::env::var("XDG_DATA_HOME")
+        let base = std::env::var("XDG_DATA_HOME")
             .ok()
             .map(PathBuf::from)
             .or_else(|| {
                 std::env::var("HOME")
                     .ok()
                     .map(|h| PathBuf::from(h).join(".local/share"))
-            })
-            .expect("Cannot determine data directory: set XDG_DATA_HOME or HOME")
-            .join("runtimo")
+            });
+        if let Some(dir) = base {
+            dir.join("runtimo")
+        } else {
+            eprintln!(
+                "[runtimo] Warning: XDG_DATA_HOME and HOME unset — using /tmp/runtimo \
+                 (data will not survive reboot)"
+            );
+            PathBuf::from("/tmp/runtimo")
+        }
     }
 
     /// Returns the WAL path (env override or default).

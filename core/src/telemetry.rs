@@ -174,11 +174,20 @@ pub struct NetworkInfo {
 
 /// Reads the entire contents of a `/proc` file into a `String`.
 ///
-/// Returns an empty string if the file does not exist or cannot be read.
-/// This is the only way to interact with `/proc` files in telemetry —
-/// all data sources are read through this function.
-fn read_proc_file(path: &str) -> String {
-    std::fs::read_to_string(path).unwrap_or_default()
+/// # Input
+///
+/// `path` — Absolute path to a `/proc` file (e.g. `"/proc/cpuinfo"`).
+///
+/// # Output
+///
+/// `Ok(String)` — Full file contents.
+/// `Err(io::Error)` — File does not exist, permission denied, or I/O error.
+///
+/// Callers must handle the error case — an empty `/proc` file is a
+/// valid success (e.g. empty tcp6 in a container), only I/O errors
+/// should produce `Err`.
+fn read_proc_file(path: &str) -> std::io::Result<String> {
+    std::fs::read_to_string(path)
 }
 
 /// Parses a `/proc/meminfo` key value in kB and returns the raw numeric value.
@@ -390,7 +399,7 @@ impl Telemetry {
 impl SystemInfo {
     fn capture() -> Self {
         // /proc/cpuinfo: extract model name and count logical processors
-        let cpuinfo = read_proc_file("/proc/cpuinfo");
+        let cpuinfo = read_proc_file("/proc/cpuinfo").unwrap_or_default();
         let cpu_model = cpuinfo
             .lines()
             .find(|l| l.starts_with("model name"))
@@ -405,14 +414,14 @@ impl SystemInfo {
             .unwrap_or(0);
 
         // /proc/meminfo: MemTotal, MemFree, MemAvailable (all in kB)
-        let meminfo = read_proc_file("/proc/meminfo");
+        let meminfo = read_proc_file("/proc/meminfo").unwrap_or_default();
         let ram_total = format_mem_kb(parse_meminfo_kb(&meminfo, "MemTotal:"));
         let ram_free = format_mem_kb(parse_meminfo_kb(&meminfo, "MemFree:"));
         let ram_available = format_mem_kb(parse_meminfo_kb(&meminfo, "MemAvailable:"));
 
         // /proc/uptime: first field is uptime in seconds (fractional).
         // The value is always non-negative; cast truncation is safe.
-        let uptime = read_proc_file("/proc/uptime");
+        let uptime = read_proc_file("/proc/uptime").unwrap_or_default();
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let uptime_seconds: u64 = uptime
             .split_whitespace()
@@ -422,7 +431,7 @@ impl SystemInfo {
         let uptime_str = format_uptime(uptime_seconds);
 
         // /proc/loadavg: first three fields are 1/5/15 min load averages
-        let loadavg = read_proc_file("/proc/loadavg");
+        let loadavg = read_proc_file("/proc/loadavg").unwrap_or_default();
         let load_average = {
             // Extract first three whitespace-separated fields from /proc/loadavg
             let mut fields = loadavg.split_whitespace();
@@ -661,7 +670,7 @@ fn read_listening_ports() -> Vec<u16> {
     let mut ports = Vec::new();
 
     for path in &["/proc/net/tcp", "/proc/net/tcp6"] {
-        let data = read_proc_file(path);
+        let data = read_proc_file(path).unwrap_or_default();
         // Skip header line (starts with "  sl")
         for line in data.lines().skip(1) {
             let parts: Vec<&str> = line.split_whitespace().collect();

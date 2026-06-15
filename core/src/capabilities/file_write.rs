@@ -307,9 +307,55 @@ fn check_disk_space(
     Ok(())
 }
 
+// ── Platform-specific O_NOFOLLOW helpers ─────────────────────────────────────
+
+/// Opens a file for writing with `O_NOFOLLOW` (symlink protection) on Unix.
+///
+/// On Linux, `O_NOFOLLOW` causes `open()` to fail with `ELOOP` if the
+/// target is a symlink — preventing symlink-based path traversal attacks.
+///
+/// On non-Unix platforms, `O_NOFOLLOW` is not available. The file is opened
+/// without symlink protection — security depends on parent directory
+/// permissions instead.
+#[cfg(unix)]
+fn open_write_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_write_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    // O_NOFOLLOW not available — symlink protection depends on parent dir permissions
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+}
+
+/// Opens a file for reading with `O_NOFOLLOW` on Unix, or without on other
+/// platforms. See [`open_write_nofollow`] for details.
+#[cfg(unix)]
+fn open_read_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_read_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new().read(true).open(path)
+}
+
 fn atomic_write(path: &std::path::Path, content: &str) -> Result<usize> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
 
     let tmp_name = format!(
         ".{}.tmp",
@@ -323,16 +369,9 @@ fn atomic_write(path: &std::path::Path, content: &str) -> Result<usize> {
         .join(&tmp_name);
 
     {
-        #[allow(clippy::cast_possible_wrap)] // libc::O_NOFOLLOW is i32
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&tmp_path)
-            .map_err(|e| {
-                Error::ExecutionFailed(format!("create temp {}: {}", tmp_path.display(), e))
-            })?;
+        let mut file = open_write_nofollow(&tmp_path).map_err(|e| {
+            Error::ExecutionFailed(format!("create temp {}: {}", tmp_path.display(), e))
+        })?;
         file.write_all(content.as_bytes()).map_err(|e| {
             Error::ExecutionFailed(format!("write temp {}: {}", tmp_path.display(), e))
         })?;
@@ -361,17 +400,11 @@ fn atomic_write(path: &std::path::Path, content: &str) -> Result<usize> {
 
 fn atomic_append(path: &std::path::Path, content: &str) -> Result<usize> {
     use std::io::{Read, Write};
-    use std::os::unix::fs::OpenOptionsExt;
 
     let existing = if path.exists() {
-        #[allow(clippy::cast_possible_wrap)] // libc::O_NOFOLLOW is i32
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)
-            .map_err(|e| {
-                Error::ExecutionFailed(format!("open {} for append: {}", path.display(), e))
-            })?;
+        let mut file = open_read_nofollow(path).map_err(|e| {
+            Error::ExecutionFailed(format!("open {} for append: {}", path.display(), e))
+        })?;
         let mut buf = Vec::new();
         file.read_to_end(&mut buf).map_err(|e| {
             Error::ExecutionFailed(format!("read {} for append: {}", path.display(), e))
@@ -396,16 +429,9 @@ fn atomic_append(path: &std::path::Path, content: &str) -> Result<usize> {
         .join(&tmp_name);
 
     {
-        #[allow(clippy::cast_possible_wrap)] // libc::O_NOFOLLOW is i32
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&tmp_path)
-            .map_err(|e| {
-                Error::ExecutionFailed(format!("create temp {}: {}", tmp_path.display(), e))
-            })?;
+        let mut file = open_write_nofollow(&tmp_path).map_err(|e| {
+            Error::ExecutionFailed(format!("create temp {}: {}", tmp_path.display(), e))
+        })?;
         file.write_all(&combined).map_err(|e| {
             Error::ExecutionFailed(format!("write temp {}: {}", tmp_path.display(), e))
         })?;

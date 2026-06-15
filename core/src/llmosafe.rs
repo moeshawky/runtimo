@@ -145,22 +145,27 @@ impl ResourceHistory {
 
 static RESOURCE_HISTORY: Mutex<Option<ResourceHistory>> = Mutex::new(None);
 
-/// Returns the default path for persisting resource history state.
-fn resource_history_path() -> PathBuf {
-    std::env::var("RUNTIMO_STATE_DIR")
-        .map_or_else(
-            |_| {
-                std::env::var("HOME")
-                    .ok()
-                    .unwrap_or_else(|| {
-                        panic!("Cannot determine state dir: set RUNTIMO_STATE_DIR or HOME")
-                    })
-                    .into()
-            },
-            PathBuf::from,
-        )
-        .join(".runtimo")
-        .join("resource_history.state")
+/// Returns the path for persisting resource history state.
+///
+/// # Input
+///
+/// Resolves from env, in priority order:
+/// 1. `RUNTIMO_STATE_DIR` env var (absolute path)
+/// 2. `HOME` env var + `.runtimo/resource_history.state`
+///
+/// # Output
+///
+/// `Some(PathBuf)` — Resolved path for persistence.
+/// `None` — Neither `RUNTIMO_STATE_DIR` nor `HOME` is set. The caller
+/// writes no persistence file — all state is in-memory only for this
+/// process lifetime.
+fn resource_history_path() -> Option<PathBuf> {
+    let base: Option<PathBuf> = std::env::var("RUNTIMO_STATE_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| std::env::var("HOME").ok().map(PathBuf::from));
+
+    base.map(|b| b.join(".runtimo").join("resource_history.state"))
 }
 
 pub struct LlmoSafeGuard {
@@ -255,7 +260,7 @@ impl LlmoSafeGuard {
     pub fn check(&self) -> Result<(), String> {
         let mut history = RESOURCE_HISTORY.lock().unwrap_or_else(|e| e.into_inner());
         if history.is_none() {
-            *history = Some(ResourceHistory::new(30, 1, Some(resource_history_path())));
+            *history = Some(ResourceHistory::new(30, 1, resource_history_path()));
         }
         #[allow(clippy::expect_used)]
         let hist = history

@@ -1,11 +1,12 @@
 //! Shared command execution helper.
 //!
-//! Provides a single `run_cmd` function used by telemetry and process modules
-//! to avoid duplication. Returns only stdout (stderr is logged separately).
+//! Provides `run_cmd` (legacy, returns empty string on failure) and
+//! `run_cmd_result` (returns `Result` so callers can distinguish "command
+//! failed" from "command returned empty string").
 //!
 //! # Security Warning
 //!
-//! This function uses `sh -c` to execute commands. **NEVER interpolate user input**
+//! This module uses `sh -c` to execute commands. **NEVER interpolate user input**
 //! into command strings — only hardcoded, trusted commands should be used.
 //! All commands in this codebase are static literals with no user data interpolation.
 //!
@@ -14,7 +15,22 @@
 
 use std::process::Command;
 
-/// Run a shell command and return trimmed stdout.
+/// Run a shell command and return trimmed stdout, or an IO error if the
+/// command fails to execute or exits with a non-zero status.
+///
+/// # Input
+///
+/// `cmd` — A shell command string (must be a hardcoded literal — see module docs).
+///
+/// # Output
+///
+/// `Ok(String)` — Trimmed stdout when the command succeeds (exit code 0).
+///
+/// # Errors
+///
+/// `Err(io::Error)` — When the process fails to spawn, or exits with a
+/// non-zero status. The error message includes the failed command and
+/// stderr output for debugging.
 ///
 /// # Safety
 ///
@@ -26,22 +42,51 @@ use std::process::Command;
 /// ```rust,ignore
 /// std::process::Command::new("cat").arg(user_path).output()
 /// ```
-///
-/// Returns an empty string on failure. Stderr is discarded — callers should
-/// not mix error output with data.
-#[must_use]
-pub fn run_cmd(cmd: &str) -> String {
+pub fn run_cmd_result(cmd: &str) -> std::io::Result<String> {
     // SECURITY: This is safe because all callers use hardcoded command literals.
     // The commands are: "cat /proc/cpuinfo | grep...", "free -h | grep...", etc.
-    // None of them interpolate user input.
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .output()
-        .map(|out| out.stdout)
-        .unwrap_or_default();
+    let output = Command::new("sh").arg("-c").arg(cmd).output()?;
 
-    String::from_utf8_lossy(&output).trim().to_string()
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(std::io::Error::other(format!(
+            "Command '{}' exited with {}: {}",
+            cmd,
+            output.status,
+            stderr.trim(),
+        )))
+    }
+}
+
+/// Run a shell command and return trimmed stdout (legacy).
+///
+/// Returns an empty string on failure and logs a warning to stderr.
+/// Prefer [`run_cmd_result`] for new code — it lets callers distinguish
+/// "command failed" from "command returned empty string."
+///
+/// # Input
+///
+/// `cmd` — A shell command string (must be a hardcoded literal — see module docs).
+///
+/// # Output
+///
+/// Trimmed stdout on success, empty string on failure (with stderr warning).
+///
+/// # Safety
+///
+/// **CRITICAL:** Only use with hardcoded, trusted command strings.
+/// Never interpolate user input, file paths, or any external data into `cmd`.
+#[must_use]
+pub fn run_cmd(cmd: &str) -> String {
+    match run_cmd_result(cmd) {
+        Ok(stdout) => stdout,
+        Err(e) => {
+            eprintln!("[runtimo] run_cmd failed — {} — cmd: {}", e, cmd);
+            String::new()
+        }
+    }
 }
 
 #[cfg(test)]

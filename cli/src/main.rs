@@ -182,19 +182,24 @@ fn backup_dir() -> PathBuf {
     runtimo_core::utils::backup_dir()
 }
 
-fn make_registry() -> CapabilityRegistry {
+/// Creates a capability registry with all built-in capabilities registered.
+///
+/// # Returns
+///
+/// `Ok(CapabilityRegistry)` — All capabilities registered successfully.
+/// `Err(String)` — FileWrite or GitExec initialization failed (e.g. backup
+/// directory cannot be created).
+fn make_registry() -> Result<CapabilityRegistry, String> {
     let mut reg = CapabilityRegistry::new();
     reg.register(FileRead);
-    #[allow(clippy::expect_used)] // BUG-4: make_registry should return Result
     reg.register(
-        FileWrite::new(backup_dir()).expect("BUG-4: make_registry should return Result, tracked"),
+        FileWrite::new(backup_dir()).map_err(|e| format!("FileWrite init failed: {}", e))?,
     );
-    #[allow(clippy::expect_used)] // GitExec construction failure should be propagated
-    reg.register(GitExec::new(backup_dir()).expect("Failed to create GitExec capability"));
+    reg.register(GitExec::new(backup_dir()).map_err(|e| format!("GitExec init failed: {}", e))?);
     reg.register(ShellExec);
     reg.register(Kill);
     reg.register(Undo);
-    reg
+    Ok(reg)
 }
 
 // Concurrency control for CLI run — mirrors daemon's MAX_CONCURRENT_JOBS = 16
@@ -408,7 +413,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             schema,
             timeout,
         } => {
-            let reg = make_registry();
+            let reg = make_registry().map_err(|e| format!("Registry init failed: {}", e))?;
             if schema {
                 if let Some(cap) = reg.get(&capability) {
                     println!("{}", cap.schema());
@@ -576,7 +581,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
 
         Commands::List { schemas, json } => {
-            let reg = make_registry();
+            let reg = make_registry().map_err(|e| format!("Registry init failed: {}", e))?;
             if json {
                 let caps: Vec<Value> = reg.list().iter().map(|name| {
                     if let Some(cap) = reg.get(name) {
@@ -812,7 +817,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
 
         Commands::Undo { job_id, dry_run } => {
-            let reg = make_registry();
+            let reg = make_registry().map_err(|e| format!("Registry init failed: {}", e))?;
             let cap = reg.get("Undo").ok_or("Undo capability not available")?;
             let args = serde_json::json!({ "job_id": job_id });
             let ctx = runtimo_core::Context {
@@ -921,7 +926,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 // Zombies can't be killed — they're already dead. We kill their
                 // parent instead, which causes the kernel to reap the zombie.
                 // Kill capability protects init (PID 1) and self.
-                let reg = make_registry();
+                let reg = make_registry().map_err(|e| format!("Registry init failed: {}", e))?;
                 let killer = reg.get("Kill").ok_or("Kill capability not available")?;
                 let mut unique_parents: std::collections::HashSet<u32> = zombies
                     .iter()

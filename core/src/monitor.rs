@@ -272,8 +272,8 @@ impl HealthMonitor {
 /// Accepts raw telemetry strings like "16Gi" (total) and "13Gi" (free).
 /// Returns used percentage: ((total - free) / total) * 100.
 fn parse_ram_percent(ram_total: &str, ram_free: &str) -> f32 {
-    let total_val = parse_size_value(ram_total.trim());
-    let free_val = parse_size_value(ram_free.trim());
+    let total_val = parse_size_value(ram_total.trim()).unwrap_or(0.0);
+    let free_val = parse_size_value(ram_free.trim()).unwrap_or(0.0);
 
     if total_val > 0.0 {
         ((total_val - free_val) / total_val) * 100.0
@@ -283,34 +283,41 @@ fn parse_ram_percent(ram_total: &str, ram_free: &str) -> f32 {
 }
 
 /// Parses a size string (e.g., "13Gi", "512Mi", "16384MB") into a numeric value in GB.
-fn parse_size_value(size_str: &str) -> f32 {
+///
+/// # Input
+///
+/// `size_str` — A size string with suffix (`Gi`, `Mi`, `Ki`, `GB`, `MB`).
+///
+/// # Output
+///
+/// `Some(f32)` — Parsed value in GB.
+/// `None` — Unrecognized suffix or non-numeric prefix (e.g. empty string, "invalid").
+fn parse_size_value(size_str: &str) -> Option<f32> {
     let size_str = size_str.trim();
     if size_str.ends_with("Gi") {
-        size_str.trim_end_matches("Gi").parse().unwrap_or(0.0)
+        size_str.trim_end_matches("Gi").parse().ok()
     } else if size_str.ends_with("Mi") {
-        #[allow(clippy::map_unwrap_or)] // parse::<f32>().unwrap_or(0.0) is idiomatic for fallback
         size_str
             .trim_end_matches("Mi")
             .parse::<f32>()
+            .ok()
             .map(|v| v / 1024.0)
-            .unwrap_or(0.0)
     } else if size_str.ends_with("Ki") {
         size_str
             .trim_end_matches("Ki")
             .parse::<f32>()
-            .map_or(0.0, |v| v / (1024.0 * 1024.0))
+            .ok()
+            .map(|v| v / (1024.0 * 1024.0))
     } else if size_str.ends_with("MB") {
         size_str
             .trim_end_matches("MB")
             .parse::<f32>()
-            .map_or(0.0, |v| v / 1000.0)
+            .ok()
+            .map(|v| v / 1000.0)
     } else if size_str.ends_with("GB") {
-        size_str
-            .trim_end_matches("GB")
-            .parse::<f32>()
-            .unwrap_or(0.0)
+        size_str.trim_end_matches("GB").parse::<f32>().ok()
     } else {
-        0.0
+        None
     }
 }
 
@@ -416,8 +423,8 @@ mod tests {
 
     #[test]
     fn test_parse_size_value() {
-        assert!((parse_size_value("13Gi") - 13.0).abs() < 0.01);
-        assert!((parse_size_value("512Mi") - 0.5).abs() < 0.01);
-        assert_eq!(parse_size_value("invalid"), 0.0);
+        assert!((parse_size_value("13Gi").unwrap() - 13.0).abs() < 0.01);
+        assert!((parse_size_value("512Mi").unwrap() - 0.5).abs() < 0.01);
+        assert_eq!(parse_size_value("invalid"), None);
     }
 }
