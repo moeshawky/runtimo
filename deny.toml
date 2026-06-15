@@ -2,7 +2,7 @@
 # https://EmbarkStudios.github.io/cargo-deny/
 
 [advisories]
-unmaintained = "deny"
+unmaintained = "all"
 yanked = "deny"
 # RUSTSEC-2024-0375: `dirs` is unmaintained — transitive via llmosafe → dirs.
 # Not directly depended on; no fix is possible without upstream changes.
