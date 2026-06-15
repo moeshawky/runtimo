@@ -5,6 +5,100 @@ All notable changes to Runtimo are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-06-15
+
+### Changed
+
+- **Telemetry redesigned as passive lens** — all service guessing and shell-out commands
+  removed. Telemetry is now a pure observer: every field backed by a direct `/proc` or `/sys`
+  read. No `pgrep`, no `ss`, no `free`, no `uptime -p`. The telemetry JSON schema has changed.
+  (`core/src/telemetry.rs`)
+
+### Added
+
+- **`cpu_count` field** — number of CPU cores from `/proc/cpuinfo`. (`core/src/telemetry.rs`)
+- **`ram_available` field** — `MemAvailable` from `/proc/meminfo`, showing actual usable RAM
+  (previously only `MemFree` was shown, which excluded reclaimable buffers/cache and was
+  misleading on modern kernels). (`core/src/telemetry.rs`)
+- **`uptime_seconds` field** — machine-parseable uptime from `/proc/uptime`. (`core/src/telemetry.rs`)
+- **`listening_ports` field** — raw TCP listening ports from `/proc/net/tcp` + `tcp6`.
+  Replaces the old `detected_services` field which used a hardcoded 6-service port-to-name
+  table and missed 7 out of 8 real services. (`core/src/telemetry.rs`)
+- **`tunnel_pid` field** — cloudflared PID from `/proc/*/comm` scan, eliminating the
+  `pgrep -fa cloudflared` self-match false positive (the observer no longer contaminates
+  the measurement). (`core/src/telemetry.rs`)
+
+### Removed
+
+- **`ServiceInfo` struct** — deleted. Service-to-port guessing was fundamentally incomplete.
+- **`DetectedService` struct** — deleted.
+- **`detected_services` field** — replaced by `listening_ports`.
+- **`detect_service_for_port()` function** — deleted. The 6-port lookup table (SSH, HTTP,
+  HTTPS, MySQL, PostgreSQL, Redis, MongoDB) is now the consumer's responsibility.
+- **`detect_version()` function** — deleted. Version detection via shell-out removed.
+- **`parse_ss_output()` function** — deleted. >50 lines of fragile positional `ss -ltnp` parsing.
+- **`tunnel_name` field** — replaced by `tunnel_pid`.
+- **All `pgrep`, `free`, `cat /proc/cpuinfo`, `ss` shell-outs** — replaced with direct
+  `/proc` file reads.
+
+### Fixed
+
+- **#1: cloudflared self-detection** — `pgrep -fa cloudflared` matched its own `sh -c`
+  wrapper, producing a guaranteed false positive. Now fixed by reading `/proc/*/comm`
+  (process name only, max 16 chars — never contains shell command lines).
+  Same bug class as v0.4.0 vLLM fix (CHANGELOG v0.4.0: "vllm service hallucination").
+- **#2: 7/8 services not detected** — hardcoded 6-port table replaced with raw
+  `/proc/net/tcp` + `tcp6` parser that returns ALL listening ports.
+- **#3: RAM misleadingly low** — `MemFree` (642Mi) falsely implied 97% RAM used when
+  `MemAvailable` was 23Gi. Both values now shown.
+- **#4: Load average without CPU context** — load line now shows CPU count.
+- **#5: Uptime human-only** — `uptime_seconds: u64` field added, machine-parseable.
+
+### Security
+
+- **Telemetry opt-in gating** — telemetry capture now checks `Config::telemetry_enabled()`
+  before executing any network-dependent operation (public IP lookup, tunnel detection).
+  Off by default; no data leaves the system without explicit user consent.
+  (`core/src/executor.rs`)
+- **ShellExec blocklist hardened** — `chown`, `mount`, `iptables`, `nftables`, `ip`,
+  `route`, `ifconfig`, `wget`, and `curl` added to the dangerous-command blocklist.
+  PATH sanitization prevents LD_PRELOAD-based bypass. (`core/src/capabilities/shell_exec.rs`)
+
+## [0.6.5] - 2026-06-15
+
+### Security
+
+- **Telemetry opt-in gating** — telemetry no longer leaks public IP without explicit consent.
+  `Config::telemetry_enabled()` gate added to `execute_with_telemetry()`.
+  (`core/src/executor.rs`, `core/src/telemetry.rs`)
+- **ShellExec hardened** — network commands blocked unless `--allow-network` flag set.
+  PATH sanitized to prevent `LD_PRELOAD` bypass. Dangerous command blocklist:
+  `chown`, `mount`, `umount`, `iptables`, `nftables`, `wget`, `curl`.
+  (`core/src/capabilities/shell_exec.rs`)
+
+### Fixed
+
+- **GitExec branch validation** — operations limited to allowed branches only.
+  (`core/src/capabilities/git_exec.rs`)
+- **`data_dir()` no longer falls back to `/tmp`** — uses `dirs::data_dir()` with
+  hard error on failure instead of `/tmp` fallback. (`core/src/lib.rs`)
+- **`deny.toml` silent no-op** — `unmaintained = "warn"` invalid for cargo-deny >=0.18.
+  Replaced with `unsound = "deny"`, `unmaintained = "deny"`, `yanked = "deny"`.
+  The old config produced a parse error that CI swallowed, so dependency auditing
+  hadn't actually been running for months. (`deny.toml`)
+- **Cargo.lock version mismatch** — workspace members now consistent with root
+  version. (`Cargo.lock`)
+- **Binary collision fix** — `daemon/src/main.rs` deleted; the CLI crate already
+  bundles the daemon binary via `src/daemon_bin.rs`. The duplicate `main.rs` caused
+  implicit Cargo binary detection collision. (`daemon/src/main.rs` removed)
+
+### Removed
+
+- **Dead code** — `SchemaValidator` struct and `run_git()` function removed.
+  (`core/src/schema.rs`, `core/src/lib.rs`)
+- **Unnecessary clones** — `clone()` calls eliminated in executor dispatch path.
+  (`core/src/executor.rs`)
+
 ## [0.6.4] - 2026-06-09
 
 ### Changed

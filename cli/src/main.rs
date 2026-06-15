@@ -829,21 +829,34 @@ fn main() -> Result<(), Box<dyn Error>> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&tel)?);
             } else {
+                // Listening ports: comma-separated list or "none"
+                let ports_str = if tel.network.listening_ports.is_empty() {
+                    "none".to_string()
+                } else {
+                    tel.network
+                        .listening_ports
+                        .iter()
+                        .map(|p| p.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
                 let text = format!(
-                    "RUNTIMO TELEMETRY\n\nSystem\nCPU: {}\nRAM: {} total, {} free\nDisk: {} total, {} free ({}% used)\nUptime: {}\nLoad: {}\n\nHardware\nAccelerators: {}\n\nServices\n{}\n\nNetwork\nPublic IP: {}\nTunnel: {}",
-                    tel.system.cpu_model,
-                    tel.system.ram_total, tel.system.ram_free,
+                    "RUNTIMO TELEMETRY\n\nSystem\nCPU: {} ({} cores)\nRAM: {} total, {} free, {} available\nDisk: {} total, {} free ({}% used)\nUptime: {} ({}s)\nLoad: {} ({} cores)\n\nHardware\nAccelerators: {}\n\nNetwork\nPublic IP: {}\nTunnel: {}\nListening ports: {}",
+                    tel.system.cpu_model, tel.system.cpu_count,
+                    tel.system.ram_total, tel.system.ram_free, tel.system.ram_available,
                     tel.system.disk_total, tel.system.disk_free, tel.system.disk_used_percent,
-                    tel.system.uptime,
-                    tel.system.load_average,
+                    tel.system.uptime, tel.system.uptime_seconds,
+                    tel.system.load_average, tel.system.cpu_count,
                     if tel.hardware.accelerators.is_empty() { "none".into() } else {
                         tel.hardware.accelerators.iter().map(|a| format!("{}: {}x", a.kind, a.count)).collect::<Vec<_>>().join(", ")
                     },
-                    if tel.services.detected_services.is_empty() { "none detected".into() } else {
-                        tel.services.detected_services.iter().map(|s| format!("{}: {} {}", s.name, s.version.as_deref().unwrap_or("?"), if s.running { "running" } else { "stopped" })).collect::<Vec<_>>().join(", ")
-                    },
                     tel.network.public_ip,
-                    if tel.network.tunnel_running { "running" } else { "not running" },
+                    if tel.network.tunnel_running {
+                        format!("cloudflared (PID {})", tel.network.tunnel_pid.map_or_else(|| "?".to_string(), |p| p.to_string()))
+                    } else {
+                        "none".to_string()
+                    },
+                    ports_str,
                 );
                 println!("{}", wall_to_markdown(&text));
             }
@@ -986,4 +999,254 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    // ── CLI Argument Parsing (GAP 3) ─────────────────────────────────
+
+    #[test]
+    fn test_cli_parse_run_command() {
+        let args = vec![
+            "runtimo",
+            "run",
+            "-c",
+            "FileRead",
+            "-a",
+            "{\"path\":\"/tmp/test.txt\"}",
+        ];
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command {
+            Commands::Run {
+                capability,
+                args,
+                dry_run,
+                ..
+            } => {
+                assert_eq!(capability, "FileRead");
+                assert_eq!(args, "{\"path\":\"/tmp/test.txt\"}");
+                assert!(!dry_run);
+            }
+            _ => panic!("Expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_run_with_flags() {
+        let args = vec![
+            "runtimo",
+            "run",
+            "-c",
+            "ShellExec",
+            "-a",
+            "{\"cmd\":\"echo hello\"}",
+            "--dry-run",
+            "--json",
+            "--timeout",
+            "10",
+        ];
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command {
+            Commands::Run {
+                capability,
+                dry_run,
+                json,
+                quiet,
+                timeout,
+                ..
+            } => {
+                assert_eq!(capability, "ShellExec");
+                assert!(dry_run);
+                assert!(json);
+                assert!(!quiet);
+                assert_eq!(timeout, 10);
+            }
+            _ => panic!("Expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_dispatch_command() {
+        let args = vec![
+            "runtimo",
+            "dispatch",
+            "-c",
+            "FileWrite",
+            "-a",
+            "{\"path\":\"/tmp/x.txt\",\"content\":\"bg\"}",
+        ];
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command {
+            Commands::Dispatch {
+                capability,
+                args,
+                dry_run,
+            } => {
+                assert_eq!(capability, "FileWrite");
+                assert!(!dry_run);
+                // Verify args was captured (not empty)
+                assert!(!args.is_empty(), "Dispatch args should not be empty");
+                // Verify args contains the expected content field
+                assert!(
+                    args.contains("\"content\":\"bg\""),
+                    "Args should contain content:bg, got: {}",
+                    args
+                );
+            }
+            _ => panic!("Expected Dispatch command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_list_command() {
+        let args = vec!["runtimo", "list"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(matches!(cli.command, Commands::List { .. }));
+    }
+
+    #[test]
+    fn test_cli_parse_telemetry_command() {
+        let args = vec!["runtimo", "telemetry", "--json"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command {
+            Commands::Telemetry { json } => assert!(json),
+            _ => panic!("Expected Telemetry command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_invalid_command() {
+        let args = vec!["runtimo", "nonexistent_command"];
+        let result = Cli::try_parse_from(args);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cli_parse_missing_required_arg() {
+        // 'run' requires -c (capability) — should fail without it
+        let args = vec!["runtimo", "run"];
+        let result = Cli::try_parse_from(args);
+        assert!(result.is_err());
+    }
+
+    // ── MAX_CLI_CONCURRENT Slot Enforcement (GAP 3) ──────────────────
+
+    #[test]
+    fn test_acquire_cli_slot_under_limit() {
+        // Reset counter for test isolation
+        CLI_ACTIVE_JOBS.store(0, Ordering::Relaxed);
+
+        let mut successes = 0;
+        for _ in 0..MAX_CLI_CONCURRENT {
+            if acquire_cli_slot() {
+                successes += 1;
+            }
+        }
+        assert_eq!(
+            successes, MAX_CLI_CONCURRENT,
+            "Should acquire all {} slots",
+            MAX_CLI_CONCURRENT
+        );
+
+        // Release all
+        for _ in 0..MAX_CLI_CONCURRENT {
+            release_cli_slot();
+        }
+    }
+
+    #[test]
+    fn test_acquire_cli_slot_over_limit() {
+        // Reset counter
+        CLI_ACTIVE_JOBS.store(0, Ordering::Relaxed);
+
+        // Acquire all slots
+        for _ in 0..MAX_CLI_CONCURRENT {
+            assert!(acquire_cli_slot(), "Should acquire slot");
+        }
+
+        // Next acquisition should fail
+        assert!(!acquire_cli_slot(), "Should reject when at limit");
+
+        // Release all
+        for _ in 0..MAX_CLI_CONCURRENT {
+            release_cli_slot();
+        }
+    }
+
+    #[test]
+    fn test_release_cli_slot_after_acquire() {
+        CLI_ACTIVE_JOBS.store(0, Ordering::Relaxed);
+
+        assert!(acquire_cli_slot());
+        assert_eq!(CLI_ACTIVE_JOBS.load(Ordering::Relaxed), 1);
+
+        release_cli_slot();
+        assert_eq!(CLI_ACTIVE_JOBS.load(Ordering::Relaxed), 0);
+
+        // Should be able to acquire again
+        assert!(acquire_cli_slot());
+        release_cli_slot();
+    }
+
+    // ── Flock Coordination (GAP 3) ───────────────────────────────────
+
+    #[test]
+    fn test_acquire_daemon_lock_creates_file() {
+        // Override XDG_DATA_HOME to use temp dir
+        let tmp = std::env::temp_dir().join("runtimo_cli_lock_test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::set_var("XDG_DATA_HOME", &tmp);
+
+        let result = acquire_daemon_lock();
+        // Should succeed since no other process holds the lock (NB mode)
+        assert!(
+            result.is_ok(),
+            "acquire_daemon_lock failed: {:?}",
+            result.err()
+        );
+
+        let lock_path = daemon_lock_path();
+        assert!(
+            lock_path.exists(),
+            "Lock file should exist at {}",
+            lock_path.display()
+        );
+
+        // Drop the lock to release it
+        drop(result.unwrap());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("XDG_DATA_HOME");
+    }
+
+    #[test]
+    fn test_daemon_lock_path_format() {
+        let lock_path = daemon_lock_path();
+        // Should end with daemon.lock
+        let path_str = lock_path.to_string_lossy();
+        assert!(
+            path_str.ends_with("daemon.lock"),
+            "Lock path should end with daemon.lock: {}",
+            path_str
+        );
+        assert!(
+            path_str.contains("runtimo"),
+            "Lock path should contain runtimo: {}",
+            path_str
+        );
+    }
+
+    #[test]
+    fn test_daemon_socket_path_format() {
+        let sock_path = daemon_socket();
+        let path_str = sock_path.to_string_lossy();
+        assert!(
+            path_str.ends_with("runtimo.sock"),
+            "Socket should end with runtimo.sock: {}",
+            path_str
+        );
+    }
 }

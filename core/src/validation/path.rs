@@ -201,6 +201,10 @@ fn path_in_prefix(path: &str, prefix: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Mutex to serialize tests that set `RUNTIMO_ALLOWED_PATHS` env var.
+    static PATH_ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn rejects_empty_path() {
@@ -267,6 +271,7 @@ mod tests {
 
     #[test]
     fn env_var_extends_allowed_prefixes() {
+        let _guard = PATH_ENV_MUTEX.lock().unwrap();
         // /srv is not in defaults, should be rejected
         let ctx = PathContext {
             require_exists: false,

@@ -850,4 +850,136 @@ mod tests {
         assert!(truncated.len() < 1100);
         assert!(truncated.ends_with("...[truncated]"));
     }
+
+    // ── GAP 9: WAL recovery from truncated file ──────────────────────
+
+    #[test]
+    fn test_wal_recovers_from_truncated_last_line() {
+        let path = tmp_wal("truncated");
+        let _ = std::fs::remove_file(&path);
+
+        // Write valid events
+        let mut wal = WalWriter::create(&path).unwrap();
+        wal.append(WalEvent {
+            seq: 0,
+            ts: 1000,
+            event_type: WalEventType::JobStarted,
+            job_id: "job1".into(),
+            capability: None,
+            output: None,
+            error: None,
+            telemetry_before: None,
+            telemetry_after: None,
+            process_before: None,
+            process_after: None,
+            cmd: None,
+            cmd_stdout: None,
+            cmd_stderr: None,
+            cmd_exit_code: None,
+            cmd_corrected: None,
+            ..Default::default()
+        })
+        .unwrap();
+
+        // Append a valid second event
+        wal.append(WalEvent {
+            seq: 1,
+            ts: 1001,
+            event_type: WalEventType::JobCompleted,
+            job_id: "job1".into(),
+            capability: None,
+            output: None,
+            error: None,
+            telemetry_before: None,
+            telemetry_after: None,
+            process_before: None,
+            process_after: None,
+            cmd: None,
+            cmd_stdout: None,
+            cmd_stderr: None,
+            cmd_exit_code: None,
+            cmd_corrected: None,
+            ..Default::default()
+        })
+        .unwrap();
+
+        // Verify 2 events exist
+        let reader_before = WalReader::load(&path).unwrap();
+        assert_eq!(reader_before.events().len(), 2);
+
+        // Simulate a crash by appending a partial line (truncated JSON)
+        // Open file in append mode without WalWriter to write raw bytes
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        // Write a partial JSON line (no newline, incomplete object)
+        file.write_all(b"{\"seq\":2,\"ts\":1002,\"type\":\"job_started\",\"job_id\":\"truncated")
+            .unwrap();
+        file.flush().unwrap();
+
+        // Now load again — should skip the truncated last line and still read 2 valid events
+        let reader_after = WalReader::load(&path).unwrap();
+        assert_eq!(
+            reader_after.events().len(),
+            2,
+            "Should skip truncated last line and read 2 valid events, got {}",
+            reader_after.events().len()
+        );
+        assert_eq!(reader_after.events()[0].job_id, "job1");
+        assert_eq!(reader_after.events()[1].job_id, "job1");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_wal_skips_garbage_lines() {
+        let path = tmp_wal("garbage");
+        let _ = std::fs::remove_file(&path);
+
+        // Write one valid event followed by a garbage line
+        let mut wal = WalWriter::create(&path).unwrap();
+        wal.append(WalEvent {
+            seq: 0,
+            ts: 1000,
+            event_type: WalEventType::JobStarted,
+            job_id: "valid".into(),
+            capability: None,
+            output: None,
+            error: None,
+            telemetry_before: None,
+            telemetry_after: None,
+            process_before: None,
+            process_after: None,
+            cmd: None,
+            cmd_stdout: None,
+            cmd_stderr: None,
+            cmd_exit_code: None,
+            cmd_corrected: None,
+            ..Default::default()
+        })
+        .unwrap();
+
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"not valid json at all\n").unwrap();
+        file.write_all(b"{\"seq\":999,\"type\":\"garbage\"}\n")
+            .unwrap(); // partial, missing required fields
+        file.flush().unwrap();
+
+        let reader = WalReader::load(&path).unwrap();
+        assert_eq!(
+            reader.events().len(),
+            1,
+            "Should only find 1 valid event, got {}",
+            reader.events().len()
+        );
+        assert_eq!(reader.events()[0].job_id, "valid");
+
+        let _ = std::fs::remove_file(&path);
+    }
 }

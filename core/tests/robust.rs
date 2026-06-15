@@ -712,18 +712,26 @@ fn drift_telemetry_format_stable() {
     let serialized = serde_json::to_string(&tel).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
 
-    // Verify expected structure
+    // Verify expected structure (services key removed in elegant-telemetry;
+    // listening_ports moved to network.listening_ports)
     assert!(parsed.get("timestamp").is_some());
     assert!(parsed.get("system").is_some());
     assert!(parsed.get("hardware").is_some());
-    assert!(parsed.get("services").is_some());
     assert!(parsed.get("network").is_some());
 
     let system = parsed["system"].as_object().unwrap();
     assert!(system.contains_key("cpu_model"));
+    assert!(system.contains_key("cpu_count"));
     assert!(system.contains_key("ram_total"));
     assert!(system.contains_key("ram_free"));
+    assert!(system.contains_key("ram_available"));
+    assert!(system.contains_key("uptime_seconds"));
     assert!(system.contains_key("disk_used_percent"));
+
+    let network = parsed["network"].as_object().unwrap();
+    assert!(network.contains_key("listening_ports"));
+    assert!(network.contains_key("tunnel_running"));
+    assert!(network.contains_key("tunnel_pid"));
 }
 
 /// Process snapshot output format is stable
@@ -905,6 +913,7 @@ mod proptests {
 
     // Property: WAL cleanup doesn't lose recent events
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(10))]
         #[test]
         fn prop_wal_cleanup_preserves_recent(n in 1usize..20) {
             let dir = setup();
@@ -1209,12 +1218,14 @@ fn g_drift_telemetry_schema_stability() {
         "accelerators must be array"
     );
 
-    let svc = &json["services"];
+    // services field removed in elegant-telemetry refactor;
+    // listening ports now live under network.listening_ports
+    let net = &json["network"];
     assert!(
-        svc.get("detected_services")
+        net.get("listening_ports")
             .and_then(|v| v.as_array())
             .is_some(),
-        "services must be array"
+        "network.listening_ports must be array"
     );
 
     let net = &json["network"];

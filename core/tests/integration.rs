@@ -1328,3 +1328,181 @@ fn test_dal_a_high_risk_rejection() {
 
     cleanup(&dir);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GAP 2: Daemon dispatch tests (integration-level)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Test RunParams deserialization (mirrors daemon/engine.rs RunParams struct).
+/// The actual struct is in the daemon crate; we test the same fields here
+/// to verify serialization contract.
+#[derive(Debug, serde::Deserialize)]
+struct RunParams {
+    capability: String,
+    #[serde(default)]
+    args: serde_json::Value,
+    #[serde(default)]
+    dry_run: bool,
+    #[serde(default)]
+    working_dir: Option<String>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+#[test]
+fn test_run_params_deserialization_all_fields() {
+    let json = serde_json::json!({
+        "capability": "FileRead",
+        "args": {"path": "/tmp/test.txt"},
+        "dry_run": true,
+        "working_dir": "/home/user",
+        "timeout_secs": 60
+    });
+    let params: RunParams = serde_json::from_value(json).unwrap();
+    assert_eq!(params.capability, "FileRead");
+    assert_eq!(params.args["path"], "/tmp/test.txt");
+    assert!(params.dry_run);
+    assert_eq!(params.working_dir.as_deref(), Some("/home/user"));
+    assert_eq!(params.timeout_secs, Some(60));
+}
+
+#[test]
+fn test_run_params_deserialization_minimal() {
+    let json = serde_json::json!({
+        "capability": "ShellExec"
+    });
+    let params: RunParams = serde_json::from_value(json).unwrap();
+    assert_eq!(params.capability, "ShellExec");
+    // When args is absent, serde default for Value is Null
+    assert!(!params.dry_run);
+    assert!(params.working_dir.is_none());
+    assert!(params.timeout_secs.is_none());
+}
+
+#[test]
+fn test_run_params_deserialization_empty_object() {
+    // Missing required "capability" field should fail
+    let json = serde_json::json!({});
+    let result: Result<RunParams, _> = serde_json::from_value(json);
+    assert!(
+        result.is_err(),
+        "Missing capability should fail deserialization"
+    );
+}
+
+/// Concurrent dispatch job ID uniqueness.
+#[test]
+fn test_concurrent_job_id_uniqueness() {
+    use runtimo_core::JobId;
+    use std::sync::{Arc, Mutex};
+
+    let ids = Arc::new(Mutex::new(Vec::new()));
+    let mut handles = vec![];
+
+    for _ in 0..8 {
+        let ids = Arc::clone(&ids);
+        handles.push(std::thread::spawn(move || {
+            for _ in 0..25 {
+                let id = JobId::new();
+                ids.lock().unwrap().push(id.as_str().to_string());
+            }
+        }));
+    }
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let all_ids = ids.lock().unwrap();
+    let mut seen = std::collections::HashSet::new();
+    for id in all_ids.iter() {
+        assert!(
+            seen.insert(id.clone()),
+            "Duplicate job ID across threads: {}",
+            id
+        );
+    }
+    assert_eq!(seen.len(), 200, "All 8*25=200 IDs should be unique");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GAP 8: WAL events ordering invariant
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_wal_events_started_before_completed() {
+    // Multiple sequential executions — verify every JobStarted precedes its JobCompleted
+    let dir = setup();
+    let wp = wal_path(&dir);
+    let p = make_file(&dir, "order.txt", "ordering test");
+
+    for _ in 0..5 {
+        execute_with_telemetry(&FileRead, &json!({"path": p.to_str().unwrap()}), false, &wp)
+            .unwrap();
+    }
+
+    let reader = WalReader::load(&wp).unwrap();
+    let events = reader.events();
+
+    // Verify for each job: Started event seq < Completed event seq
+    let mut job_starts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for event in events {
+        match event.event_type {
+            WalEventType::JobStarted => {
+                job_starts.insert(event.job_id.clone(), event.seq);
+            }
+            WalEventType::JobCompleted => {
+                if let Some(&start_seq) = job_starts.get(&event.job_id) {
+                    assert!(
+                        start_seq < event.seq,
+                        "JobStarted (seq {}) must precede JobCompleted (seq {}) for job {}",
+                        start_seq,
+                        event.seq,
+                        event.job_id
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(!job_starts.is_empty(), "Should have found job start events");
+
+    cleanup(&dir);
+}
+
+#[test]
+fn test_wal_events_monotonic_sequence() {
+    // Verify all WAL event sequence numbers are strictly increasing
+    let dir = setup();
+    let wp = wal_path(&dir);
+    let p = make_file(&dir, "seq.txt", "seq test");
+
+    execute_with_telemetry(&FileRead, &json!({"path": p.to_str().unwrap()}), false, &wp).unwrap();
+
+    let fw = FileWrite::new(backup_dir(&dir)).unwrap();
+    execute_with_telemetry(
+        &fw,
+        &json!({"path": dir.join("seq_out.txt").to_str().unwrap(), "content": "test"}),
+        false,
+        &wp,
+    )
+    .unwrap();
+
+    execute_with_telemetry(&FileRead, &json!({"path": p.to_str().unwrap()}), false, &wp).unwrap();
+
+    let reader = WalReader::load(&wp).unwrap();
+    let events = reader.events();
+    assert!(events.len() >= 6, "Should have at least 6 events");
+
+    for i in 1..events.len() {
+        assert!(
+            events[i].seq > events[i - 1].seq,
+            "WAL seq not monotonic: {} <= {} at index {}",
+            events[i].seq,
+            events[i - 1].seq,
+            i
+        );
+    }
+
+    cleanup(&dir);
+}

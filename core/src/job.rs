@@ -181,3 +181,137 @@ impl Job {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_job_state_valid_transitions() {
+        let mut job = Job::new("FileRead".into(), json!({"path": "/tmp/x"}), false);
+        assert_eq!(job.state, JobState::Pending);
+
+        // Valid transitions: Pending → Validating → Validated → Executing → Completed
+        job.transition_to(JobState::Validating).unwrap();
+        assert_eq!(job.state, JobState::Validating);
+
+        job.transition_to(JobState::Validated).unwrap();
+        assert_eq!(job.state, JobState::Validated);
+
+        job.transition_to(JobState::Executing).unwrap();
+        assert_eq!(job.state, JobState::Executing);
+
+        job.transition_to(JobState::Completed).unwrap();
+        assert_eq!(job.state, JobState::Completed);
+
+        // Completed → RolledBack is valid
+        job.transition_to(JobState::RolledBack).unwrap();
+        assert_eq!(job.state, JobState::RolledBack);
+    }
+
+    #[test]
+    fn test_job_state_invalid_transitions() {
+        let mut job = Job::new("FileRead".into(), json!({"path": "/tmp/x"}), false);
+
+        // Pending → Executing is invalid (skip Validating, Validated)
+        let result = job.transition_to(JobState::Executing);
+        assert!(result.is_err(), "Pending → Executing should be invalid");
+        assert_eq!(job.state, JobState::Pending); // state unchanged
+
+        // Pending → Completed is invalid
+        let result = job.transition_to(JobState::Completed);
+        assert!(result.is_err(), "Pending → Completed should be invalid");
+
+        // Transition normally then test reverse
+        job.transition_to(JobState::Validating).unwrap();
+        job.transition_to(JobState::Validated).unwrap();
+        job.transition_to(JobState::Executing).unwrap();
+        job.transition_to(JobState::Completed).unwrap();
+
+        // Completed → Executing is invalid (can't go backwards)
+        let result = job.transition_to(JobState::Executing);
+        assert!(result.is_err(), "Completed → Executing should be invalid");
+        assert_eq!(job.state, JobState::Completed);
+
+        // Completed → Validated is invalid
+        let result = job.transition_to(JobState::Validated);
+        assert!(result.is_err(), "Completed → Validated should be invalid");
+    }
+
+    #[test]
+    fn test_job_id_uniqueness() {
+        // Generate many IDs and verify they are all unique
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let id = JobId::new();
+            let s = id.as_str().to_string();
+            assert!(!s.is_empty(), "JobId should not be empty");
+            assert_eq!(s.len(), 32, "JobId should be 32 hex chars for urandom mode");
+            assert!(
+                seen.insert(s),
+                "JobId collision detected after {} IDs",
+                seen.len()
+            );
+        }
+        assert_eq!(seen.len(), 100);
+    }
+
+    #[test]
+    fn test_job_id_format() {
+        let id = JobId::new();
+        let s = id.as_str();
+        // Should be hex characters only
+        assert!(
+            s.chars().all(|c| c.is_ascii_hexdigit()),
+            "JobId must be hex: {}",
+            s
+        );
+    }
+
+    #[test]
+    fn test_job_state_failed_paths() {
+        // Validating → Failed
+        let mut job = Job::new("ShellExec".into(), json!({"cmd": "bad"}), false);
+        job.transition_to(JobState::Validating).unwrap();
+        job.transition_to(JobState::Failed).unwrap();
+        assert_eq!(job.state, JobState::Failed);
+
+        // Executing → Failed
+        let mut job2 = Job::new("ShellExec".into(), json!({"cmd": "bad"}), false);
+        job2.transition_to(JobState::Validating).unwrap();
+        job2.transition_to(JobState::Validated).unwrap();
+        job2.transition_to(JobState::Executing).unwrap();
+        job2.transition_to(JobState::Failed).unwrap();
+        assert_eq!(job2.state, JobState::Failed);
+    }
+
+    #[test]
+    fn test_job_timestamps() {
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let job = Job::new("FileRead".into(), json!({}), false);
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        assert!(job.created_at >= before);
+        assert!(job.created_at <= after);
+        assert_eq!(job.created_at, job.updated_at); // same at creation
+    }
+
+    #[test]
+    fn test_job_transition_updates_timestamp() {
+        let mut job = Job::new("FileRead".into(), json!({}), false);
+        let created = job.updated_at;
+
+        // Sleep a tiny bit to ensure timestamp changes
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        job.transition_to(JobState::Validating).unwrap();
+        assert!(job.updated_at >= created);
+    }
+}

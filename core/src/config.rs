@@ -108,6 +108,11 @@ impl RuntimoConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Mutex to serialize config tests that set XDG_CONFIG_HOME.
+    /// Without this, concurrent tests fight over the process-global env var.
+    static CONFIG_TEST_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn config_path_is_absolute() {
@@ -117,6 +122,7 @@ mod tests {
 
     #[test]
     fn load_returns_defaults_when_no_file() {
+        let _guard = CONFIG_TEST_MUTEX.lock().unwrap();
         let tmp = std::env::temp_dir().join("runtimo_test_config_defaults");
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::set_var("XDG_CONFIG_HOME", &tmp);
@@ -138,6 +144,7 @@ mod tests {
 
     #[test]
     fn save_and_load_roundtrip() {
+        let _guard = CONFIG_TEST_MUTEX.lock().unwrap();
         // Use a temp config path for this test
         let tmp = std::env::temp_dir().join("runtimo_test_config");
         std::env::set_var("XDG_CONFIG_HOME", &tmp);
@@ -155,6 +162,79 @@ mod tests {
         assert!(prefixes.contains(&"/opt".to_string()));
 
         // Cleanup
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn test_toml_parse_failure_returns_defaults() {
+        let _guard = CONFIG_TEST_MUTEX.lock().unwrap();
+        // GAP 12: Corrupt TOML file returns defaults, not panic
+        let tmp = std::env::temp_dir().join("runtimo_test_config_corrupt");
+        let config_dir = tmp.join("runtimo");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+
+        // Write corrupt TOML
+        std::fs::write(&config_path, "this is {{{ not valid toml at all!!!").unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+
+        let config = RuntimoConfig::load();
+        // Must return defaults, not panic
+        assert!(
+            config.allowed_paths.is_empty(),
+            "Corrupt TOML should return defaults"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn test_empty_config_file_returns_defaults() {
+        let _guard = CONFIG_TEST_MUTEX.lock().unwrap();
+        // GAP 12: Empty config file returns defaults
+        let tmp = std::env::temp_dir().join("runtimo_test_config_empty");
+        let config_dir = tmp.join("runtimo");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+
+        // Write empty file
+        std::fs::write(&config_path, "").unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+
+        let config = RuntimoConfig::load();
+        assert!(
+            config.allowed_paths.is_empty(),
+            "Empty config should return defaults"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn test_toml_missing_section_returns_defaults() {
+        let _guard = CONFIG_TEST_MUTEX.lock().unwrap();
+        // GAP 12: Valid TOML but missing expected section
+        let tmp = std::env::temp_dir().join("runtimo_test_config_missing");
+        let config_dir = tmp.join("runtimo");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+
+        // Valid TOML but no allowed_paths array
+        std::fs::write(&config_path, "[other_section]\nfoo = \"bar\"\n").unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+
+        let config = RuntimoConfig::load();
+        assert!(
+            config.allowed_paths.is_empty(),
+            "Missing section should return defaults"
+        );
+
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("XDG_CONFIG_HOME");
     }

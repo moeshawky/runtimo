@@ -203,3 +203,110 @@ impl Default for CapabilityRegistry {
         Self::new()
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    /// A minimal test capability that echoes its name.
+    struct TestCap {
+        name: &'static str,
+    }
+
+    impl Capability for TestCap {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        fn description(&self) -> &'static str {
+            "test capability"
+        }
+        fn schema(&self) -> Value {
+            serde_json::json!({})
+        }
+        fn validate(&self, _args: &Value) -> crate::Result<()> {
+            Ok(())
+        }
+        fn execute(&self, _args: &Value, _ctx: &Context) -> crate::Result<Output> {
+            Ok(Output {
+                success: true,
+                data: serde_json::json!({}),
+                message: None,
+            })
+        }
+    }
+
+    #[test]
+    fn test_registry_register_and_get() {
+        let mut reg = CapabilityRegistry::new();
+        reg.register(TestCap { name: "Alpha" });
+
+        let cap = reg.get("Alpha");
+        assert!(cap.is_some(), "Should find registered capability");
+        assert_eq!(cap.unwrap().name(), "Alpha");
+    }
+
+    #[test]
+    fn test_registry_duplicate_name_replaces() {
+        let mut reg = CapabilityRegistry::new();
+        reg.register(TestCap { name: "Beta" });
+        reg.register(TestCap { name: "Beta" }); // second registration replaces
+
+        let cap = reg.get("Beta");
+        assert!(
+            cap.is_some(),
+            "Should still find capability after duplicate registration"
+        );
+        assert_eq!(cap.unwrap().name(), "Beta");
+    }
+
+    #[test]
+    fn test_registry_case_insensitive_lookup() {
+        let mut reg = CapabilityRegistry::new();
+        reg.register(TestCap { name: "ShellExec" });
+
+        // Exact match
+        assert!(reg.get("ShellExec").is_some());
+        // Case-insensitive match
+        assert!(
+            reg.get("shellexec").is_some(),
+            "Case-insensitive lookup should find ShellExec"
+        );
+        assert!(
+            reg.get("SHELLEXEC").is_some(),
+            "Uppercase lookup should find ShellExec"
+        );
+        assert!(
+            reg.get("ShellExec").is_some(),
+            "Exact-case lookup should find ShellExec"
+        );
+    }
+
+    #[test]
+    fn test_registry_unregistered_lookup_returns_none() {
+        let mut reg = CapabilityRegistry::new();
+        reg.register(TestCap { name: "Delta" });
+
+        assert!(reg.get("NoSuchCap").is_none());
+        assert!(reg.get("").is_none());
+        // Unregistered even with case-insensitive match
+        assert!(reg.get("gamma").is_none());
+    }
+
+    #[test]
+    fn test_registry_list() {
+        let mut reg = CapabilityRegistry::new();
+        assert!(reg.list().is_empty());
+
+        reg.register(TestCap { name: "A" });
+        reg.register(TestCap { name: "B" });
+        reg.register(TestCap { name: "C" });
+
+        let list = reg.list();
+        assert_eq!(list.len(), 3);
+        assert!(list.contains(&"A"));
+        assert!(list.contains(&"B"));
+        assert!(list.contains(&"C"));
+    }
+}

@@ -194,9 +194,16 @@ mod tests {
     use super::*;
     use crate::capability::Context;
     use std::fs;
+    use std::sync::Mutex;
+
+    /// Mutex to serialize undo tests that set environment variables
+    /// (RUNTIMO_WAL_PATH, RUNTIMO_BACKUP_DIR). Without this, concurrent
+    /// tests fight over process-global env vars and produce spurious failures.
+    static UNDO_TEST_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_undo_with_backup() {
+        let _guard = UNDO_TEST_MUTEX.lock().unwrap();
         let tmpdir = std::env::temp_dir().join("runtimo_test_undo");
         let _ = fs::remove_dir_all(&tmpdir);
         fs::create_dir_all(&tmpdir).unwrap();
@@ -273,6 +280,244 @@ mod tests {
         assert_eq!(restored_content, "original content");
 
         // Clean up
+        let _ = fs::remove_dir_all(&tmpdir);
+        std::env::remove_var("RUNTIMO_WAL_PATH");
+        std::env::remove_var("RUNTIMO_BACKUP_DIR");
+    }
+
+    #[test]
+    fn test_undo_missing_backup_returns_error() {
+        let _guard = UNDO_TEST_MUTEX.lock().unwrap();
+        // GAP 7: Verify missing backup returns proper error (not panic)
+        let tmpdir = std::env::temp_dir().join("runtimo_test_undo_missing");
+        let _ = fs::remove_dir_all(&tmpdir);
+        fs::create_dir_all(&tmpdir).unwrap();
+
+        let backup_dir = tmpdir.join("backups");
+        std::env::set_var("RUNTIMO_BACKUP_DIR", &backup_dir);
+
+        let cap = Undo;
+        let ctx = Context {
+            dry_run: false,
+            job_id: "undo-missing-test".to_string(),
+            working_dir: tmpdir.clone(),
+        };
+
+        // Try to undo a job that has no backup
+        let result = cap.execute(&serde_json::json!({"job_id": "nonexistent-job-xyz"}), &ctx);
+        assert!(result.is_err(), "Should error on missing backup");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("No backup found"),
+            "Error should mention missing backup: {}",
+            err
+        );
+
+        let _ = fs::remove_dir_all(&tmpdir);
+        std::env::remove_var("RUNTIMO_BACKUP_DIR");
+    }
+
+    #[test]
+    fn test_undo_missing_job_id_validation() {
+        // GAP 7: empty job_id should be rejected by validate
+        let cap = Undo;
+        let result = cap.validate(&serde_json::json!({"job_id": ""}));
+        assert!(result.is_err(), "Empty job_id should be rejected");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("empty") || err.contains("job_id"),
+            "Error should mention empty job_id: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_undo_multi_file_restore() {
+        let _guard = UNDO_TEST_MUTEX.lock().unwrap();
+        // GAP 7: Test restoring multiple files from the same job backup
+        let tmpdir = std::env::temp_dir().join("runtimo_test_undo_multi");
+        let _ = fs::remove_dir_all(&tmpdir);
+        fs::create_dir_all(&tmpdir).unwrap();
+
+        let test_file1 = tmpdir.join("file1.txt");
+        let test_file2 = tmpdir.join("file2.txt");
+        fs::write(&test_file1, "original file 1").unwrap();
+        fs::write(&test_file2, "original file 2").unwrap();
+
+        let backup_dir = tmpdir.join("backups_multi");
+        let job_id = "multi-file-job";
+        let job_backup_dir = backup_dir.join(job_id);
+        fs::create_dir_all(&job_backup_dir).unwrap();
+
+        let backup1 = job_backup_dir.join("file1.txt");
+        let backup2 = job_backup_dir.join("file2.txt");
+        fs::copy(&test_file1, &backup1).unwrap();
+        fs::copy(&test_file2, &backup2).unwrap();
+
+        // Modify originals
+        fs::write(&test_file1, "modified file 1").unwrap();
+        fs::write(&test_file2, "modified file 2").unwrap();
+
+        // Write WAL entries for both files
+        let wal_file = tmpdir.join("multi.wal");
+        std::env::set_var("RUNTIMO_WAL_PATH", &wal_file);
+        use crate::wal::{WalEvent, WalEventType, WalWriter};
+        let mut wal = WalWriter::create(&wal_file).unwrap();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        wal.append(WalEvent {
+            seq: 0,
+            ts,
+            event_type: WalEventType::JobCompleted,
+            job_id: job_id.to_string(),
+            capability: Some("FileWrite".into()),
+            output: Some(serde_json::json!({
+                "data": {
+                    "path": test_file1.to_str().unwrap(),
+                    "backup_path": backup1.to_str().unwrap()
+                }
+            })),
+            error: None,
+            telemetry_before: None,
+            telemetry_after: None,
+            process_before: None,
+            process_after: None,
+            cmd: None,
+            cmd_stdout: None,
+            cmd_stderr: None,
+            cmd_exit_code: None,
+            cmd_corrected: None,
+            ..Default::default()
+        })
+        .unwrap();
+        wal.append(WalEvent {
+            seq: 1,
+            ts: ts + 1,
+            event_type: WalEventType::JobCompleted,
+            job_id: job_id.to_string(),
+            capability: Some("FileWrite".into()),
+            output: Some(serde_json::json!({
+                "data": {
+                    "path": test_file2.to_str().unwrap(),
+                    "backup_path": backup2.to_str().unwrap()
+                }
+            })),
+            error: None,
+            telemetry_before: None,
+            telemetry_after: None,
+            process_before: None,
+            process_after: None,
+            cmd: None,
+            cmd_stdout: None,
+            cmd_stderr: None,
+            cmd_exit_code: None,
+            cmd_corrected: None,
+            ..Default::default()
+        })
+        .unwrap();
+
+        std::env::set_var("RUNTIMO_BACKUP_DIR", &backup_dir);
+
+        let cap = Undo;
+        let ctx = Context {
+            dry_run: false,
+            job_id: "undo-multi".to_string(),
+            working_dir: tmpdir.clone(),
+        };
+        let result = cap.execute(&serde_json::json!({"job_id": job_id}), &ctx);
+
+        assert!(result.is_ok(), "undo multi-file failed: {:?}", result.err());
+        let output = result.unwrap();
+        assert!(output.success);
+        let restored = output.data["restored"].as_array().unwrap();
+        assert!(
+            restored.len() >= 2,
+            "Should restore at least 2 files, got {}: {:?}",
+            restored.len(),
+            restored
+        );
+
+        // Verify both files restored
+        assert_eq!(fs::read_to_string(&test_file1).unwrap(), "original file 1");
+        assert_eq!(fs::read_to_string(&test_file2).unwrap(), "original file 2");
+
+        let _ = fs::remove_dir_all(&tmpdir);
+        std::env::remove_var("RUNTIMO_WAL_PATH");
+        std::env::remove_var("RUNTIMO_BACKUP_DIR");
+    }
+
+    #[test]
+    fn test_undo_revalidates_target_paths() {
+        let _guard = UNDO_TEST_MUTEX.lock().unwrap();
+        // GAP 7: Restore should re-validate target paths against allowed prefixes
+        // This test verifies that validation happens (restore calls validate_path)
+        let tmpdir = std::env::temp_dir().join("runtimo_test_undo_validate");
+        let _ = fs::remove_dir_all(&tmpdir);
+        fs::create_dir_all(&tmpdir).unwrap();
+
+        let test_file = tmpdir.join("valid.txt");
+        fs::write(&test_file, "original").unwrap();
+
+        let backup_dir = tmpdir.join("backups_val");
+        let job_id = "validate-job";
+        let job_backup_dir = backup_dir.join(job_id);
+        fs::create_dir_all(&job_backup_dir).unwrap();
+
+        let backup_path = job_backup_dir.join("valid.txt");
+        fs::copy(&test_file, &backup_path).unwrap();
+
+        // Write WAL with an allowed path (/tmp/...)
+        let wal_file = tmpdir.join("val.wal");
+        std::env::set_var("RUNTIMO_WAL_PATH", &wal_file);
+        use crate::wal::{WalEvent, WalEventType, WalWriter};
+        let mut wal = WalWriter::create(&wal_file).unwrap();
+        wal.append(WalEvent {
+            seq: 0,
+            ts: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            event_type: WalEventType::JobCompleted,
+            job_id: job_id.to_string(),
+            capability: Some("FileWrite".into()),
+            output: Some(serde_json::json!({
+                "data": {
+                    "path": test_file.to_str().unwrap(),
+                    "backup_path": backup_path.to_str().unwrap()
+                }
+            })),
+            error: None,
+            telemetry_before: None,
+            telemetry_after: None,
+            process_before: None,
+            process_after: None,
+            cmd: None,
+            cmd_stdout: None,
+            cmd_stderr: None,
+            cmd_exit_code: None,
+            cmd_corrected: None,
+            ..Default::default()
+        })
+        .unwrap();
+
+        std::env::set_var("RUNTIMO_BACKUP_DIR", &backup_dir);
+
+        let cap = Undo;
+        let ctx = Context {
+            dry_run: false,
+            job_id: "undo-val".to_string(),
+            working_dir: tmpdir.clone(),
+        };
+        // This should succeed because /tmp is in allowed prefixes
+        let result = cap.execute(&serde_json::json!({"job_id": job_id}), &ctx);
+        assert!(
+            result.is_ok(),
+            "Valid path restore should succeed: {:?}",
+            result.err()
+        );
+
         let _ = fs::remove_dir_all(&tmpdir);
         std::env::remove_var("RUNTIMO_WAL_PATH");
         std::env::remove_var("RUNTIMO_BACKUP_DIR");

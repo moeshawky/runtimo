@@ -674,4 +674,105 @@ mod tests {
         std::fs::remove_dir_all(&backup_dir).ok();
         std::fs::remove_file(&source_file).ok();
     }
+
+    // ── GAP 10: BackupManager with Unicode filenames ─────────────────
+
+    #[test]
+    fn test_backup_unicode_filename() {
+        let backup_dir = std::env::temp_dir().join("runtimo_backup_unicode_test");
+        let source_dir = std::env::temp_dir().join("runtimo_source_unicode_test");
+        let _ = std::fs::remove_dir_all(&backup_dir);
+        let _ = std::fs::remove_dir_all(&source_dir);
+
+        std::fs::create_dir_all(&source_dir).unwrap();
+
+        // File with emoji in filename
+        let emoji_file = source_dir.join("🚀rocket.txt");
+        std::fs::write(&emoji_file, "emoji content").unwrap();
+
+        // File with CJK characters
+        let cjk_file = source_dir.join("你好世界.txt");
+        std::fs::write(&cjk_file, "cjk content").unwrap();
+
+        // File with Arabic
+        let arabic_file = source_dir.join("مرحبا.txt");
+        std::fs::write(&arabic_file, "arabic content").unwrap();
+
+        let mgr = BackupManager::new(backup_dir.clone()).unwrap();
+
+        // Backup each Unicode-named file individually
+        let emoji_backup = mgr.create_backup(&emoji_file, "unicode-job");
+        assert!(
+            emoji_backup.is_ok(),
+            "emoji backup failed: {:?}",
+            emoji_backup.err()
+        );
+        assert!(emoji_backup.unwrap().exists());
+
+        let cjk_backup = mgr.create_backup(&cjk_file, "unicode-job");
+        assert!(
+            cjk_backup.is_ok(),
+            "CJK backup failed: {:?}",
+            cjk_backup.err()
+        );
+        assert!(cjk_backup.unwrap().exists());
+
+        let arabic_backup = mgr.create_backup(&arabic_file, "unicode-job");
+        assert!(
+            arabic_backup.is_ok(),
+            "Arabic backup failed: {:?}",
+            arabic_backup.err()
+        );
+        assert!(arabic_backup.unwrap().exists());
+
+        // Restore from backup
+        let _ = std::fs::remove_file(&emoji_file);
+        let _ = std::fs::remove_file(&cjk_file);
+        let _ = std::fs::remove_file(&arabic_file);
+
+        let job_dir = backup_dir.join("unicode-job");
+        mgr.restore(&job_dir.join("🚀rocket.txt"), &emoji_file)
+            .unwrap();
+        mgr.restore(&job_dir.join("你好世界.txt"), &cjk_file)
+            .unwrap();
+        mgr.restore(&job_dir.join("مرحبا.txt"), &arabic_file)
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&emoji_file).unwrap(),
+            "emoji content"
+        );
+        assert_eq!(std::fs::read_to_string(&cjk_file).unwrap(), "cjk content");
+        assert_eq!(
+            std::fs::read_to_string(&arabic_file).unwrap(),
+            "arabic content"
+        );
+
+        std::fs::remove_dir_all(&backup_dir).ok();
+        std::fs::remove_dir_all(&source_dir).ok();
+    }
+
+    #[test]
+    fn test_backup_unicode_directory_name() {
+        // Backup of a directory with Unicode name
+        let backup_dir = std::env::temp_dir().join("runtimo_backup_unicode_dir_test");
+        let source_dir = std::env::temp_dir().join("source_🌟_目录");
+        let _ = std::fs::remove_dir_all(&backup_dir);
+        let _ = std::fs::remove_dir_all(&source_dir);
+
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(source_dir.join("inner.txt"), "inside unicode dir").unwrap();
+
+        let mgr = BackupManager::new(backup_dir.clone()).unwrap();
+        let backup = mgr.create_backup(&source_dir, "unicode-dir-job");
+        assert!(
+            backup.is_ok(),
+            "Unicode dir backup failed: {:?}",
+            backup.err()
+        );
+        assert!(backup.unwrap().join("inner.txt").exists());
+
+        std::fs::remove_dir_all(&backup_dir).ok();
+        std::fs::remove_dir_all(&source_dir).ok();
+    }
 }

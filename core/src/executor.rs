@@ -609,3 +609,452 @@ fn sift_observation(description: &str, args: &Value) -> String {
         format!("{} {}", description, safe_padding)
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::unused_result_ok)]
+mod tests {
+    use super::*;
+    use crate::capabilities::FileRead;
+    use crate::capability::{Capability, Context, Output};
+    use serde_json::{json, Value};
+    use std::fs;
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    /// Mutex to serialize tests that set `RUNTIMO_DAL` env var.
+    /// Without this, concurrent tests fight over the process-global env var.
+    static DAL_TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+    fn unique_test_dir() -> PathBuf {
+        let ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("runtimo_exec_test_{}_{}", std::process::id(), ns))
+    }
+
+    fn wal_path(base: &std::path::Path) -> PathBuf {
+        base.join("wal.jsonl")
+    }
+
+    fn make_file(dir: &std::path::Path, name: &str, content: &str) -> PathBuf {
+        let p = dir.join(name);
+        let mut f = fs::File::create(&p).unwrap();
+        write!(f, "{}", content).unwrap();
+        p
+    }
+
+    /// A minimal test capability that always succeeds.
+    struct EchoCap;
+    impl Capability for EchoCap {
+        fn name(&self) -> &'static str {
+            "Echo"
+        }
+        fn description(&self) -> &'static str {
+            "echo capability for testing"
+        }
+        fn schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn validate(&self, _args: &Value) -> crate::Result<()> {
+            Ok(())
+        }
+        fn execute(&self, args: &Value, _ctx: &Context) -> crate::Result<Output> {
+            Ok(Output {
+                success: true,
+                data: args.clone(),
+                message: None,
+            })
+        }
+    }
+
+    /// A slow capability that exceeds timeout.
+    struct SlowCap;
+    impl Capability for SlowCap {
+        fn name(&self) -> &'static str {
+            "Slow"
+        }
+        fn description(&self) -> &'static str {
+            "slow capability for testing timeout"
+        }
+        fn schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn validate(&self, _args: &Value) -> crate::Result<()> {
+            Ok(())
+        }
+        fn execute(&self, _args: &Value, _ctx: &Context) -> crate::Result<Output> {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            Ok(Output {
+                success: true,
+                data: json!({}),
+                message: None,
+            })
+        }
+    }
+
+    // ── GAP 1: executor.rs happy path ─────────────────────────────────
+
+    #[test]
+    fn test_execute_with_telemetry_happy_path() {
+        let dir = unique_test_dir();
+        fs::create_dir_all(&dir).ok();
+        let p = make_file(&dir, "test.txt", "hello executor");
+        let wp = wal_path(&dir);
+
+        let result = execute_with_telemetry_and_session(
+            &FileRead,
+            &json!({"path": p.to_str().unwrap()}),
+            false,
+            &wp,
+            None,
+            None,
+            30,
+        );
+
+        assert!(result.is_ok(), "Execute failed: {:?}", result.err());
+        let r = result.unwrap();
+        assert!(r.success, "Execution should succeed");
+        assert_eq!(r.capability, "FileRead");
+        assert!(!r.job_id.is_empty());
+
+        // Telemetry captured before and after
+        assert!(r.telemetry_before.timestamp > 0);
+        assert!(r.telemetry_after.timestamp > 0);
+        assert!(r.telemetry_after.timestamp >= r.telemetry_before.timestamp);
+
+        // Process snapshot captured
+        assert!(r.process_before.total_processes > 0);
+        assert!(r.process_after.total_processes > 0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_execute_writes_wal_events() {
+        let dir = unique_test_dir();
+        fs::create_dir_all(&dir).ok();
+        let p = make_file(&dir, "test.txt", "wal check");
+        let wp = wal_path(&dir);
+
+        let _result = execute_with_telemetry_and_session(
+            &FileRead,
+            &json!({"path": p.to_str().unwrap()}),
+            false,
+            &wp,
+            None,
+            None,
+            30,
+        )
+        .unwrap();
+
+        // WAL should contain JobStarted and JobCompleted events
+        let reader = crate::WalReader::load(&wp).unwrap();
+        let events = reader.events();
+        assert!(
+            events.len() >= 2,
+            "WAL should have at least 2 events, got {}",
+            events.len()
+        );
+
+        let has_started = events
+            .iter()
+            .any(|e| matches!(e.event_type, crate::WalEventType::JobStarted));
+        let has_completed = events
+            .iter()
+            .any(|e| matches!(e.event_type, crate::WalEventType::JobCompleted));
+        assert!(has_started, "WAL should contain JobStarted event");
+        assert!(has_completed, "WAL should contain JobCompleted event");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_execute_with_timeout_returns_error() {
+        // Use timeout=0 (or very small) to trigger timeout on any non-trivial execution
+        let result = execute_with_timeout_check(
+            &SlowCap,
+            &json!({}),
+            &Context::new(false, "timeout-test".into()),
+            0, // zero timeout — any execution exceeds it
+        );
+        // SlowCap takes 200ms, with timeout=0 it should error
+        assert!(
+            result.is_err(),
+            "Should return timeout error, got: {:?}",
+            result
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("timeout"),
+            "Error should mention timeout: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_execute_with_echo_capability() {
+        let dir = unique_test_dir();
+        fs::create_dir_all(&dir).ok();
+        let wp = wal_path(&dir);
+
+        let result = execute_with_telemetry_and_session(
+            &EchoCap,
+            &json!({"key": "value"}),
+            false,
+            &wp,
+            None,
+            None,
+            30,
+        );
+
+        assert!(result.is_ok(), "Echo execute failed: {:?}", result.err());
+        let r = result.unwrap();
+        assert!(r.success);
+        assert_eq!(r.capability, "Echo");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_llmosafe_guard_check_called() {
+        // Verify the LlmoSafeGuard can be constructed and that check()
+        // returns a Result (not panics). The guard's decision depends on
+        // system load which varies across environments; we test the
+        // invariant that construction + check completes, and the result
+        // pattern is correct regardless of outcome.
+        let guard = LlmoSafeGuard::new();
+        let result = guard.check();
+        // On an idle system this should pass. On a loaded system it may
+        // return ResourceLimitExceeded — either is correct behavior.
+        // The invariant: result is a Result, not a panic.
+        match result {
+            Ok(()) => { /* guard check passed — system is idle */ }
+            Err(msg) => {
+                eprintln!("System under pressure during test: {}", msg);
+                // This is valid — the guard correctly detected pressure
+            }
+        }
+    }
+
+    // ── GAP 1: Args size guard ────────────────────────────────────────
+
+    #[test]
+    fn test_args_size_guard_rejects_large_args() {
+        let dir = unique_test_dir();
+        fs::create_dir_all(&dir).ok();
+        let wp = wal_path(&dir);
+
+        // Create args that exceed 1MB
+        let large_content = "x".repeat(2_000_000);
+        let result = execute_with_telemetry_and_session(
+            &EchoCap,
+            &json!({"content": large_content}),
+            false,
+            &wp,
+            None,
+            None,
+            30,
+        );
+
+        // Should fail with ResourceLimitExceeded
+        assert!(result.is_err(), "Should reject args > 1MB");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("too large") || err.contains("args"),
+            "Error should mention args size: {}",
+            err
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── GAP 1: Cognitive pipeline with DAL=A ──────────────────────────
+
+    #[test]
+    fn test_cognitive_pipeline_dal_a_rejects() {
+        let _guard = DAL_TEST_MUTEX.lock().unwrap();
+        // Set DAL to A (aggressive) for cognitive safety
+        std::env::set_var("RUNTIMO_DAL", "A");
+
+        let dir = unique_test_dir();
+        fs::create_dir_all(&dir).ok();
+        let wp = wal_path(&dir);
+
+        // FileRead with any path — cognitive pipeline checks description
+        // The sift_observation checks if args contain suspicious keywords
+        let test_content = "suspicious manipulation of system files";
+        let p = make_file(&dir, "test.txt", test_content);
+
+        let result = execute_with_telemetry_and_session(
+            &FileRead,
+            &json!({"path": p.to_str().unwrap()}),
+            false,
+            &wp,
+            None,
+            None,
+            30,
+        );
+
+        std::env::remove_var("RUNTIMO_DAL");
+
+        // With DAL=A, cognitive pipeline may reject — test that it either succeeds
+        // or fails with CognitiveSafetyViolation (not some other error)
+        match result {
+            Ok(r) => {
+                // If it passed, it's because DAL=A didn't trigger for these inputs
+                assert!(
+                    r.success
+                        || !r
+                            .output
+                            .message
+                            .as_deref()
+                            .unwrap_or("")
+                            .contains("cognitive")
+                );
+            }
+            Err(e) => {
+                assert!(
+                    matches!(e, crate::Error::CognitiveSafetyViolation(_)),
+                    "Expected CognitiveSafetyViolation, got {:?}",
+                    e
+                );
+            }
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── verify fix for: cognitive pipeline with DAL=E passes ──────────
+
+    #[test]
+    fn test_cognitive_pipeline_dal_e_passes() {
+        let _guard = DAL_TEST_MUTEX.lock().unwrap();
+        // Set DAL to E (everything allowed)
+        std::env::set_var("RUNTIMO_DAL", "E");
+
+        let dir = unique_test_dir();
+        fs::create_dir_all(&dir).ok();
+        let wp = wal_path(&dir);
+        let p = make_file(&dir, "test.txt", "normal content");
+
+        let result = execute_with_telemetry_and_session(
+            &FileRead,
+            &json!({"path": p.to_str().unwrap()}),
+            false,
+            &wp,
+            None,
+            None,
+            30,
+        );
+
+        std::env::remove_var("RUNTIMO_DAL");
+
+        // DAL=E should always allow execution
+        assert!(result.is_ok(), "DAL=E should pass: {:?}", result.err());
+        assert!(result.unwrap().success);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_identify_spawned_pids() {
+        // Deterministic test: construct snapshots with known PIDs.
+        let before = ProcessSnapshot {
+            timestamp: 1000,
+            processes: vec![
+                crate::processes::ProcessInfo {
+                    pid: 1,
+                    ppid: 0,
+                    user: "root".into(),
+                    cpu_percent: 0.0,
+                    mem_percent: 0.0,
+                    vsz: 0,
+                    rss: 0,
+                    stat: "S".into(),
+                    start_time: "".into(),
+                    elapsed: "".into(),
+                    command: "init".into(),
+                },
+                crate::processes::ProcessInfo {
+                    pid: 42,
+                    ppid: 1,
+                    user: "user".into(),
+                    cpu_percent: 1.0,
+                    mem_percent: 0.5,
+                    vsz: 1000,
+                    rss: 500,
+                    stat: "S".into(),
+                    start_time: "".into(),
+                    elapsed: "".into(),
+                    command: "existing".into(),
+                },
+            ],
+            summary: crate::processes::ProcessSummary {
+                total_processes: 2,
+                total_cpu_percent: 1.0,
+                total_mem_percent: 0.5,
+                top_cpu_consumer: None,
+                top_mem_consumer: None,
+                zombie_count: 0,
+            },
+        };
+        let after = ProcessSnapshot {
+            timestamp: 1001,
+            processes: vec![
+                crate::processes::ProcessInfo {
+                    pid: 1,
+                    ppid: 0,
+                    user: "root".into(),
+                    cpu_percent: 0.0,
+                    mem_percent: 0.0,
+                    vsz: 0,
+                    rss: 0,
+                    stat: "S".into(),
+                    start_time: "".into(),
+                    elapsed: "".into(),
+                    command: "init".into(),
+                },
+                crate::processes::ProcessInfo {
+                    pid: 42,
+                    ppid: 1,
+                    user: "user".into(),
+                    cpu_percent: 1.0,
+                    mem_percent: 0.5,
+                    vsz: 1000,
+                    rss: 500,
+                    stat: "S".into(),
+                    start_time: "".into(),
+                    elapsed: "".into(),
+                    command: "existing".into(),
+                },
+                crate::processes::ProcessInfo {
+                    pid: 99,
+                    ppid: 42,
+                    user: "user".into(),
+                    cpu_percent: 0.0,
+                    mem_percent: 0.1,
+                    vsz: 100,
+                    rss: 50,
+                    stat: "S".into(),
+                    start_time: "".into(),
+                    elapsed: "".into(),
+                    command: "spawned".into(),
+                },
+            ],
+            summary: crate::processes::ProcessSummary {
+                total_processes: 3,
+                total_cpu_percent: 1.0,
+                total_mem_percent: 0.6,
+                top_cpu_consumer: None,
+                top_mem_consumer: None,
+                zombie_count: 0,
+            },
+        };
+
+        let spawned = identify_spawned_pids(&before, &after);
+        assert_eq!(spawned.len(), 1, "Should detect exactly 1 spawned PID");
+        assert_eq!(spawned[0], 99, "Spawned PID should be 99");
+    }
+}

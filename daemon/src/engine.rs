@@ -936,3 +936,854 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     })
 }
+
+// ── Unit tests ─────────────────────────────────────────────────────────────
+// These tests close the HIGH risk gap identified by QC (0 tests → 41 tests).
+// Tests cover: RunParams deserialization, WAL reconciliation, DaemonState,
+// path resolution, and async handler parameter validation.
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::unused_result_ok,
+    clippy::await_holding_lock,
+    clippy::no_effect_underscore_binding
+)]
+mod tests {
+    use super::*;
+    use runtimo_core::{WalEvent, WalEventType, WalReader, WalWriter};
+    use std::sync::Mutex;
+
+    /// Mutex to serialize tests that modify process-global env vars.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    // ── helpers ────────────────────────────────────────────────────────────
+
+    fn unique_test_dir() -> std::path::PathBuf {
+        let ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("runtimo_daemon_test_{}_{}", std::process::id(), ns))
+    }
+
+    fn make_wal(path: &std::path::Path, events: &[WalEvent]) {
+        let mut wal = WalWriter::create(path).unwrap();
+        for e in events {
+            wal.append(e.clone()).unwrap();
+        }
+    }
+
+    fn make_started_event(seq: u64, ts: u64, job_id: &str, capability: &str) -> WalEvent {
+        WalEvent {
+            seq,
+            ts,
+            event_type: WalEventType::JobStarted,
+            job_id: job_id.to_string(),
+            capability: Some(capability.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn make_completed_event(seq: u64, ts: u64, job_id: &str, capability: &str) -> WalEvent {
+        WalEvent {
+            seq,
+            ts,
+            event_type: WalEventType::JobCompleted,
+            job_id: job_id.to_string(),
+            capability: Some(capability.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn make_failed_event(seq: u64, ts: u64, job_id: &str) -> WalEvent {
+        WalEvent {
+            seq,
+            ts,
+            event_type: WalEventType::JobFailed,
+            job_id: job_id.to_string(),
+            error: Some(
+                "daemon terminated before job completion (reconciled on restart)".to_string(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    // ── RunParams deserialization ──────────────────────────────────────────
+
+    #[test]
+    fn test_run_params_all_fields_valid() {
+        let json = serde_json::json!({
+            "capability": "FileRead",
+            "args": {"path": "/tmp/test.txt"},
+            "dry_run": true,
+            "working_dir": "/tmp",
+            "timeout_secs": 60
+        });
+        let params: RunParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.capability, "FileRead");
+        assert_eq!(params.args, serde_json::json!({"path": "/tmp/test.txt"}));
+        assert!(params.dry_run);
+        assert_eq!(params.working_dir.as_deref(), Some("/tmp"));
+        assert_eq!(params.timeout_secs, Some(60));
+    }
+
+    #[test]
+    fn test_run_params_minimal_valid() {
+        // Only the required `capability` field; others use defaults.
+        // Note: `args` defaults to Null (serde_json::Value::default()), not empty Object.
+        let json = serde_json::json!({"capability": "ShellExec"});
+        let params: RunParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.capability, "ShellExec");
+        assert_eq!(params.args, serde_json::Value::Null);
+        assert!(!params.dry_run);
+        assert!(params.working_dir.is_none());
+        assert!(params.timeout_secs.is_none());
+    }
+
+    #[test]
+    fn test_run_params_all_defaults_except_capability() {
+        // All fields omitted except capability; verify every default.
+        // Note: `args` defaults to Null (serde_json::Value::default()), not empty Object.
+        let params: RunParams = serde_json::from_str(r#"{"capability":"Kill"}"#).unwrap();
+        assert_eq!(params.capability, "Kill");
+        assert_eq!(params.args, serde_json::Value::Null);
+        assert!(!params.dry_run);
+        assert!(params.working_dir.is_none());
+        assert!(params.timeout_secs.is_none());
+    }
+
+    #[test]
+    fn test_run_params_missing_capability() {
+        let json = serde_json::json!({"args": {"path": "/tmp/test.txt"}});
+        let result = serde_json::from_value::<RunParams>(json);
+        assert!(
+            result.is_err(),
+            "Should fail when capability field is missing"
+        );
+    }
+
+    #[test]
+    fn test_run_params_invalid_json() {
+        let result = serde_json::from_str::<RunParams>(r#"{"capability":"#);
+        assert!(result.is_err(), "Should fail on truncated JSON");
+    }
+
+    #[test]
+    fn test_run_params_empty_object() {
+        let result = serde_json::from_str::<RunParams>("{}");
+        assert!(
+            result.is_err(),
+            "Should fail on empty object (missing capability)"
+        );
+    }
+
+    #[test]
+    fn test_run_params_null_capability() {
+        // capability is String, null is not a valid string
+        let result = serde_json::from_str::<RunParams>(r#"{"capability":null}"#);
+        assert!(
+            result.is_err(),
+            "Null capability should fail deserialization — capability must be a string"
+        );
+    }
+
+    #[test]
+    fn test_run_params_extra_fields_ignored() {
+        // Serde ignores unknown fields by default
+        let json = serde_json::json!({
+            "capability": "FileRead",
+            "unknown_field": "should be ignored"
+        });
+        let params: RunParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.capability, "FileRead");
+    }
+
+    #[test]
+    fn test_run_params_wrong_type_capability() {
+        // capability must be a string, not a number
+        let result = serde_json::from_str::<RunParams>(r#"{"capability":42}"#);
+        assert!(result.is_err(), "Should reject non-string capability");
+    }
+
+    #[test]
+    fn test_run_params_timeout_as_string_fails() {
+        // timeout_secs is Option<u64>, a string should fail
+        let result = serde_json::from_str::<RunParams>(
+            r#"{"capability":"FileRead","timeout_secs":"sixty"}"#,
+        );
+        assert!(result.is_err(), "Should reject string for timeout_secs");
+    }
+
+    // ── WAL reconciliation ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_reconcile_orphaned_jobs_marks_started_only() {
+        let dir = unique_test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let wal_path = dir.join("wal.jsonl");
+
+        // Write WAL with two JobStarted events (no terminal events)
+        make_wal(
+            &wal_path,
+            &[
+                make_started_event(0, 1000, "job-orphan-1", "FileRead"),
+                make_started_event(1, 1001, "job-orphan-2", "ShellExec"),
+            ],
+        );
+
+        // Verify initial state: 2 started events
+        let reader_before = WalReader::load(&wal_path).unwrap();
+        assert_eq!(reader_before.events().len(), 2);
+
+        // Reconcile
+        reconcile_orphaned_jobs(&wal_path);
+
+        // After reconciliation: both orphans should have JobFailed events appended
+        let reader_after = WalReader::load(&wal_path).unwrap();
+        assert!(
+            reader_after.events().len() >= 4,
+            "Expected >=4 events after reconciliation (2 started + 2 failed), got {}",
+            reader_after.events().len()
+        );
+
+        let has_failed_for_1 = reader_after
+            .events()
+            .iter()
+            .any(|e| e.job_id == "job-orphan-1" && matches!(e.event_type, WalEventType::JobFailed));
+        let has_failed_for_2 = reader_after
+            .events()
+            .iter()
+            .any(|e| e.job_id == "job-orphan-2" && matches!(e.event_type, WalEventType::JobFailed));
+
+        assert!(
+            has_failed_for_1,
+            "job-orphan-1 should have a JobFailed event"
+        );
+        assert!(
+            has_failed_for_2,
+            "job-orphan-2 should have a JobFailed event"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_reconcile_orphaned_jobs_leaves_completed() {
+        let dir = unique_test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let wal_path = dir.join("wal.jsonl");
+
+        // Write WAL with a JobStarted + JobCompleted pair
+        make_wal(
+            &wal_path,
+            &[
+                make_started_event(0, 1000, "job-done", "FileRead"),
+                make_completed_event(1, 1001, "job-done", "FileRead"),
+            ],
+        );
+
+        let count_before = WalReader::load(&wal_path).unwrap().events().len();
+        assert_eq!(count_before, 2);
+
+        reconcile_orphaned_jobs(&wal_path);
+
+        // Completed jobs should NOT be marked as failed
+        let reader_after = WalReader::load(&wal_path).unwrap();
+        assert_eq!(
+            reader_after.events().len(),
+            count_before,
+            "Completed job should not have new events added"
+        );
+
+        // Verify no JobFailed event was added for job-done
+        let has_failed = reader_after
+            .events()
+            .iter()
+            .any(|e| e.job_id == "job-done" && matches!(e.event_type, WalEventType::JobFailed));
+        assert!(
+            !has_failed,
+            "Completed job should not get a JobFailed event"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_reconcile_orphaned_jobs_mixed_wal() {
+        let dir = unique_test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let wal_path = dir.join("wal.jsonl");
+
+        // Mix: one completed job, one orphaned job
+        make_wal(
+            &wal_path,
+            &[
+                make_started_event(0, 1000, "job-complete", "FileRead"),
+                make_completed_event(1, 1001, "job-complete", "FileRead"),
+                make_started_event(2, 1002, "job-orphan", "ShellExec"),
+            ],
+        );
+
+        reconcile_orphaned_jobs(&wal_path);
+
+        let reader = WalReader::load(&wal_path).unwrap();
+
+        // job-complete should have no JobFailed
+        let has_failed_for_complete = reader
+            .events()
+            .iter()
+            .any(|e| e.job_id == "job-complete" && matches!(e.event_type, WalEventType::JobFailed));
+        assert!(!has_failed_for_complete);
+
+        // job-orphan should have JobFailed
+        let has_failed_for_orphan = reader
+            .events()
+            .iter()
+            .any(|e| e.job_id == "job-orphan" && matches!(e.event_type, WalEventType::JobFailed));
+        assert!(has_failed_for_orphan);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_reconcile_orphaned_jobs_already_failed() {
+        let dir = unique_test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let wal_path = dir.join("wal.jsonl");
+
+        // Job that already has JobFailed should NOT be duplicated
+        make_wal(
+            &wal_path,
+            &[
+                make_started_event(0, 1000, "job-failed", "FileRead"),
+                make_failed_event(1, 1001, "job-failed"),
+            ],
+        );
+
+        let count_before = WalReader::load(&wal_path).unwrap().events().len();
+        reconcile_orphaned_jobs(&wal_path);
+
+        let reader = WalReader::load(&wal_path).unwrap();
+        assert_eq!(
+            reader.events().len(),
+            count_before,
+            "Already-failed job should not get a duplicate JobFailed event"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_reconcile_orphaned_jobs_empty_wal() {
+        let dir = unique_test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let wal_path = dir.join("wal.jsonl");
+
+        // Write empty WAL file
+        std::fs::write(&wal_path, "").unwrap();
+
+        let count_before = WalReader::load(&wal_path).unwrap().events().len();
+        assert_eq!(count_before, 0);
+
+        // Should not panic on empty WAL
+        reconcile_orphaned_jobs(&wal_path);
+
+        let reader = WalReader::load(&wal_path).unwrap();
+        assert_eq!(reader.events().len(), 0, "Empty WAL should stay empty");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_reconcile_orphaned_jobs_nonexistent_wal() {
+        let dir = unique_test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let wal_path = dir.join("does_not_exist.jsonl");
+
+        // Should not panic when WAL file doesn't exist
+        // (function returns early: WalReader::load fails → return)
+        reconcile_orphaned_jobs(&wal_path);
+
+        // The function returns early; no file should be created
+        assert!(
+            !wal_path.exists(),
+            "No WAL file should be created for non-existent path"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_reconcile_orphaned_jobs_reconciliation_message() {
+        let dir = unique_test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let wal_path = dir.join("wal.jsonl");
+
+        make_wal(
+            &wal_path,
+            &[make_started_event(0, 1000, "job-msg", "FileRead")],
+        );
+
+        reconcile_orphaned_jobs(&wal_path);
+
+        // Verify the reconciliation message includes the expected text
+        let reader = WalReader::load(&wal_path).unwrap();
+        let failed_events: Vec<_> = reader
+            .events()
+            .iter()
+            .filter(|e| matches!(e.event_type, WalEventType::JobFailed))
+            .collect();
+
+        assert_eq!(failed_events.len(), 1);
+        assert!(
+            failed_events[0]
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("daemon terminated before job completion"),
+            "Reconciled job should have the standard reconciliation message"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── DaemonState verification ───────────────────────────────────────────
+
+    #[test]
+    fn test_daemon_state_new_creates_valid_state() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let dir = unique_test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Set XDG_DATA_HOME so data_dir() uses our temp dir
+        std::env::set_var("XDG_DATA_HOME", dir.to_str().unwrap());
+
+        let wal_path = dir.join("test.wal");
+        let state = DaemonState::new(&wal_path).expect("DaemonState::new should succeed");
+
+        // Registry should have all 6 capabilities
+        let caps = state.registry.list();
+        assert_eq!(caps.len(), 6, "Registry should have 6 capabilities");
+        assert!(caps.contains(&"FileRead"));
+        assert!(caps.contains(&"FileWrite"));
+        assert!(caps.contains(&"GitExec"));
+        assert!(caps.contains(&"ShellExec"));
+        assert!(caps.contains(&"Kill"));
+        assert!(caps.contains(&"Undo"));
+
+        // WAL path should match what we passed in
+        assert_eq!(state.wal_path, wal_path);
+
+        // WAL directory should exist
+        assert!(dir.exists());
+
+        std::env::remove_var("XDG_DATA_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_daemon_state_registry_has_exact_six_capabilities() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let dir = unique_test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("XDG_DATA_HOME", dir.to_str().unwrap());
+
+        let wal_path = dir.join("wal.jsonl");
+        let state = DaemonState::new(&wal_path).unwrap();
+
+        let caps = state.registry.list();
+        assert_eq!(caps.len(), 6);
+
+        // Verify names are distinct
+        let mut sorted = caps.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            caps.len(),
+            "All capability names should be unique"
+        );
+
+        std::env::remove_var("XDG_DATA_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_daemon_state_wal_path_configuration() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let dir = unique_test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("XDG_DATA_HOME", dir.to_str().unwrap());
+
+        // Use a non-standard WAL path
+        let custom_wal = dir.join("custom_wal_dir").join("audit.jsonl");
+        let state = DaemonState::new(&custom_wal).unwrap();
+
+        assert_eq!(state.wal_path, custom_wal);
+
+        std::env::remove_var("XDG_DATA_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_daemon_state_new_creates_wal_parent_dir() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let dir = unique_test_dir();
+        std::env::set_var("XDG_DATA_HOME", dir.to_str().unwrap());
+
+        let deep_wal = dir.join("deep").join("nested").join("wal.jsonl");
+        assert!(!deep_wal.parent().unwrap().exists());
+
+        let state = DaemonState::new(&deep_wal).unwrap();
+        assert_eq!(state.wal_path, deep_wal);
+        assert!(deep_wal.parent().unwrap().exists());
+
+        std::env::remove_var("XDG_DATA_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Path / binary resolution ───────────────────────────────────────────
+
+    #[test]
+    fn test_data_dir_uses_xdg_data_home() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let dir = unique_test_dir();
+        std::env::set_var("XDG_DATA_HOME", dir.to_str().unwrap());
+
+        let actual = data_dir();
+        assert_eq!(actual, dir.join("runtimo"));
+
+        std::env::remove_var("XDG_DATA_HOME");
+    }
+
+    #[test]
+    fn test_default_wal_path_uses_env_override() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let dir = unique_test_dir();
+        let custom_wal = dir.join("custom.jsonl");
+        std::env::set_var("RUNTIMO_WAL_PATH", custom_wal.to_str().unwrap());
+
+        assert_eq!(default_wal_path(), custom_wal);
+
+        std::env::remove_var("RUNTIMO_WAL_PATH");
+    }
+
+    #[test]
+    fn test_default_socket_path_in_data_dir() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let dir = unique_test_dir();
+        std::env::set_var("XDG_DATA_HOME", dir.to_str().unwrap());
+
+        let expected = dir.join("runtimo").join("runtimo.sock");
+        assert_eq!(default_socket_path(), expected);
+
+        std::env::remove_var("XDG_DATA_HOME");
+    }
+
+    // ── Async handler early-exit paths (no daemon execution needed) ────────
+
+    // These tests verify that handle_run and handle_dispatch return correct
+    // error responses for invalid params. They do NOT require a running daemon
+    // because the invalid-params path returns before any capability execution.
+
+    #[tokio::test]
+    async fn test_handle_run_invalid_params() {
+        let dir = unique_test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (state, _wal_path) = {
+            let _guard = ENV_MUTEX.lock().unwrap();
+            std::env::set_var("XDG_DATA_HOME", dir.to_str().unwrap());
+            let wp = dir.join("wal.jsonl");
+            let s = Arc::new(DaemonState::new(&wp).unwrap());
+            (s, wp)
+        };
+        // MutexGuard dropped here — env var still set for the duration of the test
+
+        // Passing a non-JSON-object as params should fail deserialization
+        let response = handle_run(
+            &state,
+            serde_json::Value::String("bad".into()),
+            serde_json::Value::from(1),
+        )
+        .await;
+
+        assert!(
+            response.result.is_none(),
+            "Invalid params should return no result"
+        );
+        assert!(response.error.is_some(), "Should return an error");
+        assert_eq!(response.error.unwrap().code, -32602);
+
+        std::env::remove_var("XDG_DATA_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_handle_run_unknown_capability() {
+        let dir = unique_test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let state = {
+            let _guard = ENV_MUTEX.lock().unwrap();
+            std::env::set_var("XDG_DATA_HOME", dir.to_str().unwrap());
+            let wp = dir.join("wal.jsonl");
+            Arc::new(DaemonState::new(&wp).unwrap())
+        };
+
+        // Valid params for a capability that doesn't exist
+        let params = serde_json::json!({"capability": "NoSuchCapability"});
+        let response = handle_run(&state, params, serde_json::Value::from(1)).await;
+
+        assert!(response.result.is_none());
+        assert!(response.error.is_some());
+        assert_eq!(response.error.unwrap().code, -32602);
+
+        std::env::remove_var("XDG_DATA_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_handle_dispatch_invalid_params() {
+        let dir = unique_test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let state = {
+            let _guard = ENV_MUTEX.lock().unwrap();
+            std::env::set_var("XDG_DATA_HOME", dir.to_str().unwrap());
+            let wp = dir.join("wal.jsonl");
+            Arc::new(DaemonState::new(&wp).unwrap())
+        };
+
+        let response = handle_dispatch(
+            &state,
+            serde_json::Value::String("bad".into()),
+            serde_json::Value::from(1),
+        )
+        .await;
+
+        assert!(response.result.is_none());
+        assert!(response.error.is_some());
+        assert_eq!(response.error.unwrap().code, -32602);
+
+        std::env::remove_var("XDG_DATA_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_handle_dispatch_unknown_capability() {
+        let dir = unique_test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let state = {
+            let _guard = ENV_MUTEX.lock().unwrap();
+            std::env::set_var("XDG_DATA_HOME", dir.to_str().unwrap());
+            let wp = dir.join("wal.jsonl");
+            Arc::new(DaemonState::new(&wp).unwrap())
+        };
+
+        let params = serde_json::json!({"capability": "NoSuchCapability"});
+        let response = handle_dispatch(&state, params, serde_json::Value::from(1)).await;
+
+        assert!(response.result.is_none());
+        assert!(response.error.is_some());
+        assert_eq!(response.error.unwrap().code, -32602);
+
+        std::env::remove_var("XDG_DATA_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── BackgroundJobRegistry ──────────────────────────────────────────────
+
+    #[test]
+    fn test_background_job_registry_new_is_empty() {
+        let registry = BackgroundJobRegistry::new();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let jobs = registry.list(100).await;
+            assert!(jobs.is_empty(), "New registry should have zero jobs");
+        });
+    }
+
+    #[test]
+    fn test_background_job_registry_try_reserve() {
+        let registry = BackgroundJobRegistry::new();
+        // Should be able to reserve up to MAX_CONCURRENT_JOBS
+        for _ in 0..16 {
+            assert!(
+                registry.try_reserve(),
+                "Should be able to reserve within MAX_CONCURRENT_JOBS"
+            );
+        }
+        // 17th reserve should fail
+        assert!(!registry.try_reserve(), "17th reserve should fail");
+    }
+
+    #[test]
+    fn test_background_job_registry_release_allows_re_reserve() {
+        let registry = BackgroundJobRegistry::new();
+        for _ in 0..16 {
+            assert!(registry.try_reserve());
+        }
+        assert!(!registry.try_reserve(), "Should be full");
+
+        // Release one
+        registry.release();
+        assert!(
+            registry.try_reserve(),
+            "Should be able to reserve after release"
+        );
+    }
+
+    // ── JSON-RPC types ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_json_rpc_request_deserialization() {
+        let json = r#"{"method":"run","params":{"capability":"FileRead"},"id":1}"#;
+        let req: JsonRpcRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.method, "run");
+        assert_eq!(req.id, serde_json::Value::from(1));
+    }
+
+    #[test]
+    fn test_json_rpc_request_missing_params_defaults() {
+        let json = r#"{"method":"list","id":null}"#;
+        let req: JsonRpcRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.method, "list");
+        assert_eq!(req.params, serde_json::Value::Null);
+        assert_eq!(req.id, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn test_json_rpc_response_result_serialization() {
+        let resp = JsonRpcResponse {
+            result: Some(serde_json::json!({"ok": true})),
+            error: None,
+            id: serde_json::Value::from(1),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"result\""));
+        assert!(!json.contains("\"error\""));
+    }
+
+    #[test]
+    fn test_json_rpc_response_error_serialization() {
+        let resp = JsonRpcResponse {
+            result: None,
+            error: Some(JsonRpcError {
+                code: -32700,
+                message: "Parse error".into(),
+            }),
+            id: serde_json::Value::Null,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"error\""));
+        assert!(!json.contains("\"result\""));
+    }
+
+    // ── LogsParams ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_logs_params_default_limit() {
+        let params: LogsParams = serde_json::from_str("{}").unwrap();
+        assert_eq!(params.limit, 10);
+    }
+
+    #[test]
+    fn test_logs_params_custom_limit() {
+        let params: LogsParams = serde_json::from_str(r#"{"limit":50}"#).unwrap();
+        assert_eq!(params.limit, 50);
+    }
+
+    // ── Compile-time signature checks ──────────────────────────────────────
+    // These tests verify that function signatures compile correctly when
+    // referenced. They do not execute the daemon event loop.
+
+    #[test]
+    fn test_run_function_exists_and_is_callable() {
+        // Verify the public `run` function has the expected signature.
+        // This test only checks compilation — actual execution requires a
+        // full daemon environment with a Unix socket, tokio runtime, etc.
+        // **Requires running daemon for integration testing.**
+        let _sig: fn() -> Result<(), Box<dyn std::error::Error>> = run;
+    }
+
+    #[test]
+    fn test_handle_run_type_contract_compiles() {
+        // Verify `handle_run` type contract compiles.
+        // Calls `handle_run` with an unknown capability to exercise the
+        // early-return error path. This validates the parameter types,
+        // return type, and the basic error-handling flow without executing
+        // any actual capability (no telemetry, no WAL writes beyond the
+        // initial DaemonState creation).
+        // **Requires running daemon for full integration testing.**
+        let dir = unique_test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let state = {
+            let _guard = ENV_MUTEX.lock().unwrap();
+            std::env::set_var("XDG_DATA_HOME", dir.to_str().unwrap());
+            let wp = dir.join("wal.jsonl");
+            Arc::new(DaemonState::new(&wp).unwrap())
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            // Unknown capability → returns early before any execution
+            let params = serde_json::json!({"capability": "NoSuchCap"});
+            let response = handle_run(&state, params, serde_json::Value::Null).await;
+
+            assert!(
+                response.error.is_some(),
+                "Unknown capability should return error"
+            );
+            assert_eq!(response.error.unwrap().code, -32602);
+        });
+
+        std::env::remove_var("XDG_DATA_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_handle_dispatch_type_contract_compiles() {
+        // Verify `handle_dispatch` type contract compiles.
+        // **Requires running daemon for full integration testing.**
+        let dir = unique_test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let state = {
+            let _guard = ENV_MUTEX.lock().unwrap();
+            std::env::set_var("XDG_DATA_HOME", dir.to_str().unwrap());
+            let wp = dir.join("wal.jsonl");
+            Arc::new(DaemonState::new(&wp).unwrap())
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let params = serde_json::json!({"capability": "NoSuchCap"});
+            let response = handle_dispatch(&state, params, serde_json::Value::Null).await;
+
+            assert!(
+                response.error.is_some(),
+                "Unknown capability should return error"
+            );
+            assert_eq!(response.error.unwrap().code, -32602);
+        });
+
+        std::env::remove_var("XDG_DATA_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_parse_args_accepted_flags() {
+        // Verify `Args` struct can be constructed with a socket path.
+        // `parse_args` is private; this test validates the struct shape.
+        let args = Args {
+            socket: std::path::PathBuf::from("/tmp/test.sock"),
+        };
+        assert_eq!(args.socket, std::path::PathBuf::from("/tmp/test.sock"));
+    }
+}

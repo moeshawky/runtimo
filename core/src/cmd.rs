@@ -43,3 +43,53 @@ pub fn run_cmd(cmd: &str) -> String {
 
     String::from_utf8_lossy(&output).trim().to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_run_cmd_echo() {
+        let result = run_cmd("echo hello");
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn test_run_cmd_echo_with_spaces() {
+        let result = run_cmd("echo 'hello world'");
+        assert!(result.contains("hello world"), "Got: {}", result);
+    }
+
+    #[test]
+    fn test_run_cmd_empty_string() {
+        // Empty command should return empty output (sh -c "" produces no output,
+        // and run_cmd never panics — it returns empty string on any failure)
+        let result = run_cmd("");
+        assert_eq!(result, "", "Empty command should produce empty output");
+    }
+
+    #[test]
+    fn test_run_cmd_nonexistent_command() {
+        // Command that doesn't exist — sh returns error but run_cmd returns empty
+        let result = run_cmd("nonexistent_command_xyz_123");
+        // Should not panic, should return empty string (unwrap_or_default on error)
+        // sh actually writes to stderr, not stdout, so output is empty
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_run_cmd_exit_nonzero() {
+        // `exit 1` makes sh exit with code 1 — stdout is empty
+        let result = run_cmd("exit 1");
+        // run_cmd returns empty string on non-zero exit because stdout is empty
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_run_cmd_returns_trimmed_output() {
+        // run_cmd trims whitespace from output
+        let result = run_cmd("echo '  spaces  '");
+        // echo preserves the spaces, but trim() removes them
+        assert_eq!(result, "spaces");
+    }
+}
