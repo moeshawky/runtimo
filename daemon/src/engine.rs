@@ -14,8 +14,8 @@
 
 use runtimo_core::{
     capabilities::{FileRead, FileWrite, GitExec, Kill, ShellExec, Undo},
-    execute_with_telemetry_and_session, BackupManager, CapabilityRegistry, WalEvent, WalEventType, WalReader,
-    WalWriter,
+    execute_with_telemetry_and_session, BackupManager, CapabilityRegistry, WalEvent, WalEventType,
+    WalReader, WalWriter,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -110,15 +110,27 @@ struct JsonRpcError {
     message: String,
 }
 
+/// Parameters for the `run` and `dispatch` JSON-RPC methods.
+///
+/// Contains the capability name, JSON arguments, dry-run flag, optional
+/// working directory, and an optional execution timeout in seconds.
+/// Timeout defaults to 30s when not specified.
 #[derive(Debug, Deserialize)]
 struct RunParams {
+    /// Capability name to execute (e.g., "FileRead", "ShellExec").
     capability: String,
+    /// JSON arguments for the capability (defaults to empty object).
     #[serde(default)]
     args: Value,
+    /// If true, capability skips side effects (dry-run mode).
     #[serde(default)]
     dry_run: bool,
+    /// Optional working directory for relative path resolution.
     #[serde(default)]
     working_dir: Option<String>,
+    /// Optional execution timeout in seconds (default: 30).
+    #[serde(default)]
+    timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -299,7 +311,7 @@ async fn handle_run(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonR
         &state.wal_path,
         None,
         run_params.working_dir.clone().map(PathBuf::from),
-        30,
+        run_params.timeout_secs.unwrap_or(30),
     ) {
         Ok(result) => JsonRpcResponse {
             result: Some(serde_json::json!({
@@ -359,10 +371,17 @@ async fn handle_dispatch(state: &Arc<DaemonState>, params: Value, id: Value) -> 
                 require_file: false,
                 ..Default::default()
             };
-            runtimo_core::validation::path::validate_path(wd, &ctx).ok()
+            match runtimo_core::validation::path::validate_path(wd, &ctx) {
+                Ok(_validated) => Some(wd.clone()),
+                Err(e) => {
+                    eprintln!("[runtimo] Working directory validation failed: {}", e);
+                    None
+                }
+            }
         }
         _ => None,
     };
+    let timeout_secs = run_params.timeout_secs.unwrap_or(30);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -398,6 +417,7 @@ async fn handle_dispatch(state: &Arc<DaemonState>, params: Value, id: Value) -> 
     let jid = job_id.clone();
     let cn = cap_name.clone();
     let wd = working_dir.clone();
+    let t_secs = timeout_secs;
     std::thread::spawn(move || {
         // Acquire wal_mutex to serialize WAL writes with handle_run (Fix for CBP violation #2)
         let _wal_guard = tokio_handle.block_on(state_arc.wal_mutex.lock());
@@ -411,7 +431,15 @@ async fn handle_dispatch(state: &Arc<DaemonState>, params: Value, id: Value) -> 
             // working_dir is Option<String> from RunParams, convert to Option<PathBuf>
             #[allow(clippy::useless_conversion)]
             let wd_path = wd.map(PathBuf::from);
-            execute_with_telemetry_and_session(cap, &args, dry, &state_arc.wal_path, None, wd_path, 30)
+            execute_with_telemetry_and_session(
+                cap,
+                &args,
+                dry,
+                &state_arc.wal_path,
+                None,
+                wd_path,
+                t_secs,
+            )
         }));
 
         let now = std::time::SystemTime::now()
@@ -755,7 +783,7 @@ fn reconcile_orphaned_jobs(wal_path: &std::path::Path) {
 
     // Collect job_ids that have a JobStarted event
     let mut started: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-    let mut finished: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut finished: std::collections::HashSet<&String> = std::collections::HashSet::new();
 
     for e in events {
         if matches!(e.event_type, WalEventType::JobStarted) {
@@ -765,13 +793,13 @@ fn reconcile_orphaned_jobs(wal_path: &std::path::Path) {
             e.event_type,
             WalEventType::JobCompleted | WalEventType::JobFailed
         ) {
-            finished.insert(e.job_id.clone());
+            finished.insert(&e.job_id);
         }
     }
 
     let orphaned: Vec<String> = started
         .keys()
-        .filter(|jid| !finished.contains(*jid))
+        .filter(|jid| !finished.contains(jid))
         .cloned()
         .collect();
 
@@ -828,83 +856,83 @@ fn reconcile_orphaned_jobs(wal_path: &std::path::Path) {
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-    let args = parse_args();
-    let wal_path = PathBuf::from(
-        std::env::var("RUNTIMO_WAL_PATH")
-            .unwrap_or_else(|_| default_wal_path().to_string_lossy().to_string()),
-    );
+        let args = parse_args();
+        let wal_path = PathBuf::from(
+            std::env::var("RUNTIMO_WAL_PATH")
+                .unwrap_or_else(|_| default_wal_path().to_string_lossy().to_string()),
+        );
 
-    println!("Runtimo Daemon v{}", env!("CARGO_PKG_VERSION"));
-    println!("Socket: {}", args.socket.display());
-    println!("WAL:    {}", wal_path.display());
+        println!("Runtimo Daemon v{}", env!("CARGO_PKG_VERSION"));
+        println!("Socket: {}", args.socket.display());
+        println!("WAL:    {}", wal_path.display());
 
-    ensure_data_dir()?;
+        ensure_data_dir()?;
 
-    if args.socket.exists() {
-        std::fs::remove_file(&args.socket)?;
-        println!("Removed stale socket file");
-    }
-
-    let state = Arc::new(DaemonState::new(&wal_path)?);
-
-    // Reconcile orphaned jobs left from a previous crash/termination
-    reconcile_orphaned_jobs(&wal_path);
-
-    // Spawn periodic background maintenance tasks
-    let wal_path_bg = wal_path.clone();
-    let backup_dir = runtimo_core::utils::backup_dir();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_hours(1));
-        loop {
-            interval.tick().await;
-            let _ = BackupManager::new(backup_dir.clone()).map(|mgr| mgr.cleanup(86400 * 7));
-            let _ = WalWriter::cleanup(&wal_path_bg, 86400 * 7);
-            let _ = WalWriter::rotate(&wal_path_bg, 10 * 1024 * 1024, 5);
+        if args.socket.exists() {
+            std::fs::remove_file(&args.socket)?;
+            println!("Removed stale socket file");
         }
-    });
 
-    let _monitor = match runtimo_core::HealthMonitor::start() {
-        Ok(m) => Some(m),
-        Err(e) => {
-            eprintln!("HealthMonitor failed to start: {}", e);
-            None
-        }
-    };
+        let state = Arc::new(DaemonState::new(&wal_path)?);
 
-    // Try to acquire daemon.lock with LOCK_NB to coordinate with CLI.
-    // If CLI already holds the lock (during auto-start), we proceed without it.
-    let daemon_lock_path = runtimo_core::utils::data_dir().join("daemon.lock");
-    if let Some(parent) = daemon_lock_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let lock_file = File::create(&daemon_lock_path);
-    if let Ok(file) = lock_file {
-        use std::os::unix::io::AsRawFd;
-        let fd = file.as_raw_fd();
-        // SAFETY: fd is valid file descriptor from File::create; LOCK_EX | LOCK_NB are valid flags
-        let result = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-        if result != 0 {
-            // Lock held by CLI during auto-start — proceed without holding it
-        }
-        // Note: file is not dropped here; if we did acquire the lock, it's held for daemon lifetime.
-        // If we didn't acquire it, the CLI already holds it and will release when done.
-    }
+        // Reconcile orphaned jobs left from a previous crash/termination
+        reconcile_orphaned_jobs(&wal_path);
 
-    let listener = tokio::net::UnixListener::bind(&args.socket)?;
-    println!("Listening on {}", args.socket.display());
-
-    loop {
-        let (stream, addr) = listener.accept().await?;
-        let state = Arc::clone(&state);
-
+        // Spawn periodic background maintenance tasks
+        let wal_path_bg = wal_path.clone();
+        let backup_dir = runtimo_core::utils::backup_dir();
         tokio::spawn(async move {
-            let peer = addr
-                .as_pathname()
-                .map_or_else(|| "unknown".to_string(), |p| p.display().to_string());
-            if let Err(e) = handle_client(stream, state).await {
-                eprintln!("Client {} error: {}", peer, e);
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_hours(1));
+            loop {
+                interval.tick().await;
+                let _ = BackupManager::new(backup_dir.clone()).map(|mgr| mgr.cleanup(86400 * 7));
+                let _ = WalWriter::cleanup(&wal_path_bg, 86400 * 7);
+                let _ = WalWriter::rotate(&wal_path_bg, 10 * 1024 * 1024, 5);
             }
         });
-    }
+
+        let _monitor = match runtimo_core::HealthMonitor::start() {
+            Ok(m) => Some(m),
+            Err(e) => {
+                eprintln!("HealthMonitor failed to start: {}", e);
+                None
+            }
+        };
+
+        // Try to acquire daemon.lock with LOCK_NB to coordinate with CLI.
+        // If CLI already holds the lock (during auto-start), we proceed without it.
+        let daemon_lock_path = runtimo_core::utils::data_dir().join("daemon.lock");
+        if let Some(parent) = daemon_lock_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let lock_file = File::create(&daemon_lock_path);
+        if let Ok(file) = lock_file {
+            use std::os::unix::io::AsRawFd;
+            let fd = file.as_raw_fd();
+            // SAFETY: fd is valid file descriptor from File::create; LOCK_EX | LOCK_NB are valid flags
+            let result = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+            if result != 0 {
+                // Lock held by CLI during auto-start — proceed without holding it
+            }
+            // Note: file is not dropped here; if we did acquire the lock, it's held for daemon lifetime.
+            // If we didn't acquire it, the CLI already holds it and will release when done.
+        }
+
+        let listener = tokio::net::UnixListener::bind(&args.socket)?;
+        println!("Listening on {}", args.socket.display());
+
+        loop {
+            let (stream, addr) = listener.accept().await?;
+            let state = Arc::clone(&state);
+
+            tokio::spawn(async move {
+                let peer = addr
+                    .as_pathname()
+                    .map_or_else(|| "unknown".to_string(), |p| p.display().to_string());
+                if let Err(e) = handle_client(stream, state).await {
+                    eprintln!("Client {} error: {}", peer, e);
+                }
+            });
+        }
     })
 }

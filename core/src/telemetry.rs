@@ -139,14 +139,20 @@ pub struct DetectedService {
 }
 
 /// Network state information.
+///
+/// Public IP capture is **opt-in** via `RUNTIMO_ENABLE_PUBLIC_IP=1`.
+/// Without this env var, `public_ip` defaults to `"unknown"` to prevent
+/// unintended external network metadata leakage.
+/// Cloudflared tunnel `--token` values are redacted from `tunnel_name`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(clippy::exhaustive_structs)]
 pub struct NetworkInfo {
-    /// Public IP address (from `ifconfig.me`), or `"unknown"`.
+    /// Public IP address (from `ifconfig.me` when `RUNTIMO_ENABLE_PUBLIC_IP=1`),
+    /// or `"unknown"`.
     pub public_ip: String,
     /// Whether a `cloudflared` tunnel process is running.
     pub tunnel_running: bool,
-    /// The full `cloudflared` process command line, if running.
+    /// The `cloudflared` process command line with `--token` redacted, if running.
     pub tunnel_name: Option<String>,
 }
 
@@ -500,14 +506,26 @@ fn detect_version(cmd: &str) -> Option<String> {
 }
 
 impl NetworkInfo {
+    /// Captures network state with opt-in public IP and redacted tunnel info.
+    ///
+    /// Public IP is only queried when `RUNTIMO_ENABLE_PUBLIC_IP=1`. Without it,
+    /// `public_ip` is set to `"unknown"`. This prevents unintended disclosure
+    /// of the host's external IP address to downstream consumers.
+    ///
+    /// Cloudflared tunnel output has `--token` values redacted before storage.
     fn capture() -> Self {
-        let public_ip = run_cmd(
-            "curl -s --connect-timeout 5 --max-time 5 ifconfig.me 2>/dev/null || echo 'unknown'",
-        );
+        let public_ip = if std::env::var("RUNTIMO_ENABLE_PUBLIC_IP").as_deref() == Ok("1") {
+            run_cmd(
+                "curl -s --connect-timeout 5 --max-time 5 ifconfig.me 2>/dev/null || echo 'unknown'",
+            )
+        } else {
+            "unknown".to_string()
+        };
         let tunnel_output = run_cmd("pgrep -fa cloudflared");
         let tunnel_running = !tunnel_output.is_empty();
         let tunnel_name = if tunnel_running {
-            Some(tunnel_output)
+            // Redact --token values from cloudflared command line
+            Some(redact_cloudflared_token(&tunnel_output))
         } else {
             None
         };
@@ -518,6 +536,38 @@ impl NetworkInfo {
             tunnel_name,
         }
     }
+}
+
+/// Redacts `--token <value>` from cloudflared process output.
+///
+/// Strips any `--token` argument (and its following value) from the command
+/// line string, replacing the token value with `***`.
+fn redact_cloudflared_token(cmdline: &str) -> String {
+    let parts: Vec<&str> = cmdline.split_whitespace().collect();
+    let mut result = Vec::with_capacity(parts.len());
+    let mut skip_next = false;
+    for part in parts {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if part == "--token" {
+            result.push("--token");
+            result.push("***");
+            skip_next = true;
+        } else if let Some(stripped) = part.strip_prefix("--token=") {
+            if stripped.is_empty() {
+                result.push("--token");
+                // The value is the next argument
+                skip_next = true;
+            } else {
+                result.push("--token=***");
+            }
+        } else {
+            result.push(part);
+        }
+    }
+    result.join(" ")
 }
 
 #[cfg(test)]
@@ -552,6 +602,11 @@ mod tests {
 
         let net = &telemetry.network;
         assert!(!net.public_ip.is_empty(), "public_ip must not be empty");
+        // Default: public_ip is "unknown" unless RUNTIMO_ENABLE_PUBLIC_IP=1
+        assert_eq!(
+            net.public_ip, "unknown",
+            "public_ip should be 'unknown' by default (opt-in via RUNTIMO_ENABLE_PUBLIC_IP=1)"
+        );
     }
 
     #[test]

@@ -84,6 +84,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.5] - 2026-06-15
+
+### Security Fixes
+
+- **Telemetry public IP opt-in** — `NetworkInfo::capture()` no longer calls `curl ifconfig.me` unconditionally. Public IP lookup is gated behind `RUNTIMO_ENABLE_PUBLIC_IP=1`. Cloudflared `--token` values are redacted from tunnel output. (`core/src/telemetry.rs`)
+- **ShellExec network command gating** — Network tools (`curl`, `wget`, `nc`, `ssh`, `scp`, `telnet`, `socat`) are blocked by default in ShellExec. Gated behind `RUNTIMO_ENABLE_NETWORK=1`. (`core/src/capabilities/shell_exec.rs`)
+- **ShellExec dangerous command hardening** — `is_dangerous_command()` now blocks `--recursive` flag on `rm` (GNU long-option bypass), `chown`, `chgrp`, `mount`, `umount`, `iptables`, `nft`. Added `command_matches()` helper for prefix-based command detection. (`core/src/capabilities/shell_exec.rs`)
+- **ShellExec PATH sanitization** — `execute()` now sets `PATH=/usr/local/bin:/usr/bin:/bin` before spawning, preventing environment-based PATH hijack. (`core/src/capabilities/shell_exec.rs`)
+- **GitExec branch validation hardening** — `validate_branch_name()` now rejects option-injection prefixes (`--`), ref-injection patterns (`refs/`), control characters, whitespace, and metacharacters (`:`, `~`, `^`, `*`, `[`, `\\`, `?`, `.lock`). (`core/src/capabilities/git_exec.rs`)
+- **data_dir() /tmp fallback eliminated** — `data_dir()` now panics with a clear message when neither `XDG_DATA_HOME` nor `HOME` is set, matching the behavior of `config_path()`. No more silent WAL/backup placement in world-readable `/tmp`. (`core/src/lib.rs`)
+- **deny.toml license allow-list** — Added `MPL-2.0` and `Unicode-3.0` licenses for transitive dependencies (`cbindgen` build-dep, `unicode-ident`). (`deny.toml`)
+- **GitExec network documentation** — Added explicit documentation that Git operations are inherently network-capable by design, with network isolation at the URL validation + SSRF blocking layer. (`core/src/capabilities/git_exec.rs`)
+
+### Fixed
+
+- **Daemon timeout now configurable** — `RunParams` struct now includes `timeout_secs` field, wired through both `handle_run` and `handle_dispatch`. Previously hardcoded to 30 seconds. (`daemon/src/engine.rs`)
+- **Daemon working_dir validation errors logged** — `validate_path()` failures are now logged via `eprintln!` instead of silently converted to `None`. Users are notified when their requested working_dir is rejected. (`daemon/src/engine.rs`)
+- **deny.toml cargo-deny 0.19.4 compatibility** — Fixed `unmaintained = "warn"` (invalid for cargo-deny ≥0.18) to `unmaintained = "all"`. Removed deprecated `notice` and `unlicensed` keys. All cargo-deny subcommands now execute successfully. (`deny.toml`)
+- **Cargo.lock refreshed** — 16 packages updated to latest semver-compatible versions, including `llmosafe` 0.7.3→0.7.5. (`Cargo.lock`)
+
+### Removed
+
+- **Dead code: SchemaValidator** — Removed unused `schema.rs` module (102 lines). The module was crate-private, had zero consumers, and was annotated `#[allow(dead_code)]` for future use. (`core/src/schema.rs`, `core/src/lib.rs`)
+- **Dead code: GitExec::run_git()** — Removed unused backward-compatibility wrapper. All call sites use `run_git_with_timeout()` directly. (`core/src/capabilities/git_exec.rs`)
+- **Duplicate binary target** — Removed `daemon/src/main.rs`. The daemon binary is produced exclusively by `cli/src/daemon_bin.rs`, eliminating the `cargo build` filename collision warning between the daemon and cli crates. (`daemon/src/main.rs`)
+- **Unused workspace dependencies** — Removed unused `serde` and `thiserror` from `cli/Cargo.toml`; removed unused `thiserror` from `daemon/Cargo.toml`. (`cli/Cargo.toml`, `daemon/Cargo.toml`)
+
+### Changed
+
+- **MSRV declared correctly** — `rust-version` changed from `1.85.0` to `1.70.0`, matching the CI-tested MSRV in `ci.yml`. (`Cargo.toml`)
+- **GitClone optimization** — Changed `HashSet<String>` to `HashSet<&String>` in `cli/src/main.rs` and `daemon/src/engine.rs` job deduplication paths, eliminating redundant `String::clone()` allocations. (`cli/src/main.rs`, `daemon/src/engine.rs`)
+- **Documentation rename** — `docs/RUNTIMO_CORE_LIB.rs` renamed to `docs/RUNTIMO_CORE_LIB.rs.txt` to prevent false Rust tooling diagnostics. (`docs/`)
+- **Gitignore hardening** — Added `.moegraph/` and `.workflow-state.md` to `.gitignore` for local development artifact exclusion. (`.gitignore`)
+- **CI workflow committed** — `publish-cratesio.yml` is now tracked by git. (`.github/workflows/`)
+- **Environment variable documentation** — README now documents `RUNTIMO_ENABLE_PUBLIC_IP`, `RUNTIMO_DAL`, `RUNTIMO_STATE_DIR`, and `RUNTIMO_ENABLE_NETWORK`. (`README.md`)
+
+### Testing
+
+- **Generate ID tests** — Added deterministic uniqueness and format-invariant tests for `generate_id()`. (`core/src/lib.rs`)
+- **GitExec branch validation tests** — 15 new test cases covering option injection, ref injection, control characters, whitespace, and metacharacter rejection. (`core/src/capabilities/git_exec.rs`)
+- **ShellExec blocklist tests** — 6 new test cases for recursive-flag, ownership-command, mount-command, firewall-command, and network-command blocking. (`core/src/capabilities/shell_exec.rs`)
+- **Total test count: 233** (up from 206 in v0.6.4). All passing.
+
+---
+
 ## [0.5.0] - 2026-05-30
 
 ### Security Fixes

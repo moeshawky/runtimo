@@ -14,14 +14,9 @@ workspace = true
 name = "runtimo_daemon"
 path = "src/lib.rs"
 
-[[bin]]
-name = "runtimo-daemon"
-path = "src/main.rs"
-
 [dependencies]
 runtimo-core = { path = "../core", version = "0.6" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-thiserror.workspace = true
 libc = "0.2"

@@ -11,6 +11,24 @@
 //! - Secret file detection for git add
 //! - Telemetry and process tracking before/after execution
 //!
+//! # Network capability
+//!
+//! **Git operations ARE inherently network-capable.** `git clone`, `git pull`,
+//! and `git fetch` make outbound connections to remote repositories.
+//! This is by design — denying network access would make GitExec useless.
+//!
+//! The network isolation is at the transport/protocol level:
+//! - Only HTTPS (`https://`) and SSH (`git@`) URLs are accepted
+//! - SSRF targets (metadata services, localhost, private ranges) are blocked
+//! - Credentials are sanitized from all output and telemetry
+//!
+//! **Note on ShellExec interaction:** GitExec spawns `git` subprocesses which
+//! internally invoke `git-remote-https` (a git helper, NOT the system `curl`).
+//! The ShellExec network blocklist (`curl`, `wget`, etc.) does NOT affect
+//! GitExec — git uses its own transport layer. However, `RUNTIMO_ENABLE_NETWORK`
+//! does NOT gate GitExec; GitExec's network access is controlled by its own
+//! URL validation and SSRF blocking.
+//!
 //! # Example
 //!
 //! ```rust,ignore
@@ -179,12 +197,6 @@ impl GitExec {
         }
     }
 
-    /// Runs a git command (backwards-compatible, uses default timeout).
-    #[allow(dead_code)]
-    fn run_git(repo_path: &Path, args: &[&str]) -> Result<String> {
-        Self::run_git_with_timeout(repo_path, args, 300)
-    }
-
     /// Checks if the working tree is clean (no uncommitted changes).
     fn is_working_tree_clean(repo_path: &Path) -> bool {
         let output = Command::new("git")
@@ -270,7 +282,12 @@ impl GitExec {
             .any(|indicator| lower.contains(indicator))
     }
 
-    /// Validates a branch name.
+    /// Validates a branch name against git's ref naming rules and option injection.
+    ///
+    /// Rejects: empty branches, `..` (range spec), `@{` (reflog), `--` prefix
+    /// (option injection), `refs/` patterns (ref injection), control characters,
+    /// whitespace, and shell/git metacharacters (`:`, `~`, `^`, `*`, `[`, `\\`,
+    /// `.lock`, `?`).
     fn validate_branch_name(branch: &str) -> Result<()> {
         if branch.is_empty() {
             return Err(Error::SchemaValidationFailed("Branch name is empty".into()));
@@ -278,6 +295,34 @@ impl GitExec {
         if branch.contains("..") || branch.contains("@{") {
             return Err(Error::SchemaValidationFailed(format!(
                 "Invalid branch name: {}",
+                branch
+            )));
+        }
+        if branch.starts_with("--") {
+            return Err(Error::SchemaValidationFailed(format!(
+                "Branch name cannot start with '--': {}",
+                branch
+            )));
+        }
+        if branch.starts_with("refs/") || branch.contains("/refs/") {
+            return Err(Error::SchemaValidationFailed(format!(
+                "Ref injection detected in branch name: {}",
+                branch
+            )));
+        }
+        if branch.contains(|c: char| c.is_control() || c.is_whitespace()) {
+            return Err(Error::SchemaValidationFailed(format!(
+                "Branch name contains control or whitespace: {}",
+                branch
+            )));
+        }
+        if branch.contains([':', '~', '^', '*', '[', '\\', '?'])
+            || std::path::Path::new(branch)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("lock"))
+        {
+            return Err(Error::SchemaValidationFailed(format!(
+                "Branch name contains invalid character: {}",
                 branch
             )));
         }
@@ -1129,6 +1174,23 @@ mod tests {
         assert!(GitExec::validate_branch_name("").is_err());
         assert!(GitExec::validate_branch_name("bad..name").is_err());
         assert!(GitExec::validate_branch_name("@{..}").is_err());
+        // Option injection
+        assert!(GitExec::validate_branch_name("--force").is_err());
+        assert!(GitExec::validate_branch_name("--help").is_err());
+        // Ref injection
+        assert!(GitExec::validate_branch_name("refs/heads/main").is_err());
+        // Control chars and whitespace
+        assert!(GitExec::validate_branch_name("bad\nname").is_err());
+        assert!(GitExec::validate_branch_name("bad\tname").is_err());
+        // Metacharacters
+        assert!(GitExec::validate_branch_name("bad:name").is_err());
+        assert!(GitExec::validate_branch_name("bad~name").is_err());
+        assert!(GitExec::validate_branch_name("bad^name").is_err());
+        assert!(GitExec::validate_branch_name("bad*name").is_err());
+        assert!(GitExec::validate_branch_name("bad[name").is_err());
+        assert!(GitExec::validate_branch_name("bad\\name").is_err());
+        assert!(GitExec::validate_branch_name("bad?name").is_err());
+        assert!(GitExec::validate_branch_name("name.lock").is_err());
     }
 
     #[test]

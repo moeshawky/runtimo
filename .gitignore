@@ -40,3 +40,9 @@ runtimo_test_undo/
 runtimo_test_sessions_*/
 runtimo_symlink_test
 .sniper/
+
+# Moegraph database (local graph cache)
+.moegraph/
+
+# Workflow state (local development tracking)
+.workflow-state.md

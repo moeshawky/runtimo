@@ -16,7 +16,7 @@ Runtimo is a Rust workspace providing a **capability execution engine**. Every c
 - **Backup/undo** — Files backed up before mutation, rollback by job ID
 - **Input validation** — Capabilities validate arguments including path traversal, symlink, and null byte protection
 
-**Version:** 0.2.2 | **Rust Edition:** 2021 |  **Tests:** 206 (120 lib + 24 doc + 31 int + 31 robust)
+**Version:** 0.6.5 | **Rust Edition:** 2021 | **Tests:** 233 (127 lib + 4 doc + 51 int + 40 robust + 7 cli)
 
 ## Quick Start
 
@@ -325,6 +325,10 @@ cargo clippy --all-targets          # zero warnings required
 | `RUNTIMO_ALLOWED_PATHS` | (colon-separated) | Additional allowed path prefixes |
 | `XDG_CONFIG_HOME` | `~/.config` | Config file location (`runtimo/config.toml`) |
 | `XDG_DATA_HOME` | `~/.local/share` | Default WAL/backup/session root |
+| `RUNTIMO_ENABLE_PUBLIC_IP` | (unset) | Set to `1` to enable public IP discovery in telemetry |
+| `RUNTIMO_DAL` | (unset) | Data access layer configuration (future) |
+| `RUNTIMO_STATE_DIR` | `$XDG_DATA_HOME/runtimo` | Override state directory for WAL/backups/sessions |
+| `RUNTIMO_ENABLE_NETWORK` | (unset) | Set to `1` to allow outbound network tools (curl, wget, etc.) in ShellExec |
 
 ## License
 

@@ -1,0 +1,68 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# MASTER: Publish to crates.io (ix / sniper / llmosafe / runtimo)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Canonical source: /workspace/.github/workflows/publish-cratesio.yml
+# Reference:        /workspace/PUBLISHING.md
+#
+# REQUIRED REPO SECRET: CARGO_REGISTRY_TOKEN (from crates.io Account Settings)
+# REQUIRED: The crate must already exist on crates.io (first publish is manual)
+#
+# Only the PROJECT and PUBLISH_FLAGS env vars differ between copies.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+name: Publish to crates.io
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  PROJECT: runtimo                          # ← CHANGE: ix | sniper | llmosafe | runtimo
+  PUBLISH_FLAGS: "-p runtimo-core"                    # ← CHANGE for workspaces: "-p runtimo-core"
+
+jobs:
+  # ── Gate: verify token exists ────────────────────────────────────────────
+  check-token:
+    runs-on: ubuntu-latest
+    outputs:
+      has-token: ${{ steps.check.outputs.has-token }}
+    steps:
+      - id: check
+        run: |
+          if [[ -n "${{ secrets.CARGO_REGISTRY_TOKEN }}" ]]; then
+            echo "has-token=true" >> "$GITHUB_OUTPUT"
+            echo "✅ CARGO_REGISTRY_TOKEN is configured"
+          else
+            echo "::error::CARGO_REGISTRY_TOKEN secret is not configured for this repo"
+            echo "has-token=false" >> "$GITHUB_OUTPUT"
+            echo "❌ Set CARGO_REGISTRY_TOKEN in repo Settings > Secrets > Actions"
+          fi
+
+  # ── Dry-run: verify the crate can be published ──────────────────────────
+  dry-run:
+    needs: check-token
+    if: needs.check-token.outputs.has-token == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo publish --dry-run
+        run: cargo publish ${{ env.PUBLISH_FLAGS }} --dry-run --locked
+
+  # ── Publish ──────────────────────────────────────────────────────────────
+  publish:
+    needs: dry-run
+    runs-on: ubuntu-latest
+    environment:
+      name: cratesio
+      url: https://crates.io/crates/${{ env.PROJECT == 'runtimo' && 'runtimo-core' || env.PROJECT == 'ix' && 'moeix' || env.PROJECT == 'sniper' && 'moesniper' || 'llmosafe' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish ${{ env.PUBLISH_FLAGS }} --locked

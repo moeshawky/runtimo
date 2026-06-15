@@ -21,8 +21,6 @@ path = "src/daemon_bin.rs"
 [dependencies]
 runtimo-core = { path = "../core", version = "0.6" }
 runtimo-daemon = { path = "../daemon", version = "0.6" }
-serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
 clap = { version = "4.0", features = ["derive"] }
 libc = "0.2"

@@ -2,18 +2,24 @@
 # https://EmbarkStudios.github.io/cargo-deny/
 
 [advisories]
-unmaintained = "warn"
+# "all" catches unmaintained dependencies; cargo-deny >=0.16 requires this, not "warn"
+unmaintained = "all"
 yanked = "warn"
-notice = "warn"
+# RUSTSEC-2024-0375: `dirs` is unmaintained — transitive via llmosafe → dirs.
+# Not directly depended on; no fix is possible without upstream changes.
+ignore = [
+    "RUSTSEC-2024-0375",  # dirs — unmaintained, transitive via llmosafe → dirs
+]
 
 [licenses]
-unlicensed = "deny"
 allow = [
     "MIT",
     "Apache-2.0",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
+    "MPL-2.0",
+    "Unicode-3.0",
     "Unicode-DFS-2016",
     "Zlib",
 ]

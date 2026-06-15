@@ -11,15 +11,27 @@
 //! The blocklist catches obvious agent hallucinations/bugs.
 //!
 //! **What's blocked:**
-//! - Filesystem destruction: `rm -rf /`, `rm -rf` on system dirs (`/home`, `/etc`, `/usr`, `/var`, `/lib`, `/opt`, `/bin`, `/sbin`)
+//! - Filesystem destruction: `rm -rf /`, `rm --recursive` on system dirs (`/home`, `/etc`, `/usr`, `/var`, `/lib`, `/opt`, `/bin`, `/sbin`)
 //! - Shell expansion bypasses: `rm -rf ~` (tilde expansion)
 //! - Filesystem creation: `mkfs.*`, `mkswap`
 //! - Data destruction: `dd if=/dev/zero`
 //! - System commands: `shutdown`, `reboot`, `poweroff`
 //! - Disk operations: `fdisk`, `parted`
+//! - Permission/ownership changes: `chown`, `chgrp`, `chmod 777 /`
+//! - Mount operations: `mount`, `umount`
+//! - Firewall manipulation: `iptables`, `nft`
+//! - Outbound network tools: `curl`, `wget`, `nc`, `ncat`, `socat`, `ssh`, `scp`, `telnet`
+//!   (gated behind `RUNTIMO_ENABLE_NETWORK=1` env var)
+//!
+//! **PATH sanitization:**
+//! ShellExec sets `PATH=/usr/local/bin:/usr/bin:/bin` to limit
+//! which executables the command can invoke. Custom binaries
+//! in non-standard locations are not resolvable.
 //!
 //! **What protects you:**
 //! - Dangerous command blocklist
+//! - Network command gating (opt-in via `RUNTIMO_ENABLE_NETWORK`)
+//! - PATH sanitization to known-safe directories
 //! - Resource limits (timeout, process isolation)
 //! - WAL audit trail (supports undo/recovery)
 //!
@@ -81,6 +93,25 @@ pub struct ShellExecArgs {
     pub stdin: Option<String>,
 }
 
+/// Tests whether a command prefix (first whitespace-delimited token) matches
+/// any entry in the given list. Avoids false-positives from substrings
+/// (e.g. "ssh" in "ssh-agent" is fine when `ssh` is a prefix match but not
+/// when it appears mid-word).
+fn command_matches(cmd_lower: &str, names: &[&str]) -> bool {
+    let first_token = cmd_lower.split_whitespace().next().unwrap_or("");
+    // Also check for pipe/chaining context: `echo foo | curl ...` or `true && curl ...`
+    for part in cmd_lower.split(['|', '&', ';']) {
+        let t = part.trim();
+        if names
+            .iter()
+            .any(|n| t == *n || t.starts_with(&format!("{} ", n)))
+        {
+            return true;
+        }
+    }
+    names.contains(&first_token)
+}
+
 fn is_dangerous_command(cmd: &str) -> Option<&'static str> {
     let cmd_lower = cmd.to_lowercase();
     if cmd_lower.contains("mkfs") || cmd_lower.contains("mkswap") {
@@ -98,9 +129,22 @@ fn is_dangerous_command(cmd: &str) -> Option<&'static str> {
     {
         return Some("system power commands are blocked");
     }
+    // chown/chgrp — ownership changes
+    if command_matches(&cmd_lower, &["chown", "chgrp"]) {
+        return Some("ownership change commands are blocked");
+    }
+    // mount/unmount — filesystem mount operations
+    if command_matches(&cmd_lower, &["mount", "umount"]) {
+        return Some("mount/unmount commands are blocked");
+    }
+    // iptables/nft — firewall manipulation
+    if command_matches(&cmd_lower, &["iptables", "nft"]) {
+        return Some("firewall manipulation commands are blocked");
+    }
     if cmd_lower.contains("rm")
         && (cmd_lower.contains("-rf")
             || cmd_lower.contains("-fr")
+            || cmd_lower.contains("--recursive")
             || cmd_lower.contains(" -r ")
             || cmd_lower.contains(" -f "))
         && (cmd_lower.contains(" / ")
@@ -116,21 +160,45 @@ fn is_dangerous_command(cmd: &str) -> Option<&'static str> {
             || cmd_lower.contains("/bin")
             || cmd_lower.contains("/sbin"))
     {
-        return Some("rm -rf on system directories is blocked");
+        return Some("rm -rf / --recursive on system directories is blocked");
     }
     if cmd_lower.contains("rm")
         && (cmd_lower.contains("-rf")
             || cmd_lower.contains("-fr")
+            || cmd_lower.contains("--recursive")
             || cmd_lower.contains(" -r ")
             || cmd_lower.contains(" -f "))
         && cmd_lower.contains('~')
     {
-        return Some("rm -rf with shell expansions is blocked — use explicit paths");
+        return Some("rm with shell expansions is blocked — use explicit paths");
     }
     if cmd_lower.contains("chmod") && cmd_lower.contains("777") && cmd_lower.contains(" /") {
         return Some("chmod 777 / is blocked");
     }
     None
+}
+
+/// Tests whether a command invokes a network client.
+///
+/// Blocked tools: `curl`, `wget`, `nc`/`ncat`/`netcat`, `socat`,
+/// `ssh`, `scp`, `telnet`.
+///
+/// These are only blocked when `RUNTIMO_ENABLE_NETWORK` is not set to `"1"`.
+fn is_network_command(cmd: &str) -> bool {
+    let cmd_lower = cmd.to_lowercase();
+    command_matches(
+        &cmd_lower,
+        &[
+            "curl", "wget", "nc", "ncat", "netcat", "socat", "ssh", "scp", "telnet",
+        ],
+    )
+}
+
+/// Checks whether outbound network commands are permitted.
+///
+/// Returns `true` when network tools are allowed (env var set to `"1"`).
+fn network_enabled() -> bool {
+    std::env::var("RUNTIMO_ENABLE_NETWORK").as_deref() == Ok("1")
 }
 
 #[allow(clippy::arithmetic_side_effects)] // -(pgid) negation is safe for valid PIDs
@@ -293,7 +361,17 @@ impl Capability for ShellExec {
                 reason
             )));
         }
+        if !network_enabled() && is_network_command(&args.cmd) {
+            return Err(Error::ExecutionFailed(
+                "network commands blocked — set RUNTIMO_ENABLE_NETWORK=1 to enable".into(),
+            ));
+        }
         let mut cmd = Command::new("sh");
+        // PATH sanitization: limit executable resolution to trusted system dirs.
+        // This is defense-in-depth — the blocklist catches known-dangerous
+        // commands, but this prevents invocation of custom binaries in
+        // non-standard locations.
+        cmd.env("PATH", "/usr/local/bin:/usr/bin:/bin");
         cmd.arg("-c").arg(&args.cmd);
         if let Some(cwd) = &args.cwd {
             let path_ctx = PathContext {
@@ -406,6 +484,128 @@ mod tests {
                 }
             )
             .is_err());
+    }
+    #[test]
+    fn blocks_recursive_flag() {
+        // rm --recursive (long form) should be caught like -rf
+        assert!(ShellExec
+            .execute(
+                &serde_json::json!({"cmd": "rm --recursive /home"}),
+                &Context {
+                    dry_run: false,
+                    job_id: "test".into(),
+                    working_dir: std::env::temp_dir()
+                }
+            )
+            .is_err());
+    }
+    #[test]
+    fn blocks_ownership_commands() {
+        for cmd in &["chown root /tmp/x", "chgrp staff /tmp/x"] {
+            assert!(
+                ShellExec
+                    .execute(
+                        &serde_json::json!({"cmd": cmd}),
+                        &Context {
+                            dry_run: false,
+                            job_id: "test".into(),
+                            working_dir: std::env::temp_dir()
+                        }
+                    )
+                    .is_err(),
+                "should block: {}",
+                cmd
+            );
+        }
+    }
+    #[test]
+    fn blocks_mount_commands() {
+        for cmd in &["mount /dev/sda1 /mnt", "umount /mnt"] {
+            assert!(
+                ShellExec
+                    .execute(
+                        &serde_json::json!({"cmd": cmd}),
+                        &Context {
+                            dry_run: false,
+                            job_id: "test".into(),
+                            working_dir: std::env::temp_dir()
+                        }
+                    )
+                    .is_err(),
+                "should block: {}",
+                cmd
+            );
+        }
+    }
+    #[test]
+    fn blocks_firewall_commands() {
+        for cmd in &["iptables -L", "nft list ruleset"] {
+            assert!(
+                ShellExec
+                    .execute(
+                        &serde_json::json!({"cmd": cmd}),
+                        &Context {
+                            dry_run: false,
+                            job_id: "test".into(),
+                            working_dir: std::env::temp_dir()
+                        }
+                    )
+                    .is_err(),
+                "should block: {}",
+                cmd
+            );
+        }
+    }
+    #[test]
+    fn blocks_network_commands_by_default() {
+        // Ensure RUNTIMO_ENABLE_NETWORK is not set
+        std::env::remove_var("RUNTIMO_ENABLE_NETWORK");
+        for cmd in &[
+            "curl http://example.com",
+            "wget http://example.com",
+            "nc example.com 80",
+        ] {
+            assert!(
+                ShellExec
+                    .execute(
+                        &serde_json::json!({"cmd": cmd}),
+                        &Context {
+                            dry_run: false,
+                            job_id: "test".into(),
+                            working_dir: std::env::temp_dir()
+                        }
+                    )
+                    .is_err(),
+                "should block network cmd: {}",
+                cmd
+            );
+        }
+    }
+    #[test]
+    fn allows_network_commands_when_enabled() {
+        std::env::set_var("RUNTIMO_ENABLE_NETWORK", "1");
+        // curl --version should work (non-destructive)
+        let r = ShellExec.execute(
+            &serde_json::json!({"cmd": "curl --version"}),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::temp_dir(),
+            },
+        );
+        std::env::remove_var("RUNTIMO_ENABLE_NETWORK");
+        // May fail if curl not installed, but should NOT fail with "network commands blocked"
+        match r {
+            Ok(o) => assert!(o.success, "curl --version should succeed when enabled"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    !msg.contains("network commands blocked"),
+                    "should NOT block network when RUNTIMO_ENABLE_NETWORK=1, got: {}",
+                    msg
+                );
+            }
+        }
     }
     #[test]
     fn enforces_timeout() {

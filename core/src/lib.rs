@@ -87,7 +87,6 @@ pub mod llmosafe;
 pub mod monitor;
 /// Process snapshot, zombie detection, and top-N queries.
 pub mod processes;
-mod schema;
 /// Session tracking for reliable SSH.
 pub mod session;
 /// System telemetry capture and reporting.
@@ -165,6 +164,16 @@ pub mod utils {
     use std::path::PathBuf;
 
     /// Returns the data directory following XDG spec.
+    ///
+    /// Uses `XDG_DATA_HOME` if set, otherwise `~/.local/share/runtimo`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if neither `XDG_DATA_HOME` nor `HOME` is set. A fallback
+    /// to `/tmp` is intentionally NOT provided — data written to `/tmp`
+    /// is not persistent, which would violate the WAL/backup durability
+    /// guarantee.
+    #[allow(clippy::expect_used)]
     pub fn data_dir() -> PathBuf {
         std::env::var("XDG_DATA_HOME")
             .ok()
@@ -174,7 +183,7 @@ pub mod utils {
                     .ok()
                     .map(|h| PathBuf::from(h).join(".local/share"))
             })
-            .unwrap_or_else(std::env::temp_dir)
+            .expect("Cannot determine data directory: set XDG_DATA_HOME or HOME")
             .join("runtimo")
     }
 

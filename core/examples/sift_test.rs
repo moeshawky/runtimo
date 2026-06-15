@@ -12,8 +12,14 @@ fn main() {
         let res = guard.check_cognitive_pipeline(objective, obs);
         match res {
             Ok(result) => {
-                println!("Obs: {:?}\n  -> Decision: {:?}, Safe: {}, OOV: {}, Surprise: {}, Flags: {}\n",
-                    obs, result.decision, result.is_safe(), result.oov_ratio, result.surprise, result.detection_flags
+                println!(
+                    "Obs: {:?}\n  -> Decision: {:?}, Safe: {}, OOV: {}, Surprise: {}, Flags: {}\n",
+                    obs,
+                    result.decision,
+                    result.is_safe(),
+                    result.oov_ratio,
+                    result.surprise,
+                    result.detection_flags
                 );
             }
             Err(e) => {

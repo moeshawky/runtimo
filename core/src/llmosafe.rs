@@ -20,9 +20,8 @@
 //! ```
 
 use llmosafe::{
-    EscalationPolicy, ResourceGuard, SafetyContext, Synapse,
-    CognitivePipeline, PipelineConfig, PipelineResult, MemoryStats, PidState,
-    SafetyDecision, EscalationReason,
+    CognitivePipeline, EscalationPolicy, EscalationReason, MemoryStats, PidState, PipelineConfig,
+    PipelineResult, ResourceGuard, SafetyContext, SafetyDecision, Synapse,
 };
 use std::fs;
 
@@ -495,7 +494,10 @@ mod tests {
             // can make testing this inherently flaky. Since the goal is that *if* it fails, the closure is skipped,
             // we will strictly test the exact matching of `.execute()` failure to `.check()` failure and closure skipping.
             if guard.check().is_err() {
-                assert!(result.is_err(), "Execution must be rejected when pressure exceeds the 1 byte ceiling");
+                assert!(
+                    result.is_err(),
+                    "Execution must be rejected when pressure exceeds the 1 byte ceiling"
+                );
                 assert!(!executed, "Closure must not be executed on failure");
             }
         }
@@ -564,16 +566,26 @@ mod tests {
         assert!(res_strict.is_ok());
         let result_strict = res_strict.unwrap();
         println!("DEBUG STRICT DECISION: {:?}", result_strict.decision);
-        assert!(matches!(result_strict.decision, SafetyDecision::Halt(..) | SafetyDecision::Escalate { .. }));
+        assert!(matches!(
+            result_strict.decision,
+            SafetyDecision::Halt(..) | SafetyDecision::Escalate { .. }
+        ));
         assert!(!result_strict.is_safe());
 
         // Under DAL E, all decisions are Proceed
         let guard_permissive = LlmoSafeGuard::new().with_dal(DesignAssuranceLevel::E);
-        let res_permissive = guard_permissive.check_cognitive_pipeline("Hello world", "Hello world");
+        let res_permissive =
+            guard_permissive.check_cognitive_pipeline("Hello world", "Hello world");
         assert!(res_permissive.is_ok());
         let result_permissive = res_permissive.unwrap();
-        println!("DEBUG PERMISSIVE DECISION: {:?}", result_permissive.decision);
-        assert!(matches!(result_permissive.decision, SafetyDecision::Proceed));
+        println!(
+            "DEBUG PERMISSIVE DECISION: {:?}",
+            result_permissive.decision
+        );
+        assert!(matches!(
+            result_permissive.decision,
+            SafetyDecision::Proceed
+        ));
         assert!(result_permissive.is_safe());
 
         // Check exposure layer accessors/stats
@@ -581,8 +593,18 @@ mod tests {
         synapse.set_detection_flags(result_permissive.detection_flags);
 
         let bits = guard_permissive.combined_risk_bits(&synapse);
-        assert_eq!(guard_permissive.oov_ratio(&synapse), result_permissive.oov_ratio);
-        assert_eq!(guard_permissive.detection_flags(&synapse), result_permissive.detection_flags);
-        assert_eq!(bits, ((result_permissive.oov_ratio as u16) << 6) | (result_permissive.detection_flags as u16));
+        assert_eq!(
+            guard_permissive.oov_ratio(&synapse),
+            result_permissive.oov_ratio
+        );
+        assert_eq!(
+            guard_permissive.detection_flags(&synapse),
+            result_permissive.detection_flags
+        );
+        assert_eq!(
+            bits,
+            ((result_permissive.oov_ratio as u16) << 6)
+                | (result_permissive.detection_flags as u16)
+        );
     }
 }
