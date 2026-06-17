@@ -325,6 +325,10 @@ impl ProcessSummary {
 }
 
 /// Formats a size in kilobytes as a human-readable string (K/M/G).
+///
+/// - Values >= 1,048,576 KB → display as GiB with one decimal (e.g. "2.0G")
+/// - Values >= 1,024 KB → display as MiB (e.g. "512.0M")
+/// - Values < 1,024 KB → display as KB (e.g. "512K")
 #[allow(clippy::cast_precision_loss)]
 fn format_size(kb: u64) -> String {
     if kb >= 1024 * 1024 {

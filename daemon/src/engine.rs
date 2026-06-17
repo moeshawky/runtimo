@@ -27,6 +27,10 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
 /// Authenticate a Unix stream connection via SO_PEERCRED.
+///
+/// Reads the peer's UID from the socket and compares it against the daemon's
+/// own UID. Only same-UID connections are permitted — this is a same-user
+/// access control, not a cryptographic authentication.
 #[allow(clippy::borrow_as_ptr)] // FFI: addr_of_mut! + .cast() for getsockopt
 fn authenticate_peer(stream: &tokio::net::UnixStream) -> Result<(), String> {
     use std::os::unix::io::AsRawFd;
@@ -71,14 +75,17 @@ fn data_dir() -> PathBuf {
     runtimo_core::utils::data_dir()
 }
 
+/// Returns the default Unix socket path (`{data_dir}/runtimo.sock`).
 fn default_socket_path() -> PathBuf {
     data_dir().join("runtimo.sock")
 }
 
+/// Returns the default WAL path (env-overridable via `RUNTIMO_WAL_PATH`).
 fn default_wal_path() -> PathBuf {
     runtimo_core::utils::wal_path()
 }
 
+/// Ensures the data directory exists, creating it recursively if needed.
 fn ensure_data_dir() -> std::io::Result<()> {
     let dir = data_dir();
     std::fs::create_dir_all(&dir)?;
@@ -87,26 +94,42 @@ fn ensure_data_dir() -> std::io::Result<()> {
 
 // ── JSON-RPC types ──────────────────────────────────────────────────────────
 
+/// Inbound JSON-RPC request over the Unix socket.
+///
+/// Parsed from one line of JSON. The `id` field is echoed back in the response
+/// for request/response correlation.
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
+    /// RPC method name (e.g. "run", "dispatch", "status").
     method: String,
+    /// Method parameters (defaults to JSON null).
     #[serde(default)]
     params: Value,
+    /// Request identifier for correlation.
     id: Value,
 }
 
+/// Outbound JSON-RPC response over the Unix socket.
+///
+/// Contains either a `result` or an `error`, never both.
 #[derive(Debug, Serialize)]
 struct JsonRpcResponse {
+    /// Successful response data (absent on error).
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<Value>,
+    /// Error details (absent on success).
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<JsonRpcError>,
+    /// Echoed request identifier for correlation.
     id: Value,
 }
 
+/// JSON-RPC error response body.
 #[derive(Debug, Serialize)]
 struct JsonRpcError {
+    /// Error code (JSON-RPC standard: -32700 parse error, -32601 method not found, etc.).
     code: i32,
+    /// Human-readable error description.
     message: String,
 }
 
@@ -133,32 +156,49 @@ struct RunParams {
     timeout_secs: Option<u64>,
 }
 
+/// Parameters for the `logs` JSON-RPC method.
 #[derive(Debug, Deserialize)]
 struct LogsParams {
+    /// Maximum number of log entries to return (default: 10).
     #[serde(default = "default_limit")]
     limit: usize,
 }
 
+/// Default log entry limit.
 fn default_limit() -> usize {
     10
 }
 
 // ── Background job tracking ──────────────────────────────────────────────────
 
+/// Maximum concurrent background jobs across all dispatch calls.
 const MAX_CONCURRENT_JOBS: u32 = 16;
 
+/// A tracked background job dispatched via the `dispatch` RPC method.
 #[derive(Debug, Clone, Serialize)]
 struct BackgroundJob {
+    /// Unique job identifier.
     job_id: String,
+    /// Capability name being executed.
     capability: String,
+    /// Current status: "running", "completed", or "failed".
     status: String,
+    /// Unix timestamp when the job was dispatched.
     started_at: u64,
+    /// Unix timestamp when the job finished (absent while running).
     finished_at: Option<u64>,
+    /// Error message if the job failed.
     result: Option<String>,
 }
 
+/// Thread-safe registry of in-flight and recently-completed background jobs.
+///
+/// Uses an atomic counter to enforce `MAX_CONCURRENT_JOBS` and an `RwLock`-backed
+/// map for status queries.
 struct BackgroundJobRegistry {
+    /// Job map keyed by job ID.
     jobs: RwLock<HashMap<String, BackgroundJob>>,
+    /// Count of currently-running background jobs.
     running: AtomicU32,
 }
 
@@ -216,10 +256,17 @@ impl BackgroundJobRegistry {
 
 // ── Daemon state ────────────────────────────────────────────────────────────
 
+/// Shared daemon state — capability registry, WAL path, and background job tracker.
+///
+/// Single instance shared across all client connections via `Arc`.
 struct DaemonState {
+    /// Registry of all available capabilities.
     registry: CapabilityRegistry,
+    /// Path to the Write-Ahead Log file.
     wal_path: PathBuf,
+    /// Mutex serializing WAL writes across concurrent client handlers.
     wal_mutex: Arc<Mutex<()>>,
+    /// Background job registry for dispatch/status tracking.
     bg_jobs: BackgroundJobRegistry,
 }
 
@@ -257,6 +304,10 @@ impl DaemonState {
 
 // ── Request routing ─────────────────────────────────────────────────────────
 
+/// Routes an incoming JSON-RPC request to the appropriate handler.
+///
+/// Supported methods: `run`, `dispatch`, `status`, `jobs`, `list`, `logs`.
+/// Returns a `JsonRpcResponse` with `error.code = -32601` for unknown methods.
 async fn handle_request(state: &Arc<DaemonState>, req: JsonRpcRequest) -> JsonRpcResponse {
     match req.method.as_str() {
         "run" => handle_run(state, req.params, req.id).await,
@@ -276,6 +327,10 @@ async fn handle_request(state: &Arc<DaemonState>, req: JsonRpcRequest) -> JsonRp
     }
 }
 
+/// Handles the `run` RPC method — synchronous capability execution with full telemetry.
+///
+/// Acquires the WAL mutex, executes the capability, and returns the result.
+/// Times out at `timeout_secs` (default 30s).
 async fn handle_run(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonRpcResponse {
     let run_params: RunParams = match serde_json::from_value(params) {
         Ok(p) => p,
@@ -334,6 +389,11 @@ async fn handle_run(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonR
     }
 }
 
+/// Handles the `dispatch` RPC method — fire-and-forget background job execution.
+///
+/// Returns immediately with a job ID. The job runs on a background thread with
+/// the same safety checks, WAL logging, and telemetry as `handle_run`.
+/// Rejects when `MAX_CONCURRENT_JOBS` (16) is reached.
 async fn handle_dispatch(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonRpcResponse {
     let run_params: RunParams = match serde_json::from_value(params) {
         Ok(p) => p,
@@ -479,6 +539,10 @@ async fn handle_dispatch(state: &Arc<DaemonState>, params: Value, id: Value) -> 
     }
 }
 
+/// Handles the `status` RPC method — queries a job by ID.
+///
+/// Checks the background job registry first, then falls back to scanning the WAL
+/// for `JobStarted`/`JobCompleted`/`JobFailed` events.
 async fn handle_status(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonRpcResponse {
     let jid: String = match params.get("job_id").and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
@@ -552,6 +616,7 @@ async fn handle_status(state: &Arc<DaemonState>, params: Value, id: Value) -> Js
     }
 }
 
+/// Handles the `list` RPC method — returns all registered capability names.
 fn handle_list(state: &Arc<DaemonState>, id: Value) -> JsonRpcResponse {
     let caps: Vec<&str> = state.registry.list();
     JsonRpcResponse {
@@ -561,6 +626,10 @@ fn handle_list(state: &Arc<DaemonState>, id: Value) -> JsonRpcResponse {
     }
 }
 
+/// Handles the `logs` RPC method — returns recent WAL events.
+///
+/// Accepts an optional `limit` parameter (default 10). Events are returned
+/// in reverse chronological order.
 fn handle_logs(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonRpcResponse {
     let logs_params: LogsParams = match serde_json::from_value(params) {
         Ok(p) => p,
@@ -602,6 +671,10 @@ fn handle_logs(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonRpcRes
     }
 }
 
+/// Handles the `jobs` RPC method — lists recent jobs across background registry and WAL.
+///
+/// Merges running background jobs with completed/failed jobs from the WAL,
+/// sorted by start time (newest first), truncated to `limit`.
 async fn handle_jobs(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonRpcResponse {
     #[allow(clippy::cast_possible_truncation)] // safe: limit is capped in practice
     let limit: usize = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
@@ -680,6 +753,10 @@ async fn handle_jobs(state: &Arc<DaemonState>, params: Value, id: Value) -> Json
 
 // ── Client handler ──────────────────────────────────────────────────────────
 
+/// Handles an authenticated client connection on the Unix socket.
+///
+/// Reads JSON-RPC requests line-by-line, dispatches to `handle_request`,
+/// and writes JSON-RPC responses. Returns when the client closes the connection.
 async fn handle_client(
     stream: tokio::net::UnixStream,
     state: Arc<DaemonState>,
@@ -733,10 +810,15 @@ async fn handle_client(
 
 // ── Argument parsing ────────────────────────────────────────────────────────
 
+/// Parsed command-line arguments for the daemon binary.
 struct Args {
+    /// Unix socket path (default: `{data_dir}/runtimo.sock`).
     socket: PathBuf,
 }
 
+/// Parses command-line arguments, returning a `--socket` path if specified.
+///
+/// Falls back to `default_socket_path()` when `--socket` is absent.
 fn parse_args() -> Args {
     let args: Vec<String> = std::env::args().collect();
     let mut socket = default_socket_path();

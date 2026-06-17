@@ -173,6 +173,20 @@ pub struct LlmoSafeGuard {
     policy: EscalationPolicy,
 }
 
+/// Applies the Design Assurance Level (DAL) policy to a safety decision.
+///
+/// Maps the raw pipeline decision through the DAL escalation ladder:
+///
+/// | DAL | Behavior |
+/// |-----|----------|
+/// | A   | No override — returns the raw pipeline decision unchanged |
+/// | B   | Halt → Escalate (downgrade one level) |
+/// | C   | Halt/Escalate → Warn (downgrade two levels) |
+/// | D   | Halt/Escalate/Exit → Warn (cap at Warn) |
+/// | E   | All decisions → Proceed (allow everything) |
+///
+/// This is called after the cognitive pipeline produces a decision, applying
+/// the runtime's configured risk tolerance before the decision gates execution.
 fn apply_dal_to_decision(dal: DesignAssuranceLevel, decision: SafetyDecision) -> SafetyDecision {
     match dal {
         DesignAssuranceLevel::A => decision,

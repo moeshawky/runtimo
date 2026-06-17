@@ -590,7 +590,11 @@ pub fn truncate_to(s: &str, max_bytes: usize) -> String {
 
 #[cfg(test)]
 // Allow unwrap_used and indexing_slicing in tests as panicking on failure is desired test behavior.
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::items_after_statements
+)]
 mod tests {
     use super::*;
 

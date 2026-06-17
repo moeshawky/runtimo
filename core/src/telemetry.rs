@@ -275,6 +275,11 @@ impl Telemetry {
     /// Results are cached for [`CACHE_TTL_SECS`] (30 seconds) to avoid
     /// repeated filesystem reads on consecutive calls. Network queries
     /// (public_ip, tunnel) are included in the cached value.
+    ///
+    /// Use [`capture_lightweight`](Telemetry::capture_lightweight) for
+    /// execution paths that don't need accelerator detection or network
+    /// probing (e.g., the executor's WAL audit trail — which only needs
+    /// `/proc`-based system health data).
     pub fn capture() -> Self {
         let now = std::time::Instant::now();
         {
@@ -295,6 +300,67 @@ impl Telemetry {
             system: SystemInfo::capture(),
             hardware: HardwareInfo::capture(),
             network: NetworkInfo::capture(),
+        };
+
+        let mut cache = TELEMETRY_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        *cache = Some((telemetry.clone(), now));
+        telemetry
+    }
+
+    /// Captures a lightweight system telemetry snapshot without shell-outs.
+    ///
+    /// Unlike [`capture`](Telemetry::capture), this method skips all
+    /// accelerator detection (rocm-smi, nvidia-smi, JAX import), tunnel
+    /// probing, and public IP queries. Only [`SystemInfo`] is populated
+    /// from `/proc` reads and a single `df` shell-out.
+    ///
+    /// [`HardwareInfo`] is zeroed (empty accelerators, no JAX), and
+    /// [`NetworkInfo`] returns defaults (`public_ip = "unknown"`,
+    /// `tunnel_running = false`, empty `listening_ports`).
+    ///
+    /// Use this in hot paths like the executor's WAL audit trail where
+    /// GPU/TPU/JAX counts are irrelevant and shell-outs produce unwanted
+    /// stderr noise on systems without those tools installed.
+    ///
+    /// Results share the same [`TELEMETRY_CACHE`] — a previous full
+    /// [`capture`](Telemetry::capture) within [`CACHE_TTL_SECS`] will
+    /// be returned AS-IS (including hardware/network data). Callers
+    /// on hot paths should NOT rely on this returning empty hardware
+    /// if a full capture was recently cached.
+    #[must_use]
+    pub fn capture_lightweight() -> Self {
+        // Check cache first — if a full capture exists within TTL, return it.
+        // This is intentional: lightweight callers on hot paths benefit from
+        // cache hits without re-reading /proc.
+        let now = std::time::Instant::now();
+        {
+            let cache = TELEMETRY_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((cached, instant)) = cache.as_ref() {
+                if now.duration_since(*instant).as_secs() < CACHE_TTL_SECS {
+                    return cached.clone();
+                }
+            }
+        }
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+
+        let telemetry = Self {
+            timestamp,
+            system: SystemInfo::capture(),
+            hardware: HardwareInfo {
+                accelerators: Vec::new(),
+                jax_available: false,
+                jax_version: None,
+                jax_device_count: None,
+            },
+            network: NetworkInfo {
+                public_ip: "unknown".to_string(),
+                tunnel_running: false,
+                tunnel_pid: None,
+                listening_ports: Vec::new(),
+            },
         };
 
         let mut cache = TELEMETRY_CACHE.lock().unwrap_or_else(|e| e.into_inner());
@@ -397,7 +463,15 @@ impl Telemetry {
 // ── SystemInfo capture — direct /proc reads ──────────────────────────────
 
 impl SystemInfo {
-    fn capture() -> Self {
+    /// Captures system information from `/proc` and `/sys` files with a single
+    /// `df` shell-out for disk usage. No accelerator or network probing.
+    ///
+    /// Reads `/proc/cpuinfo` (model, count), `/proc/meminfo` (MemTotal,
+    /// MemFree, MemAvailable), `/proc/uptime`, and `/proc/loadavg`.
+    /// Disk info comes from `df` because Linux provides no per-mount usage
+    /// summary in procfs.
+    #[must_use]
+    pub(crate) fn capture() -> Self {
         // /proc/cpuinfo: extract model name and count logical processors
         let cpuinfo = read_proc_file("/proc/cpuinfo").unwrap_or_default();
         let cpu_model = cpuinfo

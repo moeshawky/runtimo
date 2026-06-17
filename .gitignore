@@ -46,3 +46,4 @@ runtimo_symlink_test
 
 # Workflow state (local development tracking)
 .workflow-state.md
+.moeinclude

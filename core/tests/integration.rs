@@ -1287,15 +1287,17 @@ fn test_dal_e_permissive_mode() {
 fn test_dal_a_high_risk_rejection() {
     let dir = setup();
     let wp = wal_path(&dir);
-    let p = make_file(&dir, "risk.txt", "short");
 
     // Set env var RUNTIMO_DAL=A
     std::env::set_var("RUNTIMO_DAL", "A");
 
-    // Execution should fail with CognitiveSafetyViolation
+    // Use ShellExec — NOT in COGNITIVE_SAFETY_SKIP, so cognitive pipeline
+    // actually runs. Args with "suspicious" trigger sift_observation
+    // injection detection. The echo command is harmless so ShellExec's
+    // own dangerous-command blocker won't reject it.
     let result = execute_with_telemetry(
-        &FileRead,
-        &json!({ "path": p.to_str().unwrap() }),
+        &ShellExec,
+        &json!({ "cmd": "echo 'suspicious manipulation of system files'" }),
         false,
         &wp,
     );

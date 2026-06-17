@@ -103,6 +103,11 @@ impl BackupManager {
     ///
     /// Preserves file permissions (including executable bit) on Unix systems.
     /// Directory permissions are set to platform defaults.
+    /// Copies file permissions from source to destination.
+    ///
+    /// On Unix, preserves the full permission mask (including executable bit).
+    /// On non-Unix, this is a no-op — permissions are inherited from the parent
+    /// directory or platform defaults.
     #[cfg(unix)]
     fn copy_permissions(src: &Path, dst: &Path) -> std::io::Result<()> {
         let src_meta = std::fs::symlink_metadata(src)?;
@@ -115,8 +120,11 @@ impl BackupManager {
         Ok(())
     }
 
-    /// Calculates the total size of a file or directory tree.
-    /// Uses symlink_metadata to avoid following symlinks.
+    /// Calculates the total size of a file or directory tree in bytes.
+    ///
+    /// Uses `symlink_metadata` to avoid following symlinks. Symlinks are
+    /// explicitly rejected (returns an error). For directories, recurses
+    /// through all entries, using saturating addition to prevent overflow.
     fn calculate_size(path: &Path) -> std::io::Result<u64> {
         let meta = path.symlink_metadata()?;
         if meta.file_type().is_symlink() {
@@ -143,6 +151,10 @@ impl BackupManager {
     }
 
     /// Verifies backup integrity by comparing source and destination sizes.
+    ///
+    /// After a backup copy completes, this function confirms that the total
+    /// byte count of the source and backup match. A mismatch indicates a
+    /// partial copy, filesystem error, or race condition during the backup.
     fn verify_integrity(src: &Path, dst: &Path) -> std::io::Result<()> {
         let src_size = Self::calculate_size(src)?;
         let dst_size = Self::calculate_size(dst)?;
@@ -158,6 +170,18 @@ impl BackupManager {
         Ok(())
     }
 
+    /// Recursively copies a file or directory, rejecting symlinks for security.
+    ///
+    /// # Security
+    ///
+    /// This function explicitly rejects symlinks to prevent symlink attack vectors.
+    /// If a symlink is encountered during traversal, the copy fails with an error.
+    ///
+    /// # Metadata
+    ///
+    /// On Unix, preserves file permissions (including executable bit). On non-Unix,
+    /// uses platform defaults. Directory permissions are set to platform defaults
+    /// on all platforms.
     fn copy_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
         let metadata = src.symlink_metadata()?;
         if metadata.file_type().is_symlink() {

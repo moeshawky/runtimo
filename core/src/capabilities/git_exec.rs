@@ -1289,7 +1289,7 @@ mod tests {
         let _hang_handle = std::thread::spawn(move || {
             if let Ok((_stream, _addr)) = listener.accept() {
                 // Hold the connection open indefinitely — never send a response
-                std::thread::sleep(std::time::Duration::from_secs(300));
+                std::thread::sleep(std::time::Duration::from_mins(5));
             }
         });
 

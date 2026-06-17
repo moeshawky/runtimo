@@ -175,9 +175,12 @@ enum AllowedPathsAction {
     List,
 }
 
+/// Returns the WAL file path (env-overridable via `RUNTIMO_WAL_PATH`).
 fn wal_path() -> PathBuf {
     runtimo_core::utils::wal_path()
 }
+
+/// Returns the backup directory (env-overridable via `RUNTIMO_BACKUP_DIR`).
 fn backup_dir() -> PathBuf {
     runtimo_core::utils::backup_dir()
 }
@@ -203,9 +206,15 @@ fn make_registry() -> Result<CapabilityRegistry, String> {
 }
 
 // Concurrency control for CLI run — mirrors daemon's MAX_CONCURRENT_JOBS = 16
+
+/// Maximum concurrent CLI `run` invocations.
 const MAX_CLI_CONCURRENT: usize = 16;
+/// Global counter of currently-running CLI jobs.
 static CLI_ACTIVE_JOBS: AtomicUsize = AtomicUsize::new(0);
 
+/// Attempts to acquire a concurrency slot for a CLI `run` command.
+///
+/// Returns `false` if `MAX_CLI_CONCURRENT` slots are already in use.
 fn acquire_cli_slot() -> bool {
     let current = CLI_ACTIVE_JOBS.fetch_add(1, Ordering::AcqRel);
     if current >= MAX_CLI_CONCURRENT {
@@ -215,16 +224,20 @@ fn acquire_cli_slot() -> bool {
     true
 }
 
+/// Releases a concurrency slot after a CLI `run` command completes.
 fn release_cli_slot() {
     CLI_ACTIVE_JOBS.fetch_sub(1, Ordering::AcqRel);
 }
 
 // ── Daemon client ───────────────────────────────────────────────────────────
 
+/// Returns the path to the daemon's Unix socket (`{data_dir}/runtimo.sock`).
 fn daemon_socket() -> PathBuf {
     runtimo_core::utils::data_dir().join("runtimo.sock")
 }
 
+/// Finds the `runtimo-daemon` binary, first checking next to the CLI binary,
+/// then falling back to `which` and `~/.cargo/bin/`.
 fn find_daemon_binary() -> Option<PathBuf> {
     let cli_path = std::env::current_exe().ok()?;
     let dir = cli_path.parent()?;
@@ -237,6 +250,7 @@ fn find_daemon_binary() -> Option<PathBuf> {
         .then_some(daemon_path)
 }
 
+/// Searches `PATH` and `~/.cargo/bin/` for the `runtimo-daemon` binary.
 fn find_daemon_in_path() -> Option<PathBuf> {
     let output = Command::new("which").arg("runtimo-daemon").output().ok()?;
     if output.status.success() {
@@ -251,10 +265,18 @@ fn find_daemon_in_path() -> Option<PathBuf> {
     cargo_bin.exists().then_some(cargo_bin)
 }
 
+/// Returns the path to the daemon lock file (`{data_dir}/daemon.lock`).
 fn daemon_lock_path() -> PathBuf {
     runtimo_core::utils::data_dir().join("daemon.lock")
 }
 
+/// Acquires an exclusive `flock` on the daemon lock file to prevent
+/// race conditions when auto-starting the daemon from multiple processes.
+///
+/// Uses `LOCK_EX | LOCK_NB` — fails immediately if another process holds the lock.
+///
+/// # Errors
+/// Returns an error string if the lock file cannot be created or the lock is held.
 fn acquire_daemon_lock() -> Result<File, String> {
     use libc::flock;
     let lock_path = daemon_lock_path();
@@ -273,10 +295,20 @@ fn acquire_daemon_lock() -> Result<File, String> {
     Ok(file)
 }
 
+/// Checks whether the daemon is running by attempting to connect to its Unix socket.
 fn daemon_is_running() -> bool {
     UnixStream::connect(daemon_socket()).is_ok()
 }
 
+/// Ensures the daemon is running, auto-starting it if necessary.
+///
+/// Uses a double-checked locking pattern with `acquire_daemon_lock` to prevent
+/// multiple processes from spawning the daemon simultaneously. Waits up to
+/// `DAEMON_STARTUP_TIMEOUT_SECS` (30s) for the daemon to become ready.
+///
+/// # Errors
+/// Returns an error if the daemon binary cannot be found, the daemon fails to
+/// start, or it doesn't become ready within the timeout.
 fn ensure_daemon_running() -> Result<(), String> {
     if daemon_is_running() {
         return Ok(());
@@ -353,6 +385,14 @@ fn ensure_daemon_running() -> Result<(), String> {
     }
 }
 
+/// Sends a JSON-RPC request to the daemon over its Unix socket.
+///
+/// Serializes `method` and `params` into a JSON-RPC request, writes it to the
+/// socket, and reads a single-line JSON-RPC response.
+///
+/// # Errors
+/// Returns an error string if the daemon cannot be reached, the request cannot
+/// be serialized, or the daemon returns an error.
 fn send_rpc(method: &str, params: Value) -> Result<Value, String> {
     let sock_path = daemon_socket();
     let mut stream = UnixStream::connect(&sock_path).map_err(|e| {
