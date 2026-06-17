@@ -5,6 +5,23 @@ All notable changes to Runtimo are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-06-17
+
+### Fixed
+
+- **Telemetry GPU probes no longer fire on every execution** — `Telemetry::capture()`
+  shelled out 6 GPU/TPU/JAX commands for every capability execution (Kill, FileRead,
+  etc.), producing warnings on systems without GPUs. Added `capture_lightweight()` —
+  `/proc`-only, skips all shell-outs. Used by executor hot path; the full `capture()`
+  still runs for `runtimo telemetry` CLI command. (`executor.rs`, `telemetry.rs`)
+- **Cognitive pipeline no longer blocks system capabilities** — Kill, FileRead,
+  FileWrite, GitExec, and Undo now skip the cognitive safety check. These
+  capabilities operate on structured inputs (PIDs, file paths) and don't carry
+  LLM-authored content. ShellExec still passes through cognitive safety. (`executor.rs`)
+- **sift_observation padding removed** — injected text triggered `BiasHaloDetected`
+  in llmosafe's content classifier regardless of neutrality. Non-high-risk inputs
+  now pass only the capability description. (`executor.rs`)
+
 ## [0.7.0] - 2026-06-15
 
 ### Changed
