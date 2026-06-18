@@ -70,7 +70,7 @@ fn reads_file_content() {
     let result = FileRead
         .execute(&json!({ "path": p.to_str().unwrap() }), &ctx("r1"))
         .unwrap();
-    assert_eq!(result.data["content"].as_str().unwrap(), "hello world");
+    assert_eq!(result.data.as_ref().unwrap()["content"].as_str().unwrap(), "hello world");
     cleanup(&dir);
 }
 
@@ -88,7 +88,7 @@ fn writes_file_content() {
             &ctx("w1"),
         )
         .unwrap();
-    assert!(result.success);
+    assert!(result.status == "ok");
     assert_eq!(fs::read_to_string(&target).unwrap(), "test data");
     cleanup(&dir);
 }
@@ -145,17 +145,19 @@ fn make_registry(bd: &std::path::Path) -> CapabilityRegistry {
 
 #[test]
 fn rejects_path_traversal_read() {
+    let ctx = ctx("traversal_read");
     assert!(FileRead
-        .validate(&json!({ "path": "../../../etc/passwd" }))
+        .execute(&json!({ "path": "../../../etc/passwd" }), &ctx)
         .is_err());
 }
 
 #[test]
 fn rejects_path_traversal_write() {
     let dir = setup();
+    let ctx = ctx("traversal_write");
     let cap = FileWrite::new(backup_dir(&dir)).expect("Failed to create FileWrite");
     assert!(cap
-        .validate(&json!({ "path": "../../../tmp/x.txt", "content": "x" }))
+        .execute(&json!({ "path": "../../../tmp/x.txt", "content": "x" }), &ctx)
         .is_err());
     cleanup(&dir);
 }
@@ -163,8 +165,9 @@ fn rejects_path_traversal_write() {
 #[test]
 fn rejects_reading_directory() {
     let dir = setup();
+    let ctx = ctx("read_dir");
     assert!(FileRead
-        .validate(&json!({ "path": dir.to_str().unwrap() }))
+        .execute(&json!({ "path": dir.to_str().unwrap() }), &ctx)
         .is_err());
     cleanup(&dir);
 }
@@ -172,10 +175,11 @@ fn rejects_reading_directory() {
 #[test]
 fn rejects_empty_path() {
     let dir = setup();
-    assert!(FileRead.validate(&json!({ "path": "" })).is_err());
+    let ctx = ctx("empty_path");
+    assert!(FileRead.execute(&json!({ "path": "" }), &ctx).is_err());
     let cap = FileWrite::new(backup_dir(&dir)).expect("Failed to create FileWrite");
     assert!(cap
-        .validate(&json!({ "path": "", "content": "x" }))
+        .execute(&json!({ "path": "", "content": "x" }), &ctx)
         .is_err());
     cleanup(&dir);
 }
@@ -189,7 +193,7 @@ fn reads_empty_file() {
     let r = FileRead
         .execute(&json!({ "path": p.to_str().unwrap() }), &ctx("e1"))
         .unwrap();
-    assert_eq!(r.data["content"].as_str().unwrap(), "");
+    assert_eq!(r.data.as_ref().unwrap()["content"].as_str().unwrap(), "");
     cleanup(&dir);
 }
 
@@ -200,7 +204,7 @@ fn reads_unicode() {
     let r = FileRead
         .execute(&json!({ "path": p.to_str().unwrap() }), &ctx("e2"))
         .unwrap();
-    assert!(r.data["content"].as_str().unwrap().contains("مرحبا"));
+    assert!(r.data.as_ref().unwrap()["content"].as_str().unwrap().contains("مرحبا"));
     cleanup(&dir);
 }
 
@@ -211,7 +215,7 @@ fn reads_large_file() {
     let r = FileRead
         .execute(&json!({ "path": p.to_str().unwrap() }), &ctx("e3"))
         .unwrap();
-    assert_eq!(r.data["content"].as_str().unwrap().len(), 100_000);
+    assert_eq!(r.data.as_ref().unwrap()["content"].as_str().unwrap().len(), 100_000);
     cleanup(&dir);
 }
 
@@ -455,17 +459,19 @@ fn g_sem_unicode_roundtrip() {
 
 #[test]
 fn rejects_missing_file() {
+    let ctx = ctx("missing_file");
     assert!(FileRead
-        .validate(&json!({ "path": "/tmp/no_such_runtimo_file.txt" }))
+        .execute(&json!({ "path": "/tmp/no_such_runtimo_file.txt" }), &ctx)
         .is_err());
 }
 
 #[test]
 fn rejects_missing_field_in_args() {
     let dir = setup();
-    assert!(FileRead.validate(&json!({ "wrong_field": "v" })).is_err());
+    let ctx = ctx("missing_field");
+    assert!(FileRead.execute(&json!({ "wrong_field": "v" }), &ctx).is_err());
     let cap = FileWrite::new(backup_dir(&dir)).expect("Failed to create FileWrite");
-    assert!(cap.validate(&json!({ "path": "/tmp/x.txt" })).is_err()); // missing content
+    assert!(cap.execute(&json!({ "path": "/tmp/x.txt" }), &ctx).is_err()); // missing content
     cleanup(&dir);
 }
 
@@ -535,7 +541,7 @@ fn write_then_read_roundtrip() {
     let r = FileRead
         .execute(&json!({ "path": target.to_str().unwrap() }), &ctx("rt2"))
         .unwrap();
-    assert_eq!(r.data["content"].as_str().unwrap(), original);
+    assert_eq!(r.data.as_ref().unwrap()["content"].as_str().unwrap(), original);
     cleanup(&dir);
 }
 
@@ -565,7 +571,7 @@ fn backup_created_on_overwrite() {
             &ctx("bk2"),
         )
         .unwrap();
-    assert!(r.success);
+    assert!(r.status == "ok");
     assert_eq!(fs::read_to_string(&target).unwrap(), "modified");
 
     let bp = bd.join("bk2").join("bk.txt");
@@ -682,10 +688,10 @@ fn multiple_jobs_in_sequence() {
     .unwrap();
     // Debug: check what's in the output
     println!("Success: {}, Output: {:?}", r.success, r.output);
-    assert!(r.success, "FileRead failed: {:?}", r.output.message);
+    assert!(r.success, "FileRead failed: {:?}", r.output.output);
     assert_eq!(
-        r.output.data["content"]
-            .as_str()
+        r.output.data.as_ref().unwrap().get("content")
+            .and_then(|v| v.as_str())
             .unwrap_or("CONTENT_MISSING"),
         "seq test"
     );
@@ -728,7 +734,7 @@ fn roundtrip_many_contents() {
             )
             .unwrap();
         assert_eq!(
-            r.data["content"].as_str().unwrap(),
+            r.data.as_ref().unwrap()["content"].as_str().unwrap(),
             content,
             "roundtrip failed case {}",
             i
@@ -818,13 +824,14 @@ fn c2_synthetic_registry_enforces_path_security() {
     registry.register(Undo);
 
     // --- Path traversal must be rejected ---
+    let ctx = ctx("c2_traversal");
     for traversal in &[
         "../../../etc/passwd",
         "/etc/shadow",
         "../.ssh/authorized_keys",
     ] {
         let cap = registry.get("FileWrite").unwrap();
-        let result = cap.validate(&json!({ "path": traversal, "content": "x" }));
+        let result = cap.execute(&json!({ "path": traversal, "content": "x" }), &ctx);
         assert!(
             result.is_err(),
             "Synthetic registry must reject traversal: {}",
@@ -834,20 +841,20 @@ fn c2_synthetic_registry_enforces_path_security() {
 
     // --- Critical files must be blocked ---
     let fw = registry.get("FileWrite").unwrap();
-    let critical = fw.validate(&json!({
+    let critical = fw.execute(&json!({
         "path": "/root/.ssh/authorized_keys",
         "content": "malicious key"
-    }));
+    }), &ctx);
     assert!(
         critical.is_err(),
         "Synthetic registry must block critical files"
     );
 
     // --- Relative path validation must work identically ---
-    let valid = fw.validate(&json!({ "path": "tmp/valid.txt", "content": "ok" }));
+    let valid = fw.execute(&json!({ "path": "tmp/valid.txt", "content": "ok" }), &ctx);
     assert!(
-        valid.is_err() || valid.is_ok(),
-        "Validation should not panic on relative paths"
+        valid.is_err(),
+        "Relative path outside allowed directories should be rejected"
     );
 
     cleanup(&dir);
@@ -1231,7 +1238,7 @@ fn dispatch_pipeline_multiple_jobs_have_unique_ids() {
             &wp,
         )
         .expect("dispatch");
-        assert!(result.success);
+    assert!(result.success);
         assert!(
             ids.insert(result.job_id.clone()),
             "Job IDs must be unique across dispatches (collision at {})",
@@ -1284,17 +1291,16 @@ fn test_dal_e_permissive_mode() {
 }
 
 #[test]
-fn test_dal_a_high_risk_rejection() {
+fn test_dal_a_shell_exec_skips_cognitive_safety() {
     let dir = setup();
     let wp = wal_path(&dir);
 
-    // Set env var RUNTIMO_DAL=A
+    // Set env var RUNTIMO_DAL=A (aggressive mode)
     std::env::set_var("RUNTIMO_DAL", "A");
 
-    // Use ShellExec — NOT in COGNITIVE_SAFETY_SKIP, so cognitive pipeline
-    // actually runs. Args with "suspicious" trigger sift_observation
-    // injection detection. The echo command is harmless so ShellExec's
-    // own dangerous-command blocker won't reject it.
+    // ShellExec IS in COGNITIVE_SAFETY_SKIP (fix for F-001), so cognitive
+    // pipeline does NOT run. The command should execute successfully
+    // regardless of suspicious keywords in args.
     let result = execute_with_telemetry(
         &ShellExec,
         &json!({ "cmd": "echo 'suspicious manipulation of system files'" }),
@@ -1304,29 +1310,25 @@ fn test_dal_a_high_risk_rejection() {
 
     std::env::remove_var("RUNTIMO_DAL");
 
-    assert!(result.is_err());
-    let err = result.err().unwrap();
-    assert!(
-        matches!(err, runtimo_core::Error::CognitiveSafetyViolation(_)),
-        "Expected CognitiveSafetyViolation error, got {:?}",
-        err
-    );
+    // Should succeed because ShellExec skips cognitive safety
+    assert!(result.is_ok(), "ShellExec should skip cognitive safety: {:?}", result.err());
+    let exec_res = result.unwrap();
+    assert!(exec_res.success, "ShellExec should execute successfully");
 
-    // Verify WAL has logged oov_ratio and detection_flags in the JobFailed event
+    // Verify WAL has JobCompleted event (not JobFailed)
     let reader = WalReader::load(&wp).expect("read");
     let events = reader.events();
 
-    // Find the JobFailed event
-    let failed_event = events
+    let has_completed = events
         .iter()
-        .find(|e| matches!(e.event_type, WalEventType::JobFailed))
-        .expect("Should find JobFailed event in WAL");
+        .any(|e| matches!(e.event_type, WalEventType::JobCompleted));
+    assert!(has_completed, "Should have JobCompleted event for ShellExec");
 
-    assert!(failed_event.oov_ratio.is_some(), "oov_ratio must be logged");
-    assert!(
-        failed_event.detection_flags.is_some(),
-        "detection_flags must be logged"
-    );
+    // No oov_ratio or detection_flags should be logged for ShellExec
+    let has_failed = !events
+        .iter()
+        .any(|e| matches!(e.event_type, WalEventType::JobFailed));
+    assert!(has_failed, "Should have no JobFailed events");
 
     cleanup(&dir);
 }

@@ -1,8 +1,8 @@
 # Runtimo Core API Reference
 
-**Version:** 0.2.2
+**Version:** 0.7.1
 **Updated:** 2026-05-28
-**Documentation:** [docs.rs/runtimo-core](https://docs.rs/runtimo-core/0.2.2)
+**Documentation:** [docs.rs/runtimo-core](https://docs.rs/runtimo-core/0.7.1)
 
 ## Quick Links
 
@@ -53,10 +53,7 @@ Capability execution result:
 pub struct Output {
     pub success: bool,
     pub data: Value,
-    pub telemetry_before: Telemetry,
-    pub telemetry_after: Telemetry,
-    pub process_before: u32,
-    pub process_after: u32,
+    pub message: Option<String>,
 }
 ```
 
@@ -446,83 +443,83 @@ match execute_with_telemetry(&FileRead, &json!({"path": "/test"}), false, wal_pa
 
 ## CLI Commands
 
-### moe run
+### runtimo run
 
 Execute a capability:
 
 ```bash
-moe run -c FileRead -a '{"path":"/etc/hostname"}'
-moe run -c FileWrite -a '{"path":"/tmp/test.txt","content":"test"}' --dry-run
+runtimo run -c FileRead -a '{"path":"/etc/hostname"}'
+runtimo run -c FileWrite -a '{"path":"/tmp/test.txt","content":"test"}' --dry-run
 ```
 
-### moe list
+### runtimo list
 
 List registered capabilities:
 
 ```bash
-moe list
+runtimo list
 ```
 
-### moe telemetry
+### runtimo telemetry
 
 View hardware telemetry:
 
 ```bash
-moe telemetry
+runtimo telemetry
 ```
 
-### moe processes
+### runtimo processes
 
 View process snapshot:
 
 ```bash
-moe processes
+runtimo processes
 ```
 
-### moe status
+### runtimo status
 
 View job status:
 
 ```bash
-moe status
-moe status -j <job_id>
+runtimo status
+runtimo status -j <job_id>
 ```
 
-### moe logs
+### runtimo logs
 
 View WAL events:
 
 ```bash
-moe logs
-moe logs -j <job_id> -l 20
+runtimo logs
+runtimo logs -j <job_id> -l 20
 ```
 
-### moe undo
+### runtimo undo
 
 Restore from backup:
 
 ```bash
-moe undo -j <job_id>
+runtimo undo -j <job_id>
 ```
 
-### moe config
+### runtimo config
 
 Manage allowed path prefixes:
 
 ```bash
-moe config allowed-paths add /srv
-moe config allowed-paths list
-moe config allowed-paths remove /srv
+runtimo config allowed-paths add /srv
+runtimo config allowed-paths list
+runtimo config allowed-paths remove /srv
 ```
 
-### moe session
+### runtimo session
 
 Create, list, and resume sessions:
 
 ```bash
-moe session --create "my-task"
-moe session --list
-moe session --resume <session_id>
+runtimo session --create "my-task"
+runtimo session --list
+runtimo session --resume <session_id>
 ```
 
 ## Environment Variables
@@ -530,7 +527,6 @@ moe session --resume <session_id>
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `RUNTIMO_WAL_PATH` | `/tmp/runtimo/wal.jsonl` | WAL file path |
-| `RUNTIMO_BACKUP_DIR` | `/tmp/runtimo/backups` | Backup directory |
 
 ## Examples
 
@@ -549,7 +545,7 @@ cargo test -- --nocapture
 
 ## Version
 
-0.2.1
+0.7.1
 
 ## License
 

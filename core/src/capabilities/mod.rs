@@ -14,9 +14,9 @@ mod kill;
 mod shell_exec;
 mod undo;
 
-pub use file_read::FileRead;
-pub use file_write::FileWrite;
-pub use git_exec::GitExec;
-pub use kill::Kill;
-pub use shell_exec::ShellExec;
-pub use undo::Undo;
+pub use file_read::{FileRead, FileReadArgs};
+pub use file_write::{FileWrite, FileWriteArgs};
+pub use git_exec::{GitExec, GitExecArgs};
+pub use kill::{Kill, KillArgs};
+pub use shell_exec::{is_dangerous_command, is_network_command, network_enabled, ShellExec, ShellExecArgs};
+pub use undo::{Undo, UndoArgs};

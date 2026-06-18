@@ -17,6 +17,7 @@ path = "src/main.rs"
 [[bin]]
 name = "runtimo-daemon"
 path = "src/daemon_bin.rs"
+doc = false
 
 [dependencies]
 runtimo-core = { path = "../core", version = "0.7" }

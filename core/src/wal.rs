@@ -468,7 +468,14 @@ impl WalWriter {
             let old = Self::rotation_path(path, i);
             let new = Self::rotation_path(path, i + 1);
             if old.exists() {
-                let _ = std::fs::rename(&old, &new);
+                if let Err(e) = std::fs::rename(&old, &new) {
+                    eprintln!(
+                        "[runtimo] WAL rotation failed: {} -> {}: {}",
+                        old.display(),
+                        new.display(),
+                        e
+                    );
+                }
             }
         }
 
@@ -484,7 +491,13 @@ impl WalWriter {
         // Remove oldest rotation if exceeding max
         let oldest = Self::rotation_path(path, max_rotations + 1);
         if oldest.exists() {
-            let _ = std::fs::remove_file(&oldest);
+            if let Err(e) = std::fs::remove_file(&oldest) {
+                eprintln!(
+                    "[runtimo] WAL cleanup failed: {}: {}",
+                    oldest.display(),
+                    e
+                );
+            }
         }
 
         Self::unlock_file(&lock_file);

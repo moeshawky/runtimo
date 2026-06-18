@@ -1,6 +1,6 @@
 # Getting Started with Runtimo
 
-**Version:** 0.2.2
+**Version:** 0.7.1
 **Last Updated:** 2026-05-28
 
 This guide walks you through using Runtimo for the first time. By the end, you'll have executed capabilities with full telemetry, process tracking, and crash recovery.
@@ -46,7 +46,7 @@ Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.2s
 ### Step 2: List Available Capabilities
 
 ```bash
-./target/debug/moe list
+./target/debug/runtimo list
 ```
 
 **Expected output:**
@@ -63,7 +63,7 @@ Available capabilities:
 ### Step 3: View System Telemetry
 
 ```bash
-./target/debug/moe telemetry
+./target/debug/runtimo telemetry
 ```
 
 **Expected output:**
@@ -99,7 +99,7 @@ Tunnel: running
 ### Step 4: View Process Snapshot
 
 ```bash
-./target/debug/moe processes
+./target/debug/runtimo processes
 ```
 
 **Expected output:**
@@ -131,7 +131,7 @@ Top Memory: python3 (1.4%)
 ### Step 5: Read a File
 
 ```bash
-./target/debug/moe run -c FileRead -a '{"path":"/etc/hostname"}'
+./target/debug/runtimo run -c FileRead -a '{"path":"/etc/hostname"}'
 ```
 
 **Expected output:**
@@ -160,7 +160,7 @@ Top Memory: python3 (1.4%)
 ### Step 6: Write a File
 
 ```bash
-./target/debug/moe run -c FileWrite -a '{"path":"/tmp/hello.txt","content":"hello runtimo"}'
+./target/debug/runtimo run -c FileWrite -a '{"path":"/tmp/hello.txt","content":"hello runtimo"}'
 ```
 
 **Expected output:**
@@ -183,7 +183,7 @@ Top Memory: python3 (1.4%)
 ### Step 6b: Execute a Shell Command
 
 ```bash
-./target/debug/moe run -c ShellExec -a '{"cmd":"echo hello && whoami"}'
+./target/debug/runtimo run -c ShellExec -a '{"cmd":"echo hello && whoami"}'
 ```
 
 **Expected output:**
@@ -209,7 +209,7 @@ Top Memory: python3 (1.4%)
 ### Step 7: Verify the File
 
 ```bash
-./target/debug/moe run -c FileRead -a '{"path":"/tmp/hello.txt"}'
+./target/debug/runtimo run -c FileRead -a '{"path":"/tmp/hello.txt"}'
 ```
 
 **Expected output:**
@@ -226,7 +226,7 @@ Top Memory: python3 (1.4%)
 ### Step 8: Dry Run (Validate Without Executing)
 
 ```bash
-./target/debug/moe run -c FileWrite -a '{"path":"/tmp/test.txt","content":"test"}' --dry-run
+./target/debug/runtimo run -c FileWrite -a '{"path":"/tmp/test.txt","content":"test"}' --dry-run
 ```
 
 **Expected output:**
@@ -250,7 +250,7 @@ Top Memory: python3 (1.4%)
 ### Step 9: View WAL Logs
 
 ```bash
-./target/debug/moe logs
+./target/debug/runtimo logs
 ```
 
 **Expected output:**
@@ -271,10 +271,10 @@ Top Memory: python3 (1.4%)
 
 ```bash
 # First, overwrite a file
-./target/debug/moe run -c FileWrite -a '{"path":"/tmp/test.txt","content":"new content"}'
+./target/debug/runtimo run -c FileWrite -a '{"path":"/tmp/test.txt","content":"new content"}'
 
 # Then undo it
-./target/debug/moe undo -j <job_id_from_logs>
+./target/debug/runtimo undo -j <job_id_from_logs>
 ```
 
 **Expected output:**
@@ -468,7 +468,7 @@ let real_result = execute_with_telemetry(&FileWrite, &args, false, wal_path)?;
 **Fix:**
 1. Wait for load to decrease
 2. Close other applications
-3. Check `moe processes` for runaway processes
+3. Check `runtimo processes` for runaway processes
 
 ### "Path traversal detected"
 
@@ -503,6 +503,6 @@ let real_result = execute_with_telemetry(&FileWrite, &args, false, wal_path)?;
 
 ## Getting Help
 
-- **CLI help:** `./target/debug/moe --help` (compiler-error style: `req=` required, `opt=` optional, `blk=` blocked, `ex=` example)
+- **CLI help:** `./target/debug/runtimo --help` (compiler-error style: `req=` required, `opt=` optional, `blk=` blocked, `ex=` example)
 - **Documentation:** `docs/` directory
 - **Examples:** `core/examples/` directory

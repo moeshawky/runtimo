@@ -79,7 +79,7 @@ pub struct ExecutionResult {
     pub job_id: String,
     /// Name of the capability that was executed.
     pub capability: String,
-    /// Whether the capability reported success.
+    /// Whether the capability reported success (derived from output.status).
     pub success: bool,
     /// Capability output data.
     pub output: Output,
@@ -167,10 +167,12 @@ pub fn execute_with_telemetry(
 /// # Cognitive Safety
 ///
 /// The cognitive safety pipeline only runs for capabilities that carry
-/// user-authored content (currently only `ShellExec`). System operations
-/// (`Kill`, `FileRead`, `FileWrite`, `GitExec`, `Undo`) skip the check
-/// because they operate on structured inputs (PIDs, file paths, job IDs)
-/// that don't require semantic content safety screening.
+/// user-authored content. System operations (`Kill`, `FileRead`, `FileWrite`,
+/// `GitExec`, `Undo`, `ShellExec`) skip the check because they operate on
+/// structured inputs (PIDs, file paths, job IDs) or execute via controlled
+/// subprocesses that don't require semantic content safety screening.
+/// `ShellExec` is included in the skip list because its command arguments
+/// are already validated by a dedicated dangerous-command blocklist.
 ///
 /// # Arguments
 ///
@@ -199,7 +201,7 @@ pub fn execute_with_telemetry_and_session(
     /// Capabilities that skip the cognitive safety pipeline — system
     /// operations that don't carry user-authored content (PIDs, file
     /// paths, job IDs) and don't need semantic safety screening.
-    const COGNITIVE_SAFETY_SKIP: &[&str] = &["Kill", "FileRead", "FileWrite", "GitExec", "Undo"];
+    const COGNITIVE_SAFETY_SKIP: &[&str] = &["Kill", "FileRead", "FileWrite", "GitExec", "Undo", "ShellExec"];
 
     let job_id = JobId::new();
     let job_id_str = job_id.as_str().to_string();
@@ -414,26 +416,30 @@ pub fn execute_with_telemetry_and_session(
     if cap_name == "ShellExec" {
         let cmd_str = output
             .data
-            .get("cmd")
+            .as_ref()
+            .and_then(|d| d.get("cmd"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
         let stdout_str = output
             .data
-            .get("stdout")
+            .as_ref()
+            .and_then(|d| d.get("stdout"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
         let stderr_str = output
             .data
-            .get("stderr")
+            .as_ref()
+            .and_then(|d| d.get("stderr"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
         #[allow(clippy::cast_possible_truncation)] // safe: exit codes are 0-255
         let exit_code = output
             .data
-            .get("exit_code")
+            .as_ref()
+            .and_then(|d| d.get("exit_code"))
             .and_then(|v| v.as_i64())
             .unwrap_or(-1) as i32;
         let cmd_seq = wal.seq();
@@ -485,7 +491,7 @@ pub fn execute_with_telemetry_and_session(
     Ok(ExecutionResult {
         job_id: job_id_str,
         capability: cap_name,
-        success: output.success,
+        success: output.status == "ok",
         output,
         telemetry_before,
         telemetry_after,
@@ -497,7 +503,7 @@ pub fn execute_with_telemetry_and_session(
 
 /// Construct a failed [`ExecutionResult`] with the given error message.
 ///
-/// Sets `success: false` and populates `output.message` with the error string.
+/// Sets `success: false` and creates an error Output with the error string.
 /// All telemetry and process snapshots are preserved for the caller to inspect
 /// the delta between before/after states even on failure.
 #[allow(clippy::too_many_arguments)]
@@ -515,11 +521,7 @@ fn fail_result(
         job_id,
         capability,
         success: false,
-        output: Output {
-            success: false,
-            data: Value::Null,
-            message: Some(error),
-        },
+        output: Output::error(error.clone(), error),
         telemetry_before,
         telemetry_after,
         process_before,
@@ -704,11 +706,9 @@ mod tests {
             Ok(())
         }
         fn execute(&self, args: &Value, _ctx: &Context) -> crate::Result<Output> {
-            Ok(Output {
-                success: true,
-                data: args.clone(),
-                message: None,
-            })
+            let mut out = Output::ok("echo completed".into());
+            out.data = Some(args.clone());
+            Ok(out)
         }
     }
 
@@ -729,11 +729,7 @@ mod tests {
         }
         fn execute(&self, _args: &Value, _ctx: &Context) -> crate::Result<Output> {
             std::thread::sleep(std::time::Duration::from_millis(200));
-            Ok(Output {
-                success: true,
-                data: json!({}),
-                message: None,
-            })
+            Ok(Output::ok("slow completed".into()))
         }
     }
 
@@ -960,9 +956,8 @@ mod tests {
                     r.success
                         || !r
                             .output
-                            .message
-                            .as_deref()
-                            .unwrap_or("")
+                            .output
+                            .as_str()
                             .contains("cognitive")
                 );
             }

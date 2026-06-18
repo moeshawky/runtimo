@@ -704,7 +704,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `WalWriter` and `WalReader` for append/read operations
   - Sequential event IDs for ordering guarantees
 - **Backup manager** - Automatic backup before file mutation:
-  - Pre-mutation file copies stored in `RUNTIMO_BACKUP_DIR/<job_id>/`
+  - Pre-mutation file copies stored in `{data_dir}/backups/<job_id>/`
   - Undo support via `moe undo -j <job_id>`
   - Parent directory creation for backups
 

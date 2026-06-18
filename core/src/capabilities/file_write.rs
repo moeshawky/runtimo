@@ -2,7 +2,8 @@
 //!
 //! Before overwriting an existing file, creates a backup via [`BackupManager`]
 //! so the operation can be rolled back. Supports both overwrite and append modes.
-//! Respects `dry_run` in the context to skip actual writes.
+//! Respects `dry_run` in the context to skip actual writes. Rejects directory
+//! paths (cannot write to a directory).
 //!
 //! # Example
 //!
@@ -15,15 +16,15 @@
 //! let cap = FileWrite::new(PathBuf::from("/tmp/backups"));
 //! let result = cap.execute(
 //!     &json!({"path": "/tmp/output.txt", "content": "hello"}),
-//!     &Context { dry_run: false, job_id: "job1".into() },
+//!     &Context { dry_run: false, job_id: "job1".into(), working_dir: std::env::temp_dir() },
 //! ).unwrap();
 //!
-//! assert!(result.success);
+//! assert_eq!(result.status, "ok");
 //! assert_eq!(std::fs::read_to_string("/tmp/output.txt").unwrap(), "hello");
 //! ```
 
 use crate::backup::BackupManager;
-use crate::capability::{Capability, Context, Output};
+use crate::capability::{CapabilityError, Context, Output, TypedCapability};
 use crate::processes::ProcessSnapshot;
 use crate::telemetry::Telemetry;
 use crate::validation::path::{validate_path, PathContext};
@@ -67,6 +68,7 @@ const CRITICAL_FILES: &[&str] = &[
 /// The target file is backed up before any write occurs, making the
 /// operation reversible through the undo system.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::exhaustive_structs)] // args struct — fields are the contract
 pub struct FileWriteArgs {
     /// Absolute path to the file to write.
     pub path: String,
@@ -96,7 +98,9 @@ impl FileWrite {
     }
 }
 
-impl Capability for FileWrite {
+impl TypedCapability for FileWrite {
+    type Args = FileWriteArgs;
+
     fn name(&self) -> &'static str {
         "FileWrite"
     }
@@ -117,27 +121,9 @@ impl Capability for FileWrite {
         })
     }
 
-    fn validate(&self, args: &Value) -> Result<()> {
-        let args: FileWriteArgs = serde_json::from_value(args.clone())
-            .map_err(|e| Error::SchemaValidationFailed(e.to_string()))?;
-
-        let ctx = PathContext {
-            require_exists: false,
-            require_file: false,
-            ..Default::default()
-        };
-
-        validate_path(&args.path, &ctx).map_err(Error::SchemaValidationFailed)?;
-
-        Ok(())
-    }
-
-    fn execute(&self, args: &Value, ctx: &Context) -> Result<Output> {
-        let args: FileWriteArgs = serde_json::from_value(args.clone())
-            .map_err(|e| Error::ExecutionFailed(e.to_string()))?;
-
+    fn execute(&self, args: FileWriteArgs, ctx: &Context) -> std::result::Result<Output, CapabilityError> {
         if args.content.len() > MAX_WRITE_SIZE {
-            return Err(Error::ExecutionFailed(format!(
+            return Err(CapabilityError::InvalidArgs(format!(
                 "Content too large: {} bytes (limit: {} bytes)",
                 args.content.len(),
                 MAX_WRITE_SIZE
@@ -154,24 +140,32 @@ impl Capability for FileWrite {
         };
 
         let path = validate_path(&args.path, &write_ctx)
-            .map_err(|e| Error::ExecutionFailed(format!("path validation: {}", e)))?;
+            .map_err(|e| CapabilityError::PermissionDenied(format!("path validation: {}", e)))?;
+
+        // Reject directory paths — cannot write to a directory
+        if path.exists() && path.is_dir() {
+            return Err(CapabilityError::PermissionDenied(format!(
+                "path is a directory: {}",
+                path.display()
+            )));
+        }
 
         if is_critical_file(&path) {
-            return Err(Error::ExecutionFailed(format!(
+            return Err(CapabilityError::PermissionDenied(format!(
                 "critical file denied: {}",
                 path.display()
             )));
         }
 
         if let Err(e) = check_disk_space(&path, args.content.len()) {
-            return Err(Error::ExecutionFailed(e));
+            return Err(CapabilityError::PermissionDenied(e));
         }
 
         if args.append {
             if let Ok(meta) = std::fs::metadata(&path) {
                 let existing = usize::try_from(meta.len()).unwrap_or(usize::MAX);
                 if existing.saturating_add(args.content.len()) > MAX_APPEND_SIZE {
-                    return Err(Error::ExecutionFailed(format!(
+                    return Err(CapabilityError::InvalidArgs(format!(
                         "append would exceed max file size: {} + {} > {} bytes",
                         existing,
                         args.content.len(),
@@ -182,65 +176,65 @@ impl Capability for FileWrite {
         }
 
         if ctx.dry_run {
-            return Ok(Output {
-                success: true,
-                data: serde_json::json!({
-                    "path": path.display().to_string(),
-                    "content_length": args.content.len(),
-                    "dry_run": true,
-                    "backup_path": null,
-                    "telemetry_before": serde_json::to_value(&telemetry_before).unwrap_or(Value::Null),
-                    "process_before_count": process_before.summary.total_processes,
-                }),
-                message: Some(format!(
-                    "DRY RUN: would write {} bytes to {}",
-                    args.content.len(),
-                    path.display()
-                )),
-            });
+            let mut out = Output::ok(format!(
+                "DRY RUN: would write {} bytes to {}",
+                args.content.len(),
+                path.display()
+            ));
+            out.data = Some(serde_json::json!({
+                "path": path.display().to_string(),
+                "content_length": args.content.len(),
+                "dry_run": true,
+                "backup_path": null,
+                "telemetry_before": serde_json::to_value(&telemetry_before).unwrap_or(Value::Null),
+                "process_before_count": process_before.summary.total_processes,
+            }));
+            return Ok(out);
         }
 
         let backup_path = if path.exists() {
             match self.backup_mgr.create_backup(&path, &ctx.job_id) {
                 Ok(bp) => Some(bp),
-                Err(e) => return Err(Error::ExecutionFailed(format!("backup: {}", e))),
+                Err(e) => return Err(CapabilityError::Internal(format!("backup: {}", e))),
             }
         } else {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
-                    Error::ExecutionFailed(format!("mkdir {}: {}", parent.display(), e))
+                    CapabilityError::Io(std::io::Error::other(
+                        format!("mkdir {}: {}", parent.display(), e),
+                    ))
                 })?;
             }
             None
         };
 
         let bytes_written = if args.append {
-            atomic_append(&path, &args.content)?
+            atomic_append(&path, &args.content)
+                .map_err(|e| CapabilityError::Internal(e.to_string()))?
         } else {
-            atomic_write(&path, &args.content)?
+            atomic_write(&path, &args.content)
+                .map_err(|e| CapabilityError::Internal(e.to_string()))?
         };
 
         let telemetry_after = Telemetry::capture();
         let process_after = ProcessSnapshot::capture();
 
-        Ok(Output {
-            success: true,
-            data: serde_json::json!({
-                "path": path.display().to_string(),
-                "bytes_written": bytes_written,
-                "append": args.append,
-                "backup_path": backup_path.map(|p| p.to_string_lossy().to_string()),
-                "telemetry_before": serde_json::to_value(&telemetry_before).unwrap_or(Value::Null),
-                "telemetry_after": serde_json::to_value(&telemetry_after).unwrap_or(Value::Null),
-                "process_before_count": process_before.summary.total_processes,
-                "process_after_count": process_after.summary.total_processes,
-            }),
-            message: Some(format!(
-                "Wrote {} bytes to {}",
-                bytes_written,
-                path.display()
-            )),
-        })
+        let mut out = Output::ok(format!(
+            "Wrote {} bytes to {}",
+            bytes_written,
+            path.display()
+        ));
+        out.data = Some(serde_json::json!({
+            "path": path.display().to_string(),
+            "bytes_written": bytes_written,
+            "append": args.append,
+            "backup_path": backup_path.map(|p| p.to_string_lossy().to_string()),
+            "telemetry_before": serde_json::to_value(&telemetry_before).unwrap_or(Value::Null),
+            "telemetry_after": serde_json::to_value(&telemetry_after).unwrap_or(Value::Null),
+            "process_before_count": process_before.summary.total_processes,
+            "process_after_count": process_after.summary.total_processes,
+        }));
+        Ok(out)
     }
 }
 
@@ -467,26 +461,34 @@ mod tests {
         std::env::temp_dir().join("runtimo_fw_test")
     }
 
+    fn test_ctx(job_id: &str) -> Context {
+        Context {
+            dry_run: false,
+            job_id: job_id.into(),
+            working_dir: std::env::temp_dir(),
+        }
+    }
+
+    fn dry_ctx(job_id: &str) -> Context {
+        Context {
+            dry_run: true,
+            job_id: job_id.into(),
+            working_dir: std::env::temp_dir(),
+        }
+    }
+
     #[test]
     fn writes_new_file() {
         let target = std::env::temp_dir().join("runtimo_fw_new.txt");
         let cap = FileWrite::new(test_backup_dir()).expect("Failed to create FileWrite");
 
-        let result = cap
-            .execute(
-                &serde_json::json!({
-                    "path": target.to_str().unwrap(),
-                    "content": "hello from runtimo"
-                }),
-                &Context {
-                    dry_run: false,
-                    job_id: "t1".into(),
-                    working_dir: std::env::temp_dir(),
-                },
-            )
-            .expect("Execution failed");
+        let result = TypedCapability::execute(
+            &cap,
+            FileWriteArgs { path: target.to_str().unwrap().to_string(), content: "hello from runtimo".to_string(), append: false },
+            &test_ctx("t1"),
+        ).expect("Execution failed");
 
-        assert!(result.success);
+        assert_eq!(result.status, "ok");
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
             "hello from runtimo"
@@ -501,18 +503,11 @@ mod tests {
         let target = std::env::temp_dir().join("runtimo_fw_dry.txt");
         let cap = FileWrite::new(test_backup_dir()).expect("Failed to create FileWrite");
 
-        cap.execute(
-            &serde_json::json!({
-                "path": target.to_str().unwrap(),
-                "content": "should not exist"
-            }),
-            &Context {
-                dry_run: true,
-                job_id: "t2".into(),
-                working_dir: std::env::temp_dir(),
-            },
-        )
-        .expect("Execution failed");
+        TypedCapability::execute(
+            &cap,
+            FileWriteArgs { path: target.to_str().unwrap().to_string(), content: "should not exist".to_string(), append: false },
+            &dry_ctx("t2"),
+        ).expect("Execution failed");
 
         assert!(!target.exists());
         std::fs::remove_dir_all(test_backup_dir()).ok();
@@ -521,12 +516,11 @@ mod tests {
     #[test]
     fn rejects_path_traversal() {
         let cap = FileWrite::new(test_backup_dir()).expect("Failed to create FileWrite");
-        let err = cap
-            .validate(&serde_json::json!({
-                "path": "../../../etc/passwd",
-                "content": "malicious"
-            }))
-            .unwrap_err();
+        let err = TypedCapability::execute(
+            &cap,
+            FileWriteArgs { path: "../../../etc/passwd".to_string(), content: "malicious".to_string(), append: false },
+            &test_ctx("t3"),
+        ).unwrap_err();
         assert!(err.to_string().contains("traversal"));
         std::fs::remove_dir_all(test_backup_dir()).ok();
     }
@@ -534,19 +528,11 @@ mod tests {
     #[test]
     fn rejects_critical_file() {
         let cap = FileWrite::new(test_backup_dir()).expect("Failed to create FileWrite");
-        let err = cap
-            .execute(
-                &serde_json::json!({
-                    "path": "/tmp/.bashrc",
-                    "content": "malicious"
-                }),
-                &Context {
-                    dry_run: false,
-                    job_id: "t3".into(),
-                    working_dir: std::env::temp_dir(),
-                },
-            )
-            .unwrap_err();
+        let err = TypedCapability::execute(
+            &cap,
+            FileWriteArgs { path: "/tmp/.bashrc".to_string(), content: "malicious".to_string(), append: false },
+            &test_ctx("t4"),
+        ).unwrap_err();
         assert!(err.to_string().contains("critical file"));
         std::fs::remove_dir_all(test_backup_dir()).ok();
     }
@@ -556,21 +542,13 @@ mod tests {
         let target = std::env::temp_dir().join("runtimo_fw_atomic.txt");
         let cap = FileWrite::new(test_backup_dir()).expect("Failed to create FileWrite");
 
-        let result = cap
-            .execute(
-                &serde_json::json!({
-                    "path": target.to_str().unwrap(),
-                    "content": "atomic content"
-                }),
-                &Context {
-                    dry_run: false,
-                    job_id: "t4".into(),
-                    working_dir: std::env::temp_dir(),
-                },
-            )
-            .expect("Execution failed");
+        let result = TypedCapability::execute(
+            &cap,
+            FileWriteArgs { path: target.to_str().unwrap().to_string(), content: "atomic content".to_string(), append: false },
+            &test_ctx("t5"),
+        ).expect("Execution failed");
 
-        assert!(result.success);
+        assert_eq!(result.status, "ok");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "atomic content");
         let tmp = target.parent().unwrap().join(".runtimo_fw_atomic.txt.tmp");
         assert!(!tmp.exists(), "temp file should not remain");
@@ -586,22 +564,13 @@ mod tests {
 
         let cap = FileWrite::new(test_backup_dir()).expect("Failed to create FileWrite");
 
-        let result = cap
-            .execute(
-                &serde_json::json!({
-                    "path": target.to_str().unwrap(),
-                    "content": " appended",
-                    "append": true
-                }),
-                &Context {
-                    dry_run: false,
-                    job_id: "t5".into(),
-                    working_dir: std::env::temp_dir(),
-                },
-            )
-            .expect("Execution failed");
+        let result = TypedCapability::execute(
+            &cap,
+            FileWriteArgs { path: target.to_str().unwrap().to_string(), content: " appended".to_string(), append: true },
+            &test_ctx("t6"),
+        ).expect("Execution failed");
 
-        assert!(result.success);
+        assert_eq!(result.status, "ok");
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
             "initial appended"
@@ -621,22 +590,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&backup_dir);
         let cap = FileWrite::new(backup_dir.clone()).expect("Failed to create FileWrite");
 
-        let result = cap
-            .execute(
-                &serde_json::json!({
-                    "path": target.to_str().unwrap(),
-                    "content": "new content"
-                }),
-                &Context {
-                    dry_run: true,
-                    job_id: "t6".into(),
-                    working_dir: std::env::temp_dir(),
-                },
-            )
-            .expect("Execution failed");
+        let result = TypedCapability::execute(
+            &cap,
+            FileWriteArgs { path: target.to_str().unwrap().to_string(), content: "new content".to_string(), append: false },
+            &dry_ctx("t7"),
+        ).expect("Execution failed");
 
-        assert!(result.success);
-        assert!(result.data["dry_run"].as_bool().unwrap());
+        assert_eq!(result.status, "ok");
+        assert!(result.data.as_ref().unwrap()["dry_run"].as_bool().unwrap());
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
             "existing content"
@@ -657,25 +618,18 @@ mod tests {
         let target = std::env::temp_dir().join("runtimo_fw_telemetry.txt");
         let cap = FileWrite::new(test_backup_dir()).expect("Failed to create FileWrite");
 
-        let result = cap
-            .execute(
-                &serde_json::json!({
-                    "path": target.to_str().unwrap(),
-                    "content": "telemetry test"
-                }),
-                &Context {
-                    dry_run: false,
-                    job_id: "t7".into(),
-                    working_dir: std::env::temp_dir(),
-                },
-            )
-            .expect("Execution failed");
+        let result = TypedCapability::execute(
+            &cap,
+            FileWriteArgs { path: target.to_str().unwrap().to_string(), content: "telemetry test".to_string(), append: false },
+            &test_ctx("t8"),
+        ).expect("Execution failed");
 
-        assert!(result.success);
-        assert!(result.data["telemetry_before"].is_object());
-        assert!(result.data["telemetry_after"].is_object());
-        assert!(result.data["process_before_count"].is_u64());
-        assert!(result.data["process_after_count"].is_u64());
+        assert_eq!(result.status, "ok");
+        let data = result.data.as_ref().unwrap();
+        assert!(data["telemetry_before"].is_object());
+        assert!(data["telemetry_after"].is_object());
+        assert!(data["process_before_count"].is_u64());
+        assert!(data["process_after_count"].is_u64());
 
         std::fs::remove_file(&target).ok();
         std::fs::remove_dir_all(test_backup_dir()).ok();
@@ -691,16 +645,10 @@ mod tests {
     fn test_content_too_large_rejected() {
         let cap = FileWrite::new(test_backup_dir()).expect("Failed to create FileWrite");
         let large_content = "x".repeat(101 * 1024 * 1024); // > 100MB
-        let result = cap.execute(
-            &serde_json::json!({
-                "path": "/tmp/runtimo_large_test.txt",
-                "content": large_content
-            }),
-            &Context {
-                dry_run: false,
-                job_id: "t8".into(),
-                working_dir: std::env::temp_dir(),
-            },
+        let result = TypedCapability::execute(
+            &cap,
+            FileWriteArgs { path: "/tmp/runtimo_large_test.txt".to_string(), content: large_content, append: false },
+            &test_ctx("t9"),
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("too large"));
@@ -711,16 +659,10 @@ mod tests {
     #[test]
     fn test_critical_file_ssh_authorized_keys_blocked() {
         let cap = FileWrite::new(test_backup_dir()).expect("Failed to create FileWrite");
-        let result = cap.execute(
-            &serde_json::json!({
-                "path": "/tmp/.ssh/authorized_keys",
-                "content": "ssh-rsa AAA..."
-            }),
-            &Context {
-                dry_run: false,
-                job_id: "t9".into(),
-                working_dir: std::env::temp_dir(),
-            },
+        let result = TypedCapability::execute(
+            &cap,
+            FileWriteArgs { path: "/tmp/.ssh/authorized_keys".to_string(), content: "ssh-rsa AAA...".to_string(), append: false },
+            &test_ctx("t10"),
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("critical file"));
@@ -733,21 +675,13 @@ mod tests {
         let target = std::env::temp_dir().join("runtimo_fw_sync.txt");
         let cap = FileWrite::new(test_backup_dir()).expect("Failed to create FileWrite");
 
-        let result = cap
-            .execute(
-                &serde_json::json!({
-                    "path": target.to_str().unwrap(),
-                    "content": "sync test"
-                }),
-                &Context {
-                    dry_run: false,
-                    job_id: "t10".into(),
-                    working_dir: std::env::temp_dir(),
-                },
-            )
-            .expect("Execution failed");
+        let result = TypedCapability::execute(
+            &cap,
+            FileWriteArgs { path: target.to_str().unwrap().to_string(), content: "sync test".to_string(), append: false },
+            &test_ctx("t11"),
+        ).expect("Execution failed");
 
-        assert!(result.success);
+        assert_eq!(result.status, "ok");
 
         let tmp = target.parent().unwrap().join(".runtimo_fw_sync.txt.tmp");
         assert!(
@@ -766,17 +700,10 @@ mod tests {
 
         let cap = FileWrite::new(test_backup_dir()).expect("Failed to create FileWrite");
         let large_append = "y".repeat(2 * 1024 * 1024); // +2MB = 101MB > 100MB
-        let result = cap.execute(
-            &serde_json::json!({
-                "path": target.to_str().unwrap(),
-                "content": large_append,
-                "append": true
-            }),
-            &Context {
-                dry_run: false,
-                job_id: "t11".into(),
-                working_dir: std::env::temp_dir(),
-            },
+        let result = TypedCapability::execute(
+            &cap,
+            FileWriteArgs { path: target.to_str().unwrap().to_string(), content: large_append, append: true },
+            &test_ctx("t12"),
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("exceed"));

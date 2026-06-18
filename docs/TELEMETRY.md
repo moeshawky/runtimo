@@ -43,37 +43,7 @@ pub struct AcceleratorInfo {
 3. **AMD** — `rocm-smi --showproductname` + `/dev/dri/render*`
 4. **DRM** — `/dev/dri/render*` fallback (generic GPU)
 
-## ServiceInfo Structure
-
-```rust
-pub struct ServiceInfo {
-    // Legacy fields (back-compat)
-    pub vllm_running: bool,
-    pub vllm_version: String,
-    pub vllm_port_bound: bool,
-
-    // Primary: discovery-based
-    pub detected_services: Vec<DetectedService>,
-}
-
-pub struct DetectedService {
-    pub name: String,     // "vllm", "nginx", "postgres", "redis", "docker"
-    pub version: String,
-    pub running: bool,
-    pub ports: Vec<u16>,
-}
-```
-
-### Service Detection
-
-Each service detected independently via `pgrep`:
-- **vLLM** — `pgrep -fa vllm`, version via `python -c "import vllm"`
-- **nginx** — `pgrep -fa nginx`
-- **postgres** — `pgrep -fa postgres`
-- **redis** — `pgrep -fa redis-server`
-- **docker** — `pgrep -fa dockerd`
-
-Only detected services are added to `detected_services`. If none are found, the list is empty — no "not running" entries.
+> **Note:** Service detection was removed in v0.7.0. Use `pgrep` directly for service status.
 
 ## Process Snapshot
 

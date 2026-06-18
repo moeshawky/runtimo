@@ -108,10 +108,10 @@ For persistent machines, this is **critical for forensics**.
 ### Commands
 ```bash
 # Hardware telemetry (ephemeral pattern)
-./target/debug/moe telemetry
+./target/debug/runtimo telemetry
 
 # Process snapshot (persistent pattern) ⭐ NEW
-./target/debug/moe processes
+./target/debug/runtimo processes
 ```
 
 ### Tests

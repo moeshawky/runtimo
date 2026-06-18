@@ -16,7 +16,7 @@ Runtimo is a Rust workspace providing a **capability execution engine**. Every c
 - **Backup/undo** — Files backed up before mutation, rollback by job ID
 - **Input validation** — Capabilities validate arguments including path traversal, symlink, and null byte protection
 
-**Version:** 0.6.5 | **Rust Edition:** 2021 | **Tests:** 233 (127 lib + 4 doc + 51 int + 40 robust + 7 cli)
+**Version:** 0.7.1 | **Rust Edition:** 2021 | **Tests:** 344
 
 ## Quick Start
 
@@ -47,7 +47,7 @@ cargo build --release
 runtimo list
 
 # Read a file
-runtimo run -c FileRead -a '{"path":"/etc/hostname"}'
+runtimo run -c FileRead -a '{"path":"/tmp/hostname.txt"}'
 
 # Write a file (creates automatic backup)
 runtimo run -c FileWrite -a '{"path":"/tmp/hello.txt","content":"hello runtimo"}'
@@ -150,7 +150,7 @@ Execute shell commands via `sh -c`. Supports pipes, redirects, chaining, variabl
 | `cwd` | string | no |
 | `stdin` | string | no |
 
-**Guardrails:** Blocks `mkfs`, `fdisk`, `dd`, `shutdown`, `reboot`, `poweroff`, `rm -rf /` (root/dev/boot), `chmod 777 /`. Timeout default 30s, max 300s. Kills all child processes on timeout. Output capped at 10 MB.
+**Guardrails:** Blocks `mkfs`, `fdisk`, `dd`, `shutdown`, `reboot`, `poweroff`, `rm -rf /`, `rm --recursive`, `rm --no-preserve-root`, `chmod 777 /`. Timeout default 30s, max 300s. Kills all child processes on timeout. Output capped at 10 MB.
 
 ```bash
 runtimo run -c ShellExec -a '{"cmd":"uptime"}'
@@ -231,7 +231,7 @@ Telemetry detects what's running — no assumptions about hardware or services.
 | **RAM** | Total, free, available | `/proc/meminfo` |
 | **Disk** | Total, used, available % | `df -h` |
 | **Accelerators** | NVIDIA, AMD, TPU, DRM | `nvidia-smi`, `rocm-smi`, `/dev/accel*`, `/dev/dri/render*` |
-| **Services** | vLLM, nginx, postgres, redis, docker | `pgrep` + version detection |
+| **Services** | vLLM, nginx, postgres, redis, docker | Use `pgrep` directly |
 | **Network** | Public IP, interfaces, tunnel status | `curl`, `/sys/class/net/*` |
 | **Processes** | Full list, zombies, top consumers, PPID chain | `ps aux` + `/proc` |
 
@@ -301,7 +301,7 @@ runtimo/
 │       └── main.rs         # CLI commands via clap
 └── daemon/                 # runtimo-daemon binary
     └── src/
-        └── main.rs         # Future JSON-RPC server
+        └── main.rs         # JSON-RPC server
 ```
 
 ## Testing
@@ -320,7 +320,6 @@ cargo clippy --all-targets          # zero warnings required
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `RUNTIMO_WAL_PATH` | `$XDG_DATA_HOME/runtimo/wal.jsonl` | WAL file path |
-| `RUNTIMO_BACKUP_DIR` | `$XDG_DATA_HOME/runtimo/backups` | Backup directory |
 | `RUNTIMO_SESSIONS_DIR` | `$XDG_DATA_HOME/runtimo/sessions` | Session storage |
 | `RUNTIMO_ALLOWED_PATHS` | (colon-separated) | Additional allowed path prefixes |
 | `XDG_CONFIG_HOME` | `~/.config` | Config file location (`runtimo/config.toml`) |

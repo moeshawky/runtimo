@@ -17,12 +17,13 @@
 //! ```
 
 use crate::validation::path::{validate_path, PathContext};
-use crate::{Capability, Context, Output, Result};
+use crate::capability::{CapabilityError, Context, Output, TypedCapability};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Input parameters for [`Undo::execute`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::exhaustive_structs)] // args struct — fields are the contract
 pub struct UndoArgs {
     /// Job ID to undo (restores backup from that job).
     pub job_id: String,
@@ -39,7 +40,9 @@ pub struct UndoArgs {
 #[allow(clippy::exhaustive_structs)]
 pub struct Undo;
 
-impl Capability for Undo {
+impl TypedCapability for Undo {
+    type Args = UndoArgs;
+
     fn name(&self) -> &'static str {
         "Undo"
     }
@@ -59,30 +62,21 @@ impl Capability for Undo {
         })
     }
 
-    fn validate(&self, args: &serde_json::Value) -> Result<()> {
-        let args: UndoArgs = serde_json::from_value(args.clone())
-            .map_err(|e| crate::Error::SchemaValidationFailed(e.to_string()))?;
+    fn execute(&self, args: UndoArgs, ctx: &Context) -> std::result::Result<Output, CapabilityError> {
         if args.job_id.is_empty() {
-            return Err(crate::Error::SchemaValidationFailed(
-                "job_id is empty".into(),
-            ));
+            return Err(CapabilityError::InvalidArgs("job_id is empty".into()));
         }
-        Ok(())
-    }
-
-    fn execute(&self, args: &serde_json::Value, ctx: &Context) -> Result<Output> {
-        let args: UndoArgs = serde_json::from_value(args.clone())
-            .map_err(|e| crate::Error::SchemaValidationFailed(e.to_string()))?;
 
         // Get backup directory from canonical utility
         let backup_dir = crate::utils::backup_dir();
 
-        let backup_mgr = crate::BackupManager::new(backup_dir.clone())?;
+        let backup_mgr = crate::BackupManager::new(backup_dir.clone())
+            .map_err(|e| CapabilityError::Internal(e.to_string()))?;
 
         // Find backup directory for the job
         let job_backup_dir = backup_dir.join(&args.job_id);
         if !job_backup_dir.exists() {
-            return Err(crate::Error::ExecutionFailed(format!(
+            return Err(CapabilityError::NotFound(format!(
                 "No backup found for job {}",
                 args.job_id
             )));
@@ -118,7 +112,7 @@ impl Capability for Undo {
                     }
                 }
                 Err(e) => {
-                    return Err(crate::Error::ExecutionFailed(format!(
+                    return Err(CapabilityError::Internal(format!(
                         "Failed to load WAL for undo: {}",
                         e
                     )));
@@ -133,7 +127,7 @@ impl Capability for Undo {
                 if backup_path.is_file() {
                     let backup_path_str = backup_path
                         .to_str()
-                        .ok_or_else(|| crate::Error::ExecutionFailed("Invalid backup path".into()))?
+                        .ok_or_else(|| CapabilityError::Internal("Invalid backup path".into()))?
                         .to_string();
 
                     // FINDING #12: Look up by full backup path, not just filename
@@ -141,7 +135,7 @@ impl Capability for Undo {
                         .get(&backup_path_str)
                         .map(std::path::PathBuf::from)
                         .ok_or_else(|| {
-                            crate::Error::ExecutionFailed(format!(
+                            CapabilityError::NotFound(format!(
                                 "No original path found for backup {}",
                                 backup_path.display()
                             ))
@@ -156,7 +150,7 @@ impl Capability for Undo {
                     };
                     let target_path = validate_path(&target_path.to_string_lossy(), &restore_ctx)
                         .map_err(|e| {
-                        crate::Error::ExecutionFailed(format!("restore target validation: {}", e))
+                        CapabilityError::PermissionDenied(format!("restore target validation: {}", e))
                     })?;
 
                     if ctx.dry_run {
@@ -166,7 +160,8 @@ impl Capability for Undo {
                             target_path.display()
                         ));
                     } else {
-                        backup_mgr.restore(&backup_path, &target_path)?;
+                        backup_mgr.restore(&backup_path, &target_path)
+                            .map_err(|e| CapabilityError::Internal(e.to_string()))?;
                         restored.push(format!(
                             "{} -> {}",
                             backup_path.display(),
@@ -177,14 +172,12 @@ impl Capability for Undo {
             }
         }
 
-        Ok(Output {
-            success: true,
-            data: serde_json::json!({
-                "restored": restored,
-                "job_id": args.job_id
-            }),
-            message: Some(format!("Restored {} file(s)", restored.len())),
-        })
+        let mut out = Output::ok(format!("Restored {} file(s)", restored.len()));
+        out.data = Some(serde_json::json!({
+            "restored": restored,
+            "job_id": args.job_id
+        }));
+        Ok(out)
     }
 }
 
@@ -192,12 +185,13 @@ impl Capability for Undo {
 #[allow(clippy::items_after_statements)]
 mod tests {
     use super::*;
+    use crate::capability::Capability;
     use crate::capability::Context;
     use std::fs;
     use std::sync::Mutex;
 
     /// Mutex to serialize undo tests that set environment variables
-    /// (RUNTIMO_WAL_PATH, RUNTIMO_BACKUP_DIR). Without this, concurrent
+    /// (RUNTIMO_WAL_PATH, XDG_DATA_HOME). Without this, concurrent
     /// tests fight over process-global env vars and produce spurious failures.
     static UNDO_TEST_MUTEX: Mutex<()> = Mutex::new(());
 
@@ -211,7 +205,10 @@ mod tests {
         let test_file = tmpdir.join("test.txt");
         fs::write(&test_file, "original content").unwrap();
 
-        let backup_dir = tmpdir.join("backups");
+        // Set XDG_DATA_HOME so backup_dir() derives from temp dir (ADR-C28)
+        std::env::set_var("XDG_DATA_HOME", &tmpdir);
+        // backup_dir() = data_dir().join("backups") = tmpdir/runtimo/backups
+        let backup_dir = tmpdir.join("runtimo").join("backups");
         let job_id = "test-job-123";
         let job_backup_dir = backup_dir.join(job_id);
         fs::create_dir_all(&job_backup_dir).unwrap();
@@ -257,21 +254,19 @@ mod tests {
         })
         .unwrap();
 
-        std::env::set_var("RUNTIMO_BACKUP_DIR", &backup_dir);
-
         let cap = Undo;
         let ctx = Context {
             dry_run: false,
             job_id: "undo-test-job".to_string(),
             working_dir: tmpdir.clone(),
         };
-        let result = cap.execute(&serde_json::json!({"job_id": job_id}), &ctx);
+        let result = Capability::execute(&cap, &serde_json::json!({"job_id": job_id}), &ctx);
 
         assert!(result.is_ok(), "undo failed: {:?}", result.err());
         let output = result.unwrap();
-        assert!(output.success, "undo not successful: {:?}", output.message);
+        assert_eq!(output.status, "ok", "undo not successful: {:?}", output.output);
         assert!(
-            !output.data["restored"].as_array().unwrap().is_empty(),
+            !output.data.as_ref().unwrap()["restored"].as_array().unwrap().is_empty(),
             "no files restored"
         );
 
@@ -282,7 +277,7 @@ mod tests {
         // Clean up
         let _ = fs::remove_dir_all(&tmpdir);
         std::env::remove_var("RUNTIMO_WAL_PATH");
-        std::env::remove_var("RUNTIMO_BACKUP_DIR");
+        std::env::remove_var("XDG_DATA_HOME");
     }
 
     #[test]
@@ -293,8 +288,8 @@ mod tests {
         let _ = fs::remove_dir_all(&tmpdir);
         fs::create_dir_all(&tmpdir).unwrap();
 
-        let backup_dir = tmpdir.join("backups");
-        std::env::set_var("RUNTIMO_BACKUP_DIR", &backup_dir);
+        // Set XDG_DATA_HOME so backup_dir() derives from temp dir
+        std::env::set_var("XDG_DATA_HOME", &tmpdir);
 
         let cap = Undo;
         let ctx = Context {
@@ -304,7 +299,7 @@ mod tests {
         };
 
         // Try to undo a job that has no backup
-        let result = cap.execute(&serde_json::json!({"job_id": "nonexistent-job-xyz"}), &ctx);
+        let result = Capability::execute(&cap, &serde_json::json!({"job_id": "nonexistent-job-xyz"}), &ctx);
         assert!(result.is_err(), "Should error on missing backup");
         let err = result.unwrap_err().to_string();
         assert!(
@@ -314,14 +309,20 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&tmpdir);
-        std::env::remove_var("RUNTIMO_BACKUP_DIR");
+        std::env::remove_var("XDG_DATA_HOME");
     }
 
     #[test]
     fn test_undo_missing_job_id_validation() {
-        // GAP 7: empty job_id should be rejected by validate
+        // GAP 7: empty job_id should be rejected by execute
         let cap = Undo;
-        let result = cap.validate(&serde_json::json!({"job_id": ""}));
+        let result = TypedCapability::execute(&cap, UndoArgs { job_id: String::new(), file: None },
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::temp_dir(),
+            },
+        );
         assert!(result.is_err(), "Empty job_id should be rejected");
         let err = result.unwrap_err().to_string();
         assert!(
@@ -344,7 +345,10 @@ mod tests {
         fs::write(&test_file1, "original file 1").unwrap();
         fs::write(&test_file2, "original file 2").unwrap();
 
-        let backup_dir = tmpdir.join("backups_multi");
+        // Set XDG_DATA_HOME so backup_dir() derives from temp dir (ADR-C28)
+        std::env::set_var("XDG_DATA_HOME", &tmpdir);
+        // backup_dir() = data_dir().join("backups") = tmpdir/runtimo/backups
+        let backup_dir = tmpdir.join("runtimo").join("backups");
         let job_id = "multi-file-job";
         let job_backup_dir = backup_dir.join(job_id);
         fs::create_dir_all(&job_backup_dir).unwrap();
@@ -418,20 +422,18 @@ mod tests {
         })
         .unwrap();
 
-        std::env::set_var("RUNTIMO_BACKUP_DIR", &backup_dir);
-
         let cap = Undo;
         let ctx = Context {
             dry_run: false,
             job_id: "undo-multi".to_string(),
             working_dir: tmpdir.clone(),
         };
-        let result = cap.execute(&serde_json::json!({"job_id": job_id}), &ctx);
+        let result = Capability::execute(&cap, &serde_json::json!({"job_id": job_id}), &ctx);
 
         assert!(result.is_ok(), "undo multi-file failed: {:?}", result.err());
         let output = result.unwrap();
-        assert!(output.success);
-        let restored = output.data["restored"].as_array().unwrap();
+        assert_eq!(output.status, "ok");
+        let restored = output.data.as_ref().unwrap()["restored"].as_array().unwrap();
         assert!(
             restored.len() >= 2,
             "Should restore at least 2 files, got {}: {:?}",
@@ -445,7 +447,7 @@ mod tests {
 
         let _ = fs::remove_dir_all(&tmpdir);
         std::env::remove_var("RUNTIMO_WAL_PATH");
-        std::env::remove_var("RUNTIMO_BACKUP_DIR");
+        std::env::remove_var("XDG_DATA_HOME");
     }
 
     #[test]
@@ -460,7 +462,10 @@ mod tests {
         let test_file = tmpdir.join("valid.txt");
         fs::write(&test_file, "original").unwrap();
 
-        let backup_dir = tmpdir.join("backups_val");
+        // Set XDG_DATA_HOME so backup_dir() derives from temp dir (ADR-C28)
+        std::env::set_var("XDG_DATA_HOME", &tmpdir);
+        // backup_dir() = data_dir().join("backups") = tmpdir/runtimo/backups
+        let backup_dir = tmpdir.join("runtimo").join("backups");
         let job_id = "validate-job";
         let job_backup_dir = backup_dir.join(job_id);
         fs::create_dir_all(&job_backup_dir).unwrap();
@@ -502,8 +507,6 @@ mod tests {
         })
         .unwrap();
 
-        std::env::set_var("RUNTIMO_BACKUP_DIR", &backup_dir);
-
         let cap = Undo;
         let ctx = Context {
             dry_run: false,
@@ -511,7 +514,7 @@ mod tests {
             working_dir: tmpdir.clone(),
         };
         // This should succeed because /tmp is in allowed prefixes
-        let result = cap.execute(&serde_json::json!({"job_id": job_id}), &ctx);
+        let result = Capability::execute(&cap, &serde_json::json!({"job_id": job_id}), &ctx);
         assert!(
             result.is_ok(),
             "Valid path restore should succeed: {:?}",
@@ -520,6 +523,6 @@ mod tests {
 
         let _ = fs::remove_dir_all(&tmpdir);
         std::env::remove_var("RUNTIMO_WAL_PATH");
-        std::env::remove_var("RUNTIMO_BACKUP_DIR");
+        std::env::remove_var("XDG_DATA_HOME");
     }
 }

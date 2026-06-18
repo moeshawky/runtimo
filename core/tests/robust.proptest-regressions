@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 44ebcd312ce2ffee836681b13d4e91f85450aaddd2cd8b3ca06ec0a81d594d82 # shrinks to content = "\0"
+cc 5f7bf6d58920600ab1fe3c8522e960c727075f07a1b2e394f3679698ece6b419 # shrinks to content = "\u{1}"

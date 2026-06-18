@@ -98,7 +98,7 @@ pub mod wal;
 
 pub use backup::BackupManager;
 pub use capabilities::{FileRead, FileWrite, GitExec, Kill, ShellExec, Undo};
-pub use capability::{Capability, CapabilityRegistry, Context, Output};
+pub use capability::{Capability, CapabilityError, CapabilityRegistry, Context, Output, TypedCapability};
 pub use config::RuntimoConfig;
 pub use executor::{execute_with_telemetry, execute_with_telemetry_and_session};
 pub use job::{Job, JobId, JobState};
@@ -197,10 +197,15 @@ pub mod utils {
             .map_or_else(|_| data_dir().join("wal.jsonl"), PathBuf::from)
     }
 
-    /// Returns the backup directory (env override or default).
+    /// Returns the backup directory derived from `data_dir()`.
+    ///
+    /// Always returns `data_dir().join("backups")`. This is a derived path
+    /// from the trusted `data_dir` root — no env var override is available
+    /// (see ADR-C28). External config of the backup location would create
+    /// an attacker control vector.
+    #[must_use]
     pub fn backup_dir() -> PathBuf {
-        std::env::var("RUNTIMO_BACKUP_DIR")
-            .map_or_else(|_| data_dir().join("backups"), PathBuf::from)
+        data_dir().join("backups")
     }
 
     /// Generates a unique ID from 16 random bytes (32 hex chars).

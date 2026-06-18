@@ -1,0 +1,146 @@
+tool: runtimo
+tool_version: 0.7.1
+test_date: 2026-06-18
+test_duration: ~5 minutes
+subagents_dispatched: 4
+findings_count: 12
+
+testers:
+  - role: Happy Path Explorer
+    findings: 0
+    evidence_quality: HIGH
+  - role: Adversarial User
+    findings: 5
+    evidence_quality: HIGH
+  - role: Edge Case Hunter
+    findings: 3
+    evidence_quality: HIGH
+  - role: Documentation Auditor
+    findings: 4
+    evidence_quality: HIGH
+
+findings:
+  - id: F-001
+    severity: CRITICAL
+    role: Documentation Auditor / Adversarial User
+    description: ShellExec does not block `rm -rf /` despite being documented as blocked. Only saved by GNU rm's built-in --preserve-root safety, trivially bypassed with --no-preserve-root.
+    command: runtimo run -c ShellExec -a '{"command": "rm -rf /"}'
+    output: '{"cmd":"rm -rf /","exit_code":1,"pid":...,"stderr":"rm: it is dangerous to operate recursively on '/'\nrm: use --no-preserve-root to override this failsafe\n"}'
+    expected: Should be blocked with "dangerous command blocked" message
+    recommendation: Add `rm\s+-[rRf]+`, `rm\s+--recursive`, `rm\s+--no-preserve-root` to ShellExec dangerous command patterns
+
+  - id: F-002
+    severity: CRITICAL
+    role: Documentation Auditor
+    description: README FileRead example uses `/etc/hostname` which is outside allowed paths — user copying the example gets an error immediately.
+    command: runtimo run -c FileRead -a '{"path":"/etc/hostname"}'
+    output: 'Execution failed: permission denied: path outside allowed directories: /etc/hostname'
+    expected: Should either work (if /etc is allowed) or README should show a valid example path like /tmp/hostname.txt
+    recommendation: Fix README example to use /tmp/test.txt or another allowed path
+
+  - id: F-003
+    severity: BLOCKING
+    role: Adversarial User / Documentation Auditor
+    description: Dispatch accepts dangerous commands at submit time — only validated at async execution time, creating a false sense of safety.
+    command: runtimo dispatch -c ShellExec -a '{"command": "shutdown -h now"}'
+    output: 'Dispatched job <id> (capability: ShellExec)'
+    expected: Should reject dangerous commands synchronously at dispatch time
+    recommendation: Move dangerous command validation to argument parsing time so dispatch rejects before creating a job
+
+  - id: F-004
+    severity: BLOCKING
+    role: Documentation Auditor
+    description: Dispatch auto-start daemon but connection fails — documented as seamless, broken in practice.
+    command: timeout 10 runtimo dispatch -c ShellExec -a '{"cmd":"echo test"}'
+    output: 'Dispatch failed: Daemon closed connection'
+    expected: Should successfully dispatch after auto-starting daemon
+    recommendation: Fix daemon socket readiness handshake — dispatch starts daemon but connects before daemon is listening
+
+  - id: F-005
+    severity: BLOCKING
+    role: Edge Case Hunter
+    description: Non-ASCII paths explicitly rejected even for valid existing files — blocks international use cases.
+    command: runtimo run -c FileRead -a '{"path": "/tmp/über.txt"}'
+    output: 'Execution failed: permission denied: path validation: non-ASCII paths are not supported'
+    expected: Should accept valid UTF-8 paths with non-ASCII characters
+    recommendation: Allow Unicode paths in path validation; only block control characters and null bytes
+
+  - id: F-006
+    severity: BLOCKING
+    role: Edge Case Hunter
+    description: No dotfile/sensitive-filename protection — .env files written without warning.
+    command: runtimo run -c FileWrite -a '{"path": "/tmp/.env", "content": "SECRET=value"}'
+    output: 'Wrote 12 bytes to /tmp/.env' (no warning)
+    expected: Should warn or block writing dotfiles containing secrets
+    recommendation: Add optional blocklist for sensitive filename patterns (.env, .gitconfig, .ssh/*)
+
+  - id: F-007
+    severity: BLOCKING
+    role: Adversarial User / Documentation Auditor
+    description: Exit code is always 0 even on failures — blocked attacks, schema errors, failed commands all return 0.
+    command: runtimo run -c ShellExec -a '{"command": "false"}'
+    output: exit code 0 for runtimo (child exit_code:1)
+    expected: Runtimo should return non-zero exit code when execution fails
+    recommendation: Return exit code 1 (or child exit code) when capability execution fails
+
+  - id: F-008
+    severity: MINOR
+    role: Adversarial User
+    description: Error messages say "permission denied" for path-not-found — misleading; leaks existence vs permission distinction.
+    command: runtimo run -c FileRead -a '{"path": "/nonexistent/file.txt"}'
+    output: 'permission denied: path validation: path does not exist: /nonexistent/file.txt'
+    expected: Should say "path does not exist" without "permission denied" prefix
+    recommendation: Differentiate "not found" from "permission denied" in error messages
+
+  - id: F-009
+    severity: MINOR
+    role: Edge Case Hunter
+    description: Empty -j "" produces "Job not found: " with trailing space — no early validation.
+    command: runtimo wait -j ""
+    output: 'Job not found: '
+    expected: Should give clear "job_id is required" validation error
+    recommendation: Add early validation for empty job_id before WAL lookup
+
+  - id: F-010
+    severity: MINOR
+    role: Adversarial User
+    description: Telemetry exposes listening ports without any gating — reconnaissance surface.
+    command: runtimo telemetry
+    output: 'Listening ports: 22, 25, 53, 3350, 3389, 5355, 11434, 39282, 51885'
+    expected: Port list should be gated behind verbose flag or removed
+    recommendation: Gate listening ports behind --verbose flag on telemetry command
+
+  - id: F-011
+    severity: MINOR
+    role: Documentation Auditor
+    description: Blocklist documentation inconsistent across README, --help, and `runtimo list` output — three different lists.
+    command: compare README vs --help vs `runtimo list`
+    output: 'README: mkfs, fdisk, dd, shutdown, reboot, poweroff, rm -rf /, chmod 777 /; list: adds chown, mount, iptables, network tools; behavior: rm -rf / NOT blocked'
+    expected: All three sources should agree on what's blocked
+    recommendation: Unify blocklist documentation — single source of truth
+
+  - id: F-012
+    severity: COSMETIC
+    role: Documentation Auditor
+    description: README calls daemon "Future JSON-RPC server" but daemon is already implemented.
+    command: grep in README
+    output: 'Future JSON-RPC server' (line 303)
+    expected: Should say "JSON-RPC server" without "Future"
+    recommendation: Remove "Future" from daemon description in README
+
+summary:
+  critical: 2
+  blocking: 5
+  minor: 4
+  cosmetic: 1
+
+verdict: FAIL
+verdict_rationale: >
+  2 CRITICAL issues remain after AP fixes: (1) ShellExec does NOT block `rm -rf /` despite being documented as such — trivially bypassed with --no-preserve-root; (2) README example
+  FileRead uses `/etc/hostname` which is outside allowed paths. 5 BLOCKING issues: dispatch accepts dangerous comands upfront, dispatch auto-start handshake broken, non-ASCII paths
+  rejected, dotfile/.env writing unguarded, exit code always 0. Previous 4 CRITICAL issues (ShellExec cognitive safety, daemon crash, wait pre-validation, help text) were successfully
+  fixed by AP phase. New regression exposure: the focus on sync/async boundary and path validation did not address the ShellExec blocklist completeness or exit code behavior.
+
+untested_surface: >
+  GitExec capability not deeply tested (clone/pull/commit/revert). Network timeout behavior. Very long-running dispatch jobs (>60s). Daemon crash recovery after abrupt SIGKILL.
+  Config persistence across runs. Custom allowed-paths add/remove round-trip.

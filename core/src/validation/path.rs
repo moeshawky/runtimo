@@ -2,8 +2,12 @@
 //!
 //! Central validation for all path-based capabilities. Handles both existing
 //! paths (canonicalize directly) and new paths (canonicalize the parent).
-//! Rejects path traversal, empty paths, null bytes, non-ASCII paths, and
-//! paths outside `allowed_prefixes`.
+//! Rejects path traversal, empty paths, null bytes, control characters,
+//! and paths outside `allowed_prefixes`. Valid UTF-8 paths with non-ASCII
+//! characters (e.g. `über.txt`, `中文`) are allowed.
+//!
+//! Error messages do not leak the list of allowed directories (prevents
+//! information disclosure about filesystem layout).
 //!
 //! # Security Considerations
 //!
@@ -14,9 +18,10 @@
 //!
 //! ## Unicode Normalization (FINDING #7)
 //! Paths are NFC-normalized before validation to prevent Unicode-based
-//! traversal attacks. Non-ASCII paths are rejected entirely because Unicode
-//! normalization edge cases (e.g., homoglyphs, combining characters) cannot
-//! be fully mitigated without filesystem-level awareness.
+//! traversal attacks. Non-ASCII paths are allowed after NFC normalization
+//! — valid UTF-8 paths with non-ASCII characters (e.g. `über.txt`, `中文`)
+//! are accepted. Only control characters (0x00-0x1F, 0x7F) and null bytes
+//! are blocked.
 //!
 //! ## Symlink TOCTOU Limitation (FINDING #9)
 //! This module canonicalizes paths via `std::fs::canonicalize()` which
@@ -92,18 +97,26 @@ fn get_allowed_prefixes(ctx: &PathContext) -> Vec<String> {
 /// symlink-based escapes. For non-existent paths (writes), canonicalizes
 /// the parent directory and appends the filename.
 ///
+/// # CWD Independence (R-C26-01)
+///
+/// This function is CWD-independent: no `std::env::current_dir()` fallback.
+/// Two calls with the same path but different CWD produce identical results
+/// or identical errors. Relative paths that do not exist and whose parent
+/// does not exist are rejected because they cannot be resolved without CWD.
+///
 /// # Arguments
 /// * `path_str` - Path string to validate
 /// * `ctx` - Validation context with allowed prefixes and requirements
 ///
 /// # Returns
 /// * `Ok(PathBuf)` - Resolved path (canonical if possible)
-/// * `Err(String)` - Validation error message
+/// * `Err(String)` - Validation error message (does not leak allowed prefixes)
 ///
 /// # Errors
 /// Returns an error string if the path is empty, contains null bytes,
-/// is non-ASCII, traverses parent directories, does not exist (when required),
-/// is not a regular file (when required), or is outside allowed directories.
+/// contains control characters, traverses parent directories,
+/// does not exist (when required), is not a regular file (when required),
+/// cannot be resolved without CWD, or is outside allowed directories.
 pub fn validate_path(path_str: &str, ctx: &PathContext) -> Result<PathBuf, String> {
     // Reject empty paths
     if path_str.is_empty() {
@@ -115,10 +128,10 @@ pub fn validate_path(path_str: &str, ctx: &PathContext) -> Result<PathBuf, Strin
         return Err("path contains null byte".to_string());
     }
 
-    // Reject non-ASCII paths — Unicode normalization edge cases cannot be
-    // fully mitigated without filesystem-level awareness (FINDING #7)
-    if !path_str.is_ascii() {
-        return Err("non-ASCII paths are not supported".to_string());
+    // Reject control characters (ASCII 0-31, 127) — can cause terminal
+    // injection, log injection, or shell metacharacter issues
+    if path_str.chars().any(|c| c.is_control()) {
+        return Err("path contains control character".to_string());
     }
 
     // NFC-normalize the path to prevent Unicode-based traversal (FINDING #7)
@@ -156,14 +169,16 @@ pub fn validate_path(path_str: &str, ctx: &PathContext) -> Result<PathBuf, Strin
                 .ok_or_else(|| "invalid filename".to_string())?;
             canonical_parent.join(filename)
         } else {
-            // Parent doesn't exist yet — convert to absolute for prefix check.
-            // This handles the case where `create_dir_all` will create parents.
+            // Parent doesn't exist yet — for absolute paths, use as-is.
+            // Relative paths rejected to enforce CWD-independent resolution
+            // (R-C26-01: same path + different CWD → identical result or error).
             if path.is_absolute() {
                 path.to_path_buf()
             } else {
-                std::env::current_dir()
-                    .map_err(|e| format!("cannot resolve relative path: {}", e))?
-                    .join(path)
+                return Err(format!(
+                    "cannot resolve relative path without CWD: {}",
+                    normalized
+                ));
             }
         }
     };
@@ -181,9 +196,8 @@ pub fn validate_path(path_str: &str, ctx: &PathContext) -> Result<PathBuf, Strin
         .any(|prefix| path_in_prefix(&resolved_str, prefix))
     {
         return Err(format!(
-            "path outside allowed directories: {} (allowed: {})",
-            resolved.display(),
-            allowed.join(", ")
+            "path outside allowed directories: {}",
+            resolved.display()
         ));
     }
 
@@ -291,15 +305,17 @@ mod tests {
     }
 
     #[test]
-    fn error_message_shows_allowed_prefixes() {
+    fn error_message_does_not_leak_allowed_prefixes() {
         let ctx = PathContext {
             require_exists: false,
             require_file: false,
             ..Default::default()
         };
         let err = validate_path("/etc/shadow", &ctx).unwrap_err();
-        assert!(err.contains("/tmp"), "error should list /tmp as allowed");
-        assert!(err.contains("/home"), "error should list /home as allowed");
+        // Error should not leak the list of allowed directories (info leak)
+        assert!(!err.contains("/tmp"), "error should not leak /tmp as allowed");
+        assert!(!err.contains("/home"), "error should not leak /home as allowed");
+        assert!(err.contains("outside allowed directories"));
     }
 
     #[test]
@@ -311,19 +327,26 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_ascii_path() {
+    fn accepts_non_ascii_path() {
+        // Create a file with non-ASCII name on disk first
+        let p = std::env::temp_dir().join("café.txt");
+        std::fs::write(&p, "test").ok();
         let ctx = PathContext::default();
-        let result = validate_path("/tmp/café.txt", &ctx);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("non-ASCII"));
+        let result = validate_path(p.to_str().unwrap(), &ctx);
+        // The file exists in a temp dir (allowed prefix), so it should pass
+        assert!(result.is_ok(), "non-ASCII path should be allowed, got: {:?}", result);
+        std::fs::remove_file(&p).ok();
     }
 
     #[test]
     fn rejects_non_ascii_unicode_traversal() {
         let ctx = PathContext::default();
-        // Unicode homoglyph attack attempt
+        // Unicode homoglyph attack attempt that doesn't exist — should error on "does not exist"
+        // The non-ASCII part is now allowed, but the traversal (..) should still be caught
         let result = validate_path("/tmp/\u{00e9}../etc/passwd", &ctx);
         assert!(result.is_err());
+        // Should fail due to traversal, not non-ASCII
+        assert!(!result.unwrap_err().contains("non-ASCII"), "should not reject for non-ASCII");
     }
 
     #[test]

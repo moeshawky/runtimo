@@ -53,7 +53,7 @@ impl RuntimoConfig {
     /// Loads config from disk, returning defaults if the file doesn't exist or is invalid.
     ///
     /// Logs a warning to stderr when the file exists but cannot be read or parsed.
-    /// Prefer [`load_result`] for new code — it propagates errors so callers can
+    /// Prefer [`Self::load_result`] for new code — it propagates errors so callers can
     /// distinguish "file doesn't exist" from "file is corrupt."
     #[must_use]
     pub fn load() -> Self {
@@ -70,7 +70,7 @@ impl RuntimoConfig {
     ///
     /// # Input
     ///
-    /// Reads from the path returned by [`config_path`] if it exists.
+    /// Reads from the path returned by [`Self::config_path`] if it exists.
     ///
     /// # Output
     ///

@@ -5,7 +5,8 @@
 //!
 //! Security: opens file with O_NOFOLLOW to prevent TOCTOU symlink escape,
 //! uses bounded reader (take) regardless of metadata to prevent size bypass,
-//! detects binary content, and handles UTF-8 boundary splits correctly.
+//! detects binary content (null bytes or >10% control chars), and handles
+//! UTF-8 boundary splits correctly.
 //!
 //! # Example
 //!
@@ -22,9 +23,8 @@
 //! assert!(schema["required"].as_array().unwrap().contains(&json!("path")));
 //! ```
 
-use crate::capability::{Capability, Context, Output};
+use crate::capability::{Context, Output, TypedCapability, CapabilityError};
 use crate::validation::path::{validate_path, PathContext};
-use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::Read;
@@ -40,10 +40,11 @@ const DEFAULT_MAX_BYTES: u64 = 1024 * 1024;
 /// Accepts a file path and an optional byte limit. The path is validated
 /// against the configured allowed-prefix list before any I/O occurs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::exhaustive_structs)] // args struct — fields are the contract
 pub struct FileReadArgs {
     /// Absolute or relative path to the file to read.
     pub path: String,
-    /// Maximum bytes to read (default: 1 MB, max: 10 MB).
+    /// Maximum bytes to read (default: 1 MB, max: 10 MB, minimum: 1).
     pub max_bytes: Option<u64>,
 }
 
@@ -55,7 +56,9 @@ pub struct FileReadArgs {
 #[allow(clippy::exhaustive_structs)] // unit struct used as trait-object marker
 pub struct FileRead;
 
-impl Capability for FileRead {
+impl TypedCapability for FileRead {
+    type Args = FileReadArgs;
+
     fn name(&self) -> &'static str {
         "FileRead"
     }
@@ -75,25 +78,7 @@ impl Capability for FileRead {
         })
     }
 
-    fn validate(&self, args: &Value) -> Result<()> {
-        let args: FileReadArgs = serde_json::from_value(args.clone())
-            .map_err(|e| Error::SchemaValidationFailed(e.to_string()))?;
-
-        let ctx = PathContext {
-            require_exists: true,
-            require_file: true,
-            ..Default::default()
-        };
-
-        validate_path(&args.path, &ctx).map_err(Error::SchemaValidationFailed)?;
-
-        Ok(())
-    }
-
-    fn execute(&self, args: &Value, _ctx: &Context) -> Result<Output> {
-        let args: FileReadArgs = serde_json::from_value(args.clone())
-            .map_err(|e| Error::ExecutionFailed(e.to_string()))?;
-
+    fn execute(&self, args: FileReadArgs, _ctx: &Context) -> std::result::Result<Output, CapabilityError> {
         let ctx = PathContext {
             require_exists: true,
             require_file: true,
@@ -101,11 +86,14 @@ impl Capability for FileRead {
         };
 
         let path = validate_path(&args.path, &ctx)
-            .map_err(|e| Error::ExecutionFailed(format!("path validation: {}", e)))?;
+            .map_err(|e| CapabilityError::PermissionDenied(format!("path validation: {}", e)))?;
 
         let max_bytes = args.max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
+        if max_bytes == 0 {
+            return Err(CapabilityError::InvalidArgs("max_bytes must be >= 1".into()));
+        }
         if max_bytes > MAX_FILE_SIZE {
-            return Err(Error::ExecutionFailed(format!(
+            return Err(CapabilityError::InvalidArgs(format!(
                 "max_bytes {} exceeds maximum allowed {}",
                 max_bytes, MAX_FILE_SIZE
             )));
@@ -114,7 +102,7 @@ impl Capability for FileRead {
         // P0 FIX: Open with O_NOFOLLOW to prevent TOCTOU symlink escape.
         // Open immediately after validation to minimize TOCTOU window.
         let file = open_file_nofollow(&path)
-            .map_err(|e| Error::ExecutionFailed(format!("open {}: {}", path.display(), e)))?;
+            .map_err(CapabilityError::Io)?;
 
         // P0 FIX: Always use bounded reader (take) regardless of metadata.
         // Prevents TOCTOU size bypass where file grows between stat and read.
@@ -127,7 +115,7 @@ impl Capability for FileRead {
         ));
         let bytes_read = limited
             .read_to_end(&mut raw_bytes)
-            .map_err(|e| Error::ExecutionFailed(format!("read {}: {}", path.display(), e)))?;
+            .map_err(CapabilityError::Io)?;
 
         let bytes_read = bytes_read as u64;
         let truncated = bytes_read >= max_bytes;
@@ -176,16 +164,14 @@ impl Capability for FileRead {
             }
         };
 
-        Ok(Output {
-            success: true,
-            data,
-            message: Some(format!(
-                "Read {} bytes from {}{}",
-                bytes_read,
-                path.display(),
-                if truncated { " (truncated)" } else { "" }
-            )),
-        })
+        let mut out = Output::ok(format!(
+            "Read {} bytes from {}{}",
+            bytes_read,
+            path.display(),
+            if truncated { " (truncated)" } else { "" }
+        ));
+        out.data = Some(data);
+        Ok(out)
     }
 }
 
@@ -204,9 +190,25 @@ fn open_file_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> 
     std::fs::File::open(path)
 }
 
-/// Detect binary content by checking for null bytes.
+/// Detect binary content by checking for null bytes and high ratio of
+/// non-printable control characters. Uses a threshold of >10% control chars
+/// (excluding common whitespace: \n, \r, \t) to classify as binary.
 fn detect_binary(data: &[u8]) -> bool {
-    data.contains(&0)
+    if data.is_empty() {
+        return false;
+    }
+    // Fast path: null byte = definitely binary
+    if data.contains(&0) {
+        return true;
+    }
+    // Count control characters (excluding common whitespace)
+    let control_count = data
+        .iter()
+        .filter(|&&b| b < 0x20 && b != b'\n' && b != b'\r' && b != b'\t')
+        .count();
+    // If more than 10% are control chars, treat as binary
+    // Use division to avoid potential multiplication overflow
+    control_count > data.len() / 10
 }
 
 /// Convert raw bytes to a UTF-8 String, trimming trailing bytes that would
@@ -229,6 +231,14 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    fn test_ctx() -> Context {
+        Context {
+            dry_run: false,
+            job_id: "test".into(),
+            working_dir: std::env::temp_dir(),
+        }
+    }
+
     #[allow(clippy::unwrap_used, clippy::unused_result_ok)]
     #[test]
     fn reads_existing_file() {
@@ -239,42 +249,31 @@ mod tests {
             writeln!(f, "hello world").unwrap();
         }
 
-        let result = FileRead
-            .execute(
-                &serde_json::json!({ "path": tmp.to_str().unwrap() }),
-                &Context {
-                    dry_run: false,
-                    job_id: "test".into(),
-                    working_dir: std::env::temp_dir(),
-                },
-            )
+        let result = TypedCapability::execute(&FileRead, FileReadArgs { path: tmp.to_str().unwrap().to_string(), max_bytes: None }, &test_ctx())
             .unwrap();
 
-        assert!(result.success);
-        assert!(result
-            .data
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap()
-            .contains("hello world"));
+        assert!(result.status == "ok");
+        let content = result.data.as_ref().and_then(|d| d.get("content"))
+            .and_then(|v| v.as_str()).unwrap_or("").to_string();
+        assert!(content.contains("hello world"));
         std::fs::remove_file(&tmp).ok();
     }
 
     #[allow(clippy::unwrap_used)]
     #[test]
     fn rejects_missing_file() {
-        let err = FileRead
-            .validate(&serde_json::json!({
-                "path": "/tmp/nonexistent_runtimo_test.txt"
-            }))
-            .unwrap_err();
-        assert!(err.to_string().contains("does not exist"));
+        let result = TypedCapability::execute(&FileRead, FileReadArgs { path: "/tmp/nonexistent_runtimo_test.txt".to_string(), max_bytes: None }, &test_ctx());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("does not exist") || err.contains("not found"),
+            "Expected error about missing file, got: {}",
+            err
+        );
     }
 
     #[test]
     fn rejects_empty_path() {
-        assert!(FileRead
-            .validate(&serde_json::json!({ "path": "" }))
+        assert!(TypedCapability::execute(&FileRead, FileReadArgs { path: String::new(), max_bytes: None }, &test_ctx())
             .is_err());
     }
 
@@ -292,33 +291,24 @@ mod tests {
             }
         }
 
-        let result = FileRead
-            .execute(
-                &serde_json::json!({ "path": tmp.to_str().unwrap(), "max_bytes": 50 }),
-                &Context {
-                    dry_run: false,
-                    job_id: "test".into(),
-                    working_dir: std::env::temp_dir(),
-                },
-            )
+        let result = TypedCapability::execute(&FileRead, FileReadArgs { path: tmp.to_str().unwrap().to_string(), max_bytes: Some(50) }, &test_ctx())
             .unwrap();
 
-        assert!(result.success);
-        assert!(result.data["truncated"].as_bool() == Some(true));
-        assert!(result.data["bytes_read"].as_u64().unwrap() <= 50);
+        assert!(result.status == "ok");
+        assert_eq!(
+            result.data.as_ref().and_then(|d| d.get("truncated")).and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert!(
+            result.data.as_ref().and_then(|d| d.get("bytes_read")).and_then(|v| v.as_u64())
+                .unwrap_or(9999) <= 50
+        );
         std::fs::remove_file(&tmp).ok();
     }
 
     #[test]
     fn test_max_bytes_rejects_exceeding_limit() {
-        let result = FileRead.execute(
-            &serde_json::json!({ "path": "/etc/hosts", "max_bytes": 9999999999u64 }),
-            &Context {
-                dry_run: false,
-                job_id: "test".into(),
-                working_dir: std::env::temp_dir(),
-            },
-        );
+        let result = TypedCapability::execute(&FileRead, FileReadArgs { path: "/etc/hosts".to_string(), max_bytes: Some(9999999999u64) }, &test_ctx());
         assert!(result.is_err());
     }
 
@@ -329,19 +319,14 @@ mod tests {
         tmp.push("runtimo_test_default_max.txt");
         std::fs::write(&tmp, "small content").unwrap();
 
-        let result = FileRead
-            .execute(
-                &serde_json::json!({ "path": tmp.to_str().unwrap() }),
-                &Context {
-                    dry_run: false,
-                    job_id: "test".into(),
-                    working_dir: std::env::temp_dir(),
-                },
-            )
+        let result = TypedCapability::execute(&FileRead, FileReadArgs { path: tmp.to_str().unwrap().to_string(), max_bytes: None }, &test_ctx())
             .unwrap();
 
-        assert!(result.success);
-        assert!(result.data["truncated"].as_bool() == Some(false));
+        assert!(result.status == "ok");
+        assert_eq!(
+            result.data.as_ref().and_then(|d| d.get("truncated")).and_then(|v| v.as_bool()),
+            Some(false)
+        );
         std::fs::remove_file(&tmp).ok();
     }
 
@@ -352,22 +337,21 @@ mod tests {
         tmp.push("runtimo_test_agent.json");
         std::fs::write(&tmp, r#"{"key": "value", "nested": {"a": 1}}"#).unwrap();
 
-        let result = FileRead
-            .execute(
-                &serde_json::json!({ "path": tmp.to_str().unwrap() }),
-                &Context {
-                    dry_run: false,
-                    job_id: "test".into(),
-                    working_dir: std::env::temp_dir(),
-                },
-            )
+        let result = TypedCapability::execute(&FileRead, FileReadArgs { path: tmp.to_str().unwrap().to_string(), max_bytes: None }, &test_ctx())
             .unwrap();
 
-        assert!(result.success);
-        assert!(result.data["content"].is_object());
-        assert_eq!(result.data["content"]["key"].as_str(), Some("value"));
-        assert_eq!(result.data["content"]["nested"]["a"].as_u64(), Some(1));
-        assert_eq!(result.data["content_type"].as_str(), Some("json"));
+        assert!(result.status == "ok");
+        let data = result.data.as_ref().unwrap();
+        assert!(data.get("content").unwrap().is_object());
+        assert_eq!(
+            data.get("content").unwrap().get("key").and_then(|v| v.as_str()),
+            Some("value")
+        );
+        assert_eq!(
+            data.get("content").unwrap().get("nested").unwrap().get("a").and_then(|v| v.as_u64()),
+            Some(1)
+        );
+        assert_eq!(data.get("content_type").and_then(|v| v.as_str()), Some("json"));
         std::fs::remove_file(&tmp).ok();
     }
 
@@ -377,20 +361,13 @@ mod tests {
         tmp.push("runtimo_test_binary.bin");
         std::fs::write(&tmp, b"hello\x00world").unwrap();
 
-        let result = FileRead
-            .execute(
-                &serde_json::json!({ "path": tmp.to_str().unwrap() }),
-                &Context {
-                    dry_run: false,
-                    job_id: "test".into(),
-                    working_dir: std::env::temp_dir(),
-                },
-            )
+        let result = TypedCapability::execute(&FileRead, FileReadArgs { path: tmp.to_str().unwrap().to_string(), max_bytes: None }, &test_ctx())
             .unwrap();
 
-        assert!(result.success);
-        assert_eq!(result.data["content_type"].as_str(), Some("binary"));
-        assert_eq!(result.data["bytes_read"].as_u64(), Some(11));
+        assert!(result.status == "ok");
+        let data = result.data.as_ref().unwrap();
+        assert_eq!(data.get("content_type").and_then(|v| v.as_str()), Some("binary"));
+        assert_eq!(data.get("bytes_read").and_then(|v| v.as_u64()), Some(11));
         std::fs::remove_file(&tmp).ok();
     }
 
@@ -402,19 +379,12 @@ mod tests {
         tmp.push("runtimo_test_utf8.txt");
         std::fs::write(&tmp, b"caf\xc3\xa9").unwrap();
 
-        let result = FileRead
-            .execute(
-                &serde_json::json!({ "path": tmp.to_str().unwrap(), "max_bytes": 4 }),
-                &Context {
-                    dry_run: false,
-                    job_id: "test".into(),
-                    working_dir: std::env::temp_dir(),
-                },
-            )
+        let result = TypedCapability::execute(&FileRead, FileReadArgs { path: tmp.to_str().unwrap().to_string(), max_bytes: Some(4) }, &test_ctx())
             .unwrap();
 
-        assert!(result.success);
-        let content = result.data["content"].as_str().unwrap();
+        assert!(result.status == "ok");
+        let content = result.data.as_ref().and_then(|d| d.get("content"))
+            .and_then(|v| v.as_str()).unwrap_or("");
         assert_eq!(content, "caf");
         std::fs::remove_file(&tmp).ok();
     }
@@ -426,20 +396,12 @@ mod tests {
         // UTF-8: "café\n" = 6 bytes (é is 2 bytes)
         std::fs::write(&tmp, "café\n").unwrap();
 
-        let result = FileRead
-            .execute(
-                &serde_json::json!({ "path": tmp.to_str().unwrap() }),
-                &Context {
-                    dry_run: false,
-                    job_id: "test".into(),
-                    working_dir: std::env::temp_dir(),
-                },
-            )
+        let result = TypedCapability::execute(&FileRead, FileReadArgs { path: tmp.to_str().unwrap().to_string(), max_bytes: None }, &test_ctx())
             .unwrap();
 
-        assert!(result.success);
+        assert!(result.status == "ok");
         // bytes_read should be 6 (raw file bytes), not String::len() which is 5
-        assert_eq!(result.data["bytes_read"].as_u64(), Some(6));
+        assert_eq!(result.data.as_ref().and_then(|d| d.get("bytes_read")).and_then(|v| v.as_u64()), Some(6));
         std::fs::remove_file(&tmp).ok();
     }
 
@@ -451,14 +413,7 @@ mod tests {
         {
             use std::os::unix::fs::symlink;
             if symlink("/etc/hostname", &link_path).is_ok() {
-                let result = FileRead.execute(
-                    &serde_json::json!({ "path": link_path.to_str().unwrap() }),
-                    &Context {
-                        dry_run: false,
-                        job_id: "test".into(),
-                        working_dir: std::env::temp_dir(),
-                    },
-                );
+                let result = TypedCapability::execute(&FileRead, FileReadArgs { path: link_path.to_str().unwrap().to_string(), max_bytes: None }, &test_ctx());
                 assert!(result.is_err(), "symlink should be rejected by O_NOFOLLOW");
                 std::fs::remove_file(&link_path).ok();
             }

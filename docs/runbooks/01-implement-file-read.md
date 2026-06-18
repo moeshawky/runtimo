@@ -158,7 +158,7 @@ git checkout -- daemon/src/main.rs
 
 After FileRead works:
 1. Implement FileWrite (with backup)
-2. Add CLI command: `moe run FileRead --args '{"path":"/tmp/test.txt"}'`
+2. Add CLI command: `runtimo run FileRead --args '{"path":"/tmp/test.txt"}'`
 3. Add WAL logging for FileRead execution
 
 ---

@@ -11,7 +11,7 @@
 //! The blocklist catches obvious agent hallucinations/bugs.
 //!
 //! **What's blocked:**
-//! - Filesystem destruction: `rm -rf /`, `rm --recursive` on system dirs (`/home`, `/etc`, `/usr`, `/var`, `/lib`, `/opt`, `/bin`, `/sbin`)
+//! - Filesystem destruction: `rm -rf /`, `rm --recursive`, `rm --no-preserve-root` (all forms blocked)
 //! - Shell expansion bypasses: `rm -rf ~` (tilde expansion)
 //! - Filesystem creation: `mkfs.*`, `mkswap`
 //! - Data destruction: `dd if=/dev/zero`
@@ -39,7 +39,7 @@
 //!
 //! - Timeout enforcement (default 30s, configurable)
 //! - Output capture (stdout/stderr, bounded to 10MB)
-//! - PID tracking (child + grandchildren via /proc/{pid}/children)
+//! - PID tracking (child PID only; spawned_pids removed from output)
 //! - Process group isolation (kills all descendants on timeout)
 //! - Telemetry before/after execution
 //! - WAL logging for audit trail
@@ -58,7 +58,7 @@
 //! ).unwrap();
 //! ```
 
-use crate::capability::{Capability, Context, Output};
+use crate::capability::{CapabilityError, Context, Output, TypedCapability};
 use crate::validation::path::{validate_path, PathContext};
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -81,6 +81,7 @@ const MAX_STDIN_BYTES: usize = 1024 * 1024;
 /// Runs a shell command with an optional timeout and working directory.
 /// Dangerous commands (rm -rf /, dd, fork bombs) are rejected before execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::exhaustive_structs)] // args struct — fields are the contract
 pub struct ShellExecArgs {
     /// Shell command to execute (e.g. `"ls -la"`, `"cargo build"`).
     #[serde(alias = "command")]
@@ -112,8 +113,24 @@ fn command_matches(cmd_lower: &str, names: &[&str]) -> bool {
     names.contains(&first_token)
 }
 
-fn is_dangerous_command(cmd: &str) -> Option<&'static str> {
+#[must_use]
+pub fn is_dangerous_command(cmd: &str) -> Option<&'static str> {
     let cmd_lower = cmd.to_lowercase();
+    // rm --no-preserve-root is always blocked — bypasses root safety guard
+    if cmd_lower.contains("rm") && cmd_lower.contains("--no-preserve-root") {
+        return Some("rm --no-preserve-root is blocked");
+    }
+    // rm with recursive/destructive flags is always blocked
+    // Catches: rm -rf /, rm -fr /*, rm --recursive /, rm -r -f /, etc.
+    if cmd_lower.contains("rm")
+        && (cmd_lower.contains("-rf")
+            || cmd_lower.contains("-fr")
+            || cmd_lower.contains("--recursive")
+            || cmd_lower.contains(" -r ")
+            || cmd_lower.contains(" -f "))
+    {
+        return Some("recursive rm is blocked");
+    }
     if cmd_lower.contains("mkfs") || cmd_lower.contains("mkswap") {
         return Some("filesystem creation commands are blocked");
     }
@@ -184,7 +201,8 @@ fn is_dangerous_command(cmd: &str) -> Option<&'static str> {
 /// `ssh`, `scp`, `telnet`.
 ///
 /// These are only blocked when `RUNTIMO_ENABLE_NETWORK` is not set to `"1"`.
-fn is_network_command(cmd: &str) -> bool {
+#[must_use]
+pub fn is_network_command(cmd: &str) -> bool {
     let cmd_lower = cmd.to_lowercase();
     command_matches(
         &cmd_lower,
@@ -197,7 +215,8 @@ fn is_network_command(cmd: &str) -> bool {
 /// Checks whether outbound network commands are permitted.
 ///
 /// Returns `true` when network tools are allowed (env var set to `"1"`).
-fn network_enabled() -> bool {
+#[must_use]
+pub fn network_enabled() -> bool {
     std::env::var("RUNTIMO_ENABLE_NETWORK").as_deref() == Ok("1")
 }
 
@@ -317,12 +336,14 @@ fn get_all_descendants(pid: u32) -> Vec<u32> {
 #[allow(clippy::exhaustive_structs)]
 pub struct ShellExec;
 
-impl Capability for ShellExec {
+impl TypedCapability for ShellExec {
+    type Args = ShellExecArgs;
+
     fn name(&self) -> &'static str {
         "ShellExec"
     }
     fn description(&self) -> &'static str {
-        "exec cmd via sh -c, timeout, audit. Dangerous cmds: mkfs,fdisk,dd,shutdown,rm -rf / blocked."
+        "execute shell command via sh -c with timeout, audit trail, and PID tracking. blocks: mkfs, fdisk, dd, shutdown, rm -rf /, chown, mount, iptables, network tools (opt-in)."
     }
     fn schema(&self) -> Value {
         serde_json::json!({
@@ -336,33 +357,21 @@ impl Capability for ShellExec {
             "required": ["cmd"]
         })
     }
-    fn validate(&self, args: &Value) -> Result<()> {
-        let args: ShellExecArgs = serde_json::from_value(args.clone())
-            .map_err(|e| Error::SchemaValidationFailed(e.to_string()))?;
-        if args.cmd.is_empty() {
-            return Err(Error::SchemaValidationFailed("cmd is empty".into()));
-        }
-        Ok(())
-    }
-    fn execute(&self, args: &Value, ctx: &Context) -> Result<Output> {
+    fn execute(&self, args: ShellExecArgs, ctx: &Context) -> std::result::Result<Output, CapabilityError> {
         if ctx.dry_run {
-            return Ok(Output {
-                success: true,
-                data: serde_json::json!({ "cmd": args.get("cmd").and_then(|v| v.as_str()).unwrap_or(""), "dry_run": true }),
-                message: Some("DRY RUN".into()),
-            });
+            let mut out = Output::ok("DRY RUN".into());
+            out.data = Some(serde_json::json!({ "cmd": &args.cmd, "dry_run": true }));
+            return Ok(out);
         }
-        let args: ShellExecArgs = serde_json::from_value(args.clone())
-            .map_err(|e| Error::ExecutionFailed(e.to_string()))?;
         let timeout = args.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
         if let Some(reason) = is_dangerous_command(&args.cmd) {
-            return Err(Error::ExecutionFailed(format!(
+            return Err(CapabilityError::PermissionDenied(format!(
                 "dangerous command blocked: {}",
                 reason
             )));
         }
         if !network_enabled() && is_network_command(&args.cmd) {
-            return Err(Error::ExecutionFailed(
+            return Err(CapabilityError::PermissionDenied(
                 "network commands blocked — set RUNTIMO_ENABLE_NETWORK=1 to enable".into(),
             ));
         }
@@ -380,7 +389,7 @@ impl Capability for ShellExec {
                 ..Default::default()
             };
             let cwd_path = validate_path(cwd, &path_ctx)
-                .map_err(|e| Error::ExecutionFailed(format!("invalid cwd: {}", e)))?;
+                .map_err(|e| CapabilityError::PermissionDenied(format!("invalid cwd: {}", e)))?;
             cmd.current_dir(cwd_path);
         }
         let mut child = cmd
@@ -393,34 +402,36 @@ impl Capability for ShellExec {
                 std::process::Stdio::null()
             })
             .spawn()
-            .map_err(|e| Error::ExecutionFailed(format!("failed to spawn: {}", e)))?;
+            .map_err(|e| CapabilityError::Io(std::io::Error::other(
+                format!("failed to spawn: {}", e),
+            )))?;
         let child_pid = child.id();
         let pgid = child_pid;
         if let Some(ref stdin_content) = args.stdin {
             if stdin_content.len() > MAX_STDIN_BYTES {
-                return Err(Error::ExecutionFailed("stdin too large".into()));
+                return Err(CapabilityError::InvalidArgs("stdin too large".into()));
             }
             if let Some(mut stdin_pipe) = child.stdin.take() {
                 let _ = stdin_pipe.write_all(stdin_content.as_bytes());
             }
         }
-        let (exit_status, stdout, stderr, descendants) =
-            wait_with_timeout(&mut child, pgid, timeout)?;
-        let mut spawned_pids = vec![child_pid];
-        spawned_pids.extend(descendants);
+        let (exit_status, stdout, stderr, _descendants) =
+            wait_with_timeout(&mut child, pgid, timeout)
+                .map_err(|e| CapabilityError::Internal(e.to_string()))?;
         let stdout_str = String::from_utf8_lossy(&stdout).to_string();
         let stderr_str = String::from_utf8_lossy(&stderr).to_string();
         let success = exit_status.success();
 
-        Ok(Output {
-            success,
-            data: serde_json::json!({ "cmd": &args.cmd, "stdout": stdout_str, "stderr": stderr_str, "exit_code": exit_status.code().unwrap_or(-1), "pid": child_pid, "spawned_pids": spawned_pids, "timeout_secs": timeout, "timed_out": exit_status.code().is_none(), "truncated": stdout.len() >= MAX_OUTPUT_BYTES || stderr.len() >= MAX_OUTPUT_BYTES }),
-            message: if success {
-                Some("completed".into())
-            } else {
-                Some(format!("exit code {}", exit_status.code().unwrap_or(-1)))
-            },
-        })
+        let mut out = if success {
+            Output::ok("completed".into())
+        } else {
+            Output::error(
+                format!("exit code {}", exit_status.code().unwrap_or(-1)),
+                format!("exit code {}", exit_status.code().unwrap_or(-1)),
+            )
+        };
+        out.data = Some(serde_json::json!({ "cmd": &args.cmd, "stdout": stdout_str, "stderr": stderr_str, "exit_code": exit_status.code().unwrap_or(-1), "pid": child_pid, "timeout_secs": timeout, "timed_out": exit_status.code().is_none(), "truncated": stdout.len() >= MAX_OUTPUT_BYTES || stderr.len() >= MAX_OUTPUT_BYTES }));
+        Ok(out)
     }
 }
 
@@ -431,88 +442,99 @@ mod tests {
     use std::time::Instant;
     #[test]
     fn executes_uptime() {
-        let r = ShellExec
-            .execute(
-                &serde_json::json!({"cmd": "uptime"}),
-                &Context {
-                    dry_run: false,
-                    job_id: "test".into(),
-                    working_dir: std::env::temp_dir(),
-                },
-            )
-            .unwrap();
-        assert!(r.success);
+        let r = Capability::execute(&ShellExec, &serde_json::json!({"cmd": "uptime"}),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::temp_dir(),
+            },
+        )
+        .unwrap();
+        assert_eq!(r.status, "ok");
     }
     #[test]
     fn pipes_work() {
-        let r = ShellExec
-            .execute(
-                &serde_json::json!({"cmd": "echo hi | cat"}),
-                &Context {
-                    dry_run: false,
-                    job_id: "test".into(),
-                    working_dir: std::env::temp_dir(),
-                },
-            )
-            .unwrap();
-        assert!(r.success);
-        assert!(r.data["stdout"].as_str().unwrap().contains("hi"));
+        let r = Capability::execute(&ShellExec, &serde_json::json!({"cmd": "echo hi | cat"}),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::temp_dir(),
+            },
+        )
+        .unwrap();
+        assert_eq!(r.status, "ok");
+        assert!(r.data.as_ref().unwrap()["stdout"].as_str().unwrap().contains("hi"));
     }
     #[test]
     fn chaining_works() {
-        let r = ShellExec
-            .execute(
-                &serde_json::json!({"cmd": "echo a && echo b"}),
-                &Context {
-                    dry_run: false,
-                    job_id: "test".into(),
-                    working_dir: std::env::temp_dir(),
-                },
-            )
-            .unwrap();
-        assert!(r.success);
+        let r = Capability::execute(&ShellExec, &serde_json::json!({"cmd": "echo a && echo b"}),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::temp_dir(),
+            },
+        )
+        .unwrap();
+        assert_eq!(r.status, "ok");
     }
     #[test]
     fn blocks_dangerous() {
-        assert!(ShellExec
-            .execute(
-                &serde_json::json!({"cmd": "mkfs"}),
-                &Context {
-                    dry_run: false,
-                    job_id: "test".into(),
-                    working_dir: std::env::temp_dir()
-                }
-            )
-            .is_err());
+        assert!(Capability::execute(&ShellExec, &serde_json::json!({"cmd": "mkfs"}),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::temp_dir()
+            }
+        )
+        .is_err());
     }
     #[test]
     fn blocks_recursive_flag() {
         // rm --recursive (long form) should be caught like -rf
-        assert!(ShellExec
-            .execute(
-                &serde_json::json!({"cmd": "rm --recursive /home"}),
-                &Context {
-                    dry_run: false,
-                    job_id: "test".into(),
-                    working_dir: std::env::temp_dir()
-                }
-            )
-            .is_err());
+        assert!(Capability::execute(&ShellExec, &serde_json::json!({"cmd": "rm --recursive /home"}),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::temp_dir()
+            }
+        )
+        .is_err());
+    }
+    #[test]
+    fn blocks_rm_rf_root() {
+        // rm -rf / should always be blocked regardless of context
+        assert!(Capability::execute(&ShellExec, &serde_json::json!({"cmd": "rm -rf /"}),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::temp_dir()
+            }
+        )
+        .is_err());
+    }
+    #[test]
+    fn blocks_rm_no_preserve_root() {
+        assert!(Capability::execute(&ShellExec, &serde_json::json!({"cmd": "rm --no-preserve-root -rf /"}),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::temp_dir()
+            }
+        )
+        .is_err());
     }
     #[test]
     fn blocks_ownership_commands() {
         for cmd in &["chown root /tmp/x", "chgrp staff /tmp/x"] {
             assert!(
-                ShellExec
-                    .execute(
-                        &serde_json::json!({"cmd": cmd}),
-                        &Context {
-                            dry_run: false,
-                            job_id: "test".into(),
-                            working_dir: std::env::temp_dir()
-                        }
-                    )
-                    .is_err(),
+                Capability::execute(&ShellExec, &serde_json::json!({"cmd": cmd}),
+                    &Context {
+                        dry_run: false,
+                        job_id: "test".into(),
+                        working_dir: std::env::temp_dir()
+                    }
+                )
+                .is_err(),
                 "should block: {}",
                 cmd
             );
@@ -522,16 +544,14 @@ mod tests {
     fn blocks_mount_commands() {
         for cmd in &["mount /dev/sda1 /mnt", "umount /mnt"] {
             assert!(
-                ShellExec
-                    .execute(
-                        &serde_json::json!({"cmd": cmd}),
-                        &Context {
-                            dry_run: false,
-                            job_id: "test".into(),
-                            working_dir: std::env::temp_dir()
-                        }
-                    )
-                    .is_err(),
+                Capability::execute(&ShellExec, &serde_json::json!({"cmd": cmd}),
+                    &Context {
+                        dry_run: false,
+                        job_id: "test".into(),
+                        working_dir: std::env::temp_dir()
+                    }
+                )
+                .is_err(),
                 "should block: {}",
                 cmd
             );
@@ -541,16 +561,14 @@ mod tests {
     fn blocks_firewall_commands() {
         for cmd in &["iptables -L", "nft list ruleset"] {
             assert!(
-                ShellExec
-                    .execute(
-                        &serde_json::json!({"cmd": cmd}),
-                        &Context {
-                            dry_run: false,
-                            job_id: "test".into(),
-                            working_dir: std::env::temp_dir()
-                        }
-                    )
-                    .is_err(),
+                Capability::execute(&ShellExec, &serde_json::json!({"cmd": cmd}),
+                    &Context {
+                        dry_run: false,
+                        job_id: "test".into(),
+                        working_dir: std::env::temp_dir()
+                    }
+                )
+                .is_err(),
                 "should block: {}",
                 cmd
             );
@@ -566,16 +584,14 @@ mod tests {
             "nc example.com 80",
         ] {
             assert!(
-                ShellExec
-                    .execute(
-                        &serde_json::json!({"cmd": cmd}),
-                        &Context {
-                            dry_run: false,
-                            job_id: "test".into(),
-                            working_dir: std::env::temp_dir()
-                        }
-                    )
-                    .is_err(),
+                Capability::execute(&ShellExec, &serde_json::json!({"cmd": cmd}),
+                    &Context {
+                        dry_run: false,
+                        job_id: "test".into(),
+                        working_dir: std::env::temp_dir()
+                    }
+                )
+                .is_err(),
                 "should block network cmd: {}",
                 cmd
             );
@@ -585,8 +601,7 @@ mod tests {
     fn allows_network_commands_when_enabled() {
         std::env::set_var("RUNTIMO_ENABLE_NETWORK", "1");
         // curl --version should work (non-destructive)
-        let r = ShellExec.execute(
-            &serde_json::json!({"cmd": "curl --version"}),
+        let r = Capability::execute(&ShellExec, &serde_json::json!({"cmd": "curl --version"}),
             &Context {
                 dry_run: false,
                 job_id: "test".into(),
@@ -596,7 +611,7 @@ mod tests {
         std::env::remove_var("RUNTIMO_ENABLE_NETWORK");
         // May fail if curl not installed, but should NOT fail with "network commands blocked"
         match r {
-            Ok(o) => assert!(o.success, "curl --version should succeed when enabled"),
+            Ok(o) => assert_eq!(o.status, "ok", "curl --version should succeed when enabled"),
             Err(e) => {
                 let msg = e.to_string();
                 assert!(
@@ -610,16 +625,14 @@ mod tests {
     #[test]
     fn enforces_timeout() {
         let s = Instant::now();
-        assert!(ShellExec
-            .execute(
-                &serde_json::json!({"cmd": "sleep 5", "timeout_secs": 1}),
-                &Context {
-                    dry_run: false,
-                    job_id: "test".into(),
-                    working_dir: std::env::temp_dir()
-                }
-            )
-            .is_err());
+        assert!(Capability::execute(&ShellExec, &serde_json::json!({"cmd": "sleep 5", "timeout_secs": 1}),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::temp_dir()
+            }
+        )
+        .is_err());
         assert!(s.elapsed().as_secs() < 3);
     }
 }

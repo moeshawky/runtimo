@@ -17,242 +17,19 @@ use runtimo_core::{
     execute_with_telemetry_and_session, BackupManager, CapabilityRegistry, WalEvent, WalEventType,
     WalReader, WalWriter,
 };
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
-/// Authenticate a Unix stream connection via SO_PEERCRED.
-///
-/// Reads the peer's UID from the socket and compares it against the daemon's
-/// own UID. Only same-UID connections are permitted — this is a same-user
-/// access control, not a cryptographic authentication.
-#[allow(clippy::borrow_as_ptr)] // FFI: addr_of_mut! + .cast() for getsockopt
-fn authenticate_peer(stream: &tokio::net::UnixStream) -> Result<(), String> {
-    use std::os::unix::io::AsRawFd;
-
-    let fd = stream.as_raw_fd();
-    // SAFETY: zeroed representation of ucred is valid — kernel fills it via getsockopt
-    let mut ucred: libc::ucred = unsafe { std::mem::zeroed() };
-    #[allow(clippy::cast_possible_truncation)] // socklen_t is u32, ucred is 32 bytes
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-
-    // SAFETY: fd is a valid open socket; getsockopt reads metadata only
-    let ret = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            std::ptr::addr_of_mut!(ucred).cast::<libc::c_void>(),
-            &mut len,
-        )
-    };
-
-    if ret != 0 {
-        return Err(format!(
-            "getsockopt(SO_PEERCRED) failed: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-
-    // SAFETY: getuid is always safe — reads caller's real UID with no side effects
-    let daemon_uid = unsafe { libc::getuid() };
-    if ucred.uid != daemon_uid {
-        return Err(format!(
-            "UID mismatch: peer={}, daemon={}",
-            ucred.uid, daemon_uid
-        ));
-    }
-
-    Ok(())
-}
-
-fn data_dir() -> PathBuf {
-    runtimo_core::utils::data_dir()
-}
-
-/// Returns the default Unix socket path (`{data_dir}/runtimo.sock`).
-fn default_socket_path() -> PathBuf {
-    data_dir().join("runtimo.sock")
-}
-
-/// Returns the default WAL path (env-overridable via `RUNTIMO_WAL_PATH`).
-fn default_wal_path() -> PathBuf {
-    runtimo_core::utils::wal_path()
-}
-
-/// Ensures the data directory exists, creating it recursively if needed.
-fn ensure_data_dir() -> std::io::Result<()> {
-    let dir = data_dir();
-    std::fs::create_dir_all(&dir)?;
-    Ok(())
-}
-
-// ── JSON-RPC types ──────────────────────────────────────────────────────────
-
-/// Inbound JSON-RPC request over the Unix socket.
-///
-/// Parsed from one line of JSON. The `id` field is echoed back in the response
-/// for request/response correlation.
-#[derive(Debug, Deserialize)]
-struct JsonRpcRequest {
-    /// RPC method name (e.g. "run", "dispatch", "status").
-    method: String,
-    /// Method parameters (defaults to JSON null).
-    #[serde(default)]
-    params: Value,
-    /// Request identifier for correlation.
-    id: Value,
-}
-
-/// Outbound JSON-RPC response over the Unix socket.
-///
-/// Contains either a `result` or an `error`, never both.
-#[derive(Debug, Serialize)]
-struct JsonRpcResponse {
-    /// Successful response data (absent on error).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<Value>,
-    /// Error details (absent on success).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<JsonRpcError>,
-    /// Echoed request identifier for correlation.
-    id: Value,
-}
-
-/// JSON-RPC error response body.
-#[derive(Debug, Serialize)]
-struct JsonRpcError {
-    /// Error code (JSON-RPC standard: -32700 parse error, -32601 method not found, etc.).
-    code: i32,
-    /// Human-readable error description.
-    message: String,
-}
-
-/// Parameters for the `run` and `dispatch` JSON-RPC methods.
-///
-/// Contains the capability name, JSON arguments, dry-run flag, optional
-/// working directory, and an optional execution timeout in seconds.
-/// Timeout defaults to 30s when not specified.
-#[derive(Debug, Deserialize)]
-struct RunParams {
-    /// Capability name to execute (e.g., "FileRead", "ShellExec").
-    capability: String,
-    /// JSON arguments for the capability (defaults to empty object).
-    #[serde(default)]
-    args: Value,
-    /// If true, capability skips side effects (dry-run mode).
-    #[serde(default)]
-    dry_run: bool,
-    /// Optional working directory for relative path resolution.
-    #[serde(default)]
-    working_dir: Option<String>,
-    /// Optional execution timeout in seconds (default: 30).
-    #[serde(default)]
-    timeout_secs: Option<u64>,
-}
-
-/// Parameters for the `logs` JSON-RPC method.
-#[derive(Debug, Deserialize)]
-struct LogsParams {
-    /// Maximum number of log entries to return (default: 10).
-    #[serde(default = "default_limit")]
-    limit: usize,
-}
-
-/// Default log entry limit.
-fn default_limit() -> usize {
-    10
-}
-
-// ── Background job tracking ──────────────────────────────────────────────────
-
-/// Maximum concurrent background jobs across all dispatch calls.
-const MAX_CONCURRENT_JOBS: u32 = 16;
-
-/// A tracked background job dispatched via the `dispatch` RPC method.
-#[derive(Debug, Clone, Serialize)]
-struct BackgroundJob {
-    /// Unique job identifier.
-    job_id: String,
-    /// Capability name being executed.
-    capability: String,
-    /// Current status: "running", "completed", or "failed".
-    status: String,
-    /// Unix timestamp when the job was dispatched.
-    started_at: u64,
-    /// Unix timestamp when the job finished (absent while running).
-    finished_at: Option<u64>,
-    /// Error message if the job failed.
-    result: Option<String>,
-}
-
-/// Thread-safe registry of in-flight and recently-completed background jobs.
-///
-/// Uses an atomic counter to enforce `MAX_CONCURRENT_JOBS` and an `RwLock`-backed
-/// map for status queries.
-struct BackgroundJobRegistry {
-    /// Job map keyed by job ID.
-    jobs: RwLock<HashMap<String, BackgroundJob>>,
-    /// Count of currently-running background jobs.
-    running: AtomicU32,
-}
-
-impl BackgroundJobRegistry {
-    fn new() -> Self {
-        Self {
-            jobs: RwLock::new(HashMap::new()),
-            running: AtomicU32::new(0),
-        }
-    }
-
-    fn try_reserve(&self) -> bool {
-        #[allow(clippy::arithmetic_side_effects)] // n+1 only when n < MAX, bounded
-        self.running
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                if n < MAX_CONCURRENT_JOBS {
-                    Some(n + 1)
-                } else {
-                    None
-                }
-            })
-            .is_ok()
-    }
-
-    fn release(&self) {
-        self.running.fetch_sub(1, Ordering::SeqCst);
-    }
-
-    async fn insert(&self, job: BackgroundJob) {
-        self.jobs.write().await.insert(job.job_id.clone(), job);
-    }
-
-    async fn get(&self, job_id: &str) -> Option<BackgroundJob> {
-        self.jobs.read().await.get(job_id).cloned()
-    }
-
-    async fn update(&self, job_id: &str, status: &str, result: Option<String>, finished_at: u64) {
-        let mut jobs = self.jobs.write().await;
-        if let Some(job) = jobs.get_mut(job_id) {
-            job.status = status.to_string();
-            job.finished_at = Some(finished_at);
-            job.result = result;
-        }
-    }
-
-    async fn list(&self, limit: usize) -> Vec<BackgroundJob> {
-        let jobs = self.jobs.read().await;
-        let mut v: Vec<_> = jobs.values().cloned().collect();
-        v.sort_by_key(|j| j.started_at);
-        v.reverse();
-        v.truncate(limit);
-        v
-    }
-}
+// Re-exports from sibling modules so `use super::*` in tests can see these names.
+pub use crate::auth::authenticate_peer;
+pub use crate::config::{data_dir, default_socket_path, default_wal_path, ensure_data_dir};
+pub use crate::dispatch::{
+    BackgroundJob, BackgroundJobRegistry, JsonRpcError, JsonRpcRequest, JsonRpcResponse,
+    LogsParams, MAX_CONCURRENT_JOBS, RunParams,
+};
 
 // ── Daemon state ────────────────────────────────────────────────────────────
 
@@ -265,6 +42,8 @@ struct DaemonState {
     /// Path to the Write-Ahead Log file.
     wal_path: PathBuf,
     /// Mutex serializing WAL writes across concurrent client handlers.
+    /// Uses std::sync::Mutex to allow locking from both async handlers and
+    /// blocking tasks (spawn_blocking) without nested runtimes.
     wal_mutex: Arc<Mutex<()>>,
     /// Background job registry for dispatch/status tracking.
     bg_jobs: BackgroundJobRegistry,
@@ -331,6 +110,7 @@ async fn handle_request(state: &Arc<DaemonState>, req: JsonRpcRequest) -> JsonRp
 ///
 /// Acquires the WAL mutex, executes the capability, and returns the result.
 /// Times out at `timeout_secs` (default 30s).
+#[allow(clippy::unused_async)]
 async fn handle_run(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonRpcResponse {
     let run_params: RunParams = match serde_json::from_value(params) {
         Ok(p) => p,
@@ -357,7 +137,7 @@ async fn handle_run(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonR
         };
     };
 
-    let _guard = state.wal_mutex.lock().await;
+    let _guard = state.wal_mutex.lock().unwrap_or_else(|e| e.into_inner());
 
     match execute_with_telemetry_and_session(
         capability,
@@ -391,9 +171,13 @@ async fn handle_run(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonR
 
 /// Handles the `dispatch` RPC method — fire-and-forget background job execution.
 ///
-/// Returns immediately with a job ID. The job runs on a background thread with
-/// the same safety checks, WAL logging, and telemetry as `handle_run`.
-/// Rejects when `MAX_CONCURRENT_JOBS` (16) is reached.
+/// Returns immediately with a job ID. The job runs on a blocking task via
+/// `tokio::task::spawn_blocking` with the same safety checks, WAL logging,
+/// and telemetry as `handle_run`. Rejects when `MAX_CONCURRENT_JOBS` (16) is reached.
+///
+/// The spawn_blocking approach avoids blocking the tokio runtime. WAL mutex and
+/// background job registry use std::sync primitives, so no nested runtime is needed.
+#[allow(clippy::unused_async)]
 async fn handle_dispatch(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonRpcResponse {
     let run_params: RunParams = match serde_json::from_value(params) {
         Ok(p) => p,
@@ -467,20 +251,22 @@ async fn handle_dispatch(state: &Arc<DaemonState>, params: Value, id: Value) -> 
             started_at: now,
             finished_at: None,
             result: None,
-        })
-        .await;
+        });
 
     // Spawn background execution routed through execute_with_telemetry
     // (parity with handle_run — full safety checks, WAL, and telemetry)
+    // Use spawn_blocking to avoid blocking the tokio runtime.
+    // WAL mutex and background job registry use std::sync primitives,
+    // so no nested runtime is needed.
     let state_arc = Arc::clone(state);
-    let tokio_handle = tokio::runtime::Handle::current();
     let jid = job_id.clone();
     let cn = cap_name.clone();
-    let wd = working_dir.clone();
+    let wd = working_dir;
     let t_secs = timeout_secs;
-    std::thread::spawn(move || {
-        // Acquire wal_mutex to serialize WAL writes with handle_run (Fix for CBP violation #2)
-        let _wal_guard = tokio_handle.block_on(state_arc.wal_mutex.lock());
+
+    tokio::task::spawn_blocking(move || {
+        // Acquire wal_mutex to serialize WAL writes with handle_run
+        let _wal_guard = state_arc.wal_mutex.lock().unwrap_or_else(|e| e.into_inner());
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let cap = state_arc.registry.get(&cn).ok_or_else(|| {
                 runtimo_core::Error::ExecutionFailed(format!(
@@ -521,10 +307,7 @@ async fn handle_dispatch(state: &Arc<DaemonState>, params: Value, id: Value) -> 
             }
         };
 
-        tokio_handle.block_on(async {
-            state_arc.bg_jobs.update(&jid, status, error_msg, now).await;
-        });
-
+        state_arc.bg_jobs.update(&jid, status, error_msg, now);
         state_arc.bg_jobs.release();
     });
 
@@ -543,6 +326,7 @@ async fn handle_dispatch(state: &Arc<DaemonState>, params: Value, id: Value) -> 
 ///
 /// Checks the background job registry first, then falls back to scanning the WAL
 /// for `JobStarted`/`JobCompleted`/`JobFailed` events.
+#[allow(clippy::unused_async)]
 async fn handle_status(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonRpcResponse {
     let jid: String = match params.get("job_id").and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
@@ -559,7 +343,7 @@ async fn handle_status(state: &Arc<DaemonState>, params: Value, id: Value) -> Js
     };
 
     // Check running jobs
-    if let Some(bg) = state.bg_jobs.get(&jid).await {
+    if let Some(bg) = state.bg_jobs.get(&jid) {
         return JsonRpcResponse {
             result: Some(serde_json::json!({
                 "job_id": bg.job_id,
@@ -675,6 +459,7 @@ fn handle_logs(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonRpcRes
 ///
 /// Merges running background jobs with completed/failed jobs from the WAL,
 /// sorted by start time (newest first), truncated to `limit`.
+#[allow(clippy::unused_async)]
 async fn handle_jobs(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonRpcResponse {
     #[allow(clippy::cast_possible_truncation)] // safe: limit is capped in practice
     let limit: usize = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
@@ -683,7 +468,7 @@ async fn handle_jobs(state: &Arc<DaemonState>, params: Value, id: Value) -> Json
     let mut jobs_list: Vec<serde_json::Value> = Vec::new();
 
     // Running jobs
-    for bg in state.bg_jobs.list(100).await {
+    for bg in state.bg_jobs.list(100) {
         seen.insert(bg.job_id.clone());
         jobs_list.push(serde_json::json!({
             "job_id": bg.job_id,
@@ -1683,11 +1468,8 @@ mod tests {
     #[test]
     fn test_background_job_registry_new_is_empty() {
         let registry = BackgroundJobRegistry::new();
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let jobs = registry.list(100).await;
-            assert!(jobs.is_empty(), "New registry should have zero jobs");
-        });
+        let jobs = registry.list(100);
+        assert!(jobs.is_empty(), "New registry should have zero jobs");
     }
 
     #[test]

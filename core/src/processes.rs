@@ -112,7 +112,8 @@ impl ProcessSnapshot {
         // Use ps with explicit format to get PPID: PID,PPID,USER,CPU,MEM,VSZ,RSS,STAT,START,TIME,COMMAND
         // This gives us parent process ID for lineage tracking
         let ps_output =
-            run_cmd("ps -eo pid,ppid,user,%cpu,%mem,vsz,rss,stat,start,time,comm --no-headers");
+            run_cmd("ps -eo pid,ppid,user,%cpu,%mem,vsz,rss,stat,start,time,comm --no-headers")
+                .unwrap_or_default();
 
         for line in ps_output.lines() {
             if let Some(proc) = parse_ps_line(line) {

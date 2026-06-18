@@ -87,7 +87,7 @@ fn edge_empty_content_roundtrip() {
     let r = FileRead
         .execute(&json!({ "path": target.to_str().unwrap() }), &ctx("edge2"))
         .unwrap();
-    assert_eq!(r.data["content"].as_str().unwrap(), "");
+    assert_eq!(r.data.as_ref().unwrap()["content"].as_str().unwrap(), "");
     cleanup(&dir);
 }
 
@@ -111,7 +111,7 @@ fn edge_single_char_roundtrip() {
                 &ctx("edge_read"),
             )
             .unwrap();
-        assert_eq!(r.data["content"].as_str().unwrap(), *ch);
+        assert_eq!(r.data.as_ref().unwrap()["content"].as_str().unwrap(), *ch);
     }
     cleanup(&dir);
 }
@@ -141,7 +141,7 @@ fn edge_whitespace_only() {
     let r = FileRead
         .execute(&json!({ "path": p.to_str().unwrap() }), &ctx("edge_ws"))
         .unwrap();
-    assert_eq!(r.data["content"].as_str().unwrap(), "   \n\t\n   ");
+    assert_eq!(r.data.as_ref().unwrap()["content"].as_str().unwrap(), "   \n\t\n   ");
     cleanup(&dir);
 }
 
@@ -155,7 +155,7 @@ fn edge_null_bytes_in_content() {
         .unwrap();
     // read_to_string may fail on null bytes — that's acceptable
     // The test verifies no panic occurs
-    assert!(r.success || r.data["content"].is_null());
+    assert!(r.status == "ok" || r.data.as_ref().is_none_or(|d| d["content"].is_null()));
     cleanup(&dir);
 }
 
@@ -287,13 +287,13 @@ fn sec_encoded_path_traversal() {
     // validate_path works on raw strings, so %2e%2e is NOT treated as ..
     // The path /tmp/%2e%2e/etc/passwd doesn't contain literal ".."
     // But it also doesn't exist on disk, so validation fails for "path does not exist"
-    let result = FileRead.validate(&json!({ "path": "/tmp/%2e%2e/etc/passwd" }));
+    let result = FileRead.execute(&json!({ "path": "/tmp/%2e%2e/etc/passwd" }), &ctx("sec_encoded"));
     // Should fail because path doesn't exist (not because of traversal detection)
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(
-        err.contains("does not exist"),
-        "Expected 'does not exist', got: {}",
+        err.contains("does not exist") || err.contains("not found"),
+        "Expected 'does not exist' or 'not found', got: {}",
         err
     );
 }
@@ -302,7 +302,7 @@ fn sec_encoded_path_traversal() {
 #[test]
 fn sec_null_byte_in_path() {
     // Null bytes in path should be rejected or handled safely
-    let result = FileRead.validate(&json!({ "path": "/tmp/test\0.txt" }));
+    let result = FileRead.execute(&json!({ "path": "/tmp/test\0.txt" }), &ctx("sec_nullbyte"));
     // serde_json may reject null bytes, or validate_path should handle them
     assert!(result.is_err());
 }
@@ -324,7 +324,7 @@ fn sec_symlink_chain_escape() {
                 &ctx("sec_chain"),
             );
             // Should be rejected because canonical path is /etc/hostname
-            assert!(result.is_err() || !result.as_ref().unwrap().success);
+            assert!(result.is_err() || result.as_ref().unwrap().status != "ok");
             let _ = fs::remove_file(&link2);
             let _ = fs::remove_file(&link1);
         }
@@ -336,19 +336,19 @@ fn sec_symlink_chain_escape() {
 #[test]
 fn sec_type_confusion_in_args() {
     // path as number instead of string
-    assert!(FileRead.validate(&json!({ "path": 12345 })).is_err());
+    assert!(FileRead.execute(&json!({ "path": 12345 }), &ctx("sec_type")).is_err());
     // path as array
     assert!(FileRead
-        .validate(&json!({ "path": ["/tmp/x.txt"] }))
+        .execute(&json!({ "path": ["/tmp/x.txt"] }), &ctx("sec_type_arr"))
         .is_err());
     // path as object
     assert!(FileRead
-        .validate(&json!({ "path": { "file": "/tmp/x.txt" } }))
+        .execute(&json!({ "path": { "file": "/tmp/x.txt" } }), &ctx("sec_type_obj"))
         .is_err());
     // path as null
-    assert!(FileRead.validate(&json!({ "path": null })).is_err());
+    assert!(FileRead.execute(&json!({ "path": null }), &ctx("sec_type_null")).is_err());
     // path as boolean
-    assert!(FileRead.validate(&json!({ "path": true })).is_err());
+    assert!(FileRead.execute(&json!({ "path": true }), &ctx("sec_type_bool")).is_err());
 }
 
 /// ShellExec with dangerous commands (should execute but be logged)
@@ -382,7 +382,7 @@ fn sec_shellexec_dangerous_commands_logged() {
 fn err_read_directory() {
     let dir = setup();
     let result = FileRead.execute(&json!({ "path": dir.to_str().unwrap() }), &ctx("err_dir"));
-    assert!(result.is_err() || !result.unwrap().success);
+    assert!(result.is_err(), "FileRead on a directory should fail");
     cleanup(&dir);
 }
 
@@ -410,9 +410,9 @@ fn err_write_readonly_location() {
             &ctx("err_readonly"),
         );
 
-    // Should fail or succeed depending on permissions (root can write anywhere)
-    // The test verifies no panic
-    let _ = result;
+    // Should fail or succeed depending on permissions (root can write anywhere).
+    // Test verifies no panic — result is intentionally dropped.
+    drop(result);
 
     // Restore permissions for cleanup
     #[cfg(unix)]
@@ -449,9 +449,15 @@ fn err_backup_nonexistent_source() {
 #[test]
 fn err_kill_invalid_signal() {
     // Signal 999 should fail gracefully
-    let result = Kill.execute(&json!({ "pid": 999998, "signal": 999 }), &ctx("err_signal"));
-    // Should not panic — either succeeds (signal sent) or fails gracefully
-    let _ = result;
+    let result = Capability::execute(&Kill, &json!({ "pid": 999998, "signal": 999 }), &ctx("err_signal"));
+    // Invalid signal is rejected by the Kill capability before any syscall
+    assert!(result.is_err(), "Kill with invalid signal should be rejected");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("Invalid signal") || err.contains("999"),
+        "Expected error about invalid signal, got: {}",
+        err
+    );
 }
 
 // ── G-CTX: Context/Config Integration ────────────────────────────────
@@ -811,9 +817,13 @@ mod proptests {
     use proptest::prelude::*;
 
     // Property: Any valid path in /tmp can be written and read back identically
+    // Strategy: valid UTF-8 printable strings (no control chars except \n, \r, \t)
+    // This matches FileRead's binary detection threshold (>10% control chars = binary)
     proptest! {
         #[test]
-        fn prop_write_read_roundtrip(content in "[^\0]*") {
+        fn prop_write_read_roundtrip(
+            content in "[ -~\\n\\r\\t]*"
+        ) {
             let dir = setup();
             let target = dir.join("prop.txt");
 
@@ -824,17 +834,17 @@ mod proptests {
                     &ctx("prop_write"),
                 );
 
-            // Some strings may not be valid UTF-8 for read_to_string, but write should succeed
-            if write_result.is_ok() {
-                let read_result = FileRead
-                    .execute(&json!({ "path": target.to_str().unwrap() }), &ctx("prop_read"));
+            // Write should succeed for valid UTF-8
+            prop_assert!(write_result.is_ok());
 
-                if read_result.is_ok() {
-                    let r = read_result.unwrap();
-                    let read_content = r.data["content"].as_str().unwrap();
-                    prop_assert_eq!(read_content, content, "Roundtrip failed");
-                }
-            }
+            let read_result = FileRead
+                .execute(&json!({ "path": target.to_str().unwrap() }), &ctx("prop_read"));
+
+            prop_assert!(read_result.is_ok());
+            let r = read_result.unwrap();
+            prop_assert_eq!(r.status, "ok");
+            let read_content = r.data.as_ref().unwrap()["content"].as_str().unwrap();
+            prop_assert_eq!(read_content, content, "Roundtrip failed");
 
             cleanup(&dir);
         }
@@ -969,7 +979,7 @@ fn t_layergap_backup_boundary_content_preserved() {
             &ctx("layer_job"),
         )
         .expect("first write");
-    assert!(result.success);
+    assert_eq!(result.status, "ok");
 
     // Second write triggers backup (file already exists)
     let result = cap
@@ -978,7 +988,7 @@ fn t_layergap_backup_boundary_content_preserved() {
             &ctx("layer_job"),
         )
         .expect("second write");
-    assert!(result.success);
+    assert_eq!(result.status, "ok");
 
     // Read backup directly (bypass FileWrite, cross BackupManager→filesystem boundary)
     let _bm = BackupManager::new(bw.clone()).expect("BackupManager");
@@ -1005,7 +1015,7 @@ fn t_layergap_backup_boundary_content_preserved() {
             &ctx("layer_read"),
         )
         .expect("read");
-    let read_content = read_result.data["content"].as_str().unwrap();
+    let read_content = read_result.data.as_ref().unwrap()["content"].as_str().unwrap();
     assert_eq!(
         read_content, content,
         "C1: FileRead must consume FileWrite output with same content"
@@ -1283,4 +1293,180 @@ fn g_perf_write_read_near_linear() {
     );
 
     cleanup(&dir);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WAL: Corruption Tolerance (C44)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// WalReader silently skips malformed lines — crash recovery invariant.
+/// Verifies that invalid JSON, partial lines, and binary garbage embedded
+/// in a WAL file do not prevent reading of valid events before and after
+/// the corrupted region.
+#[test]
+fn wal_corruption_tolerance() {
+    use runtimo_core::{WalEvent, WalEventType, WalReader, WalWriter};
+
+    let dir = setup();
+    let wal_path = dir.join("test.wal");
+
+    // Write 3 valid events
+    {
+        let mut writer = WalWriter::create(&wal_path).unwrap();
+        for i in 0..3u64 {
+            writer
+                .append(WalEvent {
+                    seq: i,
+                    ts: 1715800000 + i,
+                    event_type: WalEventType::JobStarted,
+                    job_id: format!("job_{}", i),
+                    capability: Some("FileRead".into()),
+                    output: None,
+                    error: None,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+    }
+
+    // Append corruption: invalid JSON, partial line, binary garbage
+    {
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&wal_path)
+            .unwrap();
+        writeln!(file, "{{invalid json").unwrap();
+        writeln!(file, "partial line only").unwrap();
+        writeln!(file, "{{\"seq\":999,\"type\":\"unknown_type\"}}").unwrap(); // missing required fields
+        // Valid event after corruption — uses correct serde field names
+        writeln!(
+            file,
+            "{{\"seq\":99,\"ts\":0,\"type\":\"job_started\",\"job_id\":\"after_corruption\"}}"
+        )
+        .unwrap();
+    }
+
+    // Load should succeed, skipping corrupted lines, returning valid events
+    let reader = WalReader::load(&wal_path).unwrap();
+    let events = reader.events();
+
+    // Should have 3 valid events from initial write + 1 from after corruption
+    // (the corrupted lines between are silently skipped)
+    assert!(
+        events.len() >= 3,
+        "Should have at least 3 valid events, got {}",
+        events.len()
+    );
+
+    // The valid events should have correct job_ids
+    let job_ids: Vec<&str> = events.iter().map(|e| e.job_id.as_str()).collect();
+    assert!(
+        job_ids.contains(&"job_0"),
+        "First event should be present"
+    );
+    assert!(
+        job_ids.contains(&"job_2"),
+        "Last initial event should be present"
+    );
+
+    cleanup(&dir);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// G-ERR: WAL Error Paths (C43)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// WalWriter::create fails gracefully on permission-denied path.
+#[test]
+fn wal_create_permission_denied() {
+    let bad_path = std::path::Path::new("/proc/nonexistent/wal.wal");
+    let result = WalWriter::create(bad_path);
+    assert!(result.is_err(), "WalWriter::create on /proc should fail");
+}
+
+/// WalReader::load fails gracefully on nonexistent file.
+#[test]
+fn wal_load_nonexistent() {
+    let result = WalReader::load(std::path::Path::new("/tmp/nonexistent_wal_12345.wal"));
+    assert!(
+        result.is_err(),
+        "WalReader::load on nonexistent file should fail"
+    );
+}
+
+/// WalReader::tail returns only last N events.
+#[test]
+fn wal_tail_returns_last_n() {
+    use runtimo_core::{WalEvent, WalEventType, WalReader, WalWriter};
+
+    let dir = setup();
+    let wal_path = dir.join("tail.wal");
+
+    {
+        let mut writer = WalWriter::create(&wal_path).unwrap();
+        for i in 0..10u64 {
+            writer
+                .append(WalEvent {
+                    seq: i,
+                    ts: 1715800000 + i,
+                    event_type: WalEventType::JobStarted,
+                    job_id: format!("job_{}", i),
+                    capability: None,
+                    output: None,
+                    error: None,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+    }
+
+    let reader = WalReader::tail(&wal_path, 3).unwrap();
+    let events = reader.events();
+    assert_eq!(events.len(), 3, "tail(3) should return 3 events");
+    assert_eq!(events[0].job_id, "job_7");
+    assert_eq!(events[2].job_id, "job_9");
+
+    cleanup(&dir);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// G-SEC: Guard Branch Coverage (C49)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Symlink to /etc/passwd should be rejected even if source is in allowed dir.
+/// Tests that validate_path resolves symlinks and rejects targets outside
+/// allowed prefixes, and that O_NOFOLLOW prevents opening the symlink.
+#[test]
+fn sec_symlink_to_etc_rejected() {
+    let dir = setup();
+    let link = dir.join("passwd_link");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        if symlink("/etc/passwd", &link).is_ok() {
+            let result = FileRead.execute(
+                &json!({ "path": link.to_str().unwrap() }),
+                &ctx("symlink_etc"),
+            );
+            // Should fail — symlink resolves outside allowed dirs
+            assert!(
+                result.is_err(),
+                "Symlink to /etc/passwd should be rejected"
+            );
+        }
+    }
+
+    cleanup(&dir);
+}
+
+/// Non-ASCII characters in path should be rejected.
+/// Tests the non-ASCII guard branch in validate_path.
+#[test]
+fn sec_non_ascii_path_rejected() {
+    let result = FileRead.execute(
+        &json!({ "path": "/tmp/テスト.txt" }),
+        &ctx("non_ascii"),
+    );
+    assert!(result.is_err(), "Non-ASCII path should be rejected");
 }

@@ -36,7 +36,7 @@ fn main() -> anyhow::Result<()> {
     )?;
     println!(
         "Write result: success={}, message={:?}",
-        result.success, result.output.message
+        result.success, result.output.output
     );
 
     // Verify with FileRead
@@ -49,7 +49,8 @@ fn main() -> anyhow::Result<()> {
     if let Some(content) = read_result
         .output
         .data
-        .get("content")
+        .as_ref()
+        .and_then(|d| d.get("content"))
         .and_then(|v| v.as_str())
     {
         println!("File content: {content:?}");
@@ -69,14 +70,15 @@ fn main() -> anyhow::Result<()> {
     )?;
     println!(
         "Overwrite result: success={}, message={:?}",
-        result2.success, result2.output.message
+        result2.success, result2.output.output
     );
 
     // Show backup path from the output data
     if let Some(backup_path) = result2
         .output
         .data
-        .get("backup_path")
+        .as_ref()
+        .and_then(|d| d.get("backup_path"))
         .and_then(|v| v.as_str())
     {
         println!("Backup created at: {backup_path}");
@@ -92,7 +94,8 @@ fn main() -> anyhow::Result<()> {
     if let Some(content) = read_result2
         .output
         .data
-        .get("content")
+        .as_ref()
+        .and_then(|d| d.get("content"))
         .and_then(|v| v.as_str())
     {
         println!("File content after overwrite: {content:?}");
@@ -103,7 +106,8 @@ fn main() -> anyhow::Result<()> {
     let backup_path_str = result2
         .output
         .data
-        .get("backup_path")
+        .as_ref()
+        .and_then(|d| d.get("backup_path"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("No backup path in write output"))?;
 
@@ -122,7 +126,8 @@ fn main() -> anyhow::Result<()> {
     if let Some(content) = read_result3
         .output
         .data
-        .get("content")
+        .as_ref()
+        .and_then(|d| d.get("content"))
         .and_then(|v| v.as_str())
     {
         println!("File content after restore: {content:?}");

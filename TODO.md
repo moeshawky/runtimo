@@ -2,8 +2,8 @@
 
 **Last Updated:** 2026-05-28
 **Build:** `cargo clippy --all-targets` — clean, 0 warnings
-**Tests:** 120 lib + 24 doc + 31 integration + 31 robust = 206 total (all passing)
-**Version:** 0.2.2
+**Tests:** 344 (all passing)
+**Version:** 0.7.1
 
 ---
 

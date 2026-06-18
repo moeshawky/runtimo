@@ -36,14 +36,12 @@ fn main() -> anyhow::Result<()> {
     println!("Success    : {}", result.success);
     println!("WAL seq    : {}", result.wal_seq);
 
-    if let Some(content) = result.output.data.get("content").and_then(|v| v.as_str()) {
+    if let Some(content) = result.output.data.as_ref().and_then(|d| d.get("content")).and_then(|v| v.as_str()) {
         println!("\n--- File Content ---");
         print!("{content}");
     }
 
-    if let Some(msg) = &result.output.message {
-        println!("\nMessage    : {msg}");
-    }
+    println!("\nMessage    : {}", result.output.output);
 
     println!(
         "\nProcesses before: {} | after: {}",

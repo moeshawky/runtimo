@@ -5,7 +5,7 @@ mod format;
 use clap::{Parser, Subcommand};
 use format::wall_to_markdown;
 use runtimo_core::{
-    capabilities::{FileRead, FileWrite, GitExec, Kill, ShellExec, Undo},
+    capabilities::{is_dangerous_command, FileRead, FileWrite, GitExec, Kill, ShellExec, Undo},
     execute_with_telemetry_and_session, CapabilityRegistry, ProcessSnapshot, RuntimoConfig,
     Telemetry, WalReader,
 };
@@ -30,7 +30,7 @@ const DAEMON_STARTUP_TIMEOUT_SECS: u64 = 30;
     long_about = "runtimo — capability runtime with telemetry, WAL, and process tracking\n\n\
 Every exec: telemetry + process snapshot + WAL audit\n\
 Background: dispatch jobs to daemon, check status later",
-    after_help = "USAGE:\n runtimo run -c <Capability> -a '<json>'\n runtimo dispatch -c <Capability> -a '<json>'\n runtimo jobs\n runtimo wait -j <job_id>\n runtimo list\n runtimo logs\n runtimo telemetry\n runtimo processes\n\nCAPABILITIES:\n FileRead Read file. Path validated.\n FileWrite Write file. Auto-backup for undo.\n ShellExec Exec via sh -c. Dangerous cmds blocked.\n GitExec Git ops: clone|pull|commit|revert|clean|status.\n Kill Kill PID. Protected: init, kthreadd, self.\n Undo Restore from backup. Use `runtimo logs` to find job IDs.\n\nDaemon auto-starts on first dispatch.",
+    after_help = "USAGE:\n runtimo run -c <Capability> -a '<json>'\n runtimo dispatch -c <Capability> -a '<json>'\n runtimo jobs\n runtimo wait -j <job_id>\n runtimo list\n runtimo logs\n runtimo telemetry\n runtimo processes\n\nCAPABILITIES:\n FileRead Read file. Path validated.\n FileWrite Write file. Auto-backup for undo.\n ShellExec Exec via sh -c. Dangerous cmds blocked.\n GitExec Git ops: clone|pull|commit|revert|clean|status.\n Kill Kill PID. Protected: init, kthreadd, self.\n Undo Restore from backup. Use `runtimo logs` to find job IDs.\n\nDaemon starts on first dispatch if runtimo-daemon is installed.",
     version
 )]
 struct Cli {
@@ -43,7 +43,7 @@ enum Commands {
     /// Execute a capability with telemetry
     #[command(
         about = "exec capability with telemetry",
-        after_help = "CAPABILITY HELP:\n runtimo run -c <Cap> --schema\n\nEXAMPLES:\n runtimo run -c FileRead -a '{\"path\":\"/etc/hostname\"}'\n runtimo run -c ShellExec -a '{\"cmd\":\"uptime\"}'"
+        after_help = "CAPABILITY HELP:\n runtimo run -c <Cap> --schema\n\nEXAMPLES:\n runtimo run -c FileRead -a '{\"path\":\"/tmp/test.txt\"}'\n runtimo run -c ShellExec -a '{\"cmd\":\"uptime\"}'"
     )]
     Run {
         #[arg(short = 'c', long)]
@@ -64,7 +64,7 @@ enum Commands {
     /// Dispatch job to background daemon (returns immediately)
     #[command(
         about = "Dispatch job to background daemon (starts daemon automatically if needed)",
-        after_help = "EXAMPLES:\n runtimo dispatch -c ShellExec -a '{\"cmd\":\"sleep 30\"}'\n runtimo dispatch -c FileWrite -a '{\"path\":\"/tmp/x.txt\",\"content\":\"bg\"}'"
+        after_help = "EXAMPLES:\n runtimo dispatch -c ShellExec -a '{\"cmd\":\"sleep 30\"}'\n runtimo dispatch -c FileWrite -a '{\"path\":\"/tmp/x.txt\",\"content\":\"bg\"}'\n runtimo dispatch -c GitExec -a '{\"operation\":\"status\",\"path\":\"/tmp/repo\"}'"
     )]
     Dispatch {
         #[arg(short = 'c', long)]
@@ -75,6 +75,10 @@ enum Commands {
         dry_run: bool,
     },
     /// Wait for a dispatched job to complete
+    ///
+    /// Pre-validates job existence via daemon RPC or WAL scan before entering
+    /// the poll loop. Returns immediately with "Job not found" if the job ID
+    /// is unknown and the daemon is unreachable.
     #[command(
         about = "Wait for a dispatched job",
         after_help = "EXAMPLES:\n runtimo wait -j abc123\n runtimo wait -j abc123 --timeout 60"
@@ -138,6 +142,9 @@ enum Commands {
     Telemetry {
         #[arg(short = 'j', long)]
         json: bool,
+        /// Show extended telemetry details (listening ports)
+        #[arg(short = 'v', long)]
+        verbose: bool,
     },
     #[command(about = "Print process snapshot")]
     Processes {
@@ -180,7 +187,10 @@ fn wal_path() -> PathBuf {
     runtimo_core::utils::wal_path()
 }
 
-/// Returns the backup directory (env-overridable via `RUNTIMO_BACKUP_DIR`).
+/// Returns the backup directory derived from `data_dir()`.
+///
+/// Delegates to [`runtimo_core::utils::backup_dir`], which always
+/// returns `data_dir().join("backups")` — no env var override (ADR-C28).
 fn backup_dir() -> PathBuf {
     runtimo_core::utils::backup_dir()
 }
@@ -492,16 +502,20 @@ fn main() -> Result<(), Box<dyn Error>> {
             .map_err(|e| format!("{}", e));
             release_cli_slot();
             let result = result?;
+            if !result.success {
+                eprintln!("{}", result.output.output);
+                std::process::exit(1);
+            }
             let output = result.output;
             if json {
                 println!("{}", serde_json::to_string_pretty(&output)?);
             } else if !quiet {
-                println!("{}", output.message.as_deref().unwrap_or("ok"));
-                if !output.data.is_null() {
-                    let text = if let Some(s) = output.data.as_str() {
+                println!("{}", output.output);
+                if let Some(ref data) = output.data {
+                    let text = if let Some(s) = data.as_str() {
                         s.to_string()
                     } else {
-                        output.data.to_string()
+                        data.to_string()
                     };
                     println!("{}", wall_to_markdown(&text));
                 }
@@ -519,6 +533,21 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             let args_val: Value =
                 serde_json::from_str(&args).map_err(|e| format!("Invalid JSON args: {}", e))?;
+            // Pre-validate dangerous commands at dispatch time
+            if capability == "ShellExec" {
+                if let Some(cmd) = args_val.get("cmd").and_then(|v| v.as_str()) {
+                    if let Some(reason) = is_dangerous_command(cmd) {
+                        eprintln!("Dispatch rejected: dangerous command blocked: {}", reason);
+                        std::process::exit(1);
+                    }
+                    if !runtimo_core::capabilities::network_enabled()
+                        && runtimo_core::capabilities::is_network_command(cmd)
+                    {
+                        eprintln!("Dispatch rejected: network commands blocked — set RUNTIMO_ENABLE_NETWORK=1 to enable");
+                        std::process::exit(1);
+                    }
+                }
+            }
             let params = serde_json::json!({
                 "capability": capability,
                 "args": args_val,
@@ -543,6 +572,45 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
 
         Commands::Wait { job_id, timeout } => {
+            // Early validation: reject empty job_id
+            if job_id.is_empty() {
+                eprintln!("Job ID cannot be empty");
+                std::process::exit(1);
+            }
+            // Pre-validate: check if job exists before entering poll loop
+            // Try daemon RPC first
+            let job_exists = send_rpc("status", serde_json::json!({ "job_id": &job_id }))
+                .map_or_else(
+                    |_| {
+                        // Daemon unreachable; check WAL for any job event
+                        if let Ok(reader) = WalReader::load(&wal_path()) {
+                            reader.events().iter().any(|e| {
+                                e.job_id == job_id
+                                    && matches!(
+                                        e.event_type,
+                                        runtimo_core::WalEventType::JobStarted
+                                            | runtimo_core::WalEventType::JobCompleted
+                                            | runtimo_core::WalEventType::JobFailed
+                                    )
+                            })
+                        } else {
+                            false
+                        }
+                    },
+                    |result| {
+                        let status = result
+                            .get("status")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        status != "unknown"
+                    },
+                );
+
+            if !job_exists {
+                eprintln!("Job not found: {}", job_id);
+                std::process::exit(1);
+            }
+
             let start = std::time::Instant::now();
             loop {
                 let params = serde_json::json!({ "job_id": &job_id });
@@ -781,7 +849,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                                     runtimo_core::WalEventType::JobStarted => "started",
                                     runtimo_core::WalEventType::JobCompleted => "completed",
                                     runtimo_core::WalEventType::JobFailed => "failed",
-                                    _ => "?",
+                                    _ => "unknown",
                                 },
                                 "started_at": e.ts,
                             }));
@@ -866,27 +934,30 @@ fn main() -> Result<(), Box<dyn Error>> {
                 working_dir: std::env::current_dir().unwrap_or_default(),
             };
             let output = cap.execute(&args, &ctx).map_err(|e| format!("{}", e))?;
-            println!("{}", output.message.as_deref().unwrap_or("undo completed"));
+            println!("{}", output.output);
         }
 
-        Commands::Telemetry { json } => {
+        Commands::Telemetry { json, verbose } => {
             let tel = Telemetry::capture();
             if json {
                 println!("{}", serde_json::to_string_pretty(&tel)?);
             } else {
-                // Listening ports: comma-separated list or "none"
-                let ports_str = if tel.network.listening_ports.is_empty() {
-                    "none".to_string()
+                // Listening ports: shown only with --verbose flag
+                let ports_str = if verbose && !tel.network.listening_ports.is_empty() {
+                    format!(
+                        "\nListening ports: {}",
+                        tel.network
+                            .listening_ports
+                            .iter()
+                            .map(|p| p.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
                 } else {
-                    tel.network
-                        .listening_ports
-                        .iter()
-                        .map(|p| p.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    String::new()
                 };
                 let text = format!(
-                    "RUNTIMO TELEMETRY\n\nSystem\nCPU: {} ({} cores)\nRAM: {} total, {} free, {} available\nDisk: {} total, {} free ({}% used)\nUptime: {} ({}s)\nLoad: {} ({} cores)\n\nHardware\nAccelerators: {}\n\nNetwork\nPublic IP: {}\nTunnel: {}\nListening ports: {}",
+                    "RUNTIMO TELEMETRY\n\nSystem\nCPU: {} ({} cores)\nRAM: {} total, {} free, {} available\nDisk: {} total, {} free ({}% used)\nUptime: {} ({}s)\nLoad: {} ({} cores)\n\nHardware\nAccelerators: {}\n\nNetwork\nPublic IP: {}\nTunnel: {}{}",
                     tel.system.cpu_model, tel.system.cpu_count,
                     tel.system.ram_total, tel.system.ram_free, tel.system.ram_available,
                     tel.system.disk_total, tel.system.disk_free, tel.system.disk_used_percent,
@@ -990,7 +1061,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         working_dir: std::env::current_dir().unwrap_or_default(),
                     };
                     match killer.execute(&serde_json::json!({"pid": ppid, "signal": 15}), &ctx) {
-                        Ok(o) => println!("{}", o.message.as_deref().unwrap_or("ok")),
+                        Ok(o) => println!("{}", o.output),
                         Err(e) => println!("blocked: {}", e),
                     }
                 }
@@ -1050,6 +1121,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Mutex to serialize tests that modify CLI_ACTIVE_JOBS counter.
+    /// Without this, concurrent tests fight over the process-global counter.
+    static CLI_SLOT_MUTEX: Mutex<()> = Mutex::new(());
 
     // ── CLI Argument Parsing (GAP 3) ─────────────────────────────────
 
@@ -1157,7 +1233,23 @@ mod tests {
         let args = vec!["runtimo", "telemetry", "--json"];
         let cli = Cli::try_parse_from(args).unwrap();
         match cli.command {
-            Commands::Telemetry { json } => assert!(json),
+            Commands::Telemetry { json, verbose } => {
+                assert!(json);
+                assert!(!verbose);
+            }
+            _ => panic!("Expected Telemetry command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_telemetry_verbose() {
+        let args = vec!["runtimo", "telemetry", "--verbose"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command {
+            Commands::Telemetry { json, verbose } => {
+                assert!(!json);
+                assert!(verbose);
+            }
             _ => panic!("Expected Telemetry command"),
         }
     }
@@ -1181,6 +1273,7 @@ mod tests {
 
     #[test]
     fn test_acquire_cli_slot_under_limit() {
+        let _guard = CLI_SLOT_MUTEX.lock().unwrap();
         // Reset counter for test isolation
         CLI_ACTIVE_JOBS.store(0, Ordering::Relaxed);
 
@@ -1204,6 +1297,7 @@ mod tests {
 
     #[test]
     fn test_acquire_cli_slot_over_limit() {
+        let _guard = CLI_SLOT_MUTEX.lock().unwrap();
         // Reset counter
         CLI_ACTIVE_JOBS.store(0, Ordering::Relaxed);
 
@@ -1223,6 +1317,7 @@ mod tests {
 
     #[test]
     fn test_release_cli_slot_after_acquire() {
+        let _guard = CLI_SLOT_MUTEX.lock().unwrap();
         CLI_ACTIVE_JOBS.store(0, Ordering::Relaxed);
 
         assert!(acquire_cli_slot());
@@ -1240,6 +1335,7 @@ mod tests {
 
     #[test]
     fn test_acquire_daemon_lock_creates_file() {
+        let _guard = CLI_SLOT_MUTEX.lock().unwrap(); // serialize env var access
         // Override XDG_DATA_HOME to use temp dir
         let tmp = std::env::temp_dir().join("runtimo_cli_lock_test");
         let _ = std::fs::remove_dir_all(&tmp);

@@ -33,7 +33,7 @@
 //!
 //! # Performance
 //!
-//! Results are cached for 30 seconds via [`TELEMETRY_CACHE`] to avoid
+//! Results are cached for 30 seconds via an internal mutex cache to avoid
 //! repeated `/proc` reads on consecutive calls.
 
 use crate::cmd::run_cmd;
@@ -272,7 +272,7 @@ fn format_uptime(total_seconds: u64) -> String {
 impl Telemetry {
     /// Captures a full system telemetry snapshot.
     ///
-    /// Results are cached for [`CACHE_TTL_SECS`] (30 seconds) to avoid
+    /// Results are cached for 30 seconds to avoid
     /// repeated filesystem reads on consecutive calls. Network queries
     /// (public_ip, tunnel) are included in the cached value.
     ///
@@ -322,8 +322,8 @@ impl Telemetry {
     /// GPU/TPU/JAX counts are irrelevant and shell-outs produce unwanted
     /// stderr noise on systems without those tools installed.
     ///
-    /// Results share the same [`TELEMETRY_CACHE`] — a previous full
-    /// [`capture`](Telemetry::capture) within [`CACHE_TTL_SECS`] will
+    /// Results share the same internal cache — a previous full
+    /// [`capture`](Telemetry::capture) within 30 seconds will
     /// be returned AS-IS (including hardware/network data). Callers
     /// on hot paths should NOT rely on this returning empty hardware
     /// if a full capture was recently cached.
@@ -366,6 +366,15 @@ impl Telemetry {
         let mut cache = TELEMETRY_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         *cache = Some((telemetry.clone(), now));
         telemetry
+    }
+
+    /// Clears the telemetry cache.
+    ///
+    /// Call this in tests or between full/lightweight captures to prevent
+    /// stale cached data from leaking across capture modes.
+    pub fn clear_cache() {
+        let mut cache = TELEMETRY_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        *cache = None;
     }
 
     /// Prints telemetry in a human-readable report to stdout.
@@ -518,9 +527,9 @@ impl SystemInfo {
         };
 
         // Disk: no /proc equivalent; keep df shell-out
-        let disk_total = run_cmd("df -h / | tail -1 | awk '{print $2}'");
-        let disk_free = run_cmd("df -h / | tail -1 | awk '{print $4}'");
-        let disk_pct_str = run_cmd("df / | tail -1 | awk '{print $5}'");
+        let disk_total = run_cmd("df -h / | tail -1 | awk '{print $2}'").unwrap_or_default();
+        let disk_free = run_cmd("df -h / | tail -1 | awk '{print $4}'").unwrap_or_default();
+        let disk_pct_str = run_cmd("df / | tail -1 | awk '{print $5}'").unwrap_or_default();
         let disk_used_percent = disk_pct_str.replace('%', "");
 
         Self {
@@ -547,6 +556,7 @@ impl HardwareInfo {
 
         // TPU devices via /dev/accel*
         let tpu_count: usize = run_cmd("ls /dev/accel* 2>/dev/null | wc -l")
+            .unwrap_or_default()
             .parse()
             .unwrap_or(0);
         if tpu_count > 0 {
@@ -560,11 +570,14 @@ impl HardwareInfo {
 
         // NVIDIA GPUs via nvidia-smi
         let nvidia_gpu_count: usize = run_cmd("nvidia-smi --list-gpus 2>/dev/null | wc -l")
+            .unwrap_or_default()
             .parse()
             .unwrap_or(0);
         if nvidia_gpu_count > 0 {
-            let model =
-                run_cmd("nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1");
+            let model = run_cmd(
+                "nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1",
+            )
+            .unwrap_or_default();
             accelerators.push(AcceleratorInfo {
                 kind: "gpu".into(),
                 count: nvidia_gpu_count,
@@ -574,10 +587,10 @@ impl HardwareInfo {
         }
 
         // AMD GPUs via rocm-smi
-        let amd_gpu_count: usize =
-            run_cmd("rocm-smi --showproductname 2>/dev/null | grep -c 'GPU\\['")
-                .parse()
-                .unwrap_or(0);
+        let amd_gpu_count: usize = run_cmd("rocm-smi --showproductname 2>/dev/null | grep -c 'GPU\\['")
+            .unwrap_or_default()
+            .parse()
+            .unwrap_or(0);
         if amd_gpu_count > 0 {
             accelerators.push(AcceleratorInfo {
                 kind: "gpu".into(),
@@ -590,6 +603,7 @@ impl HardwareInfo {
         // Generic DRM devices (fallback for any GPU)
         if nvidia_gpu_count == 0 && amd_gpu_count == 0 {
             let dri_count: usize = run_cmd("ls /dev/dri/render* 2>/dev/null | wc -l")
+                .unwrap_or_default()
                 .parse()
                 .unwrap_or(0);
             if dri_count > 0 {
@@ -604,16 +618,19 @@ impl HardwareInfo {
 
         let jax_available =
             run_cmd("timeout 10 python3 -c 'import jax' 2>/dev/null && echo yes || echo no")
+                .unwrap_or_default()
                 == "yes";
         let jax_version = if jax_available {
-            Some(run_cmd(
-                "timeout 10 python3 -c 'import jax; print(jax.__version__)'",
-            ))
+            Some(
+                run_cmd("timeout 10 python3 -c 'import jax; print(jax.__version__)'")
+                    .unwrap_or_default(),
+            )
         } else {
             None
         };
         let jax_device_count = if jax_available {
             run_cmd("timeout 10 python3 -c 'import jax; print(len(jax.devices()))'")
+                .unwrap_or_default()
                 .parse()
                 .ok()
         } else {
@@ -647,6 +664,7 @@ impl NetworkInfo {
             run_cmd(
                 "curl -s --connect-timeout 5 --max-time 5 ifconfig.me 2>/dev/null || echo 'unknown'",
             )
+            .unwrap_or_else(|_| "unknown".to_string())
         } else {
             "unknown".to_string()
         };

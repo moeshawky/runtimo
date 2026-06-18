@@ -65,7 +65,7 @@ TOTAL: 51 passed; 0 failed; 11 ignored
 ### Security Hardening (G-SEC-4)
 - XDG-compliant data directory: `$XDG_DATA_HOME/runtimo/`
 - Fallback chain: XDG → `~/.local/share/runtimo/` → `/tmp/runtimo/`
-- Environment variable overrides (`RUNTIMO_WAL_PATH`, `RUNTIMO_BACKUP_DIR`) preserved
+- Environment variable overrides (`RUNTIMO_WAL_PATH`) preserved; `RUNTIMO_BACKUP_DIR` removed per ADR-C28 (backup_dir now derived from data_dir)
 
 ### Performance (G-PERF-1 + G-PERF-2)
 - Telemetry cached for 30 seconds (was: 15+ subprocesses per call)

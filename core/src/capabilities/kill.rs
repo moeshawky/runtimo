@@ -9,6 +9,13 @@
 //! same one by comparing start times from `/proc/{pid}/stat` field 22. This
 //! prevents PID reuse races where a new process inherits the killed PID.
 //!
+//! # Protected Processes
+//!
+//! The following PIDs are protected and cannot be killed:
+//! - `1` (init), `2` (kthreadd)
+//! - Current process, parent process, session leader, process group leader
+//! - All systemd-managed services (detected via cgroup)
+//!
 //! # Example
 //!
 //! ```rust,ignore
@@ -22,12 +29,11 @@
 //!     &Context { dry_run: false, job_id: "test".into(), ..Default::default() }
 //! ).unwrap();
 //!
-//! assert!(result.success);
+//! assert_eq!(result.status, "ok");
 //! ```
 
-use crate::capability::{Capability, Context, Output};
+use crate::capability::{CapabilityError, Context, Output, TypedCapability};
 use crate::processes::ProcessSnapshot;
-use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
@@ -148,6 +154,7 @@ fn protected_pids() -> Vec<u32> {
 
 /// Input parameters for [`Kill::execute`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::exhaustive_structs)] // args struct — fields are the contract
 pub struct KillArgs {
     /// Process ID to kill.
     pub pid: u32,
@@ -162,13 +169,15 @@ pub struct KillArgs {
 #[allow(clippy::exhaustive_structs)]
 pub struct Kill;
 
-impl Capability for Kill {
+impl TypedCapability for Kill {
+    type Args = KillArgs;
+
     fn name(&self) -> &'static str {
         "Kill"
     }
 
     fn description(&self) -> &'static str {
-        "kill PID. Protected: init,kthreadd,self. Custom sig ok."
+        "terminate process by PID with PID reuse protection. protected: init (1), kthreadd (2), self, parent, session/group leaders, systemd services. signals: 1-31, 64 (SIGRTMIN)."
     }
 
     /// Returns the JSON Schema for Kill arguments.
@@ -192,31 +201,21 @@ impl Capability for Kill {
         })
     }
 
-    fn validate(&self, args: &Value) -> Result<()> {
-        let args: KillArgs = serde_json::from_value(args.clone())
-            .map_err(|e| Error::SchemaValidationFailed(e.to_string()))?;
-
+    fn execute(&self, args: KillArgs, ctx: &Context) -> std::result::Result<Output, CapabilityError> {
         // FINDING #3: Restrict signal to valid POSIX values (1-31, 64)
         if let Some(signal) = args.signal {
             if !(1..=31).contains(&signal) && signal != 64 {
-                return Err(Error::SchemaValidationFailed(format!(
+                return Err(CapabilityError::InvalidArgs(format!(
                     "Invalid signal {}: must be 1-31 or 64 (POSIX signals)",
                     signal
                 )));
             }
         }
 
-        Ok(())
-    }
-
-    fn execute(&self, args: &Value, ctx: &Context) -> Result<Output> {
-        let args: KillArgs = serde_json::from_value(args.clone())
-            .map_err(|e| Error::ExecutionFailed(e.to_string()))?;
-
         // Safety check: protected PIDs (init, kthreadd, self, parent)
         let protected = protected_pids();
         if protected.contains(&args.pid) {
-            return Err(Error::ExecutionFailed(format!(
+            return Err(CapabilityError::PermissionDenied(format!(
                 "PID {} is a protected system process (protected: {:?})",
                 args.pid, protected
             )));
@@ -225,16 +224,14 @@ impl Capability for Kill {
         // Respect dry_run — skip kill entirely
         if ctx.dry_run {
             // FINDING #20: Limit dry-run output to "would kill PID X", hide command/user info
-            return Ok(Output {
-                success: true,
-                data: serde_json::json!({
-                    "pid": args.pid,
-                    "killed": false,
-                    "dry_run": true,
-                    "signal": args.signal.unwrap_or(15),
-                }),
-                message: Some(format!("DRY RUN: would kill PID {}", args.pid)),
-            });
+            let mut out = Output::ok(format!("DRY RUN: would kill PID {}", args.pid));
+            out.data = Some(serde_json::json!({
+                "pid": args.pid,
+                "killed": false,
+                "dry_run": true,
+                "signal": args.signal.unwrap_or(15),
+            }));
+            return Ok(out);
         }
 
         // Capture process snapshot before kill
@@ -242,15 +239,16 @@ impl Capability for Kill {
         let process_exists = process_before.processes.iter().any(|p| p.pid == args.pid);
 
         if !process_exists {
-            return Ok(Output {
-                success: false,
-                data: serde_json::json!({
-                    "pid": args.pid,
-                    "killed": false,
-                    "reason": "Process not found"
-                }),
-                message: Some(format!("Process {} not found", args.pid)),
-            });
+            let mut out = Output::error(
+                format!("Process {} not found", args.pid),
+                "Process not found".into(),
+            );
+            out.data = Some(serde_json::json!({
+                "pid": args.pid,
+                "killed": false,
+                "reason": "Process not found"
+            }));
+            return Ok(out);
         }
 
         // Get process info before killing
@@ -267,19 +265,20 @@ impl Capability for Kill {
         // If the PID was recycled between these reads, abort the kill.
         let start_time_before_confirm = get_process_start_time_retry(args.pid);
         if start_time_before != start_time_before_confirm {
-            return Ok(Output {
-                success: false,
-                data: serde_json::json!({
-                    "pid": args.pid,
-                    "killed": false,
-                    "reason": "PID reused between safety checks",
-                    "pid_reused": true,
-                }),
-                message: Some(format!(
+            let mut out = Output::error(
+                format!(
                     "PID {} was reused by a different process (start time changed before kill)",
                     args.pid
-                )),
-            });
+                ),
+                "PID reused between safety checks".into(),
+            );
+            out.data = Some(serde_json::json!({
+                "pid": args.pid,
+                "killed": false,
+                "reason": "PID reused between safety checks",
+                "pid_reused": true,
+            }));
+            return Ok(out);
         }
 
         // Determine signal — default to SIGTERM (15) for graceful shutdown
@@ -333,27 +332,29 @@ impl Capability for Kill {
             format!("Process {} still exists after signal {}", args.pid, signal)
         };
 
-        Ok(Output {
-            success: killed_success,
-            data: serde_json::json!({
-                "pid": args.pid,
-                "killed": killed_success,
-                "signal": signal,
-                "command": process_info.as_ref().map(|(cmd, _)| cmd),
-                "user": process_info.as_ref().map(|(_, user)| user),
-                "stderr": if success { String::new() } else { stderr_str },
-                "pid_reused": pid_reused,
-                "process_before": {
-                    "count": process_before.summary.total_processes,
-                    "zombies": process_before.summary.zombie_count
-                },
-                "process_after": {
-                    "count": process_after.summary.total_processes,
-                    "zombies": process_after.summary.zombie_count
-                }
-            }),
-            message: Some(message),
-        })
+        let mut out = if killed_success {
+            Output::ok(message)
+        } else {
+            Output::error(message, if success { String::new() } else { stderr_str.clone() })
+        };
+        out.data = Some(serde_json::json!({
+            "pid": args.pid,
+            "killed": killed_success,
+            "signal": signal,
+            "command": process_info.as_ref().map(|(cmd, _)| cmd),
+            "user": process_info.as_ref().map(|(_, user)| user),
+            "stderr": if success { String::new() } else { stderr_str },
+            "pid_reused": pid_reused,
+            "process_before": {
+                "count": process_before.summary.total_processes,
+                "zombies": process_before.summary.zombie_count
+            },
+            "process_after": {
+                "count": process_after.summary.total_processes,
+                "zombies": process_after.summary.zombie_count
+            }
+        }));
+        Ok(out)
     }
 }
 
@@ -368,7 +369,7 @@ mod tests {
     #[test]
     fn test_kill_schema() {
         let cap = Kill;
-        let _schema = cap.schema();
+        let _schema = Capability::schema(&cap);
         // Retry function test
         // Test retry logic with existing process
         let mut child = Command::new("sleep").arg("60").spawn().unwrap();
@@ -392,8 +393,7 @@ mod tests {
     fn test_kill_protected_pid() {
         let cap = Kill;
         // PID 1 is protected
-        let result = cap.execute(
-            &serde_json::json!({ "pid": 1 }),
+        let result = Capability::execute(&cap, &serde_json::json!({ "pid": 1 }),
             &Context {
                 dry_run: false,
                 job_id: "test".into(),
@@ -413,8 +413,7 @@ mod tests {
     fn test_kill_self_protected() {
         let cap = Kill;
         let self_pid = std::process::id();
-        let result = cap.execute(
-            &serde_json::json!({ "pid": self_pid }),
+        let result = Capability::execute(&cap, &serde_json::json!({ "pid": self_pid }),
             &Context {
                 dry_run: false,
                 job_id: "test".into(),
@@ -430,19 +429,17 @@ mod tests {
     fn test_kill_nonexistent() {
         let cap = Kill;
         // Use a PID that's very unlikely to exist
-        let result = cap
-            .execute(
-                &serde_json::json!({ "pid": 999999 }),
-                &Context {
-                    dry_run: false,
-                    job_id: "test".into(),
-                    working_dir: std::env::current_dir().unwrap(),
-                },
-            )
-            .unwrap();
+        let result = Capability::execute(&cap, &serde_json::json!({ "pid": 999999 }),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::current_dir().unwrap(),
+            },
+        )
+        .unwrap();
 
-        assert!(!result.success);
-        assert!(result.data["killed"].as_bool() == Some(false));
+        assert_eq!(result.status, "error");
+        assert!(result.data.as_ref().unwrap()["killed"].as_bool() == Some(false));
     }
 
     #[test]
@@ -451,20 +448,18 @@ mod tests {
         // Use a real PID (self) but in dry_run mode — should NOT error as protected
         // because dry_run skips the actual kill but still checks protection
         // Actually, protection check runs before dry_run, so use a non-protected PID
-        let result = cap
-            .execute(
-                &serde_json::json!({ "pid": 999998 }),
-                &Context {
-                    dry_run: true,
-                    job_id: "test".into(),
-                    working_dir: std::env::current_dir().unwrap(),
-                },
-            )
-            .unwrap();
+        let result = Capability::execute(&cap, &serde_json::json!({ "pid": 999998 }),
+            &Context {
+                dry_run: true,
+                job_id: "test".into(),
+                working_dir: std::env::current_dir().unwrap(),
+            },
+        )
+        .unwrap();
 
-        assert!(result.success);
-        assert!(result.data["dry_run"].as_bool() == Some(true));
-        assert!(result.data["killed"].as_bool() == Some(false));
+        assert_eq!(result.status, "ok");
+        assert!(result.data.as_ref().unwrap()["dry_run"].as_bool() == Some(true));
+        assert!(result.data.as_ref().unwrap()["killed"].as_bool() == Some(false));
     }
 
     #[test]
@@ -504,25 +499,23 @@ mod tests {
 
         // Kill it via the capability using SIGKILL for reliability
         let cap = Kill;
-        let result = cap
-            .execute(
-                &serde_json::json!({ "pid": pid, "signal": 9 }),
-                &Context {
-                    dry_run: false,
-                    job_id: "test".into(),
-                    working_dir: std::env::current_dir().unwrap(),
-                },
-            )
-            .unwrap();
+        let result = Capability::execute(&cap, &serde_json::json!({ "pid": pid, "signal": 9 }),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::current_dir().unwrap(),
+            },
+        )
+        .unwrap();
 
         // Kill should succeed — process becomes zombie until reaped
         assert!(
-            result.data["killed"].as_bool() == Some(true),
+            result.data.as_ref().unwrap()["killed"].as_bool() == Some(true),
             "Kill failed: {:?}",
             result.data
         );
         assert!(
-            result.data["signal"].as_i64() == Some(9),
+            result.data.as_ref().unwrap()["signal"].as_i64() == Some(9),
             "Should use SIGKILL"
         );
 
@@ -569,7 +562,13 @@ mod tests {
     fn test_signal_validation_rejects_negative() {
         // FINDING #3: negative signals should be rejected
         let cap = Kill;
-        let result = cap.validate(&serde_json::json!({ "pid": 999998, "signal": -1 }));
+        let result = Capability::execute(&cap, &serde_json::json!({ "pid": 999998, "signal": -1 }),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::current_dir().unwrap(),
+            },
+        );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Invalid signal"));
     }
@@ -578,7 +577,13 @@ mod tests {
     fn test_signal_validation_rejects_zero() {
         // FINDING #3: signal 0 should be rejected
         let cap = Kill;
-        let result = cap.validate(&serde_json::json!({ "pid": 999998, "signal": 0 }));
+        let result = Capability::execute(&cap, &serde_json::json!({ "pid": 999998, "signal": 0 }),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::current_dir().unwrap(),
+            },
+        );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Invalid signal"));
     }
@@ -587,7 +592,13 @@ mod tests {
     fn test_signal_validation_rejects_out_of_range() {
         // FINDING #3: signal > 31 (except 64) should be rejected
         let cap = Kill;
-        let result = cap.validate(&serde_json::json!({ "pid": 999998, "signal": 32 }));
+        let result = Capability::execute(&cap, &serde_json::json!({ "pid": 999998, "signal": 32 }),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::current_dir().unwrap(),
+            },
+        );
         assert!(result.is_err());
     }
 
@@ -595,8 +606,23 @@ mod tests {
     fn test_signal_validation_accepts_valid_signals() {
         let cap = Kill;
         for sig in [1, 9, 15, 31, 64] {
-            let result = cap.validate(&serde_json::json!({ "pid": 999998, "signal": sig }));
-            assert!(result.is_ok(), "Signal {} should be valid", sig);
+            let result = Capability::execute(&cap, &serde_json::json!({ "pid": 999998, "signal": sig }),
+                &Context {
+                    dry_run: false,
+                    job_id: "test".into(),
+                    working_dir: std::env::current_dir().unwrap(),
+                },
+            );
+            // Should not fail with InvalidArgs for valid signals
+            // May fail with other errors (nonexistent PID) — that's OK
+            if let Err(e) = &result {
+                assert!(
+                    !e.to_string().contains("Invalid signal"),
+                    "Signal {} should be valid, got: {}",
+                    sig,
+                    e
+                );
+            }
         }
     }
 
@@ -604,29 +630,27 @@ mod tests {
     fn test_dry_run_hides_process_info() {
         // FINDING #20: dry-run should NOT expose command or user info
         let cap = Kill;
-        let result = cap
-            .execute(
-                &serde_json::json!({ "pid": 999998 }),
-                &Context {
-                    dry_run: true,
-                    job_id: "test".into(),
-                    working_dir: std::env::current_dir().unwrap(),
-                },
-            )
-            .unwrap();
+        let result = Capability::execute(&cap, &serde_json::json!({ "pid": 999998 }),
+            &Context {
+                dry_run: true,
+                job_id: "test".into(),
+                working_dir: std::env::current_dir().unwrap(),
+            },
+        )
+        .unwrap();
 
-        assert!(result.success);
-        assert!(result.data["dry_run"].as_bool() == Some(true));
+        assert_eq!(result.status, "ok");
+        assert!(result.data.as_ref().unwrap()["dry_run"].as_bool() == Some(true));
         assert!(
-            result.data.get("command").is_none(),
+            result.data.as_ref().unwrap().get("command").is_none(),
             "dry-run must not expose command"
         );
         assert!(
-            result.data.get("user").is_none(),
+            result.data.as_ref().unwrap().get("user").is_none(),
             "dry-run must not expose user"
         );
         assert!(
-            result.data.get("process_exists").is_none(),
+            result.data.as_ref().unwrap().get("process_exists").is_none(),
             "dry-run must not expose process_exists"
         );
     }
