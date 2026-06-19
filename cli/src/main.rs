@@ -30,7 +30,7 @@ const DAEMON_STARTUP_TIMEOUT_SECS: u64 = 30;
     long_about = "runtimo — capability runtime with telemetry, WAL, and process tracking\n\n\
 Every exec: telemetry + process snapshot + WAL audit\n\
 Background: dispatch jobs to daemon, check status later",
-    after_help = "USAGE:\n runtimo run -c <Capability> -a '<json>'\n runtimo dispatch -c <Capability> -a '<json>'\n runtimo jobs\n runtimo wait -j <job_id>\n runtimo list\n runtimo logs\n runtimo telemetry\n runtimo processes\n\nCAPABILITIES:\n FileRead Read file. Path validated.\n FileWrite Write file. Auto-backup for undo.\n ShellExec Exec via sh -c. Dangerous cmds blocked.\n GitExec Git ops: clone|pull|commit|revert|clean|status.\n Kill Kill PID. Protected: init, kthreadd, self.\n Undo Restore from backup. Use `runtimo logs` to find job IDs.\n\nDaemon starts on first dispatch if runtimo-daemon is installed.",
+    after_help = "USAGE:\n runtimo run -c <Capability> -a '<json>'\n runtimo dispatch -c <Capability> -a '<json>'\n runtimo jobs\n runtimo wait -j <job_id>\n runtimo list\n runtimo logs\n runtimo telemetry\n runtimo processes\n\nCAPABILITIES:\n FileRead  Read file. Path validated. No dirs, no traversal.\n FileWrite Write file. Auto-backup for undo. Append mode ok.\n ShellExec Exec via sh -c. Blocks rm, shutdown, chmod, mkfs, dd, iptables, fork bombs, env dumpers, network tools (opt-in). See `runtimo list` for full blocklist.\n GitExec   Git ops: clone|pull|commit|revert|clean|status.\n Kill      Kill process by PID. Protected: init, kthreadd, self.\n Undo      Restore from backup. Find job IDs with `runtimo jobs` or `runtimo logs`.\n\nTIP: Use `runtimo run -c <Cap> --schema` to see the JSON args a capability expects.\nTIP: Use `runtimo list --schemas` to see all schemas at once.\n\nDaemon starts on first dispatch if runtimo-daemon is installed.",
     version
 )]
 struct Cli {
@@ -43,34 +43,44 @@ enum Commands {
     /// Execute a capability with telemetry
     #[command(
         about = "exec capability with telemetry",
-        after_help = "CAPABILITY HELP:\n runtimo run -c <Cap> --schema\n\nEXAMPLES:\n runtimo run -c FileRead -a '{\"path\":\"/tmp/test.txt\"}'\n runtimo run -c ShellExec -a '{\"cmd\":\"uptime\"}'"
+        after_help = "CAPABILITY HELP:\n runtimo run -c <Cap> --schema     → see expected JSON args\n runtimo run -c <Cap> --dry-run    → validate without executing\n\nEXAMPLES:\n runtimo run -c FileRead -a '{\"path\":\"/tmp/test.txt\"}'\n runtimo run -c ShellExec -a '{\"cmd\":\"uptime\"}'\n runtimo run -c FileWrite -a '{\"path\":\"/tmp/x.txt\",\"content\":\"hello\"}'\n\nBlocked commands: rm, shutdown, chmod, mkfs, dd, iptables, fork bombs, env dumpers.\nSee `runtimo list` for the full blocklist."
     )]
     Run {
+        /// Capability name (e.g., FileRead, ShellExec). Use `runtimo list` to see all.
         #[arg(short = 'c', long)]
         capability: String,
+        /// Capability arguments as JSON (e.g., '{"path":"/tmp/test.txt"}'). Use --schema to see the expected shape.
         #[arg(short = 'a', long, default_value = "{}")]
         args: String,
+        /// Validate args and check blocklist but don't execute
         #[arg(long)]
         dry_run: bool,
+        /// Output raw JSON instead of formatted text
         #[arg(short = 'j', long)]
         json: bool,
+        /// Suppress output except errors (useful for scripting)
         #[arg(short = 'q', long)]
         quiet: bool,
+        /// Print the capability's JSON Schema and exit
         #[arg(long)]
         schema: bool,
+        /// Execution timeout in seconds (1–3600, default: 30)
         #[arg(long, default_value = "30", value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout: u64,
     },
     /// Dispatch job to background daemon (returns immediately)
     #[command(
         about = "Dispatch job to background daemon (starts daemon automatically if needed)",
-        after_help = "EXAMPLES:\n runtimo dispatch -c ShellExec -a '{\"cmd\":\"sleep 30\"}'\n runtimo dispatch -c FileWrite -a '{\"path\":\"/tmp/x.txt\",\"content\":\"bg\"}'\n runtimo dispatch -c GitExec -a '{\"operation\":\"status\",\"path\":\"/tmp/repo\"}'"
+        after_help = "EXAMPLES:\n runtimo dispatch -c ShellExec -a '{\"cmd\":\"sleep 30\"}'\n runtimo dispatch -c FileWrite -a '{\"path\":\"/tmp/x.txt\",\"content\":\"bg\"}'\n runtimo dispatch -c GitExec -a '{\"operation\":\"status\",\"path\":\"/tmp/repo\"}'\n\nAfter dispatch:\n runtimo status                # check all job statuses\n runtimo wait -j <job_id>      # wait for completion\n runtimo logs -j <job_id>      # view WAL events\n\nDaemon starts automatically on first dispatch."
     )]
     Dispatch {
+        /// Capability name (e.g., ShellExec, FileWrite). Use `runtimo list` to see all.
         #[arg(short = 'c', long)]
         capability: String,
+        /// Capability arguments as JSON (same format as `run`)
         #[arg(short = 'a', long, default_value = "{}")]
         args: String,
+        /// Validate and check blocklist but don't enqueue the job
         #[arg(long)]
         dry_run: bool,
     },
@@ -84,70 +94,101 @@ enum Commands {
         after_help = "EXAMPLES:\n runtimo wait -j abc123\n runtimo wait -j abc123 --timeout 60"
     )]
     Wait {
+        /// Job ID to wait for (from dispatch output or `runtimo jobs`)
         #[arg(short = 'j', long)]
         job_id: String,
+        /// Maximum seconds to wait (0 = wait forever)
         #[arg(long, default_value = "0")]
         timeout: u64,
     },
     /// List available capabilities
     #[command(
         about = "List capabilities",
-        after_help = "Use --schemas to see JSON argument schemas."
+        after_help = "Use --schemas to see JSON argument schemas for each capability.\nUse --json for machine-readable output."
     )]
     List {
+        /// Show each capability's JSON argument schema
         #[arg(long)]
         schemas: bool,
+        /// Output as JSON (machine-readable)
         #[arg(short = 'j', long)]
         json: bool,
     },
-    /// Check job status
-    #[command(about = "Check job status")]
+    /// Check job status (local or dispatched)
+    #[command(
+        about = "Check job status",
+        after_help = "EXAMPLES:\n runtimo status             # all jobs\n runtimo status -j abc123   # specific job\n runtimo status -oj         # JSON output"
+    )]
     Status {
+        /// Job ID to check (omit to list all)
         #[arg(short = 'j', long)]
         job_id: Option<String>,
+        /// Output raw JSON
         #[arg(short = 'o', long)]
         json: bool,
     },
-    /// List recent jobs (queriable job history)
+    /// List recent jobs from WAL (local + dispatched)
     #[command(
         about = "List recent jobs",
         after_help = "EXAMPLES:\n runtimo jobs\n runtimo jobs --limit 5\n runtimo jobs --json"
     )]
     Jobs {
+        /// Number of jobs to show (default: 20)
         #[arg(short = 'n', long, default_value = "20")]
         limit: usize,
+        /// Output raw JSON
         #[arg(short = 'j', long)]
         json: bool,
     },
-    #[command(about = "View WAL logs")]
+    /// View WAL logs (audit trail of all events)
+    #[command(
+        about = "View WAL logs",
+        after_help = "EXAMPLES:\n runtimo logs              # last 10 events\n runtimo logs -j abc123    # events for a specific job\n runtimo logs -n 50        # last 50 events\n runtimo logs -oj          # JSON output"
+    )]
     Logs {
+        /// Filter by job ID
         #[arg(short = 'j', long)]
         job_id: Option<String>,
+        /// Number of events to show (default: 10)
         #[arg(short = 'n', long, default_value = "10")]
         limit: usize,
+        /// Output raw JSON
         #[arg(short = 'o', long)]
         json: bool,
     },
+    /// Undo a completed job (restore files from backup)
     #[command(
         about = "Undo a completed job",
-        after_help = "Find job IDs with `runtimo jobs` or `runtimo logs`."
+        after_help = "Find job IDs with `runtimo jobs` or `runtimo logs`.\n\nEXAMPLES:\n runtimo undo -j abc123\n runtimo undo -j abc123 --dry-run    # check what would be restored"
     )]
     Undo {
+        /// Job ID to undo (from `runtimo jobs` or `runtimo logs`)
         #[arg(short = 'j', long)]
         job_id: String,
+        /// Show what files would be restored without actually restoring them
         #[arg(long)]
         dry_run: bool,
     },
-    #[command(about = "Print system telemetry")]
+    /// Print system telemetry (CPU, RAM, disk, GPU, network)
+    #[command(
+        about = "Print system telemetry",
+        after_help = "EXAMPLES:\n runtimo telemetry             # formatted\n runtimo telemetry -j          # JSON\n runtimo telemetry -v          # include listening ports\n runtimo telemetry -jv         # JSON with verbose"
+    )]
     Telemetry {
+        /// Output raw JSON
         #[arg(short = 'j', long)]
         json: bool,
-        /// Show extended telemetry details (listening ports)
+        /// Show extended details (listening ports, GPU info)
         #[arg(short = 'v', long)]
         verbose: bool,
     },
-    #[command(about = "Print process snapshot")]
+    /// Print process snapshot (top consumers, zombie count)
+    #[command(
+        about = "Print process snapshot",
+        after_help = "EXAMPLES:\n runtimo processes             # formatted table\n runtimo processes -j          # JSON output"
+    )]
     Processes {
+        /// Output raw JSON
         #[arg(short = 'j', long)]
         json: bool,
     },
@@ -466,14 +507,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                 if let Some(cap) = reg.get(&capability) {
                     println!("{}", cap.schema());
                 } else {
-                    eprintln!("Capability not found: {}", capability);
+                    eprintln!("Capability not found: {}. Use `runtimo list` to see available capabilities.", capability);
                     std::process::exit(1);
                 }
                 return Ok(());
             }
             let cap = reg
                 .get(&capability)
-                .ok_or_else(|| format!("Capability not found: {}", capability))?;
+                .ok_or_else(|| format!("Capability not found: {}. Use `runtimo list` to see available capabilities.", capability))?;
             let args_val: Value =
                 serde_json::from_str(&args).map_err(|e| format!("Invalid JSON args: {}", e))?;
             if let Err(e) = cap.validate(&args_val) {
@@ -563,7 +604,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                     println!("Check status: runtimo wait -j {}", jid);
                 }
                 Err(e) => {
-                    eprintln!("Dispatch failed: {}", e);
+                    let mut msg = format!("Dispatch failed: {}", e);
+                    if e.contains("Capability not found") {
+                        msg.push_str("\nUse `runtimo list` to see available capabilities.");
+                    }
+                    eprintln!("{}", msg);
                     std::process::exit(1);
                 }
             }
