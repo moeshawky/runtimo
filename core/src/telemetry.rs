@@ -574,10 +574,9 @@ impl HardwareInfo {
             .parse()
             .unwrap_or(0);
         if nvidia_gpu_count > 0 {
-            let model = run_cmd(
-                "nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1",
-            )
-            .unwrap_or_default();
+            let model =
+                run_cmd("nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1")
+                    .unwrap_or_default();
             accelerators.push(AcceleratorInfo {
                 kind: "gpu".into(),
                 count: nvidia_gpu_count,
@@ -587,10 +586,11 @@ impl HardwareInfo {
         }
 
         // AMD GPUs via rocm-smi
-        let amd_gpu_count: usize = run_cmd("rocm-smi --showproductname 2>/dev/null | grep -c 'GPU\\['")
-            .unwrap_or_default()
-            .parse()
-            .unwrap_or(0);
+        let amd_gpu_count: usize =
+            run_cmd("rocm-smi --showproductname 2>/dev/null | grep -c 'GPU\\['")
+                .unwrap_or_default()
+                .parse()
+                .unwrap_or(0);
         if amd_gpu_count > 0 {
             accelerators.push(AcceleratorInfo {
                 kind: "gpu".into(),

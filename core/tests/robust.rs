@@ -77,7 +77,7 @@ fn ctx(id: impl Into<String>) -> runtimo_core::Context {
 fn edge_empty_content_roundtrip() {
     let dir = setup();
     let target = dir.join("empty.txt");
-    FileWrite::new(backup_dir(&dir))
+    FileWrite::new()
         .expect("Failed to create FileWrite")
         .execute(
             &json!({ "path": target.to_str().unwrap(), "content": "" }),
@@ -98,7 +98,7 @@ fn edge_single_char_roundtrip() {
     let target = dir.join("single.txt");
     for ch in &["a", " ", "0", "\n", "\t"] {
         let _ = fs::remove_file(&target);
-        FileWrite::new(backup_dir(&dir))
+        FileWrite::new()
             .expect("Failed to create FileWrite")
             .execute(
                 &json!({ "path": target.to_str().unwrap(), "content": ch }),
@@ -122,7 +122,7 @@ fn edge_long_filename() {
     let dir = setup();
     let long_name = format!("{}.txt", "x".repeat(200));
     let target = dir.join(&long_name);
-    FileWrite::new(backup_dir(&dir))
+    FileWrite::new()
         .expect("Failed to create FileWrite")
         .execute(
             &json!({ "path": target.to_str().unwrap(), "content": "long name" }),
@@ -163,14 +163,13 @@ fn edge_null_bytes_in_content() {
 #[test]
 fn edge_concurrent_writes_different_files() {
     let dir = setup();
-    let bw = backup_dir(&dir);
+    let _bw = runtimo_core::utils::backup_dir();
     let handles: Vec<_> = (0..5)
         .map(|i| {
             let d = dir.clone();
-            let bw = bw.clone();
             std::thread::spawn(move || {
                 let target = d.join(format!("concurrent_{}.txt", i));
-                FileWrite::new(bw)
+                FileWrite::new()
                     .unwrap()
                     .execute(
                         &json!({
@@ -209,7 +208,7 @@ fn t_falsepass_creates_parent_must_require_disk_check_after_mkdir() {
     // If check_disk_space runs BEFORE create_dir_all, this fails with:
     //   "No such file or directory" (from df) or
     //   "insufficient disk space" (df on wrong path)
-    let result = FileWrite::new(backup_dir(&dir))
+    let result = FileWrite::new()
         .expect("Failed to create FileWrite")
         .execute(
             &json!({
@@ -233,7 +232,7 @@ fn t_falsepass_content_not_just_exists() {
     let dir = setup();
     let target = dir.join("content_check.txt");
     let payload = "exact_payload_42";
-    FileWrite::new(backup_dir(&dir))
+    FileWrite::new()
         .expect("Failed to create FileWrite")
         .execute(
             &json!({
@@ -257,7 +256,7 @@ fn t_weakoracle_exact_content_not_substring() {
     let dir = setup();
     let target = dir.join("exact.txt");
     let content = "precise";
-    FileWrite::new(backup_dir(&dir))
+    FileWrite::new()
         .expect("Failed to create FileWrite")
         .execute(
             &json!({
@@ -403,7 +402,7 @@ fn err_write_readonly_location() {
     }
 
     let target = readonly_dir.join("test.txt");
-    let result = FileWrite::new(backup_dir(&dir))
+    let result = FileWrite::new()
         .expect("Failed to create FileWrite")
         .execute(
             &json!({ "path": target.to_str().unwrap(), "content": "test" }),
@@ -569,7 +568,7 @@ fn ctx_path_validation_uses_config() {
 #[test]
 fn sem_backup_numbering_preserves_original() {
     let dir = setup();
-    let bw = backup_dir(&dir);
+    let bw = runtimo_core::utils::backup_dir();
     let target = dir.join("numbered.txt");
     let job_dir = bw.join("job1");
 
@@ -577,7 +576,7 @@ fn sem_backup_numbering_preserves_original() {
     fs::write(&target, "original").unwrap();
 
     // First write (creates backup of "original")
-    FileWrite::new(bw.clone())
+    FileWrite::new()
         .expect("Failed to create FileWrite")
         .execute(
             &json!({ "path": target.to_str().unwrap(), "content": "first" }),
@@ -586,7 +585,7 @@ fn sem_backup_numbering_preserves_original() {
         .unwrap();
 
     // Second write in same job (should create numbered backup)
-    FileWrite::new(bw.clone())
+    FileWrite::new()
         .expect("Failed to create FileWrite")
         .execute(
             &json!({ "path": target.to_str().unwrap(), "content": "second" }),
@@ -595,7 +594,7 @@ fn sem_backup_numbering_preserves_original() {
         .unwrap();
 
     // Third write in same job
-    FileWrite::new(bw.clone())
+    FileWrite::new()
         .expect("Failed to create FileWrite")
         .execute(
             &json!({ "path": target.to_str().unwrap(), "content": "third" }),
@@ -827,7 +826,7 @@ mod proptests {
             let dir = setup();
             let target = dir.join("prop.txt");
 
-            let write_result = FileWrite::new(backup_dir(&dir))
+            let write_result = FileWrite::new()
                 .expect("Failed to create FileWrite")
                 .execute(
                     &json!({ "path": target.to_str().unwrap(), "content": &content }),
@@ -855,14 +854,14 @@ mod proptests {
         #[test]
         fn prop_backup_no_duplicates(n in 1usize..10) {
             let dir = setup();
-            let bw = backup_dir(&dir);
+            let bw = runtimo_core::utils::backup_dir();
             let target = dir.join("prop_backup.txt");
             let job_dir = bw.join("job_prop");
 
             fs::write(&target, "original").unwrap();
 
             // First write creates backup
-            FileWrite::new(bw.clone())
+            FileWrite::new()
                 .unwrap()
                 .execute(
                     &json!({ "path": target.to_str().unwrap(), "content": "first" }),
@@ -872,7 +871,7 @@ mod proptests {
 
             // Subsequent writes in same job create numbered backups
             for i in 1..n {
-                FileWrite::new(bw.clone())
+                FileWrite::new()
                     .unwrap()
                     .execute(
                         &json!({ "path": target.to_str().unwrap(), "content": format!("write {}", i) }),
@@ -969,10 +968,10 @@ fn t_layergap_backup_boundary_content_preserved() {
     let dir = setup();
     let target = dir.join("layer.txt");
     let content = "boundary crossing content сrossover";
-    let bw = backup_dir(&dir);
+    let bw = runtimo_core::utils::backup_dir();
 
     // First write creates the file (no backup for new files)
-    let cap = FileWrite::new(bw.clone()).expect("FileWrite");
+    let cap = FileWrite::new().expect("FileWrite");
     let result = cap
         .execute(
             &json!({ "path": target.to_str().unwrap(), "content": "initial" }),
@@ -1254,14 +1253,14 @@ fn g_drift_telemetry_schema_stability() {
 #[test]
 fn g_perf_write_read_near_linear() {
     let dir = setup();
-    let bw = backup_dir(&dir);
+    let _bw = runtimo_core::utils::backup_dir();
 
     let measure = |size: usize| -> std::time::Duration {
         let target = dir.join(format!("perf_{}.txt", size));
         let content = "a".repeat(size);
         let start = std::time::Instant::now();
 
-        FileWrite::new(bw.clone())
+        FileWrite::new()
             .expect("FileWrite")
             .execute(
                 &json!({ "path": target.to_str().unwrap(), "content": &content }),

@@ -201,7 +201,14 @@ pub fn execute_with_telemetry_and_session(
     /// Capabilities that skip the cognitive safety pipeline — system
     /// operations that don't carry user-authored content (PIDs, file
     /// paths, job IDs) and don't need semantic safety screening.
-    const COGNITIVE_SAFETY_SKIP: &[&str] = &["Kill", "FileRead", "FileWrite", "GitExec", "Undo", "ShellExec"];
+    const COGNITIVE_SAFETY_SKIP: &[&str] = &[
+        "Kill",
+        "FileRead",
+        "FileWrite",
+        "GitExec",
+        "Undo",
+        "ShellExec",
+    ];
 
     let job_id = JobId::new();
     let job_id_str = job_id.as_str().to_string();
@@ -302,34 +309,11 @@ pub fn execute_with_telemetry_and_session(
         }
     }
 
-    if let Err(e) = capability.validate(args) {
-        let telemetry_after = Telemetry::capture_lightweight();
-        let process_after = ProcessSnapshot::capture();
-        let end_seq = wal.seq();
-        log_job_failed_with_snapshots(
-            &mut wal,
-            &job_id_str,
-            &cap_name,
-            &format!("Validation failed: {}", e),
-            &telemetry_before,
-            &telemetry_after,
-            &process_before.summary,
-            &process_after.summary,
-            None,
-            None,
-        )?;
-
-        return Ok(fail_result(
-            job_id_str,
-            cap_name,
-            format!("Validation failed: {}", e),
-            telemetry_before,
-            telemetry_after,
-            process_before.summary,
-            process_after.summary,
-            end_seq,
-        ));
-    }
+    // Validation is performed by the TypedCapability blanket impl during
+    // deserialization in execute(). The Capability::validate() method
+    // always returns Ok(()) for TypedCapability implementations, so this
+    // separate validation step is redundant and has been removed.
+    // Direct Capability implementers should perform validation in execute().
 
     // Execute capability with timeout enforcement
     let output = match execute_with_timeout_check(capability, args, &ctx, timeout_secs) {
@@ -447,7 +431,7 @@ pub fn execute_with_telemetry_and_session(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let _ = wal.append(WalEvent {
+        if let Err(e) = wal.append(WalEvent {
             seq: cmd_seq,
             ts: cmd_ts,
             event_type: WalEventType::CommandExecuted,
@@ -466,7 +450,9 @@ pub fn execute_with_telemetry_and_session(
             cmd_corrected: None,
             oov_ratio: None,
             detection_flags: None,
-        });
+        }) {
+            log::error!("WAL CommandExecuted append failed: {}", e);
+        }
     }
 
     // Add job to session if session tracking is enabled
@@ -476,12 +462,12 @@ pub fn execute_with_telemetry_and_session(
         match SessionManager::new(sessions_dir) {
             Ok(mut mgr) => {
                 if let Err(e) = mgr.add_job(sid, &job_id_str) {
-                    eprintln!("[runtimo] Failed to add job to session '{}': {}", sid, e);
+                    log::error!("Failed to add job to session '{}': {}", sid, e);
                 }
             }
             Err(e) => {
-                eprintln!(
-                    "[runtimo] Failed to create SessionManager for session '{}': {}",
+                log::error!(
+                    "Failed to create SessionManager for session '{}': {}",
                     sid, e
                 );
             }
@@ -952,14 +938,7 @@ mod tests {
         match result {
             Ok(r) => {
                 // If it passed, it's because DAL=A didn't trigger for these inputs
-                assert!(
-                    r.success
-                        || !r
-                            .output
-                            .output
-                            .as_str()
-                            .contains("cognitive")
-                );
+                assert!(r.success || !r.output.output.as_str().contains("cognitive"));
             }
             Err(e) => {
                 assert!(

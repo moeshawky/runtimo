@@ -313,8 +313,14 @@ mod tests {
         };
         let err = validate_path("/etc/shadow", &ctx).unwrap_err();
         // Error should not leak the list of allowed directories (info leak)
-        assert!(!err.contains("/tmp"), "error should not leak /tmp as allowed");
-        assert!(!err.contains("/home"), "error should not leak /home as allowed");
+        assert!(
+            !err.contains("/tmp"),
+            "error should not leak /tmp as allowed"
+        );
+        assert!(
+            !err.contains("/home"),
+            "error should not leak /home as allowed"
+        );
         assert!(err.contains("outside allowed directories"));
     }
 
@@ -334,7 +340,11 @@ mod tests {
         let ctx = PathContext::default();
         let result = validate_path(p.to_str().unwrap(), &ctx);
         // The file exists in a temp dir (allowed prefix), so it should pass
-        assert!(result.is_ok(), "non-ASCII path should be allowed, got: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "non-ASCII path should be allowed, got: {:?}",
+            result
+        );
         std::fs::remove_file(&p).ok();
     }
 
@@ -346,7 +356,10 @@ mod tests {
         let result = validate_path("/tmp/\u{00e9}../etc/passwd", &ctx);
         assert!(result.is_err());
         // Should fail due to traversal, not non-ASCII
-        assert!(!result.unwrap_err().contains("non-ASCII"), "should not reject for non-ASCII");
+        assert!(
+            !result.unwrap_err().contains("non-ASCII"),
+            "should not reject for non-ASCII"
+        );
     }
 
     #[test]

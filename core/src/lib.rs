@@ -98,7 +98,9 @@ pub mod wal;
 
 pub use backup::BackupManager;
 pub use capabilities::{FileRead, FileWrite, GitExec, Kill, ShellExec, Undo};
-pub use capability::{Capability, CapabilityError, CapabilityRegistry, Context, Output, TypedCapability};
+pub use capability::{
+    Capability, CapabilityError, CapabilityRegistry, Context, Output, TypedCapability,
+};
 pub use config::RuntimoConfig;
 pub use executor::{execute_with_telemetry, execute_with_telemetry_and_session};
 pub use job::{Job, JobId, JobState};

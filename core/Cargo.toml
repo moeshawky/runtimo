@@ -20,6 +20,7 @@ workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+log.workspace = true
 llmosafe = { version = "0.7.3", default-features = false, features = ["std", "dal"] }
 libc = "0.2"
 toml = "0.8"

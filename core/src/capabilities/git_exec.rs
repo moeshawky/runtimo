@@ -960,7 +960,11 @@ impl TypedCapability for GitExec {
         })
     }
 
-    fn execute(&self, args: GitExecArgs, ctx: &Context) -> std::result::Result<Output, CapabilityError> {
+    fn execute(
+        &self,
+        args: GitExecArgs,
+        ctx: &Context,
+    ) -> std::result::Result<Output, CapabilityError> {
         let valid_ops = ["clone", "pull", "commit", "revert", "clean", "status"];
         if !valid_ops.contains(&args.operation.as_str()) {
             return Err(CapabilityError::InvalidArgs(format!(
@@ -972,7 +976,8 @@ impl TypedCapability for GitExec {
 
         if args.operation == "clone" {
             if let Some(url) = &args.url {
-                Self::validate_url(url).map_err(|e| CapabilityError::PermissionDenied(e.to_string()))?;
+                Self::validate_url(url)
+                    .map_err(|e| CapabilityError::PermissionDenied(e.to_string()))?;
             } else {
                 return Err(CapabilityError::InvalidArgs(
                     "URL required for clone".into(),
@@ -1000,11 +1005,13 @@ impl TypedCapability for GitExec {
         }
 
         if let Some(branch) = &args.branch {
-            Self::validate_branch_name(branch).map_err(|e| CapabilityError::InvalidArgs(e.to_string()))?;
+            Self::validate_branch_name(branch)
+                .map_err(|e| CapabilityError::InvalidArgs(e.to_string()))?;
         }
 
         if let Some(sha) = &args.commit_sha {
-            Self::validate_commit_sha(sha).map_err(|e| CapabilityError::InvalidArgs(e.to_string()))?;
+            Self::validate_commit_sha(sha)
+                .map_err(|e| CapabilityError::InvalidArgs(e.to_string()))?;
         }
 
         let telemetry_before = Telemetry::capture();
@@ -1020,31 +1027,27 @@ impl TypedCapability for GitExec {
                 self.op_pull(&args, ctx, Path::new(path))
             }
             "commit" => {
-                let path = args
-                    .path
-                    .as_ref()
-                    .ok_or_else(|| CapabilityError::InvalidArgs("Path required for commit".into()))?;
+                let path = args.path.as_ref().ok_or_else(|| {
+                    CapabilityError::InvalidArgs("Path required for commit".into())
+                })?;
                 self.op_commit(&args, ctx, Path::new(path))
             }
             "revert" => {
-                let path = args
-                    .path
-                    .as_ref()
-                    .ok_or_else(|| CapabilityError::InvalidArgs("Path required for revert".into()))?;
+                let path = args.path.as_ref().ok_or_else(|| {
+                    CapabilityError::InvalidArgs("Path required for revert".into())
+                })?;
                 self.op_revert(&args, ctx, Path::new(path))
             }
             "clean" => {
-                let path = args
-                    .path
-                    .as_ref()
-                    .ok_or_else(|| CapabilityError::InvalidArgs("Path required for clean".into()))?;
+                let path = args.path.as_ref().ok_or_else(|| {
+                    CapabilityError::InvalidArgs("Path required for clean".into())
+                })?;
                 self.op_clean(&args, ctx, Path::new(path))
             }
             "status" => {
-                let path = args
-                    .path
-                    .as_ref()
-                    .ok_or_else(|| CapabilityError::InvalidArgs("Path required for status".into()))?;
+                let path = args.path.as_ref().ok_or_else(|| {
+                    CapabilityError::InvalidArgs("Path required for status".into())
+                })?;
                 self.op_status(&args, ctx, Path::new(path))
             }
             _ => Err(Error::ExecutionFailed(format!(
@@ -1185,7 +1188,9 @@ mod tests {
     fn rejects_path_traversal() {
         let cap = GitExec::new(test_backup_dir()).expect("Failed to create GitExec");
 
-        let result = Capability::execute(&cap, &serde_json::json!({
+        let result = Capability::execute(
+            &cap,
+            &serde_json::json!({
                 "operation": "clone",
                 "url": "https://github.com/user/repo.git",
                 "path": "../../../etc/passwd"
@@ -1208,7 +1213,9 @@ mod tests {
     fn rejects_invalid_operation() {
         let cap = GitExec::new(test_backup_dir()).expect("Failed to create GitExec");
 
-        let result = Capability::execute(&cap, &serde_json::json!({
+        let result = Capability::execute(
+            &cap,
+            &serde_json::json!({
                 "operation": "invalid_op"
             }),
             &Context {
@@ -1227,7 +1234,9 @@ mod tests {
     fn status_on_nonexistent_repo() {
         let cap = GitExec::new(test_backup_dir()).expect("Failed to create GitExec");
 
-        let result = Capability::execute(&cap, &serde_json::json!({
+        let result = Capability::execute(
+            &cap,
+            &serde_json::json!({
                 "operation": "status",
                 "path": "/tmp/nonexistent_repo"
             }),

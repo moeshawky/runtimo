@@ -9,11 +9,11 @@
 //!
 //! ```rust,ignore
 //! use runtimo_core::capabilities::FileWrite;
+//!;
 //! use runtimo_core::capability::{Capability, Context};
 //! use serde_json::json;
-//! use std::path::PathBuf;
 //!
-//! let cap = FileWrite::new(PathBuf::from("/tmp/backups"));
+//! let cap = FileWrite::new();
 //! let result = cap.execute(
 //!     &json!({"path": "/tmp/output.txt", "content": "hello"}),
 //!     &Context { dry_run: false, job_id: "job1".into(), working_dir: std::env::temp_dir() },
@@ -31,7 +31,6 @@ use crate::validation::path::{validate_path, PathContext};
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::PathBuf;
 
 /// Maximum content size allowed for writing (100 MB).
 const MAX_WRITE_SIZE: usize = 100 * 1024 * 1024;
@@ -58,6 +57,8 @@ const CRITICAL_FILES: &[&str] = &[
     ".netrc",
     ".npmrc",
     ".pypirc",
+    ".env",
+    ".env.*",
     "authorized_keys",
     "id_rsa",
     "id_ed25519",
@@ -89,9 +90,13 @@ pub struct FileWrite {
 }
 
 impl FileWrite {
-    /// Create a new `FileWrite` capability backed by the given backup directory.
+    /// Create a new `FileWrite` capability backed by the default backup directory.
+    ///
+    /// The backup directory is derived from `data_dir()` as `data_dir().join("backups")`.
+    /// This eliminates external configuration of the backup path (ADR-C28).
     #[allow(clippy::missing_errors_doc)] // Error path is self-documenting — propagates BackupManager::new
-    pub fn new(backup_dir: PathBuf) -> Result<Self> {
+    pub fn new() -> Result<Self> {
+        let backup_dir = crate::utils::backup_dir();
         Ok(Self {
             backup_mgr: BackupManager::new(backup_dir)?,
         })
@@ -121,7 +126,11 @@ impl TypedCapability for FileWrite {
         })
     }
 
-    fn execute(&self, args: FileWriteArgs, ctx: &Context) -> std::result::Result<Output, CapabilityError> {
+    fn execute(
+        &self,
+        args: FileWriteArgs,
+        ctx: &Context,
+    ) -> std::result::Result<Output, CapabilityError> {
         if args.content.len() > MAX_WRITE_SIZE {
             return Err(CapabilityError::InvalidArgs(format!(
                 "Content too large: {} bytes (limit: {} bytes)",
@@ -200,9 +209,11 @@ impl TypedCapability for FileWrite {
         } else {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
-                    CapabilityError::Io(std::io::Error::other(
-                        format!("mkdir {}: {}", parent.display(), e),
-                    ))
+                    CapabilityError::Io(std::io::Error::other(format!(
+                        "mkdir {}: {}",
+                        parent.display(),
+                        e
+                    )))
                 })?;
             }
             None
@@ -240,12 +251,34 @@ impl TypedCapability for FileWrite {
 
 fn is_critical_file(path: &std::path::Path) -> bool {
     let path_str = path.to_string_lossy();
+    let filename = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
     for critical in CRITICAL_FILES {
-        if path_str.ends_with(critical) {
+        if critical.contains('*') {
+            if glob_match(critical, &filename) {
+                return true;
+            }
+        } else if path_str.ends_with(critical) {
             return true;
         }
     }
     false
+}
+
+fn glob_match(pattern: &str, text: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() != 2 {
+        return text == pattern;
+    }
+    let Some(prefix) = parts.first() else {
+        return text == pattern;
+    };
+    let Some(suffix) = parts.get(1) else {
+        return text == pattern;
+    };
+    text.starts_with(prefix) && text.ends_with(suffix)
 }
 
 fn check_disk_space(
@@ -456,6 +489,7 @@ fn atomic_append(path: &std::path::Path, content: &str) -> Result<usize> {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn test_backup_dir() -> PathBuf {
         std::env::temp_dir().join("runtimo_fw_test")
@@ -480,13 +514,18 @@ mod tests {
     #[test]
     fn writes_new_file() {
         let target = std::env::temp_dir().join("runtimo_fw_new.txt");
-        let cap = FileWrite::new(test_backup_dir()).expect("Failed to create FileWrite");
+        let cap = FileWrite::new().expect("Failed to create FileWrite");
 
         let result = TypedCapability::execute(
             &cap,
-            FileWriteArgs { path: target.to_str().unwrap().to_string(), content: "hello from runtimo".to_string(), append: false },
+            FileWriteArgs {
+                path: target.to_str().unwrap().to_string(),
+                content: "hello from runtimo".to_string(),
+                append: false,
+            },
             &test_ctx("t1"),
-        ).expect("Execution failed");
+        )
+        .expect("Execution failed");
 
         assert_eq!(result.status, "ok");
         assert_eq!(
@@ -501,13 +540,18 @@ mod tests {
     #[test]
     fn dry_run_does_not_write() {
         let target = std::env::temp_dir().join("runtimo_fw_dry.txt");
-        let cap = FileWrite::new(test_backup_dir()).expect("Failed to create FileWrite");
+        let cap = FileWrite::new().expect("Failed to create FileWrite");
 
         TypedCapability::execute(
             &cap,
-            FileWriteArgs { path: target.to_str().unwrap().to_string(), content: "should not exist".to_string(), append: false },
+            FileWriteArgs {
+                path: target.to_str().unwrap().to_string(),
+                content: "should not exist".to_string(),
+                append: false,
+            },
             &dry_ctx("t2"),
-        ).expect("Execution failed");
+        )
+        .expect("Execution failed");
 
         assert!(!target.exists());
         std::fs::remove_dir_all(test_backup_dir()).ok();
@@ -515,24 +559,34 @@ mod tests {
 
     #[test]
     fn rejects_path_traversal() {
-        let cap = FileWrite::new(test_backup_dir()).expect("Failed to create FileWrite");
+        let cap = FileWrite::new().expect("Failed to create FileWrite");
         let err = TypedCapability::execute(
             &cap,
-            FileWriteArgs { path: "../../../etc/passwd".to_string(), content: "malicious".to_string(), append: false },
+            FileWriteArgs {
+                path: "../../../etc/passwd".to_string(),
+                content: "malicious".to_string(),
+                append: false,
+            },
             &test_ctx("t3"),
-        ).unwrap_err();
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("traversal"));
         std::fs::remove_dir_all(test_backup_dir()).ok();
     }
 
     #[test]
     fn rejects_critical_file() {
-        let cap = FileWrite::new(test_backup_dir()).expect("Failed to create FileWrite");
+        let cap = FileWrite::new().expect("Failed to create FileWrite");
         let err = TypedCapability::execute(
             &cap,
-            FileWriteArgs { path: "/tmp/.bashrc".to_string(), content: "malicious".to_string(), append: false },
+            FileWriteArgs {
+                path: "/tmp/.bashrc".to_string(),
+                content: "malicious".to_string(),
+                append: false,
+            },
             &test_ctx("t4"),
-        ).unwrap_err();
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("critical file"));
         std::fs::remove_dir_all(test_backup_dir()).ok();
     }
@@ -540,13 +594,18 @@ mod tests {
     #[test]
     fn atomic_write_produces_correct_content() {
         let target = std::env::temp_dir().join("runtimo_fw_atomic.txt");
-        let cap = FileWrite::new(test_backup_dir()).expect("Failed to create FileWrite");
+        let cap = FileWrite::new().expect("Failed to create FileWrite");
 
         let result = TypedCapability::execute(
             &cap,
-            FileWriteArgs { path: target.to_str().unwrap().to_string(), content: "atomic content".to_string(), append: false },
+            FileWriteArgs {
+                path: target.to_str().unwrap().to_string(),
+                content: "atomic content".to_string(),
+                append: false,
+            },
             &test_ctx("t5"),
-        ).expect("Execution failed");
+        )
+        .expect("Execution failed");
 
         assert_eq!(result.status, "ok");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "atomic content");
@@ -562,13 +621,18 @@ mod tests {
         let target = std::env::temp_dir().join("runtimo_fw_append.txt");
         std::fs::write(&target, "initial").ok();
 
-        let cap = FileWrite::new(test_backup_dir()).expect("Failed to create FileWrite");
+        let cap = FileWrite::new().expect("Failed to create FileWrite");
 
         let result = TypedCapability::execute(
             &cap,
-            FileWriteArgs { path: target.to_str().unwrap().to_string(), content: " appended".to_string(), append: true },
+            FileWriteArgs {
+                path: target.to_str().unwrap().to_string(),
+                content: " appended".to_string(),
+                append: true,
+            },
             &test_ctx("t6"),
-        ).expect("Execution failed");
+        )
+        .expect("Execution failed");
 
         assert_eq!(result.status, "ok");
         assert_eq!(
@@ -588,13 +652,18 @@ mod tests {
         // Use unique backup dir to avoid pollution from parallel tests
         let backup_dir = std::env::temp_dir().join("runtimo_fw_dry_backup_test");
         let _ = std::fs::remove_dir_all(&backup_dir);
-        let cap = FileWrite::new(backup_dir.clone()).expect("Failed to create FileWrite");
+        let cap = FileWrite::new().expect("Failed to create FileWrite");
 
         let result = TypedCapability::execute(
             &cap,
-            FileWriteArgs { path: target.to_str().unwrap().to_string(), content: "new content".to_string(), append: false },
+            FileWriteArgs {
+                path: target.to_str().unwrap().to_string(),
+                content: "new content".to_string(),
+                append: false,
+            },
             &dry_ctx("t7"),
-        ).expect("Execution failed");
+        )
+        .expect("Execution failed");
 
         assert_eq!(result.status, "ok");
         assert!(result.data.as_ref().unwrap()["dry_run"].as_bool().unwrap());
@@ -616,13 +685,18 @@ mod tests {
     #[test]
     fn telemetry_included_in_output() {
         let target = std::env::temp_dir().join("runtimo_fw_telemetry.txt");
-        let cap = FileWrite::new(test_backup_dir()).expect("Failed to create FileWrite");
+        let cap = FileWrite::new().expect("Failed to create FileWrite");
 
         let result = TypedCapability::execute(
             &cap,
-            FileWriteArgs { path: target.to_str().unwrap().to_string(), content: "telemetry test".to_string(), append: false },
+            FileWriteArgs {
+                path: target.to_str().unwrap().to_string(),
+                content: "telemetry test".to_string(),
+                append: false,
+            },
             &test_ctx("t8"),
-        ).expect("Execution failed");
+        )
+        .expect("Execution failed");
 
         assert_eq!(result.status, "ok");
         let data = result.data.as_ref().unwrap();
@@ -643,11 +717,15 @@ mod tests {
 
     #[test]
     fn test_content_too_large_rejected() {
-        let cap = FileWrite::new(test_backup_dir()).expect("Failed to create FileWrite");
+        let cap = FileWrite::new().expect("Failed to create FileWrite");
         let large_content = "x".repeat(101 * 1024 * 1024); // > 100MB
         let result = TypedCapability::execute(
             &cap,
-            FileWriteArgs { path: "/tmp/runtimo_large_test.txt".to_string(), content: large_content, append: false },
+            FileWriteArgs {
+                path: "/tmp/runtimo_large_test.txt".to_string(),
+                content: large_content,
+                append: false,
+            },
             &test_ctx("t9"),
         );
         assert!(result.is_err());
@@ -658,10 +736,14 @@ mod tests {
 
     #[test]
     fn test_critical_file_ssh_authorized_keys_blocked() {
-        let cap = FileWrite::new(test_backup_dir()).expect("Failed to create FileWrite");
+        let cap = FileWrite::new().expect("Failed to create FileWrite");
         let result = TypedCapability::execute(
             &cap,
-            FileWriteArgs { path: "/tmp/.ssh/authorized_keys".to_string(), content: "ssh-rsa AAA...".to_string(), append: false },
+            FileWriteArgs {
+                path: "/tmp/.ssh/authorized_keys".to_string(),
+                content: "ssh-rsa AAA...".to_string(),
+                append: false,
+            },
             &test_ctx("t10"),
         );
         assert!(result.is_err());
@@ -673,13 +755,18 @@ mod tests {
     #[test]
     fn test_atomic_write_syncs_directory() {
         let target = std::env::temp_dir().join("runtimo_fw_sync.txt");
-        let cap = FileWrite::new(test_backup_dir()).expect("Failed to create FileWrite");
+        let cap = FileWrite::new().expect("Failed to create FileWrite");
 
         let result = TypedCapability::execute(
             &cap,
-            FileWriteArgs { path: target.to_str().unwrap().to_string(), content: "sync test".to_string(), append: false },
+            FileWriteArgs {
+                path: target.to_str().unwrap().to_string(),
+                content: "sync test".to_string(),
+                append: false,
+            },
             &test_ctx("t11"),
-        ).expect("Execution failed");
+        )
+        .expect("Execution failed");
 
         assert_eq!(result.status, "ok");
 
@@ -698,11 +785,15 @@ mod tests {
         let target = std::env::temp_dir().join("runtimo_fw_append_overflow.txt");
         std::fs::write(&target, "x".repeat(99 * 1024 * 1024)).ok(); // 99MB existing
 
-        let cap = FileWrite::new(test_backup_dir()).expect("Failed to create FileWrite");
+        let cap = FileWrite::new().expect("Failed to create FileWrite");
         let large_append = "y".repeat(2 * 1024 * 1024); // +2MB = 101MB > 100MB
         let result = TypedCapability::execute(
             &cap,
-            FileWriteArgs { path: target.to_str().unwrap().to_string(), content: large_append, append: true },
+            FileWriteArgs {
+                path: target.to_str().unwrap().to_string(),
+                content: large_append,
+                append: true,
+            },
             &test_ctx("t12"),
         );
         assert!(result.is_err());

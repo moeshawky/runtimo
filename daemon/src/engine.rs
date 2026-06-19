@@ -13,7 +13,7 @@
 //! Uses `status` and `jobs` RPC methods for queriable job history.
 
 use runtimo_core::{
-    capabilities::{FileRead, FileWrite, GitExec, Kill, ShellExec, Undo},
+    capabilities::{FileRead, FileWrite, GitExec, Kill, ShellExec, Undo, is_dangerous_command},
     execute_with_telemetry_and_session, BackupManager, CapabilityRegistry, WalEvent, WalEventType,
     WalReader, WalWriter,
 };
@@ -25,11 +25,11 @@ use std::sync::{Arc, Mutex};
 
 // Re-exports from sibling modules so `use super::*` in tests can see these names.
 pub use crate::auth::authenticate_peer;
-pub use crate::config::{data_dir, default_socket_path, default_wal_path, ensure_data_dir};
-pub use crate::dispatch::{
-    BackgroundJob, BackgroundJobRegistry, JsonRpcError, JsonRpcRequest, JsonRpcResponse,
-    LogsParams, MAX_CONCURRENT_JOBS, RunParams,
-};
+pub use crate::config::{default_socket_path, default_wal_path, ensure_data_dir};
+#[allow(unused_imports)] // used in inline tests
+pub use crate::jobs::{BackgroundJob, BackgroundJobRegistry, MAX_CONCURRENT_JOBS};
+#[allow(unused_imports)] // used in inline tests
+pub use crate::rpc::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, LogsParams, RunParams};
 
 // ── Daemon state ────────────────────────────────────────────────────────────
 
@@ -54,11 +54,11 @@ impl DaemonState {
         let mut registry = CapabilityRegistry::new();
         registry.register(FileRead);
 
-        let backup_dir = data_dir().join("backups");
-        let file_write = FileWrite::new(backup_dir.clone())
+        let file_write = FileWrite::new()
             .map_err(|e| format!("Failed to create FileWrite capability: {}", e))?;
         registry.register(file_write);
 
+        let backup_dir = runtimo_core::utils::backup_dir();
         let git_exec = GitExec::new(backup_dir)
             .map_err(|e| format!("Failed to create GitExec capability: {}", e))?;
         registry.register(git_exec);
@@ -204,6 +204,26 @@ async fn handle_dispatch(state: &Arc<DaemonState>, params: Value, id: Value) -> 
         };
     }
 
+    // Early validation for ShellExec: check for dangerous commands before
+    // creating a job. This prevents accepting dangerous commands at dispatch
+    // time that would only fail at async execution time (F-003).
+    if run_params.capability == "ShellExec" {
+        if let Some(cmd) = run_params.args.get("cmd").or_else(|| run_params.args.get("command")) {
+            if let Some(cmd_str) = cmd.as_str() {
+                if let Some(reason) = is_dangerous_command(cmd_str) {
+                    return JsonRpcResponse {
+                        result: None,
+                        error: Some(JsonRpcError {
+                            code: -32602,
+                            message: format!("dangerous command blocked: {}", reason),
+                        }),
+                        id,
+                    };
+                }
+            }
+        }
+    }
+
     let job_id = runtimo_core::utils::generate_id();
     let cap_name = run_params.capability.clone();
     let dry = run_params.dry_run;
@@ -242,16 +262,14 @@ async fn handle_dispatch(state: &Arc<DaemonState>, params: Value, id: Value) -> 
         };
     }
 
-    state
-        .bg_jobs
-        .insert(BackgroundJob {
-            job_id: job_id.clone(),
-            capability: cap_name.clone(),
-            status: "running".into(),
-            started_at: now,
-            finished_at: None,
-            result: None,
-        });
+    state.bg_jobs.insert(BackgroundJob {
+        job_id: job_id.clone(),
+        capability: cap_name.clone(),
+        status: "running".into(),
+        started_at: now,
+        finished_at: None,
+        result: None,
+    });
 
     // Spawn background execution routed through execute_with_telemetry
     // (parity with handle_run — full safety checks, WAL, and telemetry)
@@ -266,7 +284,10 @@ async fn handle_dispatch(state: &Arc<DaemonState>, params: Value, id: Value) -> 
 
     tokio::task::spawn_blocking(move || {
         // Acquire wal_mutex to serialize WAL writes with handle_run
-        let _wal_guard = state_arc.wal_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        let _wal_guard = state_arc
+            .wal_mutex
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let cap = state_arc.registry.get(&cn).ok_or_else(|| {
                 runtimo_core::Error::ExecutionFailed(format!(
@@ -1320,7 +1341,7 @@ mod tests {
         let dir = unique_test_dir();
         std::env::set_var("XDG_DATA_HOME", dir.to_str().unwrap());
 
-        let actual = data_dir();
+        let actual = runtimo_core::utils::data_dir();
         assert_eq!(actual, dir.join("runtimo"));
 
         std::env::remove_var("XDG_DATA_HOME");

@@ -357,7 +357,11 @@ pub trait TypedCapability: Send + Sync {
     ///
     /// Returns [`CapabilityError`] if deserialization, validation, or
     /// execution fails.
-    fn execute(&self, args: Self::Args, ctx: &Context) -> std::result::Result<Output, CapabilityError>;
+    fn execute(
+        &self,
+        args: Self::Args,
+        ctx: &Context,
+    ) -> std::result::Result<Output, CapabilityError>;
 
     /// Dry-run execution — same as [`execute`](TypedCapability::execute)
     /// but the capability should skip side effects.
@@ -368,7 +372,11 @@ pub trait TypedCapability: Send + Sync {
     /// # Errors
     ///
     /// Returns [`CapabilityError`] if the dry-run simulation fails.
-    fn dry_run(&self, args: Self::Args, ctx: &Context) -> std::result::Result<Output, CapabilityError> {
+    fn dry_run(
+        &self,
+        args: Self::Args,
+        ctx: &Context,
+    ) -> std::result::Result<Output, CapabilityError> {
         self.execute(args, ctx)
     }
 }
@@ -681,7 +689,11 @@ mod tests {
             serde_json::json!({"type": "object"})
         }
 
-        fn execute(&self, args: Self::Args, _ctx: &Context) -> std::result::Result<Output, CapabilityError> {
+        fn execute(
+            &self,
+            args: Self::Args,
+            _ctx: &Context,
+        ) -> std::result::Result<Output, CapabilityError> {
             Ok(Output::ok(format!("typed: {}", args)))
         }
     }
@@ -696,7 +708,10 @@ mod tests {
         let cap = reg.get("TypedTest").unwrap();
         assert_eq!(cap.name(), "TypedTest");
 
-        let result = cap.execute(&serde_json::json!("hello"), &Context::new(false, "test".into()));
+        let result = cap.execute(
+            &serde_json::json!("hello"),
+            &Context::new(false, "test".into()),
+        );
         assert!(result.is_ok());
         let output = result.unwrap();
         assert_eq!(output.status, "ok");

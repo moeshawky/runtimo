@@ -78,7 +78,7 @@ fn reads_file_content() {
 fn writes_file_content() {
     let dir = setup();
     let target = dir.join("w.txt");
-    let result = FileWrite::new(backup_dir(&dir))
+    let result = FileWrite::new()
         .expect("Failed to create FileWrite")
         .execute(
             &json!({
@@ -134,10 +134,10 @@ fn registry_lists_capabilities() {
     cleanup(&dir);
 }
 
-fn make_registry(bd: &std::path::Path) -> CapabilityRegistry {
+fn make_registry(_bd: &std::path::Path) -> CapabilityRegistry {
     let mut r = CapabilityRegistry::new();
     r.register(FileRead);
-    r.register(FileWrite::new(bd.to_path_buf()).expect("Failed to create FileWrite"));
+    r.register(FileWrite::new().expect("Failed to create FileWrite"));
     r
 }
 
@@ -155,7 +155,7 @@ fn rejects_path_traversal_read() {
 fn rejects_path_traversal_write() {
     let dir = setup();
     let ctx = ctx("traversal_write");
-    let cap = FileWrite::new(backup_dir(&dir)).expect("Failed to create FileWrite");
+    let cap = FileWrite::new().expect("Failed to create FileWrite");
     assert!(cap
         .execute(&json!({ "path": "../../../tmp/x.txt", "content": "x" }), &ctx)
         .is_err());
@@ -177,7 +177,7 @@ fn rejects_empty_path() {
     let dir = setup();
     let ctx = ctx("empty_path");
     assert!(FileRead.execute(&json!({ "path": "" }), &ctx).is_err());
-    let cap = FileWrite::new(backup_dir(&dir)).expect("Failed to create FileWrite");
+    let cap = FileWrite::new().expect("Failed to create FileWrite");
     assert!(cap
         .execute(&json!({ "path": "", "content": "x" }), &ctx)
         .is_err());
@@ -224,7 +224,7 @@ fn writes_unicode() {
     let dir = setup();
     let target = dir.join("uni_w.txt");
     let content = "日本語 🔥 مرحبا";
-    FileWrite::new(backup_dir(&dir))
+    FileWrite::new()
         .expect("Failed to create FileWrite")
         .execute(
             &json!({
@@ -242,7 +242,7 @@ fn creates_parent_directories() {
     let dir = setup();
     let deep = dir.join("a/b/c");
     let target = deep.join("f.txt");
-    FileWrite::new(backup_dir(&dir))
+    FileWrite::new()
         .expect("Failed to create FileWrite")
         .execute(
             &json!({
@@ -262,7 +262,7 @@ fn creates_parent_directories() {
 fn check_disk_space_skips_when_parent_missing() {
     let dir = setup();
     let target = dir.join("x/y/z/deep.txt");
-    let result = FileWrite::new(backup_dir(&dir))
+    let result = FileWrite::new()
         .expect("Failed to create FileWrite")
         .execute(
             &json!({
@@ -286,7 +286,7 @@ fn check_disk_space_skips_when_parent_missing() {
 fn check_disk_space_deep_nesting() {
     let dir = setup();
     let target = dir.join("a/b/c/d/e/file.txt");
-    FileWrite::new(backup_dir(&dir))
+    FileWrite::new()
         .expect("Failed to create FileWrite")
         .execute(
             &json!({
@@ -306,7 +306,7 @@ fn check_disk_space_deep_nesting() {
 fn check_disk_space_single_new_parent() {
     let dir = setup();
     let target = dir.join("newdir/file.txt");
-    FileWrite::new(backup_dir(&dir))
+    FileWrite::new()
         .expect("Failed to create FileWrite")
         .execute(
             &json!({
@@ -326,7 +326,7 @@ fn check_disk_space_single_new_parent() {
 fn check_disk_space_runs_when_parent_exists() {
     let dir = setup();
     make_file(&dir, "existing.txt", "old");
-    let result = FileWrite::new(backup_dir(&dir))
+    let result = FileWrite::new()
         .expect("Failed to create FileWrite")
         .execute(
             &json!({
@@ -345,7 +345,7 @@ fn check_disk_space_runs_when_parent_exists() {
 fn check_disk_space_empty_content_new_parent() {
     let dir = setup();
     let target = dir.join("newdir_empty/file.txt");
-    FileWrite::new(backup_dir(&dir))
+    FileWrite::new()
         .expect("Failed to create FileWrite")
         .execute(
             &json!({
@@ -371,7 +371,7 @@ fn c4_ordering_concurrent_paths_same_parent() {
         .map(|i| parent.join(format!("sub{}/f{}.txt", i, i)))
         .collect();
 
-    let fw = FileWrite::new(backup_dir(&dir)).expect("Failed to create FileWrite");
+    let fw = FileWrite::new().expect("Failed to create FileWrite");
     for (i, path) in paths.iter().enumerate() {
         fw.execute(
             &json!({
@@ -399,7 +399,7 @@ fn c4_ordering_write_after_parent_creation() {
     // Manually create parent first
     fs::create_dir_all(target.parent().unwrap()).unwrap();
 
-    let result = FileWrite::new(backup_dir(&dir))
+    let result = FileWrite::new()
         .expect("Failed to create FileWrite")
         .execute(
             &json!({
@@ -421,7 +421,7 @@ fn g_sem_content_identity() {
     let dir = setup();
     let target = dir.join("identity.txt");
     let content = "The quick brown fox jumps over the lazy dog";
-    FileWrite::new(backup_dir(&dir))
+    FileWrite::new()
         .expect("Failed to create FileWrite")
         .execute(
             &json!({
@@ -441,7 +441,7 @@ fn g_sem_unicode_roundtrip() {
     let dir = setup();
     let target = dir.join("unicode.txt");
     let content = "مرحبا世界🚀";
-    FileWrite::new(backup_dir(&dir))
+    FileWrite::new()
         .expect("Failed to create FileWrite")
         .execute(
             &json!({
@@ -470,7 +470,7 @@ fn rejects_missing_field_in_args() {
     let dir = setup();
     let ctx = ctx("missing_field");
     assert!(FileRead.execute(&json!({ "wrong_field": "v" }), &ctx).is_err());
-    let cap = FileWrite::new(backup_dir(&dir)).expect("Failed to create FileWrite");
+    let cap = FileWrite::new().expect("Failed to create FileWrite");
     assert!(cap.execute(&json!({ "path": "/tmp/x.txt" }), &ctx).is_err()); // missing content
     cleanup(&dir);
 }
@@ -528,7 +528,7 @@ fn write_then_read_roundtrip() {
     let target = dir.join("rt.txt");
     let original = "roundtrip\nmulti-line 你好";
 
-    FileWrite::new(backup_dir(&dir))
+    FileWrite::new()
         .expect("Failed to create FileWrite")
         .execute(
             &json!({
@@ -548,11 +548,11 @@ fn write_then_read_roundtrip() {
 #[test]
 fn backup_created_on_overwrite() {
     let dir = setup();
-    let bd = backup_dir(&dir);
+    let bd = runtimo_core::utils::backup_dir();
     fs::create_dir_all(&bd).ok();
     let target = dir.join("bk.txt");
 
-    FileWrite::new(bd.clone())
+    FileWrite::new()
         .expect("Failed to create FileWrite")
         .execute(
             &json!({
@@ -562,7 +562,7 @@ fn backup_created_on_overwrite() {
         )
         .unwrap();
 
-    let r = FileWrite::new(bd.clone())
+    let r = FileWrite::new()
         .expect("Failed to create FileWrite")
         .execute(
             &json!({
@@ -616,7 +616,7 @@ fn wal_records_jobs() {
 fn dry_run_does_not_write() {
     let dir = setup();
     let target = dir.join("dry.txt");
-    FileWrite::new(backup_dir(&dir))
+    FileWrite::new()
         .expect("Failed to create FileWrite")
         .execute(
             &json!({
@@ -637,9 +637,9 @@ fn dry_run_does_not_write() {
 fn append_mode() {
     let dir = setup();
     let target = dir.join("app.txt");
-    let bw = backup_dir(&dir);
+    let _bw = backup_dir(&dir);
 
-    FileWrite::new(bw.clone())
+    FileWrite::new()
         .expect("Failed to create FileWrite")
         .execute(
             &json!({
@@ -649,7 +649,7 @@ fn append_mode() {
         )
         .unwrap();
 
-    FileWrite::new(bw)
+    FileWrite::new()
         .expect("Failed to create FileWrite")
         .execute(
             &json!({
@@ -672,7 +672,7 @@ fn multiple_jobs_in_sequence() {
     let target = dir.join("seq.txt");
 
     execute_with_telemetry(
-        &FileWrite::new(backup_dir(&dir)).expect("Failed to create FileWrite"),
+        &FileWrite::new().expect("Failed to create FileWrite"),
         &json!({ "path": target.to_str().unwrap(), "content": "seq test" }),
         false,
         &wp,
@@ -717,7 +717,7 @@ fn roundtrip_many_contents() {
 
     for (i, content) in cases.into_iter().enumerate() {
         let target = dir.join(format!("r{}.txt", i));
-        FileWrite::new(backup_dir(&dir))
+        FileWrite::new()
             .expect("Failed to create FileWrite")
             .execute(
                 &json!({
@@ -817,7 +817,7 @@ fn c2_synthetic_registry_enforces_path_security() {
     let dir = setup();
     let mut registry = CapabilityRegistry::new();
     registry.register(FileRead);
-    registry.register(FileWrite::new(backup_dir(&dir)).expect("FileWrite"));
+    registry.register(FileWrite::new().expect("FileWrite"));
     registry.register(GitExec::new(backup_dir(&dir)).expect("GitExec"));
     registry.register(ShellExec);
     registry.register(Kill);
@@ -1066,16 +1066,15 @@ fn c5_concurrent_writes_no_data_loss() {
 
     let dir = setup();
     let target = dir.join("concurrent.txt");
-    let bw = backup_dir(&dir);
+    let bw = runtimo_core::utils::backup_dir();
 
     std::fs::write(&target, "initial").ok();
 
     let t1 = {
         let target = target.clone();
-        let bw = bw.clone();
         thread::spawn(move || {
             for i in 0..5 {
-                FileWrite::new(bw.clone())
+                FileWrite::new()
                     .expect("FileWrite")
                     .execute(
                         &json!({ "path": target.to_str().unwrap(), "content": format!("t1-{}", i) }),
@@ -1088,10 +1087,9 @@ fn c5_concurrent_writes_no_data_loss() {
 
     let t2 = {
         let target = target.clone();
-        let bw = bw.clone();
         thread::spawn(move || {
             for i in 0..5 {
-                FileWrite::new(bw.clone())
+                FileWrite::new()
                     .expect("FileWrite")
                     .execute(
                         &json!({ "path": target.to_str().unwrap(), "content": format!("t2-{}", i) }),
@@ -1483,7 +1481,7 @@ fn test_wal_events_monotonic_sequence() {
 
     execute_with_telemetry(&FileRead, &json!({"path": p.to_str().unwrap()}), false, &wp).unwrap();
 
-    let fw = FileWrite::new(backup_dir(&dir)).unwrap();
+    let fw = FileWrite::new().unwrap();
     execute_with_telemetry(
         &fw,
         &json!({"path": dir.join("seq_out.txt").to_str().unwrap(), "content": "test"}),

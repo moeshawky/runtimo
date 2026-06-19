@@ -24,7 +24,7 @@ fn main() -> anyhow::Result<()> {
 
     // ── Step 1: Write initial content ──────────────────────────────
     println!("=== Step 1: Write initial file ===");
-    let file_write = FileWrite::new(backup_dir.clone()).expect("Failed to create FileWrite");
+    let file_write = FileWrite::new().expect("Failed to create FileWrite");
     let result = execute_with_telemetry(
         &file_write,
         &serde_json::json!({
@@ -58,7 +58,7 @@ fn main() -> anyhow::Result<()> {
 
     // ── Step 2: Overwrite (creates backup automatically) ───────────
     println!("\n=== Step 2: Overwrite file (backup created) ===");
-    let file_write2 = FileWrite::new(backup_dir.clone()).expect("Failed to create FileWrite");
+    let file_write2 = FileWrite::new().expect("Failed to create FileWrite");
     let result2 = execute_with_telemetry(
         &file_write2,
         &serde_json::json!({

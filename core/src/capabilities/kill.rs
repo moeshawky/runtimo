@@ -201,7 +201,11 @@ impl TypedCapability for Kill {
         })
     }
 
-    fn execute(&self, args: KillArgs, ctx: &Context) -> std::result::Result<Output, CapabilityError> {
+    fn execute(
+        &self,
+        args: KillArgs,
+        ctx: &Context,
+    ) -> std::result::Result<Output, CapabilityError> {
         // FINDING #3: Restrict signal to valid POSIX values (1-31, 64)
         if let Some(signal) = args.signal {
             if !(1..=31).contains(&signal) && signal != 64 {
@@ -335,7 +339,14 @@ impl TypedCapability for Kill {
         let mut out = if killed_success {
             Output::ok(message)
         } else {
-            Output::error(message, if success { String::new() } else { stderr_str.clone() })
+            Output::error(
+                message,
+                if success {
+                    String::new()
+                } else {
+                    stderr_str.clone()
+                },
+            )
         };
         out.data = Some(serde_json::json!({
             "pid": args.pid,
@@ -393,7 +404,9 @@ mod tests {
     fn test_kill_protected_pid() {
         let cap = Kill;
         // PID 1 is protected
-        let result = Capability::execute(&cap, &serde_json::json!({ "pid": 1 }),
+        let result = Capability::execute(
+            &cap,
+            &serde_json::json!({ "pid": 1 }),
             &Context {
                 dry_run: false,
                 job_id: "test".into(),
@@ -413,7 +426,9 @@ mod tests {
     fn test_kill_self_protected() {
         let cap = Kill;
         let self_pid = std::process::id();
-        let result = Capability::execute(&cap, &serde_json::json!({ "pid": self_pid }),
+        let result = Capability::execute(
+            &cap,
+            &serde_json::json!({ "pid": self_pid }),
             &Context {
                 dry_run: false,
                 job_id: "test".into(),
@@ -429,7 +444,9 @@ mod tests {
     fn test_kill_nonexistent() {
         let cap = Kill;
         // Use a PID that's very unlikely to exist
-        let result = Capability::execute(&cap, &serde_json::json!({ "pid": 999999 }),
+        let result = Capability::execute(
+            &cap,
+            &serde_json::json!({ "pid": 999999 }),
             &Context {
                 dry_run: false,
                 job_id: "test".into(),
@@ -448,7 +465,9 @@ mod tests {
         // Use a real PID (self) but in dry_run mode — should NOT error as protected
         // because dry_run skips the actual kill but still checks protection
         // Actually, protection check runs before dry_run, so use a non-protected PID
-        let result = Capability::execute(&cap, &serde_json::json!({ "pid": 999998 }),
+        let result = Capability::execute(
+            &cap,
+            &serde_json::json!({ "pid": 999998 }),
             &Context {
                 dry_run: true,
                 job_id: "test".into(),
@@ -499,7 +518,9 @@ mod tests {
 
         // Kill it via the capability using SIGKILL for reliability
         let cap = Kill;
-        let result = Capability::execute(&cap, &serde_json::json!({ "pid": pid, "signal": 9 }),
+        let result = Capability::execute(
+            &cap,
+            &serde_json::json!({ "pid": pid, "signal": 9 }),
             &Context {
                 dry_run: false,
                 job_id: "test".into(),
@@ -562,7 +583,9 @@ mod tests {
     fn test_signal_validation_rejects_negative() {
         // FINDING #3: negative signals should be rejected
         let cap = Kill;
-        let result = Capability::execute(&cap, &serde_json::json!({ "pid": 999998, "signal": -1 }),
+        let result = Capability::execute(
+            &cap,
+            &serde_json::json!({ "pid": 999998, "signal": -1 }),
             &Context {
                 dry_run: false,
                 job_id: "test".into(),
@@ -577,7 +600,9 @@ mod tests {
     fn test_signal_validation_rejects_zero() {
         // FINDING #3: signal 0 should be rejected
         let cap = Kill;
-        let result = Capability::execute(&cap, &serde_json::json!({ "pid": 999998, "signal": 0 }),
+        let result = Capability::execute(
+            &cap,
+            &serde_json::json!({ "pid": 999998, "signal": 0 }),
             &Context {
                 dry_run: false,
                 job_id: "test".into(),
@@ -592,7 +617,9 @@ mod tests {
     fn test_signal_validation_rejects_out_of_range() {
         // FINDING #3: signal > 31 (except 64) should be rejected
         let cap = Kill;
-        let result = Capability::execute(&cap, &serde_json::json!({ "pid": 999998, "signal": 32 }),
+        let result = Capability::execute(
+            &cap,
+            &serde_json::json!({ "pid": 999998, "signal": 32 }),
             &Context {
                 dry_run: false,
                 job_id: "test".into(),
@@ -606,7 +633,9 @@ mod tests {
     fn test_signal_validation_accepts_valid_signals() {
         let cap = Kill;
         for sig in [1, 9, 15, 31, 64] {
-            let result = Capability::execute(&cap, &serde_json::json!({ "pid": 999998, "signal": sig }),
+            let result = Capability::execute(
+                &cap,
+                &serde_json::json!({ "pid": 999998, "signal": sig }),
                 &Context {
                     dry_run: false,
                     job_id: "test".into(),
@@ -630,7 +659,9 @@ mod tests {
     fn test_dry_run_hides_process_info() {
         // FINDING #20: dry-run should NOT expose command or user info
         let cap = Kill;
-        let result = Capability::execute(&cap, &serde_json::json!({ "pid": 999998 }),
+        let result = Capability::execute(
+            &cap,
+            &serde_json::json!({ "pid": 999998 }),
             &Context {
                 dry_run: true,
                 job_id: "test".into(),
@@ -650,7 +681,12 @@ mod tests {
             "dry-run must not expose user"
         );
         assert!(
-            result.data.as_ref().unwrap().get("process_exists").is_none(),
+            result
+                .data
+                .as_ref()
+                .unwrap()
+                .get("process_exists")
+                .is_none(),
             "dry-run must not expose process_exists"
         );
     }

@@ -120,6 +120,9 @@ impl RuntimoConfig {
     /// 1. Built-in defaults
     /// 2. `RUNTIMO_ALLOWED_PATHS` env var
     /// 3. Config file `allowed_paths`
+    ///
+    /// Empty strings are filtered out to prevent matching everything
+    /// via `format!("{}/", "")` which produces `"/"` (N-014).
     #[must_use]
     pub fn get_allowed_prefixes() -> Vec<String> {
         let mut prefixes: Vec<String> = DEFAULT_PREFIXES.iter().map(|s| s.to_string()).collect();
@@ -128,6 +131,9 @@ impl RuntimoConfig {
         if let Ok(env_paths) = std::env::var("RUNTIMO_ALLOWED_PATHS") {
             for p in env_paths.split(':').filter(|s| !s.is_empty()) {
                 let trimmed = p.trim().to_string();
+                if trimmed.is_empty() {
+                    continue;
+                }
                 if !prefixes.contains(&trimmed) {
                     prefixes.push(trimmed);
                 }
@@ -138,6 +144,9 @@ impl RuntimoConfig {
         let config = Self::load();
         for p in &config.allowed_paths {
             let trimmed = p.trim().to_string();
+            if trimmed.is_empty() {
+                continue;
+            }
             if !prefixes.contains(&trimmed) {
                 prefixes.push(trimmed);
             }

@@ -629,6 +629,7 @@ dependencies = [
  "anyhow",
  "libc",
  "llmosafe",
+ "log",
  "proptest",
  "serde",
  "serde_json",

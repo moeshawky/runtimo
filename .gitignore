@@ -50,3 +50,7 @@ runtimo_symlink_test
 
 # Maat audit reports
 .maat/
+
+# Agentic artifacts
+elegantify-report.md
+publishing.md

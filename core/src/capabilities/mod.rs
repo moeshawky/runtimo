@@ -18,5 +18,7 @@ pub use file_read::{FileRead, FileReadArgs};
 pub use file_write::{FileWrite, FileWriteArgs};
 pub use git_exec::{GitExec, GitExecArgs};
 pub use kill::{Kill, KillArgs};
-pub use shell_exec::{is_dangerous_command, is_network_command, network_enabled, ShellExec, ShellExecArgs};
+pub use shell_exec::{
+    is_dangerous_command, is_network_command, network_enabled, ShellExec, ShellExecArgs,
+};
 pub use undo::{Undo, UndoArgs};

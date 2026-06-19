@@ -23,7 +23,7 @@
 //! assert!(schema["required"].as_array().unwrap().contains(&json!("path")));
 //! ```
 
-use crate::capability::{Context, Output, TypedCapability, CapabilityError};
+use crate::capability::{CapabilityError, Context, Output, TypedCapability};
 use crate::validation::path::{validate_path, PathContext};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -78,7 +78,11 @@ impl TypedCapability for FileRead {
         })
     }
 
-    fn execute(&self, args: FileReadArgs, _ctx: &Context) -> std::result::Result<Output, CapabilityError> {
+    fn execute(
+        &self,
+        args: FileReadArgs,
+        _ctx: &Context,
+    ) -> std::result::Result<Output, CapabilityError> {
         let ctx = PathContext {
             require_exists: true,
             require_file: true,
@@ -90,7 +94,9 @@ impl TypedCapability for FileRead {
 
         let max_bytes = args.max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
         if max_bytes == 0 {
-            return Err(CapabilityError::InvalidArgs("max_bytes must be >= 1".into()));
+            return Err(CapabilityError::InvalidArgs(
+                "max_bytes must be >= 1".into(),
+            ));
         }
         if max_bytes > MAX_FILE_SIZE {
             return Err(CapabilityError::InvalidArgs(format!(
@@ -101,8 +107,7 @@ impl TypedCapability for FileRead {
 
         // P0 FIX: Open with O_NOFOLLOW to prevent TOCTOU symlink escape.
         // Open immediately after validation to minimize TOCTOU window.
-        let file = open_file_nofollow(&path)
-            .map_err(CapabilityError::Io)?;
+        let file = open_file_nofollow(&path).map_err(CapabilityError::Io)?;
 
         // P0 FIX: Always use bounded reader (take) regardless of metadata.
         // Prevents TOCTOU size bypass where file grows between stat and read.
@@ -249,12 +254,24 @@ mod tests {
             writeln!(f, "hello world").unwrap();
         }
 
-        let result = TypedCapability::execute(&FileRead, FileReadArgs { path: tmp.to_str().unwrap().to_string(), max_bytes: None }, &test_ctx())
-            .unwrap();
+        let result = TypedCapability::execute(
+            &FileRead,
+            FileReadArgs {
+                path: tmp.to_str().unwrap().to_string(),
+                max_bytes: None,
+            },
+            &test_ctx(),
+        )
+        .unwrap();
 
         assert!(result.status == "ok");
-        let content = result.data.as_ref().and_then(|d| d.get("content"))
-            .and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let content = result
+            .data
+            .as_ref()
+            .and_then(|d| d.get("content"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         assert!(content.contains("hello world"));
         std::fs::remove_file(&tmp).ok();
     }
@@ -262,7 +279,14 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     #[test]
     fn rejects_missing_file() {
-        let result = TypedCapability::execute(&FileRead, FileReadArgs { path: "/tmp/nonexistent_runtimo_test.txt".to_string(), max_bytes: None }, &test_ctx());
+        let result = TypedCapability::execute(
+            &FileRead,
+            FileReadArgs {
+                path: "/tmp/nonexistent_runtimo_test.txt".to_string(),
+                max_bytes: None,
+            },
+            &test_ctx(),
+        );
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("does not exist") || err.contains("not found"),
@@ -273,8 +297,15 @@ mod tests {
 
     #[test]
     fn rejects_empty_path() {
-        assert!(TypedCapability::execute(&FileRead, FileReadArgs { path: String::new(), max_bytes: None }, &test_ctx())
-            .is_err());
+        assert!(TypedCapability::execute(
+            &FileRead,
+            FileReadArgs {
+                path: String::new(),
+                max_bytes: None
+            },
+            &test_ctx()
+        )
+        .is_err());
     }
 
     #[allow(clippy::indexing_slicing)]
@@ -291,24 +322,47 @@ mod tests {
             }
         }
 
-        let result = TypedCapability::execute(&FileRead, FileReadArgs { path: tmp.to_str().unwrap().to_string(), max_bytes: Some(50) }, &test_ctx())
-            .unwrap();
+        let result = TypedCapability::execute(
+            &FileRead,
+            FileReadArgs {
+                path: tmp.to_str().unwrap().to_string(),
+                max_bytes: Some(50),
+            },
+            &test_ctx(),
+        )
+        .unwrap();
 
         assert!(result.status == "ok");
         assert_eq!(
-            result.data.as_ref().and_then(|d| d.get("truncated")).and_then(|v| v.as_bool()),
+            result
+                .data
+                .as_ref()
+                .and_then(|d| d.get("truncated"))
+                .and_then(|v| v.as_bool()),
             Some(true)
         );
         assert!(
-            result.data.as_ref().and_then(|d| d.get("bytes_read")).and_then(|v| v.as_u64())
-                .unwrap_or(9999) <= 50
+            result
+                .data
+                .as_ref()
+                .and_then(|d| d.get("bytes_read"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(9999)
+                <= 50
         );
         std::fs::remove_file(&tmp).ok();
     }
 
     #[test]
     fn test_max_bytes_rejects_exceeding_limit() {
-        let result = TypedCapability::execute(&FileRead, FileReadArgs { path: "/etc/hosts".to_string(), max_bytes: Some(9999999999u64) }, &test_ctx());
+        let result = TypedCapability::execute(
+            &FileRead,
+            FileReadArgs {
+                path: "/etc/hosts".to_string(),
+                max_bytes: Some(9999999999u64),
+            },
+            &test_ctx(),
+        );
         assert!(result.is_err());
     }
 
@@ -319,12 +373,23 @@ mod tests {
         tmp.push("runtimo_test_default_max.txt");
         std::fs::write(&tmp, "small content").unwrap();
 
-        let result = TypedCapability::execute(&FileRead, FileReadArgs { path: tmp.to_str().unwrap().to_string(), max_bytes: None }, &test_ctx())
-            .unwrap();
+        let result = TypedCapability::execute(
+            &FileRead,
+            FileReadArgs {
+                path: tmp.to_str().unwrap().to_string(),
+                max_bytes: None,
+            },
+            &test_ctx(),
+        )
+        .unwrap();
 
         assert!(result.status == "ok");
         assert_eq!(
-            result.data.as_ref().and_then(|d| d.get("truncated")).and_then(|v| v.as_bool()),
+            result
+                .data
+                .as_ref()
+                .and_then(|d| d.get("truncated"))
+                .and_then(|v| v.as_bool()),
             Some(false)
         );
         std::fs::remove_file(&tmp).ok();
@@ -337,21 +402,39 @@ mod tests {
         tmp.push("runtimo_test_agent.json");
         std::fs::write(&tmp, r#"{"key": "value", "nested": {"a": 1}}"#).unwrap();
 
-        let result = TypedCapability::execute(&FileRead, FileReadArgs { path: tmp.to_str().unwrap().to_string(), max_bytes: None }, &test_ctx())
-            .unwrap();
+        let result = TypedCapability::execute(
+            &FileRead,
+            FileReadArgs {
+                path: tmp.to_str().unwrap().to_string(),
+                max_bytes: None,
+            },
+            &test_ctx(),
+        )
+        .unwrap();
 
         assert!(result.status == "ok");
         let data = result.data.as_ref().unwrap();
         assert!(data.get("content").unwrap().is_object());
         assert_eq!(
-            data.get("content").unwrap().get("key").and_then(|v| v.as_str()),
+            data.get("content")
+                .unwrap()
+                .get("key")
+                .and_then(|v| v.as_str()),
             Some("value")
         );
         assert_eq!(
-            data.get("content").unwrap().get("nested").unwrap().get("a").and_then(|v| v.as_u64()),
+            data.get("content")
+                .unwrap()
+                .get("nested")
+                .unwrap()
+                .get("a")
+                .and_then(|v| v.as_u64()),
             Some(1)
         );
-        assert_eq!(data.get("content_type").and_then(|v| v.as_str()), Some("json"));
+        assert_eq!(
+            data.get("content_type").and_then(|v| v.as_str()),
+            Some("json")
+        );
         std::fs::remove_file(&tmp).ok();
     }
 
@@ -361,12 +444,22 @@ mod tests {
         tmp.push("runtimo_test_binary.bin");
         std::fs::write(&tmp, b"hello\x00world").unwrap();
 
-        let result = TypedCapability::execute(&FileRead, FileReadArgs { path: tmp.to_str().unwrap().to_string(), max_bytes: None }, &test_ctx())
-            .unwrap();
+        let result = TypedCapability::execute(
+            &FileRead,
+            FileReadArgs {
+                path: tmp.to_str().unwrap().to_string(),
+                max_bytes: None,
+            },
+            &test_ctx(),
+        )
+        .unwrap();
 
         assert!(result.status == "ok");
         let data = result.data.as_ref().unwrap();
-        assert_eq!(data.get("content_type").and_then(|v| v.as_str()), Some("binary"));
+        assert_eq!(
+            data.get("content_type").and_then(|v| v.as_str()),
+            Some("binary")
+        );
         assert_eq!(data.get("bytes_read").and_then(|v| v.as_u64()), Some(11));
         std::fs::remove_file(&tmp).ok();
     }
@@ -379,12 +472,23 @@ mod tests {
         tmp.push("runtimo_test_utf8.txt");
         std::fs::write(&tmp, b"caf\xc3\xa9").unwrap();
 
-        let result = TypedCapability::execute(&FileRead, FileReadArgs { path: tmp.to_str().unwrap().to_string(), max_bytes: Some(4) }, &test_ctx())
-            .unwrap();
+        let result = TypedCapability::execute(
+            &FileRead,
+            FileReadArgs {
+                path: tmp.to_str().unwrap().to_string(),
+                max_bytes: Some(4),
+            },
+            &test_ctx(),
+        )
+        .unwrap();
 
         assert!(result.status == "ok");
-        let content = result.data.as_ref().and_then(|d| d.get("content"))
-            .and_then(|v| v.as_str()).unwrap_or("");
+        let content = result
+            .data
+            .as_ref()
+            .and_then(|d| d.get("content"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         assert_eq!(content, "caf");
         std::fs::remove_file(&tmp).ok();
     }
@@ -396,12 +500,26 @@ mod tests {
         // UTF-8: "café\n" = 6 bytes (é is 2 bytes)
         std::fs::write(&tmp, "café\n").unwrap();
 
-        let result = TypedCapability::execute(&FileRead, FileReadArgs { path: tmp.to_str().unwrap().to_string(), max_bytes: None }, &test_ctx())
-            .unwrap();
+        let result = TypedCapability::execute(
+            &FileRead,
+            FileReadArgs {
+                path: tmp.to_str().unwrap().to_string(),
+                max_bytes: None,
+            },
+            &test_ctx(),
+        )
+        .unwrap();
 
         assert!(result.status == "ok");
         // bytes_read should be 6 (raw file bytes), not String::len() which is 5
-        assert_eq!(result.data.as_ref().and_then(|d| d.get("bytes_read")).and_then(|v| v.as_u64()), Some(6));
+        assert_eq!(
+            result
+                .data
+                .as_ref()
+                .and_then(|d| d.get("bytes_read"))
+                .and_then(|v| v.as_u64()),
+            Some(6)
+        );
         std::fs::remove_file(&tmp).ok();
     }
 
@@ -413,7 +531,14 @@ mod tests {
         {
             use std::os::unix::fs::symlink;
             if symlink("/etc/hostname", &link_path).is_ok() {
-                let result = TypedCapability::execute(&FileRead, FileReadArgs { path: link_path.to_str().unwrap().to_string(), max_bytes: None }, &test_ctx());
+                let result = TypedCapability::execute(
+                    &FileRead,
+                    FileReadArgs {
+                        path: link_path.to_str().unwrap().to_string(),
+                        max_bytes: None,
+                    },
+                    &test_ctx(),
+                );
                 assert!(result.is_err(), "symlink should be rejected by O_NOFOLLOW");
                 std::fs::remove_file(&link_path).ok();
             }

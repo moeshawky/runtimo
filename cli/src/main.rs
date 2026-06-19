@@ -58,7 +58,7 @@ enum Commands {
         quiet: bool,
         #[arg(long)]
         schema: bool,
-        #[arg(long, default_value = "30")]
+        #[arg(long, default_value = "30", value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout: u64,
     },
     /// Dispatch job to background daemon (returns immediately)
@@ -205,9 +205,7 @@ fn backup_dir() -> PathBuf {
 fn make_registry() -> Result<CapabilityRegistry, String> {
     let mut reg = CapabilityRegistry::new();
     reg.register(FileRead);
-    reg.register(
-        FileWrite::new(backup_dir()).map_err(|e| format!("FileWrite init failed: {}", e))?,
-    );
+    reg.register(FileWrite::new().map_err(|e| format!("FileWrite init failed: {}", e))?);
     reg.register(GitExec::new(backup_dir()).map_err(|e| format!("GitExec init failed: {}", e))?);
     reg.register(ShellExec);
     reg.register(Kill);
@@ -1336,7 +1334,7 @@ mod tests {
     #[test]
     fn test_acquire_daemon_lock_creates_file() {
         let _guard = CLI_SLOT_MUTEX.lock().unwrap(); // serialize env var access
-        // Override XDG_DATA_HOME to use temp dir
+                                                     // Override XDG_DATA_HOME to use temp dir
         let tmp = std::env::temp_dir().join("runtimo_cli_lock_test");
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::set_var("XDG_DATA_HOME", &tmp);

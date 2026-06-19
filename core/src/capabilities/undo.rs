@@ -16,8 +16,8 @@
 //! ).unwrap();
 //! ```
 
-use crate::validation::path::{validate_path, PathContext};
 use crate::capability::{CapabilityError, Context, Output, TypedCapability};
+use crate::validation::path::{validate_path, PathContext};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -62,7 +62,11 @@ impl TypedCapability for Undo {
         })
     }
 
-    fn execute(&self, args: UndoArgs, ctx: &Context) -> std::result::Result<Output, CapabilityError> {
+    fn execute(
+        &self,
+        args: UndoArgs,
+        ctx: &Context,
+    ) -> std::result::Result<Output, CapabilityError> {
         if args.job_id.is_empty() {
             return Err(CapabilityError::InvalidArgs("job_id is empty".into()));
         }
@@ -150,7 +154,10 @@ impl TypedCapability for Undo {
                     };
                     let target_path = validate_path(&target_path.to_string_lossy(), &restore_ctx)
                         .map_err(|e| {
-                        CapabilityError::PermissionDenied(format!("restore target validation: {}", e))
+                        CapabilityError::PermissionDenied(format!(
+                            "restore target validation: {}",
+                            e
+                        ))
                     })?;
 
                     if ctx.dry_run {
@@ -160,7 +167,8 @@ impl TypedCapability for Undo {
                             target_path.display()
                         ));
                     } else {
-                        backup_mgr.restore(&backup_path, &target_path)
+                        backup_mgr
+                            .restore(&backup_path, &target_path)
                             .map_err(|e| CapabilityError::Internal(e.to_string()))?;
                         restored.push(format!(
                             "{} -> {}",
@@ -264,9 +272,16 @@ mod tests {
 
         assert!(result.is_ok(), "undo failed: {:?}", result.err());
         let output = result.unwrap();
-        assert_eq!(output.status, "ok", "undo not successful: {:?}", output.output);
+        assert_eq!(
+            output.status, "ok",
+            "undo not successful: {:?}",
+            output.output
+        );
         assert!(
-            !output.data.as_ref().unwrap()["restored"].as_array().unwrap().is_empty(),
+            !output.data.as_ref().unwrap()["restored"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
             "no files restored"
         );
 
@@ -299,7 +314,11 @@ mod tests {
         };
 
         // Try to undo a job that has no backup
-        let result = Capability::execute(&cap, &serde_json::json!({"job_id": "nonexistent-job-xyz"}), &ctx);
+        let result = Capability::execute(
+            &cap,
+            &serde_json::json!({"job_id": "nonexistent-job-xyz"}),
+            &ctx,
+        );
         assert!(result.is_err(), "Should error on missing backup");
         let err = result.unwrap_err().to_string();
         assert!(
@@ -316,7 +335,12 @@ mod tests {
     fn test_undo_missing_job_id_validation() {
         // GAP 7: empty job_id should be rejected by execute
         let cap = Undo;
-        let result = TypedCapability::execute(&cap, UndoArgs { job_id: String::new(), file: None },
+        let result = TypedCapability::execute(
+            &cap,
+            UndoArgs {
+                job_id: String::new(),
+                file: None,
+            },
             &Context {
                 dry_run: false,
                 job_id: "test".into(),
@@ -433,7 +457,9 @@ mod tests {
         assert!(result.is_ok(), "undo multi-file failed: {:?}", result.err());
         let output = result.unwrap();
         assert_eq!(output.status, "ok");
-        let restored = output.data.as_ref().unwrap()["restored"].as_array().unwrap();
+        let restored = output.data.as_ref().unwrap()["restored"]
+            .as_array()
+            .unwrap();
         assert!(
             restored.len() >= 2,
             "Should restore at least 2 files, got {}: {:?}",

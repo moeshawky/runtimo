@@ -31,6 +31,7 @@
 use crate::processes::ProcessSummary;
 use crate::telemetry::Telemetry;
 use crate::Result;
+
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -469,8 +470,8 @@ impl WalWriter {
             let new = Self::rotation_path(path, i + 1);
             if old.exists() {
                 if let Err(e) = std::fs::rename(&old, &new) {
-                    eprintln!(
-                        "[runtimo] WAL rotation failed: {} -> {}: {}",
+                    log::error!(
+                        "WAL rotation shift failed: {} -> {}: {}",
                         old.display(),
                         new.display(),
                         e
@@ -492,11 +493,7 @@ impl WalWriter {
         let oldest = Self::rotation_path(path, max_rotations + 1);
         if oldest.exists() {
             if let Err(e) = std::fs::remove_file(&oldest) {
-                eprintln!(
-                    "[runtimo] WAL cleanup failed: {}: {}",
-                    oldest.display(),
-                    e
-                );
+                log::error!("WAL cleanup failed: {}: {}", oldest.display(), e);
             }
         }
 
