@@ -5,7 +5,29 @@ All notable changes to Runtimo are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.7.1] - 2026-06-17
+## [0.7.1] - 2026-06-19
+
+### Security
+
+- **ShellExec blocklist hardening** — multi-layer defense added: (1) detokenized blocklist now normalizes shell quoting AND backslash escapes before matching; (2) regex patterns catch `rm -rf /`, `rm --recursive`, `rm -r --no-preserve-root` regardless of flag order and intervening path quoting; (3) system power commands (`shutdown`, `reboot`, `halt`, `poweroff`) blocked; (4) additional dangerous commands blocked: `chown`, `chgrp`, `mount`, `umount`, `iptables`, `nft`, `killall`, fork bombs (`:(){`), env dumpers (`env`, `printenv`). (`core/src/capabilities/shell_exec.rs`)
+- **ShellExec quoting bypass detection** — `r"m"`, `$'rm'`, backslash-escaped variants all normalized before blocklist check. The catastrophic `rm -rf /` bypass chain from the 2026-05 session is permanently closed. (`core/src/capabilities/shell_exec.rs`)
+- **ShellExec PATH sanitization** — forced `PATH=/usr/local/bin:/usr/bin:/bin` before spawn, preventing environment-based PATH hijack. (`core/src/capabilities/shell_exec.rs`)
+- **ShellExec network gating** — network tools (`curl`, `wget`, `nc`, `ssh`, `scp`, `telnet`, `socat`) blocked by default in ShellExec. Opt-in via `RUNTIMO_ENABLE_NETWORK=1`. (`core/src/capabilities/shell_exec.rs`)
+- **Dispatch pre-validation (F-003)** — arguments now validated at dispatch time (early `serde_json::from_value` deserialization) before reaching the daemon. Dangerous commands caught at the CLI, not the server. (`daemon/src/dispatch.rs`)
+- **FileWrite .env denylist (F-006)** — `.env` and `.env.*` files now blocked via existing `CRITICAL_FILES` denylist, preventing credential file overwrite. (`core/src/capabilities/file_write.rs`)
+- **Path validation hardening (N-002, N-003)** — `~` and `$HOME` expansions now rejected in file paths. `/home` no longer a default allowed prefix. CWD fallback removed — paths are validated against explicit allowed prefixes only. (`core/src/validation/path.rs`)
+
+### Added
+
+- **TypedCapability<A> trait** — type-safe capability execution with associated `Args` type. Blanket `impl<T: TypedCapability> Capability for T` bridges to untyped `&dyn Capability` dispatch, so both paths coexist. Each capability now defines its own args struct (`FileReadArgs`, `FileWriteArgs`, `ShellExecArgs`, etc.) validated at deserialization time. (`core/src/capability.rs`)
+- **CmdError struct** — structured error type for command execution failures: `exit_code`, `signal`, `stderr`, `timed_out`, `was_killed`, `truncated`. (`core/src/capability.rs`)
+- **CapabilityError enum** — `Blocked(reason)`, `Failed(reason)`, `Timeout(reason)`, `Io(io::Error)` variants for typed capability errors. (`core/src/capability.rs`)
+- **Capability::description() trait method** — each capability now returns a one-line human-readable description for CLI `list` and `--help` output. (`core/src/capability.rs`)
+
+### Changed
+
+- **FileWrite::new() no longer takes backup_dir (ADR-C28)** — backup directory now derived automatically from `data_dir()`. All call sites updated (daemon, tests, examples). (`core/src/capabilities/file_write.rs`, `daemon/src/engine.rs`)
+- **Daemon engine.rs decomposed** — 1674-line module split into `rpc.rs` (JSON-RPC protocol), `jobs.rs` (job lifecycle), `auth.rs` (session management), `config.rs` (persistent config), and `dispatch.rs` (pre-validation + routing). (`daemon/src/engine.rs`, `daemon/src/rpc.rs`, `daemon/src/jobs.rs`, `daemon/src/auth.rs`, `daemon/src/config.rs`)
 
 ### Fixed
 
@@ -21,6 +43,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **sift_observation padding removed** — injected text triggered `BiasHaloDetected`
   in llmosafe's content classifier regardless of neutrality. Non-high-risk inputs
   now pass only the capability description. (`executor.rs`)
+- **WAL error logging (C9, C10)** — `let _ =` silent drops in rotation/cleanup replaced with `log::error!` for observability. WAL failures no longer invisible. (`core/src/wal.rs`)
+- **Dead validate() call removed (C24)** — executor no longer calls `Capability::validate()` redundantly after the blanket TypedCapability impl handles it during deserialization. (`core/src/executor.rs`)
+- **Telemetry run_cmd() returns Result** — command execution errors now propagated instead of silently swallowed. (`core/src/telemetry.rs`)
 
 ## [0.7.0] - 2026-06-15
 
