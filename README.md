@@ -16,7 +16,7 @@ Runtimo is a Rust workspace providing a **capability execution engine**. Every c
 - **Backup/undo** — Files backed up before mutation, rollback by job ID
 - **Input validation** — Capabilities validate arguments including path traversal, symlink, and null byte protection
 
-**Version:** 0.7.1 | **Rust Edition:** 2021 | **Tests:** 344
+**Version:** 0.7.1 | **Rust Edition:** 2021 | **Tests:** 436
 
 ## Quick Start
 
@@ -132,7 +132,7 @@ Write file content with backup-before-mutate for undo support. Appends supported
 | `content` | string | yes |
 | `append` | boolean | no |
 
-**Limit:** 100 MB max content. 100 MB max cumulative file size for append. 10 MB minimum free disk required. Critical files (`.bashrc`, `.ssh/authorized_keys`, etc.) blocked.
+**Limit:** 100 MB max content. 100 MB max cumulative file size for append. 10 MB minimum free disk required. Critical files blocked (`.env`, `.env.*`, `.bashrc`, `.ssh/authorized_keys`, etc.).
 
 ```bash
 runtimo run -c FileWrite -a '{"path":"/tmp/out.txt","content":"hello"}'
@@ -141,21 +141,33 @@ runtimo run -c FileWrite -a '{"path":"/tmp/log.txt","content":"\nline 2","append
 
 ### ShellExec
 
-Execute shell commands via `sh -c`. Supports pipes, redirects, chaining, variables. Enforces timeout and dangerous command blocklist.
+Execute shell commands via `sh -c`. Supports pipes, redirects, chaining, variables. Enforces timeout and multi-layer dangerous command blocklist with quoting-bypass detection.
 
 | Field | Type | Required? |
 |-------|------|-----------|
 | `cmd` | string | yes |
 | `timeout_secs` | integer (1–300) | no |
-| `cwd` | string | no |
-| `stdin` | string | no |
 
-**Guardrails:** Blocks `mkfs`, `fdisk`, `dd`, `shutdown`, `reboot`, `poweroff`, `rm -rf /`, `rm --recursive`, `rm --no-preserve-root`, `chmod 777 /`. Timeout default 30s, max 300s. Kills all child processes on timeout. Output capped at 10 MB.
+**Multi-layer security:**
+| Layer | What it blocks |
+|-------|----------------|
+| **Detokenized blocklist** | `rm`, `shred`, `mkfs`, `fdisk`, `dd`, `shutdown`, `reboot`, `halt`, `poweroff`, `chown`, `chgrp`, `mount`, `umount`, `iptables`, `nft`, `chmod`, `killall`, fork bombs (`:(){`), env dumpers |
+| **Quoting bypass** | Normalizes `r"m"`, `$'rm'`, backslash escapes before blocklist check |
+| **Regex patterns** | Catches `rm -rf /`, `rm --recursive /`, `rm -r --no-preserve-root` regardless of flag order |
+| **PATH sanitization** | Forced `PATH=/usr/local/bin:/usr/bin:/bin` before spawn |
+| **Network gating** | `curl`, `wget`, `nc`, `ssh`, etc. blocked — opt-in via `RUNTIMO_ENABLE_NETWORK=1` |
+| **Process isolation** | Process group, `SIGKILL` fallback on timeout (default 30s, max 300s), PID tracking |
+| **Output caps** | Stdout/stderr capped at 10 MB |
 
 ```bash
 runtimo run -c ShellExec -a '{"cmd":"uptime"}'
 runtimo run -c ShellExec -a '{"cmd":"ls | head -5"}'
 runtimo run -c ShellExec -a '{"cmd":"echo hi && whoami"}'
+
+# These are all blocked — no execution happens:
+runtimo run -c ShellExec -a '{"cmd":"rm -rf /"}'
+runtimo run -c ShellExec -a "{\"cmd\":\"r\\\"m\\\" -rf /\"}"  # quoting bypass
+# → blocked: dangerous command blocked: rm command blocked
 ```
 
 ### Undo
@@ -325,6 +337,7 @@ cargo clippy --all-targets          # zero warnings required
 | `XDG_CONFIG_HOME` | `~/.config` | Config file location (`runtimo/config.toml`) |
 | `XDG_DATA_HOME` | `~/.local/share` | Default WAL/backup/session root |
 | `RUNTIMO_ENABLE_PUBLIC_IP` | (unset) | Set to `1` to enable public IP discovery in telemetry |
+| `RUNTIMO_ENABLE_NETWORK` | (unset) | Set to `1` to allow outbound network tools (curl, wget, ssh, etc.) in ShellExec |
 | `RUNTIMO_DAL` | (unset) | Data access layer configuration (future) |
 | `RUNTIMO_STATE_DIR` | `$XDG_DATA_HOME/runtimo` | Override state directory for WAL/backups/sessions |
 | `RUNTIMO_ENABLE_NETWORK` | (unset) | Set to `1` to allow outbound network tools (curl, wget, etc.) in ShellExec |

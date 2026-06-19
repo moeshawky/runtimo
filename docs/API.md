@@ -1,7 +1,7 @@
 # Runtimo Core API Reference
 
 **Version:** 0.7.1
-**Updated:** 2026-05-28
+**Updated:** 2026-06-19
 **Documentation:** [docs.rs/runtimo-core](https://docs.rs/runtimo-core/0.7.1)
 
 ## Quick Links
@@ -22,8 +22,8 @@ pub trait Capability {
     /// Unique identifier for this capability
     fn name(&self) -> &'static str;
     
-    /// JSON Schema for argument validation
-    fn schema(&self) -> &'static str;
+    /// JSON Schema for argument validation (returns raw JSON Value)
+    fn schema(&self) -> Value;
     
     /// Validate arguments against schema
     fn validate(&self, args: &Value) -> Result<()>;
@@ -32,6 +32,10 @@ pub trait Capability {
     fn execute(&self, args: &Value, ctx: &Context) -> Result<Output>;
 }
 ```
+
+> **New in 0.7.1:** The blanket `impl<T: TypedCapability> Capability for T` bridges
+> type-safe capability implementations to the untyped `Capability` trait. See
+> [`TypedCapability`](#typedcapability) below.
 
 ### Context
 
@@ -54,6 +58,51 @@ pub struct Output {
     pub success: bool,
     pub data: Value,
     pub message: Option<String>,
+}
+```
+
+### TypedCapability (since 0.7.1)
+
+Type-safe capability trait — each capability defines a typed `Args` struct and implements
+`TypedCapability`. A blanket `impl<T: TypedCapability> Capability for T` bridges
+to the untyped `Capability` trait, so `&dyn Capability` dynamic dispatch still works.
+
+```rust
+pub trait TypedCapability {
+    type Args: DeserializeOwned;
+
+    fn name(&self) -> &'static str;
+    fn description(&self) -> &'static str;
+    fn schema(&self) -> Value;
+    fn validate(&self, args: &Value) -> Result<()>;
+
+    /// Execute with deserialized args. The blanket impl deserializes Value → Self::Args
+    /// before calling this method. Direct callers get compile-time type safety.
+    fn execute(&self, args: Self::Args, ctx: &Context) -> Result<Output>;
+}
+```
+
+### CmdError / CapabilityError (since 0.7.1)
+
+Structured error types for command execution and capability operations:
+
+```rust
+/// Error from executing an external command
+pub struct CmdError {
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    pub stderr: String,
+    pub timed_out: bool,
+    pub was_killed: bool,
+    pub truncated: bool,
+}
+
+/// Error returned by capability operations
+pub enum CapabilityError {
+    Blocked(String),   // operation blocked by security policy
+    Failed(String),    // operation failed with reason
+    Timeout(String),   // operation timed out
+    Io(std::io::Error),
 }
 ```
 
@@ -120,19 +169,114 @@ println!("Content: {}", result.output.data["content"]);
 - Supports append mode
 - Undo support via `BackupManager`
 
-**Example:**
+**Security:**
+- `.env`, `.env.*` files blocked via `CRITICAL_FILES` denylist — prevents credential overwrite
+- Path validation: no `..` traversal, no null bytes, no symlink escape, no `~`/`$HOME` expansion
+- Backup created *before* mutation — failed writes leave recoverable state
+- Backup directory automatically derived from `data_dir()` (no external config needed)
+
+**API (since 0.7.1):**
 ```rust
 use runtimo_core::{FileWrite, Capability, execute_with_telemetry};
 use serde_json::json;
 use std::path::Path;
 
-let cap = FileWrite;
+// FileWrite::new() derives backup_dir from data_dir() automatically
+// — no more passing backup_dir as a parameter (ADR-C28)
+let cap = FileWrite::new()?;
 let args = json!({
     "path": "/tmp/hello.txt",
     "content": "hello runtimo"
 });
 let result = execute_with_telemetry(&cap, &args, false, Path::new("/tmp/wal.jsonl"))?;
 ```
+
+### ShellExec (← since 0.7.1)
+
+**Purpose:** Execute shell commands via `sh -c` with timeout, isolation, and audit trail
+
+**Schema:**
+```json
+{
+  "type": "object",
+  "properties": {
+    "cmd": { "type": "string" },
+    "timeout_secs": { "type": "integer" }
+  },
+  "required": ["cmd"]
+}
+```
+
+> The `cmd` field also accepts `command` as a serde alias.
+
+**Security (multi-layer defense):**
+
+| Layer | Protection |
+|-------|-----------|
+| **Detokenized blocklist** | Normalizes shell quoting and escapes before matching. Blocks: `rm`, `shred`, `mkfs`, `fdisk`, `dd`, `shutdown`, `reboot`, `halt`, `poweroff`, `chown`, `chgrp`, `mount`, `umount`, `iptables`, `nft`, `chmod`, `killall`, fork bombs (`:(){`), env dumpers (`env`, `printenv`) |
+| **Regex patterns** | Catches `rm -rf /`, `rm --recursive`, `rm -r --no-preserve-root` and variants regardless of intermediate flags and path quoting |
+| **PATH sanitization** | Forced `PATH=/usr/local/bin:/usr/bin:/bin` before spawn |
+| **Network gating** | `curl`, `wget`, `nc`, `ssh`, `scp`, `telnet`, `socat` blocked by default — gated behind `RUNTIMO_ENABLE_NETWORK=1` |
+| **Process isolation** | Process group created, timeout with `SIGKILL` fallback, PID tracked |
+| **Audit trail** | Full command, stdout, stderr, exit code logged to WAL (debug builds) |
+
+> **Testing:** Blocklist tests are run inside Docker/Podman containers with `--rm`. Never test destructive payloads against the real filesystem. See the ShellExec Adversarial Testing Protocol in AGENTS.md.
+
+**Example:**
+```bash
+runtimo run -c ShellExec -a '{"cmd":"echo hello && whoami"}'
+# → {"cmd":"echo hello && whoami","exit_code":0,"stdout":"hello\nuser\n",...}
+```
+
+**Blocked example:**
+```bash
+runtimo run -c ShellExec -a '{"cmd":"rm -rf /"}'
+# → blocked: dangerous command blocked: rm command blocked — use FileWrite/Undo capability
+```
+
+### GitExec
+
+**Purpose:** Git operations with validation, state tracking, and SSRF protection
+
+**Schema:**
+```json
+{
+  "type": "object",
+  "properties": {
+    "operation": { "enum": ["clone", "pull", "commit", "revert", "clean", "status"] },
+    "path": { "type": "string" },
+    "url": { "type": "string" },
+    "branch": { "type": "string" },
+    "message": { "type": "string" }
+  },
+  "required": ["operation", "path"]
+}
+```
+
+**Security:**
+- Branch name validation: rejects `--` prefixes, `refs/` injection, whitespace, metacharacters
+- URL validation: SSRF-blocked (localhost, private IPs, file://, git:// internal)
+- Secret detection: scans staged diffs for credential patterns
+- Undo via backup: pre-mutation snapshot for revert operations
+
+### Kill
+
+**Purpose:** Terminate process by PID with protected-process list
+
+**Schema:**
+```json
+{
+  "type": "object",
+  "properties": {
+    "pid": { "type": "integer" },
+    "signal": { "type": "integer" }
+  },
+  "required": ["pid"]
+}
+```
+
+**Protected processes:** init (1), kthreadd (2), self, parent, session/group leaders, systemd services.
+Valid signals: 1–31, SIGRTMIN (64).
 
 ## Telemetry
 
@@ -411,6 +555,7 @@ pub enum Error {
     ExecutionFailed(String),
     WalError(String),
     BackupError(String),
+    SessionError(String),
     ResourceLimitExceeded(String),
     TelemetryError(String),
 }
@@ -451,6 +596,25 @@ Execute a capability:
 runtimo run -c FileRead -a '{"path":"/etc/hostname"}'
 runtimo run -c FileWrite -a '{"path":"/tmp/test.txt","content":"test"}' --dry-run
 ```
+
+### runtimo dispatch (since 0.7.1)
+
+Dispatch a job to the background daemon for async execution.
+**Pre-validation:** Arguments are validated at dispatch time — dangerous commands
+are blocked before they reach the daemon (F-003).
+
+```bash
+# Dispatch a long-running shell command
+runtimo dispatch -c ShellExec -a '{"cmd":"sleep 30"}'
+
+# Dispatch with dry-run (validate only, don't enqueue)
+runtimo dispatch -c FileWrite -a '{"path":"/tmp/x.txt","content":"bg"}' --dry-run
+
+# Wait for a dispatched job
+runtimo wait -j <job_id>
+```
+
+See `runtimo dispatch --help` for full options.
 
 ### runtimo list
 

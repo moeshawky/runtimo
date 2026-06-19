@@ -1,7 +1,7 @@
 # Getting Started with Runtimo
 
 **Version:** 0.7.1
-**Last Updated:** 2026-05-28
+**Last Updated:** 2026-06-19
 
 This guide walks you through using Runtimo for the first time. By the end, you'll have executed capabilities with full telemetry, process tracking, and crash recovery.
 
@@ -18,15 +18,18 @@ This guide walks you through using Runtimo for the first time. By the end, you'l
 ```bash
 git clone https://github.com/your-org/runtimo.git
 cd runtimo
-cargo build
+cargo build --release
 ```
+
+The release binary is at `./target/release/runtimo`. For debug builds, use `cargo build`
+and find the binary at `./target/release/runtimo`.
 
 ### From Cargo
 
 ```bash
 # Add to your Cargo.toml
 [dependencies]
-runtimo-core = "0.1"
+runtimo-core = "0.7"
 ```
 
 ## Quick Start (5 Minutes)
@@ -46,24 +49,23 @@ Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.2s
 ### Step 2: List Available Capabilities
 
 ```bash
-./target/debug/runtimo list
+./target/release/runtimo list
 ```
 
 **Expected output:**
 ```
-Available capabilities:
-  - FileRead
-  - FileWrite
-  - ShellExec
-  - Kill
-  - GitExec
-  - Undo
+      FileRead  read file. path validated. no dirs, no traversal.
+     ShellExec  execute shell command via sh -c with timeout, audit trail, detokenized blocklist, path restrictions, env sanitization, and PID tracking. blocks: rm, shred, mkfs, fdisk, dd, shutdown, chown, chmod, kill, mount, iptables, interpreters (opt-in), network tools (opt-in), fork bombs, env dumpers.
+       GitExec  git operations: clone, pull, commit, revert, clean, status. state tracking (sha, branch, remote), SSRF-blocked URLs, secret detection, timeout, undo via backup.
+          Kill  terminate process by PID with PID reuse protection. protected: init (1), kthreadd (2), self, parent, session/group leaders, systemd services. signals: 1-31, 64 (SIGRTMIN).
+          Undo  restore from backup. use `runtimo logs` for job IDs.
+     FileWrite  write file. auto-backup for undo. append ok.
 ```
 
 ### Step 3: View System Telemetry
 
 ```bash
-./target/debug/runtimo telemetry
+./target/release/runtimo telemetry
 ```
 
 **Expected output:**
@@ -99,7 +101,7 @@ Tunnel: running
 ### Step 4: View Process Snapshot
 
 ```bash
-./target/debug/runtimo processes
+./target/release/runtimo processes
 ```
 
 **Expected output:**
@@ -131,7 +133,7 @@ Top Memory: python3 (1.4%)
 ### Step 5: Read a File
 
 ```bash
-./target/debug/runtimo run -c FileRead -a '{"path":"/etc/hostname"}'
+./target/release/runtimo run -c FileRead -a '{"path":"/etc/hostname"}'
 ```
 
 **Expected output:**
@@ -160,7 +162,7 @@ Top Memory: python3 (1.4%)
 ### Step 6: Write a File
 
 ```bash
-./target/debug/runtimo run -c FileWrite -a '{"path":"/tmp/hello.txt","content":"hello runtimo"}'
+./target/release/runtimo run -c FileWrite -a '{"path":"/tmp/hello.txt","content":"hello runtimo"}'
 ```
 
 **Expected output:**
@@ -183,7 +185,7 @@ Top Memory: python3 (1.4%)
 ### Step 6b: Execute a Shell Command
 
 ```bash
-./target/debug/runtimo run -c ShellExec -a '{"cmd":"echo hello && whoami"}'
+./target/release/runtimo run -c ShellExec -a '{"cmd":"echo hello && whoami"}'
 ```
 
 **Expected output:**
@@ -209,7 +211,7 @@ Top Memory: python3 (1.4%)
 ### Step 7: Verify the File
 
 ```bash
-./target/debug/runtimo run -c FileRead -a '{"path":"/tmp/hello.txt"}'
+./target/release/runtimo run -c FileRead -a '{"path":"/tmp/hello.txt"}'
 ```
 
 **Expected output:**
@@ -226,7 +228,7 @@ Top Memory: python3 (1.4%)
 ### Step 8: Dry Run (Validate Without Executing)
 
 ```bash
-./target/debug/runtimo run -c FileWrite -a '{"path":"/tmp/test.txt","content":"test"}' --dry-run
+./target/release/runtimo run -c FileWrite -a '{"path":"/tmp/test.txt","content":"test"}' --dry-run
 ```
 
 **Expected output:**
@@ -250,7 +252,7 @@ Top Memory: python3 (1.4%)
 ### Step 9: View WAL Logs
 
 ```bash
-./target/debug/runtimo logs
+./target/release/runtimo logs
 ```
 
 **Expected output:**
@@ -271,15 +273,61 @@ Top Memory: python3 (1.4%)
 
 ```bash
 # First, overwrite a file
-./target/debug/runtimo run -c FileWrite -a '{"path":"/tmp/test.txt","content":"new content"}'
+./target/release/runtimo run -c FileWrite -a '{"path":"/tmp/test.txt","content":"new content"}'
 
 # Then undo it
-./target/debug/runtimo undo -j <job_id_from_logs>
+./target/release/runtimo undo -j <job_id_from_logs>
 ```
 
 **Expected output:**
 ```
 Restored 1 file(s) from job <job_id>
+```
+
+### Step 11: Dispatch a Background Job (new in 0.7.1)
+
+```bash
+# Start the daemon (auto-starts on first dispatch)
+runtimo dispatch -c ShellExec -a '{"cmd":"sleep 10"}'
+
+# Check job status
+runtimo status -j <job_id_from_output>
+
+# Wait for it to complete
+runtimo wait -j <job_id>
+```
+
+**What happened:**
+1. CLI validates the command against the blocklist (same as `run`)
+2. Job serialized and sent to daemon via JSON-RPC
+3. Daemon executes in background
+4. Status tracked via WAL events
+5. `runtimo wait` polls until completion
+
+### Security: What Gets Blocked
+
+Runtimo blocks dangerous operations by default:
+
+| Category | What's blocked | How to bypass |
+|----------|---------------|---------------|
+| **File destruction** | `rm`, `shred`, `dd` | Use `FileWrite` + `Undo` capabilities |
+| **System takeover** | `chown`, `chmod`, `chgrp` | — blocked permanently |
+| **Kernel/filesystem** | `mkfs`, `fdisk`, `mount`, `iptables` | — blocked permanently |
+| **Power state** | `shutdown`, `reboot`, `halt`, `poweroff` | — blocked permanently |
+| **Credential files** | `.env`, `.env.*` via FileWrite | Use alternative filename |
+| **Path escape** | `..`, `~`, `$HOME`, null bytes | Use full paths within allowed dirs |
+| **Network tools** | `curl`, `wget`, `ssh`, `nc`, etc. | Set `RUNTIMO_ENABLE_NETWORK=1` |
+
+### Quoting Bypass Protection (new in 0.7.1)
+
+ShellExec normalizes shell quoting AND backslash escapes before applying the blocklist:
+
+```bash
+# All of these are caught — no execution happens
+runtimo run -c ShellExec -a '{"cmd":"r\"m\" -rf /"}'   # shell quoting
+runtimo run -c ShellExec -a '{"cmd":"r\\m -rf /"}'      # backslash
+runtimo run -c ShellExec -a "{\"cmd\":\"rm --recursive /\"}"  # long option
+# → blocked: dangerous command blocked: rm command blocked
 ```
 
 ## Using as a Library
@@ -311,7 +359,7 @@ use serde_json::json;
 use std::path::Path;
 
 fn main() -> runtimo_core::Result<()> {
-    let cap = FileWrite;
+    let cap = FileWrite::new()?;  // backup_dir derived from data_dir() automatically
     let args = json!({
         "path": "/tmp/hello.txt",
         "content": "hello from runtimo"
@@ -405,9 +453,14 @@ pub struct ProcessSummary {
 
 ## Common Patterns
 
+> **Note:** All patterns assume `let fw = FileWrite::new()?;` is called once at the top of the
+> function. `FileRead` still works as a unit struct (`&FileRead`).
+
 ### Pattern 1: Read-Modify-Write
 
 ```rust
+let fw = FileWrite::new()?;
+
 // Read existing content
 let read_args = json!({"path": "/tmp/config.txt"});
 let read_result = execute_with_telemetry(&FileRead, &read_args, false, wal_path)?;
@@ -421,12 +474,14 @@ let write_args = json!({
     "path": "/tmp/config.txt",
     "content": content
 });
-let write_result = execute_with_telemetry(&FileWrite, &write_args, false, wal_path)?;
+let write_result = execute_with_telemetry(&fw, &write_args, false, wal_path)?;
 ```
 
 ### Pattern 2: Conditional Write
 
 ```rust
+let fw = FileWrite::new()?;
+
 // Check if file exists first
 let check_args = json!({"path": "/tmp/important.txt"});
 match execute_with_telemetry(&FileRead, &check_args, false, wal_path) {
@@ -440,7 +495,7 @@ match execute_with_telemetry(&FileRead, &check_args, false, wal_path) {
             "path": "/tmp/important.txt",
             "content": "created by runtimo"
         });
-        execute_with_telemetry(&FileWrite, &write_args, false, wal_path)?;
+        execute_with_telemetry(&fw, &write_args, false, wal_path)?;
     }
 }
 ```
@@ -448,13 +503,15 @@ match execute_with_telemetry(&FileRead, &check_args, false, wal_path) {
 ### Pattern 3: Dry Run Before Execution
 
 ```rust
-// First, validate with dry run
+let fw = FileWrite::new()?;
 let args = json!({"path": "/tmp/test.txt", "content": "test"});
-let dry_result = execute_with_telemetry(&FileWrite, &args, true, wal_path)?;
+
+// First, validate with dry run
+let dry_result = execute_with_telemetry(&fw, &args, true, wal_path)?;
 assert!(dry_result.success);
 
 // Then execute for real
-let real_result = execute_with_telemetry(&FileWrite, &args, false, wal_path)?;
+let real_result = execute_with_telemetry(&fw, &args, false, wal_path)?;
 ```
 
 ## Troubleshooting
@@ -503,6 +560,6 @@ let real_result = execute_with_telemetry(&FileWrite, &args, false, wal_path)?;
 
 ## Getting Help
 
-- **CLI help:** `./target/debug/runtimo --help` (compiler-error style: `req=` required, `opt=` optional, `blk=` blocked, `ex=` example)
+- **CLI help:** `./target/release/runtimo --help` (compiler-error style: `req=` required, `opt=` optional, `blk=` blocked, `ex=` example)
 - **Documentation:** `docs/` directory
 - **Examples:** `core/examples/` directory
