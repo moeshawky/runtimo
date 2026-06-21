@@ -240,6 +240,15 @@ impl GitExec {
                     )));
                 }
             }
+        } else if is_ssh {
+            if let Some(host) = url.strip_prefix("git@").and_then(|s| s.split(':').next()) {
+                if Self::is_ssrf_host(host) {
+                    return Err(Error::SchemaValidationFailed(format!(
+                        "SSRF blocked: URL targets internal/metadata address: {}",
+                        url
+                    )));
+                }
+            }
         }
 
         Ok(())
