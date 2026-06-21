@@ -1237,7 +1237,7 @@ impl TypedCapability for ShellExec {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "cmd": { "type": "string", "description": "Command to execute via sh -c" },
+                "cmd": { "type": "string", "description": "Command to execute via sh -c", "minLength": 1 },
                 "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 300 },
                 "cwd": { "type": "string" },
                 "stdin": { "type": "string" }
@@ -1261,6 +1261,13 @@ impl TypedCapability for ShellExec {
             }
         }
         let timeout = args.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
+
+        // Reject empty or whitespace-only commands
+        if args.cmd.trim().is_empty() {
+            return Err(CapabilityError::InvalidArgs(
+                "command is empty or contains only whitespace".into(),
+            ));
+        }
 
         // F-013: Blocklist check (original + detokenized) — runs BEFORE dry_run
         // so dangerous commands are rejected even in dry-run mode (F-017).
