@@ -13,7 +13,7 @@
 //! Uses `status` and `jobs` RPC methods for queriable job history.
 
 use runtimo_core::{
-    capabilities::{FileRead, FileWrite, GitExec, Kill, ShellExec, Undo, is_dangerous_command},
+    capabilities::{is_dangerous_command, FileRead, FileWrite, GitExec, Kill, ShellExec, Undo},
     execute_with_telemetry_and_session, BackupManager, CapabilityRegistry, WalEvent, WalEventType,
     WalReader, WalWriter,
 };
@@ -208,7 +208,11 @@ async fn handle_dispatch(state: &Arc<DaemonState>, params: Value, id: Value) -> 
     // creating a job. This prevents accepting dangerous commands at dispatch
     // time that would only fail at async execution time (F-003).
     if run_params.capability == "ShellExec" {
-        if let Some(cmd) = run_params.args.get("cmd").or_else(|| run_params.args.get("command")) {
+        if let Some(cmd) = run_params
+            .args
+            .get("cmd")
+            .or_else(|| run_params.args.get("command"))
+        {
             if let Some(cmd_str) = cmd.as_str() {
                 if let Some(reason) = is_dangerous_command(cmd_str) {
                     return JsonRpcResponse {
@@ -377,8 +381,8 @@ async fn handle_status(state: &Arc<DaemonState>, params: Value, id: Value) -> Js
         };
     }
 
-    // Check WAL
-    if let Ok(reader) = WalReader::load(&state.wal_path) {
+    // Check WAL (read all files including archived rotations)
+    if let Ok(reader) = WalReader::load_all(&state.wal_path) {
         let events = reader.events();
         let started = events
             .iter()
@@ -450,7 +454,7 @@ fn handle_logs(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonRpcRes
         }
     };
 
-    match WalReader::load(&state.wal_path) {
+    match WalReader::load_all(&state.wal_path) {
         Ok(reader) => {
             let events = reader.events();
             let filtered: Vec<_> = if let Some(ref jid) = logs_params.job_id {
@@ -504,8 +508,8 @@ async fn handle_jobs(state: &Arc<DaemonState>, params: Value, id: Value) -> Json
         }));
     }
 
-    // WAL jobs
-    if let Ok(reader) = WalReader::load(&state.wal_path) {
+    // WAL jobs (read all files including archived rotations)
+    if let Ok(reader) = WalReader::load_all(&state.wal_path) {
         #[derive(Default)]
         struct JobEntry {
             started: Option<u64>,
@@ -568,6 +572,8 @@ async fn handle_jobs(state: &Arc<DaemonState>, params: Value, id: Value) -> Json
 ///
 /// Reads JSON-RPC requests line-by-line, dispatches to `handle_request`,
 /// and writes JSON-RPC responses. Returns when the client closes the connection.
+/// Write errors (broken socket, client disconnect) propagate via `?`, closing
+/// the connection and logging the error at the caller site.
 async fn handle_client(
     stream: tokio::net::UnixStream,
     state: Arc<DaemonState>,
@@ -606,14 +612,14 @@ async fn handle_client(
                     id: Value::Null,
                 };
                 let resp_str = serde_json::to_string(&resp)?;
-                let _ = writer.write_all(format!("{}\n", resp_str).as_bytes()).await;
+                writer.write_all(format!("{}\n", resp_str).as_bytes()).await?;
                 continue;
             }
         };
 
         let response = handle_request(&state, request).await;
         let resp_str = serde_json::to_string(&response)?;
-        let _ = writer.write_all(format!("{}\n", resp_str).as_bytes()).await;
+        writer.write_all(format!("{}\n", resp_str).as_bytes()).await?;
     }
 
     Ok(())
@@ -668,7 +674,7 @@ fn parse_args() -> Args {
 /// This ensures every job has a definitive terminal state in the audit
 /// trail — no permanently "unknown" jobs after recovery.
 fn reconcile_orphaned_jobs(wal_path: &std::path::Path) {
-    let Ok(reader) = WalReader::load(wal_path) else {
+    let Ok(reader) = WalReader::load_all(wal_path) else {
         return; // No WAL yet — nothing to reconcile
     };
 
@@ -771,16 +777,23 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         // Reconcile orphaned jobs left from a previous crash/termination
         reconcile_orphaned_jobs(&wal_path);
 
-        // Spawn periodic background maintenance tasks
+        // Spawn periodic background maintenance tasks.
+        // Errors from cleanup/rotate are logged to stderr for diagnostics.
         let wal_path_bg = wal_path.clone();
         let backup_dir = runtimo_core::utils::backup_dir();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_hours(1));
             loop {
                 interval.tick().await;
-                let _ = BackupManager::new(backup_dir.clone()).map(|mgr| mgr.cleanup(86400 * 7));
-                let _ = WalWriter::cleanup(&wal_path_bg, 86400 * 7);
-                let _ = WalWriter::rotate(&wal_path_bg, 10 * 1024 * 1024, 5);
+                if let Err(e) = BackupManager::new(backup_dir.clone()).map(|mgr| mgr.cleanup(86400 * 7)) {
+                    eprintln!("[runtimo] BackupManager cleanup failed: {}", e);
+                }
+                if let Err(e) = WalWriter::cleanup(&wal_path_bg, 86400 * 7) {
+                    eprintln!("[runtimo] WalWriter cleanup failed: {}", e);
+                }
+                if let Err(e) = WalWriter::rotate(&wal_path_bg, 10 * 1024 * 1024, 5) {
+                    eprintln!("[runtimo] WalWriter rotate failed: {}", e);
+                }
             }
         });
 
