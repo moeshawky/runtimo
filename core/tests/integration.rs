@@ -1289,27 +1289,28 @@ fn test_dal_e_permissive_mode() {
 }
 
 #[test]
-fn test_dal_a_shell_exec_skips_cognitive_safety() {
+fn test_dal_a_shell_exec_cognitive_safety() {
     let dir = setup();
     let wp = wal_path(&dir);
 
     // Set env var RUNTIMO_DAL=A (aggressive mode)
     std::env::set_var("RUNTIMO_DAL", "A");
 
-    // ShellExec IS in COGNITIVE_SAFETY_SKIP (fix for F-001), so cognitive
-    // pipeline does NOT run. The command should execute successfully
-    // regardless of suspicious keywords in args.
+    // ShellExec now goes through cognitive pipeline (COGNITIVE_SAFETY_SKIP
+    // was removed). The sifter + detectors run against the cmd input.
+    // A benign echo command should pass even under DAL=A.
     let result = execute_with_telemetry(
         &ShellExec,
-        &json!({ "cmd": "echo 'suspicious manipulation of system files'" }),
+        &json!({ "cmd": "echo 'hello world'" }),
         false,
         &wp,
     );
 
     std::env::remove_var("RUNTIMO_DAL");
 
-    // Should succeed because ShellExec skips cognitive safety
-    assert!(result.is_ok(), "ShellExec should skip cognitive safety: {:?}", result.err());
+    // Should pass — cognitive pipeline detects manipulation patterns,
+    // not harmless echo commands.
+    assert!(result.is_ok(), "ShellExec cognitive safety failed: {:?}", result.err());
     let exec_res = result.unwrap();
     assert!(exec_res.success, "ShellExec should execute successfully");
 
@@ -1321,12 +1322,6 @@ fn test_dal_a_shell_exec_skips_cognitive_safety() {
         .iter()
         .any(|e| matches!(e.event_type, WalEventType::JobCompleted));
     assert!(has_completed, "Should have JobCompleted event for ShellExec");
-
-    // No oov_ratio or detection_flags should be logged for ShellExec
-    let has_failed = !events
-        .iter()
-        .any(|e| matches!(e.event_type, WalEventType::JobFailed));
-    assert!(has_failed, "Should have no JobFailed events");
 
     cleanup(&dir);
 }

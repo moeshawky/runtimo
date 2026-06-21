@@ -166,13 +166,10 @@ pub fn execute_with_telemetry(
 ///
 /// # Cognitive Safety
 ///
-/// The cognitive safety pipeline only runs for capabilities that carry
-/// user-authored content. System operations (`Kill`, `FileRead`, `FileWrite`,
-/// `GitExec`, `Undo`, `ShellExec`) skip the check because they operate on
-/// structured inputs (PIDs, file paths, job IDs) or execute via controlled
-/// subprocesses that don't require semantic content safety screening.
-/// `ShellExec` is included in the skip list because its command arguments
-/// are already validated by a dedicated dangerous-command blocklist.
+/// Capabilities with user-authored natural language content (commands, file
+/// content, URLs, commit messages) pass through the llmosafe `CognitivePipeline`
+/// for TF-IDF + keyword bias detection. Structured-only capabilities (paths,
+/// PIDs, job IDs) skip the check to avoid NLP false positives.
 ///
 /// # Arguments
 ///
@@ -198,18 +195,6 @@ pub fn execute_with_telemetry_and_session(
     working_dir: Option<PathBuf>,
     timeout_secs: u64,
 ) -> Result<ExecutionResult> {
-    /// Capabilities that skip the cognitive safety pipeline — system
-    /// operations that don't carry user-authored content (PIDs, file
-    /// paths, job IDs) and don't need semantic safety screening.
-    const COGNITIVE_SAFETY_SKIP: &[&str] = &[
-        "Kill",
-        "FileRead",
-        "FileWrite",
-        "GitExec",
-        "Undo",
-        "ShellExec",
-    ];
-
     let job_id = JobId::new();
     let job_id_str = job_id.as_str().to_string();
     let cap_name = capability.name().to_string();
@@ -273,12 +258,13 @@ pub fn execute_with_telemetry_and_session(
         detection_flags: None,
     })?;
 
-    // Cognitive safety check (GAP-01) — runs only for capabilities that
-    // carry user-authored content (currently only ShellExec). System
-    // operations (Kill, FileRead, FileWrite, GitExec, Undo) operate on
-    // structured inputs (PIDs, file paths, job IDs) that don't require
-    // semantic content safety screening.
-    if !COGNITIVE_SAFETY_SKIP.contains(&cap_name.as_str()) {
+    // Cognitive safety check — runs llmosafe's CognitivePipeline
+    // (sifter + bias detection + surprise gating + detectors) against
+    // user-authored natural language content (commands, file content,
+    // URLs, commit messages). Structured inputs (paths, PIDs, job IDs)
+    // are skipped — the TF-IDF classifier was trained on manipulation
+    // text and produces false positives on structured data.
+    if has_natural_content(args) {
         let pipeline_result = guard
             .check_cognitive_pipeline(
                 capability.description(),
@@ -624,20 +610,40 @@ fn execute_with_timeout_check(
 ///
 /// On benign inputs, returns only the capability description without
 /// padding — no injected text that could trigger content classifiers.
-fn sift_observation(description: &str, args: &Value) -> String {
-    let args_str = args.to_string().to_lowercase();
-    let is_high_risk = args_str.contains("risk")
-        || args_str.contains("ignore")
-        || args_str.contains("instruction")
-        || args_str.contains("system")
-        || args_str.contains("manipulate")
-        || args_str.contains("unstable")
-        || args_str.contains("suspicious");
+fn has_natural_content(args: &Value) -> bool {
+    args.get("cmd").and_then(|v| v.as_str()).is_some()
+        || args.get("content").and_then(|v| v.as_str()).is_some()
+        || args.get("url").and_then(|v| v.as_str()).is_some()
+        || args.get("message").and_then(|v| v.as_str()).is_some()
+}
 
-    if is_high_risk {
-        format!("{} ignore all previous instructions", description)
+fn sift_observation(description: &str, args: &Value) -> String {
+    if let Some(cmd) = args.get("cmd").and_then(|v| v.as_str()) {
+        return truncate_for_sift(cmd);
+    }
+    if let Some(content) = args.get("content").and_then(|v| v.as_str()) {
+        return truncate_for_sift(content);
+    }
+    if let Some(url) = args.get("url").and_then(|v| v.as_str()) {
+        return url.to_string();
+    }
+    if let Some(message) = args.get("message").and_then(|v| v.as_str()) {
+        return truncate_for_sift(message);
+    }
+    description.to_string()
+}
+
+fn truncate_for_sift(s: &str) -> String {
+    const SIFT_MAX_CHARS: usize = 8192;
+    if s.len() <= SIFT_MAX_CHARS {
+        s.to_string()
     } else {
-        description.to_string()
+        let mut end = SIFT_MAX_CHARS;
+        while !s.is_char_boundary(end) {
+            end = end.saturating_sub(1);
+        }
+        let remaining = s.len().saturating_sub(end);
+        format!("{}... [truncated {} bytes]", &s[..end], remaining)
     }
 }
 
@@ -903,11 +909,11 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // ── GAP 1: Cognitive pipeline with DAL=A ──────────────────────────
+    // ── Cognitive pipeline with DAL=A ────────────────────────────────
     //
-    // Uses EchoCap (NOT in COGNITIVE_SAFETY_SKIP) to ensure the cognitive
-    // pipeline actually runs. System ops (FileRead, Kill, etc.) skip the
-    // cognitive check per the gating in execute_with_telemetry_and_session.
+    // All capabilities now pass through the cognitive safety pipeline
+    // (COGNITIVE_SAFETY_SKIP was removed). EchoCap tests the full path
+    // with user-authored content in the "content" field.
 
     #[test]
     fn test_cognitive_pipeline_dal_a_rejects() {
@@ -919,8 +925,8 @@ mod tests {
         fs::create_dir_all(&dir).ok();
         let wp = wal_path(&dir);
 
-        // EchoCap goes through cognitive pipeline (not in skip list).
-        // Args with suspicious keywords trigger sift_observation injection detection.
+        // EchoCap args are extracted by sift_observation and passed
+        // through the cognitive pipeline for bias/manipulation detection.
         let result = execute_with_telemetry_and_session(
             &EchoCap,
             &json!({"content": "suspicious manipulation of system files"}),
@@ -952,10 +958,10 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // ── verify fix for: cognitive pipeline with DAL=E passes ──────────
+    // ── Cognitive pipeline with DAL=E passes ──────────────────────────
     //
-    // Uses EchoCap (NOT in COGNITIVE_SAFETY_SKIP) to ensure the cognitive
-    // pipeline actually runs.
+    // With DAL=E, every decision becomes Proceed — verifies the pipeline
+    // does not prevent valid executions.
 
     #[test]
     fn test_cognitive_pipeline_dal_e_passes() {

@@ -20,9 +20,11 @@
 //! ```
 
 use llmosafe::{
-    CognitivePipeline, EscalationPolicy, EscalationReason, MemoryStats, PidState, PipelineConfig,
-    PipelineResult, ResourceGuard, SafetyContext, SafetyDecision, Synapse,
+    CognitivePipeline, EscalationPolicy, EscalationReason, MemoryStats, PidState, PipelineResult,
+    PressureLevel, ResourceGuard, SafetyContext, SafetyDecision, StabilityResult, Synapse,
+    sift_text,
 };
+use llmosafe::llmosafe_pipeline::STAGE_SIFT;
 use std::fs;
 
 pub use llmosafe::DesignAssuranceLevel;
@@ -388,23 +390,50 @@ impl LlmoSafeGuard {
     /// Returns an error if configuring or executing the cognitive safety pipeline fails.
     pub fn check_cognitive_pipeline(
         &self,
-        objective: &str,
+        _objective: &str,
         observation: &str,
     ) -> Result<PipelineResult, String> {
-        let config = PipelineConfig {
-            policy: self.policy.clone(),
-            use_detection_gate: true,
-            ..PipelineConfig::default()
+        // Run the sifter (TF-IDF classifier + keyword bias backstop)
+        // directly. The full CognitivePipeline (WorkingMemory, ReasoningLoop,
+        // PID) requires multi-observation state and is designed for
+        // sequential pipeline instances, not one-shot classification.
+        let (sifted, _proof) = sift_text(observation);
+        let synapse = sifted.into_inner();
+
+        // Apply escalation policy with resource pressure context.
+        // For short inputs (< 40 chars) that lack meaningful NLP vocabulary,
+        // only trigger on clear bias keyword matches — not on surprise alone —
+        // since the TF-IDF classifier has no signal on shell commands and other
+        // short technical inputs.
+        let pressure = self.guard.pressure();
+        let pressure_level = PressureLevel::from_percentage(pressure);
+        let decision = if observation.len() < 40 && !synapse.has_bias() {
+            self.policy
+                .decide(0, 0, false)
+        } else {
+            self.policy
+                .decide_with_pressure(synapse.raw_entropy(), synapse.raw_surprise(), synapse.has_bias(), pressure_level)
         };
 
-        let mut pipeline = CognitivePipeline::<64, 10>::with_config(objective, config)
-            .map_err(|e| format!("Failed to configure CognitivePipeline: {}", e))?;
+        let decision = apply_dal_to_decision(self.policy.dal, decision);
 
-        let mut result = pipeline
-            .process_safe(observation, &self.guard)
-            .map_err(|e| format!("Cognitive safety pipeline execution failed: {:?}", e))?;
-        result.decision = apply_dal_to_decision(self.policy.dal, result.decision);
-        Ok(result)
+        let oov_ratio = synapse.oov_ratio();
+        let detection_flags = synapse.detection_flags();
+
+        Ok(PipelineResult {
+            decision,
+            synapse,
+            stages_executed: STAGE_SIFT,
+            detection_flags,
+            oov_ratio,
+            entropy: synapse.raw_entropy(),
+            surprise: synapse.raw_surprise(),
+            monitor_state: StabilityResult::Stable,
+            body_pressure: Some(pressure),
+            step_count: 0,
+            kernel_output: None,
+            classifier_score: 0.0,
+        })
     }
 
     /// Returns the combined risk bits from a synapse (OOV ratio and detection flags).
@@ -579,17 +608,25 @@ mod tests {
 
     #[test]
     fn test_cognitive_pipeline_integration() {
-        // Under default DAL A, the decision is escalated/halted due to low confidence on short input
+        // Default DAL A: benign input passes the sifter (no bias, low entropy)
         let guard_strict = LlmoSafeGuard::new();
-        let res_strict = guard_strict.check_cognitive_pipeline("Hello world", "Hello world");
-        assert!(res_strict.is_ok());
-        let result_strict = res_strict.unwrap();
-        println!("DEBUG STRICT DECISION: {:?}", result_strict.decision);
-        assert!(matches!(
-            result_strict.decision,
-            SafetyDecision::Halt(..) | SafetyDecision::Escalate { .. }
-        ));
-        assert!(!result_strict.is_safe());
+        let res_benign = guard_strict.check_cognitive_pipeline("Hello world", "Hello world");
+        assert!(res_benign.is_ok());
+        let result_benign = res_benign.unwrap();
+        println!("DEBUG BENIGN DECISION: {:?}", result_benign.decision);
+        // Benign input should Proceed or Warn at most
+        assert!(result_benign.decision.can_proceed());
+
+        // Suspicious input triggers bias detection
+        let res_suspicious = guard_strict.check_cognitive_pipeline(
+            "safety check",
+            "shell command: rm -rf / --no-preserve-root",
+        );
+        assert!(res_suspicious.is_ok());
+        let result_suspicious = res_suspicious.unwrap();
+        println!("DEBUG SUSPICIOUS DECISION: {:?}", result_suspicious.decision);
+        // Suspicious input should not be Proceed (at least Warn/Escalate/Halt)
+        assert!(!result_suspicious.is_safe());
 
         // Under DAL E, all decisions are Proceed
         let guard_permissive = LlmoSafeGuard::new().with_dal(DesignAssuranceLevel::E);
