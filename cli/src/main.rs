@@ -12,7 +12,7 @@ use runtimo_core::{
 use serde_json::Value;
 use std::error::Error;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -525,15 +525,18 @@ fn send_rpc(method: &str, params: Value) -> Result<Value, String> {
         .write_all(b"\n")
         .map_err(|e| format!("Write nl: {}", e))?;
 
-    let mut buf = vec![0u8; 65536];
-    let n = stream.read(&mut buf).map_err(|e| format!("Read: {}", e))?;
-    if n == 0 {
+    // Use buffered reader for line-based reading — handles responses of any size
+    let mut reader = std::io::BufReader::new(&stream);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .map_err(|e| format!("Read: {}", e))?;
+    if line.is_empty() {
         return Err("Daemon closed connection".into());
     }
 
-    let resp_str = String::from_utf8_lossy(buf.get(..n).unwrap_or(&[]));
-    let last_line = resp_str.lines().last().unwrap_or("");
-    let resp: Value = serde_json::from_str(last_line).map_err(|e| format!("JSON parse: {}", e))?;
+    let resp: Value =
+        serde_json::from_str(line.trim()).map_err(|e| format!("JSON parse: {}", e))?;
 
     if let Some(err) = resp
         .get("error")
