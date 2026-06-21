@@ -146,7 +146,7 @@ pub fn validate_path(path_str: &str, ctx: &PathContext) -> Result<PathBuf, Strin
 
     // Check existence if required
     if ctx.require_exists && !path.exists() {
-        return Err(format!("path does not exist: {}", normalized));
+        return Err(format!("path does not exist: {}", truncate_path(&normalized)));
     }
 
     // Resolve the canonical path:
@@ -177,7 +177,7 @@ pub fn validate_path(path_str: &str, ctx: &PathContext) -> Result<PathBuf, Strin
             } else {
                 return Err(format!(
                     "cannot resolve relative path without CWD: {}",
-                    normalized
+                    truncate_path(&normalized)
                 ));
             }
         }
@@ -185,7 +185,7 @@ pub fn validate_path(path_str: &str, ctx: &PathContext) -> Result<PathBuf, Strin
 
     // Verify it's a file if required (only meaningful for existing paths)
     if ctx.require_file && resolved.exists() && !resolved.is_file() {
-        return Err(format!("not a file: {}", resolved.display()));
+        return Err(format!("not a file: {}", truncate_path(&resolved.to_string_lossy())));
     }
 
     // Check allowed prefixes against the resolved path
@@ -197,11 +197,20 @@ pub fn validate_path(path_str: &str, ctx: &PathContext) -> Result<PathBuf, Strin
     {
         return Err(format!(
             "path outside allowed directories: {}",
-            resolved.display()
+            truncate_path(&resolved.to_string_lossy())
         ));
     }
 
     Ok(resolved)
+}
+
+fn truncate_path(s: &str) -> String {
+    if s.len() <= 160 {
+        s.to_string()
+    } else {
+        let end = s.len().saturating_sub(50);
+        format!("{}...{}", &s[..100], &s[end..])
+    }
 }
 
 /// Checks if `path` is within `prefix` directory.
