@@ -220,8 +220,8 @@ impl TypedCapability for Kill {
         let protected = protected_pids();
         if protected.contains(&args.pid) {
             return Err(CapabilityError::PermissionDenied(format!(
-                "PID {} is a protected system process (protected: {:?})",
-                args.pid, protected
+                "PID {} is a protected system process",
+                args.pid
             )));
         }
 
@@ -254,13 +254,6 @@ impl TypedCapability for Kill {
             }));
             return Ok(out);
         }
-
-        // Get process info before killing
-        let process_info: Option<(String, String)> = process_before
-            .processes
-            .iter()
-            .find(|p| p.pid == args.pid)
-            .map(|p| (p.command.clone(), p.user.clone()));
 
         // Record start time to detect PID reuse (FINDING #1)
         let start_time_before = get_process_start_time_retry(args.pid);
@@ -352,8 +345,6 @@ impl TypedCapability for Kill {
             "pid": args.pid,
             "killed": killed_success,
             "signal": signal,
-            "command": process_info.as_ref().map(|(cmd, _)| cmd),
-            "user": process_info.as_ref().map(|(_, user)| user),
             "stderr": if success { String::new() } else { stderr_str },
             "pid_reused": pid_reused,
             "process_before": {
