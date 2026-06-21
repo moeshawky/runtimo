@@ -29,7 +29,10 @@
 //! an attacker could replace a validated path with a symlink between the
 //! two operations. **Mitigation status**: All file-opening capabilities
 //! (`FileRead`, `FileWrite`) use `O_NOFOLLOW` flag to prevent symlink
-//! attacks at open time. Remaining risk: non-file capabilities (e.g.,
+//! attacks at open time. However, O_NOFOLLOW only protects the final
+//! path component — a parent-directory symlink swap during the TOCTOU
+//! window can redirect file operations to an unexpected location.
+//! Remaining risk: non-file capabilities (e.g.,
 //! `GitExec`, `ShellExec`) may not use `O_NOFOLLOW`. Full mitigation
 //! requires filesystem-level atomicity (not available in std).
 //!
@@ -208,8 +211,18 @@ fn truncate_path(s: &str) -> String {
     if s.len() <= 160 {
         s.to_string()
     } else {
-        let end = s.len().saturating_sub(50);
-        format!("{}...{}", &s[..100], &s[end..])
+        let prefix_end = s
+            .char_indices()
+            .take_while(|(i, _)| *i < 100)
+            .last()
+            .map_or(0, |(i, c)| i.saturating_add(c.len_utf8()));
+        let suffix_start = s
+            .char_indices()
+            .rev()
+            .take_while(|(i, _)| i.saturating_add(50) > s.len())
+            .last()
+            .map_or(s.len(), |(i, _)| i);
+        format!("{}...{}", &s[..prefix_end], &s[suffix_start..])
     }
 }
 
