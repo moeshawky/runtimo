@@ -73,6 +73,9 @@ pub struct LogsParams {
     /// Maximum number of log entries to return (default: 10).
     #[serde(default = "default_limit")]
     pub limit: usize,
+    /// Optional job ID to filter events by.
+    #[serde(default)]
+    pub job_id: Option<String>,
 }
 
 /// Default log entry limit.

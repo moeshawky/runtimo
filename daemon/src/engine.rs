@@ -433,8 +433,8 @@ fn handle_list(state: &Arc<DaemonState>, id: Value) -> JsonRpcResponse {
 
 /// Handles the `logs` RPC method — returns recent WAL events.
 ///
-/// Accepts an optional `limit` parameter (default 10). Events are returned
-/// in reverse chronological order.
+/// Accepts an optional `limit` (default 10) and optional `job_id` filter.
+/// Events are returned in reverse chronological order.
 fn handle_logs(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonRpcResponse {
     let logs_params: LogsParams = match serde_json::from_value(params) {
         Ok(p) => p,
@@ -453,12 +453,17 @@ fn handle_logs(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonRpcRes
     match WalReader::load(&state.wal_path) {
         Ok(reader) => {
             let events = reader.events();
-            let limit = logs_params.limit.min(events.len());
-            let recent: Vec<_> = events.iter().rev().take(limit).rev().collect();
+            let filtered: Vec<_> = if let Some(ref jid) = logs_params.job_id {
+                events.iter().filter(|e| e.job_id == *jid).collect()
+            } else {
+                events.iter().collect()
+            };
+            let limit = logs_params.limit.min(filtered.len());
+            let recent: Vec<_> = filtered.iter().rev().take(limit).rev().collect();
             JsonRpcResponse {
                 result: Some(serde_json::json!({
                     "events": recent,
-                    "total": events.len(),
+                    "total": filtered.len(),
                 })),
                 error: None,
                 id,
