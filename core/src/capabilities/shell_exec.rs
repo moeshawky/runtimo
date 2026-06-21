@@ -2163,8 +2163,15 @@ mod tests {
 
     #[test]
     fn allows_cat_in_home() {
-        // cat $HOME/somefile should be ALLOWED (within /home prefix)
+        // cat $HOME/somefile should be ALLOWED (within allowed prefix)
         let home = std::env::var("HOME").unwrap_or_else(|_| "/home/user".to_string());
+        let allowed = crate::config::RuntimoConfig::get_allowed_prefixes();
+        let is_allowed = allowed.iter().any(|p| home.starts_with(p) || p.starts_with(&home));
+        if !is_allowed {
+            // Skip test when HOME is outside allowed prefixes (e.g., /root in CI/containers)
+            eprintln!("SKIP: HOME ({}) is outside allowed prefixes; test requires HOME within allowed area", home);
+            return;
+        }
         let test_path = format!("{}/runtimo_home_path_test.txt", home);
         let cmd = format!("echo ok > {} && cat {}", test_path, test_path);
         let r = Capability::execute(

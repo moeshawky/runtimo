@@ -424,11 +424,13 @@ fn err_write_readonly_location() {
     cleanup(&dir);
 }
 
-/// WAL write failure simulation (invalid path)
+/// WAL write failure simulation (invalid path — file where a directory exists)
 #[test]
 fn err_wal_invalid_path() {
-    let result = WalWriter::create(PathBuf::from("/nonexistent/deep/path/wal.jsonl").as_path());
-    assert!(result.is_err());
+    // Use an existing directory as the "file" path — this should fail
+    let tmp = std::env::temp_dir();
+    let result = WalWriter::create(tmp.as_path());
+    assert!(result.is_err(), "Should fail when path is an existing directory");
 }
 
 /// BackupManager with non-existent source

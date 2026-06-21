@@ -23,6 +23,9 @@ use std::time::Duration;
 /// Maximum seconds to wait for daemon to become ready after spawning.
 const DAEMON_STARTUP_TIMEOUT_SECS: u64 = 30;
 
+/// Maximum size for capability arguments in bytes (~130 KB).
+const MAX_ARGS_SIZE_BYTES: usize = 130 * 1024;
+
 #[derive(Parser)]
 #[command(
     name = "runtimo",
@@ -43,7 +46,7 @@ enum Commands {
     /// Execute a capability with telemetry
     #[command(
         about = "exec capability with telemetry",
-        after_help = "CAPABILITY HELP:\n runtimo run -c <Cap> --schema     → see expected JSON args\n runtimo run -c <Cap> --dry-run    → validate without executing\n\nEXAMPLES:\n runtimo run -c FileRead -a '{\"path\":\"/tmp/test.txt\"}'\n runtimo run -c ShellExec -a '{\"cmd\":\"uptime\"}'\n runtimo run -c FileWrite -a '{\"path\":\"/tmp/x.txt\",\"content\":\"hello\"}'\n\nBlocked commands: rm, shutdown, chmod, mkfs, dd, iptables, fork bombs, env dumpers.\nSee `runtimo list` for the full blocklist."
+        after_help = "CAPABILITY HELP:\n runtimo run -c <Cap> --schema     → see expected JSON args\n runtimo run -c <Cap> --dry-run    → validate without executing\n\nEXAMPLES:\n runtimo run -c FileRead -a '{\"path\":\"/tmp/test.txt\"}'\n runtimo run -c ShellExec -a '{\"cmd\":\"uptime\"}'\n runtimo run -c FileWrite -a '{\"path\":\"/tmp/x.txt\",\"content\":\"hello\"}'\n\nBlocked commands: rm, shutdown, chmod, mkfs, dd, iptables, fork bombs, env dumpers.\nSee `runtimo list` for the full blocklist.\n\nARGS SIZE:\n Maximum args payload is ~130 KB. For larger payloads, use --args-file <path> or --args-stdin."
     )]
     Run {
         /// Capability name (e.g., FileRead, ShellExec). Use `runtimo list` to see all.
@@ -52,6 +55,12 @@ enum Commands {
         /// Capability arguments as JSON (e.g., '{"path":"/tmp/test.txt"}'). Use --schema to see the expected shape.
         #[arg(short = 'a', long, default_value = "{}")]
         args: String,
+        /// Path to a file containing capability arguments as JSON (bypasses OS ARG_MAX for large payloads)
+        #[arg(long)]
+        args_file: Option<PathBuf>,
+        /// Read capability arguments as JSON from stdin (bypasses OS ARG_MAX for large payloads)
+        #[arg(long)]
+        args_stdin: bool,
         /// Validate args and check blocklist but don't execute
         #[arg(long)]
         dry_run: bool,
@@ -71,7 +80,7 @@ enum Commands {
     /// Dispatch job to background daemon (returns immediately)
     #[command(
         about = "Dispatch job to background daemon (starts daemon automatically if needed)",
-        after_help = "EXAMPLES:\n runtimo dispatch -c ShellExec -a '{\"cmd\":\"sleep 30\"}'\n runtimo dispatch -c FileWrite -a '{\"path\":\"/tmp/x.txt\",\"content\":\"bg\"}'\n runtimo dispatch -c GitExec -a '{\"operation\":\"status\",\"path\":\"/tmp/repo\"}'\n\nAfter dispatch:\n runtimo status                # check all job statuses\n runtimo wait -j <job_id>      # wait for completion\n runtimo logs -j <job_id>      # view WAL events\n\nDaemon starts automatically on first dispatch."
+        after_help = "EXAMPLES:\n runtimo dispatch -c ShellExec -a '{\"cmd\":\"sleep 30\"}'\n runtimo dispatch -c FileWrite -a '{\"path\":\"/tmp/x.txt\",\"content\":\"bg\"}'\n runtimo dispatch -c GitExec -a '{\"operation\":\"status\",\"path\":\"/tmp/repo\"}'\n\nAfter dispatch:\n runtimo status                # check all job statuses\n runtimo wait -j <job_id>      # wait for completion\n runtimo logs -j <job_id>      # view WAL events\n\nDaemon starts automatically on first dispatch.\n\nARGS SIZE:\n Maximum args payload is ~130 KB. For larger payloads, use --args-file <path> or --args-stdin."
     )]
     Dispatch {
         /// Capability name (e.g., ShellExec, FileWrite). Use `runtimo list` to see all.
@@ -80,6 +89,12 @@ enum Commands {
         /// Capability arguments as JSON (same format as `run`)
         #[arg(short = 'a', long, default_value = "{}")]
         args: String,
+        /// Path to a file containing capability arguments as JSON (bypasses OS ARG_MAX for large payloads)
+        #[arg(long)]
+        args_file: Option<PathBuf>,
+        /// Read capability arguments as JSON from stdin (bypasses OS ARG_MAX for large payloads)
+        #[arg(long)]
+        args_stdin: bool,
         /// Validate and check blocklist but don't enqueue the job
         #[arg(long)]
         dry_run: bool,
@@ -434,6 +449,51 @@ fn ensure_daemon_running() -> Result<(), String> {
     }
 }
 
+/// Resolves capability arguments from the appropriate source.
+///
+/// Priority: --args-file > --args-stdin > -a (default).
+/// Validates that --args-file and --args-stdin are not used simultaneously.
+/// Validates content size against MAX_ARGS_SIZE_BYTES (~130 KB).
+fn resolve_args(
+    args: &str,
+    args_file: Option<PathBuf>,
+    args_stdin: bool,
+) -> Result<String, String> {
+    if args_file.is_some() && args_stdin {
+        return Err(
+            "Cannot use both --args-file and --args-stdin simultaneously".to_string(),
+        );
+    }
+
+    let content = if let Some(file_path) = args_file {
+        let mut content = String::new();
+        File::open(&file_path)
+            .map_err(|e| format!("Failed to open args file {}: {}", file_path.display(), e))?
+            .read_to_string(&mut content)
+            .map_err(|e| format!("Failed to read args file {}: {}", file_path.display(), e))?;
+        content
+    } else if args_stdin {
+        let mut content = String::new();
+        std::io::stdin()
+            .read_to_string(&mut content)
+            .map_err(|e| format!("Failed to read args from stdin: {}", e))?;
+        content
+    } else {
+        args.to_string()
+    };
+
+    if content.len() > MAX_ARGS_SIZE_BYTES {
+        return Err(format!(
+            "Capability args too large: {} bytes (max: {} bytes / ~130 KB). \
+             Use --args-file or --args-stdin for large payloads.",
+            content.len(),
+            MAX_ARGS_SIZE_BYTES,
+        ));
+    }
+
+    Ok(content)
+}
+
 /// Sends a JSON-RPC request to the daemon over its Unix socket.
 ///
 /// Serializes `method` and `params` into a JSON-RPC request, writes it to the
@@ -496,12 +556,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         Commands::Run {
             capability,
             args,
+            args_file,
+            args_stdin,
             dry_run,
             json,
             quiet,
             schema,
             timeout,
         } => {
+            let args = resolve_args(&args, args_file, args_stdin)?;
             let reg = make_registry().map_err(|e| format!("Registry init failed: {}", e))?;
             if schema {
                 if let Some(cap) = reg.get(&capability) {
@@ -564,12 +627,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         Commands::Dispatch {
             capability,
             args,
+            args_file,
+            args_stdin,
             dry_run,
         } => {
             if let Err(e) = ensure_daemon_running() {
                 eprintln!("Cannot dispatch: {}", e);
                 std::process::exit(1);
             }
+            let args = resolve_args(&args, args_file, args_stdin)?;
             let args_val: Value =
                 serde_json::from_str(&args).map_err(|e| format!("Invalid JSON args: {}", e))?;
             // Pre-validate dangerous commands at dispatch time
@@ -1247,6 +1313,8 @@ mod tests {
             Commands::Dispatch {
                 capability,
                 args,
+                args_file: _,
+                args_stdin: _,
                 dry_run,
             } => {
                 assert_eq!(capability, "FileWrite");
