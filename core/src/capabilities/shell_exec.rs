@@ -1251,6 +1251,15 @@ impl TypedCapability for ShellExec {
         ctx: &Context,
     ) -> std::result::Result<Output, CapabilityError> {
         // Timeout from JSON args, falling back to default
+        // Enforce range: minimum 1, maximum 300 (matching schema declaration)
+        if let Some(secs) = args.timeout_secs {
+            if !(1..=300).contains(&secs) {
+                return Err(CapabilityError::InvalidArgs(format!(
+                    "timeout_secs must be between 1 and 300, got {}",
+                    secs
+                )));
+            }
+        }
         let timeout = args.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
 
         // F-013: Blocklist check (original + detokenized) — runs BEFORE dry_run

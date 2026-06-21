@@ -33,7 +33,7 @@ const MAX_ARGS_SIZE_BYTES: usize = 130 * 1024;
     long_about = "runtimo — capability runtime with telemetry, WAL, and process tracking\n\n\
 Every exec: telemetry + process snapshot + WAL audit\n\
 Background: dispatch jobs to daemon, check status later",
-    after_help = "USAGE:\n runtimo run -c <Capability> -a '<json>'\n runtimo dispatch -c <Capability> -a '<json>'\n runtimo jobs\n runtimo wait -j <job_id>\n runtimo list\n runtimo logs\n runtimo telemetry\n runtimo processes\n\nCAPABILITIES:\n FileRead  Read file. Path validated. No dirs, no traversal.\n FileWrite Write file. Auto-backup for undo. Append mode ok.\n ShellExec Exec via sh -c. Blocks rm, shutdown, chmod, mkfs, dd, iptables, fork bombs, env dumpers, network tools (opt-in). See `runtimo list` for full blocklist.\n GitExec   Git ops: clone|pull|commit|revert|clean|status.\n Kill      Kill process by PID. Protected: init, kthreadd, self.\n Undo      Restore from backup. Find job IDs with `runtimo jobs` or `runtimo logs`.\n\nTIP: Use `runtimo run -c <Cap> --schema` to see the JSON args a capability expects.\nTIP: Use `runtimo list --schemas` to see all schemas at once.\n\nDaemon starts on first dispatch if runtimo-daemon is installed.",
+    after_help = "USAGE:\n runtimo run -c <Capability> -a '<json>'\n runtimo dispatch -c <Capability> -a '<json>'\n runtimo jobs\n runtimo wait -j <job_id>\n runtimo list\n runtimo logs\n runtimo telemetry\n runtimo processes\n\nCAPABILITIES:\n FileRead  Read file. Path validated. No dirs, no traversal.\n FileWrite Write file. Auto-backup for undo. Append mode ok.\n ShellExec Exec via sh -c. Blocks rm, shutdown, chmod, mkfs, dd, iptables, fork bombs, env dumpers, network tools (opt-in). See `runtimo list` for full blocklist.\n GitExec   Git ops: clone|pull|commit|revert|clean|status.\n Kill      Kill process by PID. Protected: init, kthreadd, self.\n Undo      Restore from backup. Find job IDs with `runtimo jobs` or `runtimo logs`.\n\nTIP: Use `runtimo run -c <Cap> --schema` to see the JSON args a capability expects.\nTIP: Use `runtimo list --schemas` to see all schemas at once.\nTIP: ShellExec timeout range is 1–300 seconds (default: 30).\n\nDaemon starts on first dispatch if runtimo-daemon is installed.",
     version
 )]
 struct Cli {
@@ -73,8 +73,8 @@ enum Commands {
         /// Print the capability's JSON Schema and exit
         #[arg(long)]
         schema: bool,
-        /// Execution timeout in seconds (1–3600, default: 30)
-        #[arg(long, default_value = "30", value_parser = clap::value_parser!(u64).range(1..=3600))]
+        /// Execution timeout in seconds (1–300, default: 30)
+        #[arg(long, default_value = "30", value_parser = clap::value_parser!(u64).range(1..=300))]
         timeout: u64,
     },
     /// Dispatch job to background daemon (returns immediately)
