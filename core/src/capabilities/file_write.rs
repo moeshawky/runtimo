@@ -131,6 +131,13 @@ impl TypedCapability for FileWrite {
         args: FileWriteArgs,
         ctx: &Context,
     ) -> std::result::Result<Output, CapabilityError> {
+        // Validate content is valid UTF-8 (defense-in-depth)
+        if let Err(e) = std::str::from_utf8(args.content.as_bytes()) {
+            return Err(CapabilityError::InvalidArgs(format!(
+                "Content is not valid UTF-8: {}",
+                e
+            )));
+        }
         if args.content.len() > MAX_WRITE_SIZE {
             return Err(CapabilityError::InvalidArgs(format!(
                 "Content too large: {} bytes (limit: {} bytes)",
