@@ -612,14 +612,18 @@ async fn handle_client(
                     id: Value::Null,
                 };
                 let resp_str = serde_json::to_string(&resp)?;
-                writer.write_all(format!("{}\n", resp_str).as_bytes()).await?;
+                writer
+                    .write_all(format!("{}\n", resp_str).as_bytes())
+                    .await?;
                 continue;
             }
         };
 
         let response = handle_request(&state, request).await;
         let resp_str = serde_json::to_string(&response)?;
-        writer.write_all(format!("{}\n", resp_str).as_bytes()).await?;
+        writer
+            .write_all(format!("{}\n", resp_str).as_bytes())
+            .await?;
     }
 
     Ok(())
@@ -785,7 +789,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_hours(1));
             loop {
                 interval.tick().await;
-                if let Err(e) = BackupManager::new(backup_dir.clone()).map(|mgr| mgr.cleanup(86400 * 7)) {
+                if let Err(e) =
+                    BackupManager::new(backup_dir.clone()).map(|mgr| mgr.cleanup(86400 * 7))
+                {
                     eprintln!("[runtimo] BackupManager cleanup failed: {}", e);
                 }
                 if let Err(e) = WalWriter::cleanup(&wal_path_bg, 86400 * 7) {
