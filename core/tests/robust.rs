@@ -141,7 +141,10 @@ fn edge_whitespace_only() {
     let r = FileRead
         .execute(&json!({ "path": p.to_str().unwrap() }), &ctx("edge_ws"))
         .unwrap();
-    assert_eq!(r.data.as_ref().unwrap()["content"].as_str().unwrap(), "   \n\t\n   ");
+    assert_eq!(
+        r.data.as_ref().unwrap()["content"].as_str().unwrap(),
+        "   \n\t\n   "
+    );
     cleanup(&dir);
 }
 
@@ -286,7 +289,10 @@ fn sec_encoded_path_traversal() {
     // validate_path works on raw strings, so %2e%2e is NOT treated as ..
     // The path /tmp/%2e%2e/etc/passwd doesn't contain literal ".."
     // But it also doesn't exist on disk, so validation fails for "path does not exist"
-    let result = FileRead.execute(&json!({ "path": "/tmp/%2e%2e/etc/passwd" }), &ctx("sec_encoded"));
+    let result = FileRead.execute(
+        &json!({ "path": "/tmp/%2e%2e/etc/passwd" }),
+        &ctx("sec_encoded"),
+    );
     // Should fail because path doesn't exist (not because of traversal detection)
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
@@ -335,19 +341,28 @@ fn sec_symlink_chain_escape() {
 #[test]
 fn sec_type_confusion_in_args() {
     // path as number instead of string
-    assert!(FileRead.execute(&json!({ "path": 12345 }), &ctx("sec_type")).is_err());
+    assert!(FileRead
+        .execute(&json!({ "path": 12345 }), &ctx("sec_type"))
+        .is_err());
     // path as array
     assert!(FileRead
         .execute(&json!({ "path": ["/tmp/x.txt"] }), &ctx("sec_type_arr"))
         .is_err());
     // path as object
     assert!(FileRead
-        .execute(&json!({ "path": { "file": "/tmp/x.txt" } }), &ctx("sec_type_obj"))
+        .execute(
+            &json!({ "path": { "file": "/tmp/x.txt" } }),
+            &ctx("sec_type_obj")
+        )
         .is_err());
     // path as null
-    assert!(FileRead.execute(&json!({ "path": null }), &ctx("sec_type_null")).is_err());
+    assert!(FileRead
+        .execute(&json!({ "path": null }), &ctx("sec_type_null"))
+        .is_err());
     // path as boolean
-    assert!(FileRead.execute(&json!({ "path": true }), &ctx("sec_type_bool")).is_err());
+    assert!(FileRead
+        .execute(&json!({ "path": true }), &ctx("sec_type_bool"))
+        .is_err());
 }
 
 /// ShellExec with dangerous commands (should execute but be logged)
@@ -430,7 +445,10 @@ fn err_wal_invalid_path() {
     // Use an existing directory as the "file" path — this should fail
     let tmp = std::env::temp_dir();
     let result = WalWriter::create(tmp.as_path());
-    assert!(result.is_err(), "Should fail when path is an existing directory");
+    assert!(
+        result.is_err(),
+        "Should fail when path is an existing directory"
+    );
 }
 
 /// BackupManager with non-existent source
@@ -450,9 +468,16 @@ fn err_backup_nonexistent_source() {
 #[test]
 fn err_kill_invalid_signal() {
     // Signal 999 should fail gracefully
-    let result = Capability::execute(&Kill, &json!({ "pid": 999998, "signal": 999 }), &ctx("err_signal"));
+    let result = Capability::execute(
+        &Kill,
+        &json!({ "pid": 999998, "signal": 999 }),
+        &ctx("err_signal"),
+    );
     // Invalid signal is rejected by the Kill capability before any syscall
-    assert!(result.is_err(), "Kill with invalid signal should be rejected");
+    assert!(
+        result.is_err(),
+        "Kill with invalid signal should be rejected"
+    );
     let err = result.unwrap_err().to_string();
     assert!(
         err.contains("Invalid signal") || err.contains("999"),
@@ -1016,7 +1041,9 @@ fn t_layergap_backup_boundary_content_preserved() {
             &ctx("layer_read"),
         )
         .expect("read");
-    let read_content = read_result.data.as_ref().unwrap()["content"].as_str().unwrap();
+    let read_content = read_result.data.as_ref().unwrap()["content"]
+        .as_str()
+        .unwrap();
     assert_eq!(
         read_content, content,
         "C1: FileRead must consume FileWrite output with same content"
@@ -1332,14 +1359,11 @@ fn wal_corruption_tolerance() {
 
     // Append corruption: invalid JSON, partial line, binary garbage
     {
-        let mut file = fs::OpenOptions::new()
-            .append(true)
-            .open(&wal_path)
-            .unwrap();
+        let mut file = fs::OpenOptions::new().append(true).open(&wal_path).unwrap();
         writeln!(file, "{{invalid json").unwrap();
         writeln!(file, "partial line only").unwrap();
         writeln!(file, "{{\"seq\":999,\"type\":\"unknown_type\"}}").unwrap(); // missing required fields
-        // Valid event after corruption — uses correct serde field names
+                                                                              // Valid event after corruption — uses correct serde field names
         writeln!(
             file,
             "{{\"seq\":99,\"ts\":0,\"type\":\"job_started\",\"job_id\":\"after_corruption\"}}"
@@ -1361,10 +1385,7 @@ fn wal_corruption_tolerance() {
 
     // The valid events should have correct job_ids
     let job_ids: Vec<&str> = events.iter().map(|e| e.job_id.as_str()).collect();
-    assert!(
-        job_ids.contains(&"job_0"),
-        "First event should be present"
-    );
+    assert!(job_ids.contains(&"job_0"), "First event should be present");
     assert!(
         job_ids.contains(&"job_2"),
         "Last initial event should be present"
@@ -1451,10 +1472,7 @@ fn sec_symlink_to_etc_rejected() {
                 &ctx("symlink_etc"),
             );
             // Should fail — symlink resolves outside allowed dirs
-            assert!(
-                result.is_err(),
-                "Symlink to /etc/passwd should be rejected"
-            );
+            assert!(result.is_err(), "Symlink to /etc/passwd should be rejected");
         }
     }
 
@@ -1465,9 +1483,6 @@ fn sec_symlink_to_etc_rejected() {
 /// Tests the non-ASCII guard branch in validate_path.
 #[test]
 fn sec_non_ascii_path_rejected() {
-    let result = FileRead.execute(
-        &json!({ "path": "/tmp/テスト.txt" }),
-        &ctx("non_ascii"),
-    );
+    let result = FileRead.execute(&json!({ "path": "/tmp/テスト.txt" }), &ctx("non_ascii"));
     assert!(result.is_err(), "Non-ASCII path should be rejected");
 }

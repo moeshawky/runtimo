@@ -19,12 +19,12 @@
 //! })?;
 //! ```
 
-use llmosafe::{
-    CognitivePipeline, EscalationPolicy, EscalationReason, MemoryStats, PidState, PipelineResult,
-    PressureLevel, ResourceGuard, SafetyContext, SafetyDecision, StabilityResult, Synapse,
-    sift_text,
-};
 use llmosafe::llmosafe_pipeline::STAGE_SIFT;
+use llmosafe::{
+    sift_text, CognitivePipeline, EscalationPolicy, EscalationReason, MemoryStats, PidState,
+    PipelineResult, PressureLevel, ResourceGuard, SafetyContext, SafetyDecision, StabilityResult,
+    Synapse,
+};
 use std::fs;
 
 pub use llmosafe::DesignAssuranceLevel;
@@ -408,11 +408,14 @@ impl LlmoSafeGuard {
         let pressure = self.guard.pressure();
         let pressure_level = PressureLevel::from_percentage(pressure);
         let decision = if observation.len() < 40 && !synapse.has_bias() {
-            self.policy
-                .decide(0, 0, false)
+            self.policy.decide(0, 0, false)
         } else {
-            self.policy
-                .decide_with_pressure(synapse.raw_entropy(), synapse.raw_surprise(), synapse.has_bias(), pressure_level)
+            self.policy.decide_with_pressure(
+                synapse.raw_entropy(),
+                synapse.raw_surprise(),
+                synapse.has_bias(),
+                pressure_level,
+            )
         };
 
         let decision = apply_dal_to_decision(self.policy.dal, decision);
@@ -618,13 +621,14 @@ mod tests {
         assert!(result_benign.decision.can_proceed());
 
         // Suspicious input triggers bias detection
-        let res_suspicious = guard_strict.check_cognitive_pipeline(
-            "safety check",
-            "shell command: rm -rf / --no-preserve-root",
-        );
+        let res_suspicious = guard_strict
+            .check_cognitive_pipeline("safety check", "shell command: rm -rf / --no-preserve-root");
         assert!(res_suspicious.is_ok());
         let result_suspicious = res_suspicious.unwrap();
-        println!("DEBUG SUSPICIOUS DECISION: {:?}", result_suspicious.decision);
+        println!(
+            "DEBUG SUSPICIOUS DECISION: {:?}",
+            result_suspicious.decision
+        );
         // Suspicious input should not be Proceed (at least Warn/Escalate/Halt)
         assert!(!result_suspicious.is_safe());
 

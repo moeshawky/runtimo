@@ -149,7 +149,10 @@ pub fn validate_path(path_str: &str, ctx: &PathContext) -> Result<PathBuf, Strin
 
     // Check existence if required
     if ctx.require_exists && !path.exists() {
-        return Err(format!("path does not exist: {}", truncate_path(&normalized)));
+        return Err(format!(
+            "path does not exist: {}",
+            truncate_path(&normalized)
+        ));
     }
 
     // Resolve the canonical path:
@@ -188,7 +191,10 @@ pub fn validate_path(path_str: &str, ctx: &PathContext) -> Result<PathBuf, Strin
 
     // Verify it's a file if required (only meaningful for existing paths)
     if ctx.require_file && resolved.exists() && !resolved.is_file() {
-        return Err(format!("not a file: {}", truncate_path(&resolved.to_string_lossy())));
+        return Err(format!(
+            "not a file: {}",
+            truncate_path(&resolved.to_string_lossy())
+        ));
     }
 
     // Check allowed prefixes against the resolved path

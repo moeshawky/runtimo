@@ -461,9 +461,7 @@ fn resolve_args(
     args_stdin: bool,
 ) -> Result<String, String> {
     if args_file.is_some() && args_stdin {
-        return Err(
-            "Cannot use both --args-file and --args-stdin simultaneously".to_string(),
-        );
+        return Err("Cannot use both --args-file and --args-stdin simultaneously".to_string());
     }
 
     let content = if let Some(file_path) = args_file {
@@ -579,9 +577,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
                 return Ok(());
             }
-            let cap = reg
-                .get(&capability)
-                .ok_or_else(|| format!("Capability not found: {}. Use `runtimo list` to see available capabilities.", capability))?;
+            let cap = reg.get(&capability).ok_or_else(|| {
+                format!(
+                    "Capability not found: {}. Use `runtimo list` to see available capabilities.",
+                    capability
+                )
+            })?;
             let args_val: Value =
                 serde_json::from_str(&args).map_err(|e| format!("Invalid JSON args: {}", e))?;
             if let Err(e) = cap.validate(&args_val) {
@@ -696,7 +697,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .map_or_else(
                     |_| {
                         // Daemon unreachable; check WAL for any job event
-                        if let Ok(reader) = WalReader::load(&wal_path()) {
+                        if let Ok(reader) = WalReader::load_all(&wal_path()) {
                             reader.events().iter().any(|e| {
                                 e.job_id == job_id
                                     && matches!(
@@ -769,7 +770,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                     Err(_) => {
                         // Daemon might not be running; check WAL directly
-                        if let Ok(reader) = WalReader::load(&wal_path()) {
+                        if let Ok(reader) = WalReader::load_all(&wal_path()) {
                             let events = reader.events();
                             let has_completed = events.iter().any(|e| {
                                 e.job_id == job_id
@@ -851,7 +852,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
 
                 // Fallback to WAL
-                if let Ok(reader) = WalReader::load(&wal_path()) {
+                if let Ok(reader) = WalReader::load_all(&wal_path()) {
                     let events = reader.events();
                     let by_job: Vec<_> = events.iter().filter(|e| e.job_id == jid).collect();
                     if by_job.is_empty() {
@@ -887,7 +888,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                 } else {
                     // Fallback to WAL
-                    if let Ok(reader) = WalReader::load(&wal_path()) {
+                    if let Ok(reader) = WalReader::load_all(&wal_path()) {
                         let events = reader.events();
                         let mut seen: std::collections::HashSet<&String> =
                             std::collections::HashSet::new();
@@ -942,7 +943,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
                 Err(_) => {
                     // Fallback to WAL
-                    if let Ok(reader) = WalReader::load(&wal_path()) {
+                    if let Ok(reader) = WalReader::load_all(&wal_path()) {
                         let events = reader.events();
                         let mut jobs: Vec<Value> = Vec::new();
                         let mut seen: std::collections::HashSet<&String> =
@@ -1013,7 +1014,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         println!("{:?}  {}  {}  {:>15}", et, ts, jid, cap);
                     }
                 }
-            } else if let Ok(reader) = WalReader::load(&wal_path()) {
+            } else if let Ok(reader) = WalReader::load_all(&wal_path()) {
                 let events = reader.events();
                 let filtered: Vec<_> = if let Some(ref jid) = job_id {
                     events.iter().filter(|e| e.job_id == *jid).collect()

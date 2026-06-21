@@ -454,7 +454,8 @@ pub fn execute_with_telemetry_and_session(
             Err(e) => {
                 log::error!(
                     "Failed to create SessionManager for session '{}': {}",
-                    sid, e
+                    sid,
+                    e
                 );
             }
         }

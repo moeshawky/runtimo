@@ -70,7 +70,10 @@ fn reads_file_content() {
     let result = FileRead
         .execute(&json!({ "path": p.to_str().unwrap() }), &ctx("r1"))
         .unwrap();
-    assert_eq!(result.data.as_ref().unwrap()["content"].as_str().unwrap(), "hello world");
+    assert_eq!(
+        result.data.as_ref().unwrap()["content"].as_str().unwrap(),
+        "hello world"
+    );
     cleanup(&dir);
 }
 
@@ -157,7 +160,10 @@ fn rejects_path_traversal_write() {
     let ctx = ctx("traversal_write");
     let cap = FileWrite::new().expect("Failed to create FileWrite");
     assert!(cap
-        .execute(&json!({ "path": "../../../tmp/x.txt", "content": "x" }), &ctx)
+        .execute(
+            &json!({ "path": "../../../tmp/x.txt", "content": "x" }),
+            &ctx
+        )
         .is_err());
     cleanup(&dir);
 }
@@ -204,7 +210,10 @@ fn reads_unicode() {
     let r = FileRead
         .execute(&json!({ "path": p.to_str().unwrap() }), &ctx("e2"))
         .unwrap();
-    assert!(r.data.as_ref().unwrap()["content"].as_str().unwrap().contains("مرحبا"));
+    assert!(r.data.as_ref().unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .contains("مرحبا"));
     cleanup(&dir);
 }
 
@@ -215,7 +224,10 @@ fn reads_large_file() {
     let r = FileRead
         .execute(&json!({ "path": p.to_str().unwrap() }), &ctx("e3"))
         .unwrap();
-    assert_eq!(r.data.as_ref().unwrap()["content"].as_str().unwrap().len(), 100_000);
+    assert_eq!(
+        r.data.as_ref().unwrap()["content"].as_str().unwrap().len(),
+        100_000
+    );
     cleanup(&dir);
 }
 
@@ -469,7 +481,9 @@ fn rejects_missing_file() {
 fn rejects_missing_field_in_args() {
     let dir = setup();
     let ctx = ctx("missing_field");
-    assert!(FileRead.execute(&json!({ "wrong_field": "v" }), &ctx).is_err());
+    assert!(FileRead
+        .execute(&json!({ "wrong_field": "v" }), &ctx)
+        .is_err());
     let cap = FileWrite::new().expect("Failed to create FileWrite");
     assert!(cap.execute(&json!({ "path": "/tmp/x.txt" }), &ctx).is_err()); // missing content
     cleanup(&dir);
@@ -541,7 +555,10 @@ fn write_then_read_roundtrip() {
     let r = FileRead
         .execute(&json!({ "path": target.to_str().unwrap() }), &ctx("rt2"))
         .unwrap();
-    assert_eq!(r.data.as_ref().unwrap()["content"].as_str().unwrap(), original);
+    assert_eq!(
+        r.data.as_ref().unwrap()["content"].as_str().unwrap(),
+        original
+    );
     cleanup(&dir);
 }
 
@@ -690,7 +707,11 @@ fn multiple_jobs_in_sequence() {
     println!("Success: {}, Output: {:?}", r.success, r.output);
     assert!(r.success, "FileRead failed: {:?}", r.output.output);
     assert_eq!(
-        r.output.data.as_ref().unwrap().get("content")
+        r.output
+            .data
+            .as_ref()
+            .unwrap()
+            .get("content")
             .and_then(|v| v.as_str())
             .unwrap_or("CONTENT_MISSING"),
         "seq test"
@@ -841,10 +862,13 @@ fn c2_synthetic_registry_enforces_path_security() {
 
     // --- Critical files must be blocked ---
     let fw = registry.get("FileWrite").unwrap();
-    let critical = fw.execute(&json!({
-        "path": "/root/.ssh/authorized_keys",
-        "content": "malicious key"
-    }), &ctx);
+    let critical = fw.execute(
+        &json!({
+            "path": "/root/.ssh/authorized_keys",
+            "content": "malicious key"
+        }),
+        &ctx,
+    );
     assert!(
         critical.is_err(),
         "Synthetic registry must block critical files"
@@ -1236,7 +1260,7 @@ fn dispatch_pipeline_multiple_jobs_have_unique_ids() {
             &wp,
         )
         .expect("dispatch");
-    assert!(result.success);
+        assert!(result.success);
         assert!(
             ids.insert(result.job_id.clone()),
             "Job IDs must be unique across dispatches (collision at {})",
@@ -1310,7 +1334,11 @@ fn test_dal_a_shell_exec_cognitive_safety() {
 
     // Should pass — cognitive pipeline detects manipulation patterns,
     // not harmless echo commands.
-    assert!(result.is_ok(), "ShellExec cognitive safety failed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "ShellExec cognitive safety failed: {:?}",
+        result.err()
+    );
     let exec_res = result.unwrap();
     assert!(exec_res.success, "ShellExec should execute successfully");
 
@@ -1321,7 +1349,10 @@ fn test_dal_a_shell_exec_cognitive_safety() {
     let has_completed = events
         .iter()
         .any(|e| matches!(e.event_type, WalEventType::JobCompleted));
-    assert!(has_completed, "Should have JobCompleted event for ShellExec");
+    assert!(
+        has_completed,
+        "Should have JobCompleted event for ShellExec"
+    );
 
     cleanup(&dir);
 }

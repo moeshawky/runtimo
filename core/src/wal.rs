@@ -355,6 +355,14 @@ impl WalWriter {
 /// Malformed lines are silently skipped. This is intentional — partial writes
 /// from crashes may leave incomplete JSON at the end of the file.
 ///
+/// # Single-File vs Multi-File Loading
+///
+/// - [`WalReader::load`] reads only the current (active) WAL file.
+/// - [`WalReader::load_all`] reads the current file PLUS all archived rotation
+///   files (`{path}.1`, `{path}.2`, ...) in chronological order (oldest first,
+///   newest last). Use `load_all` when consumers need complete event history
+///   across WAL rotations.
+///
 /// # Example
 ///
 /// ```rust,ignore
@@ -372,7 +380,11 @@ pub struct WalReader {
 }
 
 impl WalReader {
-    /// Loads and parses all events from a WAL file.
+    /// Loads and parses all events from a single WAL file.
+    ///
+    /// Reads only the file at `path`. If WAL rotation has occurred, events
+    /// in archived files (`{path}.1`, `{path}.2`, ...) are NOT included.
+    /// Use [`WalReader::load_all`] when complete event history is needed.
     ///
     /// # Errors
     ///
@@ -386,6 +398,85 @@ impl WalReader {
             .lines()
             .filter_map(|line| serde_json::from_str(line).ok())
             .collect();
+
+        Ok(Self { events })
+    }
+
+    /// Loads and parses all events from the current WAL file and all archived
+    /// rotation files.
+    ///
+    /// Reads archived files (`{path}.1`, `{path}.2`, ..., `{path}.N`) first
+    /// in reverse index order (newest archive → oldest archive), then the
+    /// current file. This produces events in chronological order (oldest first,
+    /// newest last) — the order needed by consumers that must see the full
+    /// event history across WAL rotations.
+    ///
+    /// Archived files that do not exist are silently skipped. Malformed lines
+    /// within any file are silently skipped (same behavior as [`Self::load`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::WalError`](crate::Error::WalError) if the current WAL
+    /// file at `path` cannot be read. Archived file read failures are logged
+    /// and skipped (non-fatal).
+    pub fn load_all(path: &Path) -> Result<Self> {
+        // Discover archived rotation files by scanning for numeric suffixes.
+        // Rotation naming: path.1, path.2, ..., path.N
+        // We read in reverse order (newest archive first) so events end up
+        // in chronological order after we append the current file last.
+        let mut archived_indices: Vec<usize> = Vec::new();
+        if let Some(parent) = path.parent() {
+            let dir_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if let Ok(entries) = std::fs::read_dir(parent) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if name.starts_with(&dir_name) {
+                        let suffix = &name[dir_name.len()..];
+                        if let Some(index_str) = suffix.strip_prefix('.') {
+                            if let Ok(index) = index_str.parse::<usize>() {
+                                if index > 0 {
+                                    archived_indices.push(index);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Sort descending so we read newest archive first, oldest last.
+        // After prepending these to the event list, the current file's
+        // events are appended last, preserving chronological order.
+        archived_indices.sort_unstable_by(|a, b| b.cmp(a));
+
+        let mut events: Vec<WalEvent> = Vec::new();
+
+        // Read archived files (newest archive first → oldest archive last)
+        for index in &archived_indices {
+            let rotated = rotation_path_for(path, *index);
+            if let Ok(content) = std::fs::read_to_string(&rotated) {
+                let file_events: Vec<WalEvent> = content
+                    .lines()
+                    .filter_map(|line| serde_json::from_str(line).ok())
+                    .collect();
+                // Prepend: archived events are older, so they go before
+                // whatever we've already collected.
+                let mut combined = file_events;
+                combined.extend(events);
+                events = combined;
+            }
+        }
+
+        // Read the current (active) WAL file
+        let content =
+            std::fs::read_to_string(path).map_err(|e| crate::Error::WalError(e.to_string()))?;
+        let current_events: Vec<WalEvent> = content
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        events.extend(current_events);
 
         Ok(Self { events })
     }
@@ -428,6 +519,17 @@ impl WalReader {
     }
 }
 
+/// Computes the rotation path for a WAL file and rotation index.
+///
+/// For `foo.jsonl` with index `1`, returns `foo.jsonl.1` (preserves the
+/// original extension instead of replacing it).
+fn rotation_path_for(path: &Path, index: usize) -> std::path::PathBuf {
+    let mut s = path.to_string_lossy().into_owned();
+    s.push('.');
+    s.push_str(&index.to_string());
+    std::path::PathBuf::from(s)
+}
+
 /// WAL cleanup and rotation utilities.
 impl WalWriter {
     /// Returns the rotation path for a given WAL file and rotation index.
@@ -435,10 +537,7 @@ impl WalWriter {
     /// For `foo.jsonl` with index `1`, returns `foo.jsonl.1` (preserves the
     /// original extension instead of replacing it).
     fn rotation_path(path: &Path, index: usize) -> std::path::PathBuf {
-        let mut s = path.to_string_lossy().into_owned();
-        s.push('.');
-        s.push_str(&index.to_string());
-        std::path::PathBuf::from(s)
+        rotation_path_for(path, index)
     }
 
     /// Rotates the WAL when it exceeds max_size_bytes.
@@ -995,5 +1094,115 @@ mod tests {
         assert_eq!(reader.events()[0].job_id, "valid");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_wal_load_all_reads_archived_files() {
+        // Regression test for WAL rotation ↔ consumer mismatch:
+        // After rotation, WalReader::load_all must still see events
+        // from the archived .1 file.
+        let path = tmp_wal("load_all");
+        let rotated = WalWriter::rotation_path(&path, 1);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&rotated);
+
+        // Write events to current WAL
+        let mut wal = WalWriter::create(&path).unwrap();
+        wal.append(WalEvent {
+            seq: 0,
+            ts: 1000,
+            event_type: WalEventType::JobStarted,
+            job_id: "archived-job".into(),
+            capability: None,
+            output: Some(serde_json::json!({
+                "data": {
+                    "path": "/tmp/original.txt",
+                    "backup_path": "/tmp/backups/archived-job/test.txt"
+                }
+            })),
+            error: None,
+            telemetry_before: None,
+            telemetry_after: None,
+            process_before: None,
+            process_after: None,
+            cmd: None,
+            cmd_stdout: None,
+            cmd_stderr: None,
+            cmd_exit_code: None,
+            cmd_corrected: None,
+            ..Default::default()
+        })
+        .unwrap();
+
+        // Rotate: moves events to .1, creates empty current file
+        let size = std::fs::metadata(&path).unwrap().len();
+        WalWriter::rotate(&path, size - 1, 3).unwrap();
+        assert!(rotated.exists());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+
+        // Write new events to current WAL after rotation
+        wal.append(WalEvent {
+            seq: 0,
+            ts: 2000,
+            event_type: WalEventType::JobStarted,
+            job_id: "current-job".into(),
+            capability: Some("FileRead".into()),
+            output: None,
+            error: None,
+            telemetry_before: None,
+            telemetry_after: None,
+            process_before: None,
+            process_after: None,
+            cmd: None,
+            cmd_stdout: None,
+            cmd_stderr: None,
+            cmd_exit_code: None,
+            cmd_corrected: None,
+            ..Default::default()
+        })
+        .unwrap();
+
+        // WalReader::load (current only) should see 1 event
+        let single = WalReader::load(&path).unwrap();
+        assert_eq!(single.events().len(), 1);
+        assert_eq!(single.events()[0].job_id, "current-job");
+
+        // WalReader::load_all should see BOTH events (archived + current)
+        let all = WalReader::load_all(&path).unwrap();
+        assert_eq!(
+            all.events().len(),
+            2,
+            "load_all should see events from both current and .1 archived file"
+        );
+
+        // Archived event should come first (chronological order)
+        assert_eq!(all.events()[0].job_id, "archived-job");
+        assert_eq!(all.events()[0].ts, 1000);
+        assert_eq!(all.events()[1].job_id, "current-job");
+        assert_eq!(all.events()[1].ts, 2000);
+
+        // Verify the backup_path mapping is accessible from load_all
+        let backup_mapping: std::collections::HashMap<_, _> = all
+            .events()
+            .iter()
+            .filter_map(|e| {
+                e.output.as_ref().and_then(|o| {
+                    let data = o.get("data")?;
+                    let path = data.get("path")?.as_str()?;
+                    let backup = data.get("backup_path")?.as_str()?;
+                    Some((backup.to_string(), path.to_string()))
+                })
+            })
+            .collect();
+        assert_eq!(
+            backup_mapping
+                .get("/tmp/backups/archived-job/test.txt")
+                .map(String::as_str),
+            Some("/tmp/original.txt"),
+            "load_all must expose backup→original mapping from archived WAL"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&rotated);
     }
 }

@@ -1275,7 +1275,8 @@ impl TypedCapability for ShellExec {
         if args.cmd.len() > max_cmd_len {
             return Err(CapabilityError::InvalidArgs(format!(
                 "command too long ({} bytes, max {})",
-                args.cmd.len(), max_cmd_len
+                args.cmd.len(),
+                max_cmd_len
             )));
         }
 
@@ -2192,7 +2193,9 @@ mod tests {
         // cat $HOME/somefile should be ALLOWED (within allowed prefix)
         let home = std::env::var("HOME").unwrap_or_else(|_| "/home/user".to_string());
         let allowed = crate::config::RuntimoConfig::get_allowed_prefixes();
-        let is_allowed = allowed.iter().any(|p| home.starts_with(p) || p.starts_with(&home));
+        let is_allowed = allowed
+            .iter()
+            .any(|p| home.starts_with(p) || p.starts_with(&home));
         if !is_allowed {
             // Skip test when HOME is outside allowed prefixes (e.g., /root in CI/containers)
             eprintln!("SKIP: HOME ({}) is outside allowed prefixes; test requires HOME within allowed area", home);

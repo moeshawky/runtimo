@@ -266,7 +266,10 @@ impl TypedCapability for FileWrite {
 
 fn is_critical_file(path: &std::path::Path) -> bool {
     let path_str = path.to_string_lossy();
-    let filename = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+    let filename = path
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default();
     for critical in CRITICAL_FILES {
         if critical.contains('*') {
             if glob_match(critical, &filename) {

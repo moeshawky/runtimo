@@ -94,7 +94,7 @@ impl TypedCapability for Undo {
         let mut original_paths: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         if wal_path.exists() {
-            match crate::WalReader::load(&wal_path) {
+            match crate::WalReader::load_all(&wal_path) {
                 Ok(reader) => {
                     for event in reader.events() {
                         if event.job_id == args.job_id {
