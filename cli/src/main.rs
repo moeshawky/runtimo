@@ -33,7 +33,7 @@ const MAX_ARGS_SIZE_BYTES: usize = 130 * 1024;
     long_about = "runtimo — capability runtime with telemetry, WAL, and process tracking\n\n\
 Every exec: telemetry + process snapshot + WAL audit\n\
 Background: dispatch jobs to daemon, check status later",
-    after_help = "USAGE:\n runtimo run -c <Capability> -a '<json>'\n runtimo dispatch -c <Capability> -a '<json>'\n runtimo jobs\n runtimo wait -j <job_id>\n runtimo list\n runtimo logs\n runtimo telemetry\n runtimo processes\n\nCAPABILITIES:\n FileRead  Read file. Path validated. No dirs, no traversal.\n FileWrite Write file. Auto-backup for undo. Append mode ok.\n ShellExec Exec via sh -c. Blocks rm, shutdown, chmod, mkfs, dd, iptables, fork bombs, env dumpers, network tools (opt-in). See `runtimo list` for full blocklist.\n GitExec   Git ops: clone|pull|commit|revert|clean|status.\n Kill      Kill process by PID. Protected: init, kthreadd, self.\n Undo      Restore from backup. Find job IDs with `runtimo jobs` or `runtimo logs`.\n\nTIP: Use `runtimo run -c <Cap> --schema` to see the JSON args a capability expects.\nTIP: Use `runtimo list --schemas` to see all schemas at once.\nTIP: ShellExec timeout range is 1–300 seconds (default: 30).\n\nDaemon starts on first dispatch if runtimo-daemon is installed.",
+    after_help = "USAGE:\n runtimo run -c <Capability> -a '<json>'\n runtimo dispatch -c <Capability> -a '<json>'\n runtimo jobs\n runtimo wait -j <job_id>\n runtimo list\n runtimo logs\n runtimo telemetry\n runtimo processes\n\nCAPABILITIES:\n FileRead  Read file. Path validated (allowed dirs only). No dirs, no traversal.\n FileWrite Write file. Auto-backup for undo. Append mode ok.\n ShellExec Exec via sh -c. Blocks many dangerous commands (see `runtimo list` for full blocklist). Network tools and interpreters are opt-in.\n GitExec   Git ops: clone|pull|commit|revert|clean|status.\n Kill      Kill process by PID. Protected: init, kthreadd, self, parent, session/group leaders, systemd services.\n Undo      Restore from backup. Find job IDs with `runtimo jobs` or `runtimo logs`.\n\nTIP: Use `runtimo run -c <Cap> --schema` to see the JSON args a capability expects.\nTIP: Use `runtimo list --schemas` to see all schemas at once.\nTIP: ShellExec timeout range is 1–300 seconds (default: 30).\n\nDaemon starts on first dispatch if runtimo-daemon is installed.",
     version
 )]
 struct Cli {
@@ -129,10 +129,10 @@ enum Commands {
         #[arg(short = 'j', long)]
         json: bool,
     },
-    /// Check job status (local or dispatched)
+    /// Check job status (via daemon RPC if running, falls back to WAL)
     #[command(
-        about = "Check job status",
-        after_help = "EXAMPLES:\n runtimo status             # all jobs\n runtimo status -j abc123   # specific job\n runtimo status -oj         # JSON output"
+        about = "Check job status (daemon RPC or WAL fallback)",
+        after_help = "EXAMPLES:\n runtimo status             # all jobs (daemon RPC)\n runtimo status -j abc123   # specific job\n runtimo status -oj         # JSON output\n\nNote: queries daemon for live status; falls back to WAL data if daemon unreachable."
     )]
     Status {
         /// Job ID to check (omit to list all)
@@ -142,10 +142,10 @@ enum Commands {
         #[arg(short = 'o', long)]
         json: bool,
     },
-    /// List recent jobs from WAL (local + dispatched)
+    /// List recent jobs from WAL (local + dispatched, read-only snapshot)
     #[command(
-        about = "List recent jobs",
-        after_help = "EXAMPLES:\n runtimo jobs\n runtimo jobs --limit 5\n runtimo jobs --json"
+        about = "List recent jobs from WAL",
+        after_help = "EXAMPLES:\n runtimo jobs\n runtimo jobs --limit 5\n runtimo jobs --json\n\nNote: reads from WAL directly (no daemon needed). Use `status` for live daemon query."
     )]
     Jobs {
         /// Number of jobs to show (default: 20)
@@ -225,6 +225,7 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum ConfigAction {
+    #[command(about = "Manage allowed path prefixes for FileRead/FileWrite")]
     AllowedPaths {
         #[command(subcommand)]
         subaction: AllowedPathsAction,
