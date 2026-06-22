@@ -73,9 +73,9 @@ enum Commands {
         /// Print the capability's JSON Schema and exit
         #[arg(long)]
         schema: bool,
-        /// Execution timeout in seconds (1–300, default: 30)
-        #[arg(long, default_value = "30", value_parser = clap::value_parser!(u64).range(1..=300))]
-        timeout: u64,
+        /// Execution timeout in seconds (1–300). Defaults to config value, then 30s.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=300))]
+        timeout: Option<u64>,
     },
     /// Dispatch job to background daemon (returns immediately)
     #[command(
@@ -229,6 +229,17 @@ enum ConfigAction {
     AllowedPaths {
         #[command(subcommand)]
         subaction: AllowedPathsAction,
+    },
+    /// Show current configuration
+    #[command(about = "Show current configuration (from config.toml)")]
+    Show,
+    /// Get or set the Design Assurance Level (DAL)
+    #[command(
+        about = "Get or set the Design Assurance Level (A-E) for the cognitive safety pipeline"
+    )]
+    Dal {
+        /// New DAL level to set (A, B, C, D, or E). Omit to show current value.
+        level: Option<String>,
     },
 }
 
@@ -597,6 +608,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 );
                 std::process::exit(1);
             }
+            let resolved_timeout =
+                timeout.unwrap_or_else(|| RuntimoConfig::get_capability_timeout(&capability, 30));
             let result = execute_with_telemetry_and_session(
                 cap,
                 &args_val,
@@ -604,7 +617,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 &wal_path(),
                 None,
                 None,
-                timeout,
+                resolved_timeout,
             )
             .map_err(|e| format!("{}", e));
             release_cli_slot();
@@ -1225,6 +1238,60 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
             }
+            ConfigAction::Show => {
+                let config = RuntimoConfig::load();
+                println!("Configuration: {}", RuntimoConfig::config_path().display());
+                println!();
+                println!("Allowed paths (config file): {:?}", config.allowed_paths);
+                println!("DAL (config): {:?}", config.dal);
+                println!("Blocklist overrides: {:?}", config.blocklist_overrides);
+                if config.capability_timeouts.is_empty() {
+                    println!("Capability timeouts: (none configured, using defaults)");
+                } else {
+                    println!("Capability timeouts:");
+                    for (cap, timeout) in &config.capability_timeouts {
+                        println!("  {}: {}s", cap, timeout);
+                    }
+                }
+                println!();
+                println!("Effective settings (with env var + defaults):");
+                println!("  DAL: {}", RuntimoConfig::get_dal());
+                let all_prefixes = RuntimoConfig::get_allowed_prefixes();
+                println!("  Allowed paths ({} total):", all_prefixes.len());
+                for p in &all_prefixes {
+                    println!("    {}", p);
+                }
+            }
+            ConfigAction::Dal { level } => {
+                if let Some(new_level) = level {
+                    let upper = new_level.to_uppercase();
+                    if !matches!(upper.as_str(), "A" | "B" | "C" | "D" | "E") {
+                        eprintln!(
+                            "Invalid DAL level: {}. Must be A, B, C, D, or E.",
+                            new_level
+                        );
+                        std::process::exit(1);
+                    }
+                    let mut config = RuntimoConfig::load();
+                    config.dal = Some(upper.clone());
+                    config.save().map_err(|e| format!("Save failed: {}", e))?;
+                    println!("DAL set to {} in config file.", upper);
+                    println!("Note: RUNTIMO_DAL env var (if set) still takes precedence.");
+                } else {
+                    let current = RuntimoConfig::get_dal();
+                    let source = if std::env::var("RUNTIMO_DAL").is_ok() {
+                        "env var (RUNTIMO_DAL)"
+                    } else {
+                        let config = RuntimoConfig::load();
+                        if config.dal.is_some() {
+                            "config file"
+                        } else {
+                            "default"
+                        }
+                    };
+                    println!("Current DAL: {} (source: {})", current, source);
+                }
+            }
         },
     }
 
@@ -1297,7 +1364,7 @@ mod tests {
                 assert!(dry_run);
                 assert!(json);
                 assert!(!quiet);
-                assert_eq!(timeout, 10);
+                assert_eq!(timeout, Some(10));
             }
             _ => panic!("Expected Run command"),
         }

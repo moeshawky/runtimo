@@ -8,6 +8,7 @@
 //! 4. Context-specific prefixes (programmatic override)
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Built-in default allowed prefixes.
@@ -20,6 +21,34 @@ pub struct RuntimoConfig {
     /// Additional allowed path prefixes (merged with defaults + env var).
     #[serde(default)]
     pub allowed_paths: Vec<String>,
+
+    /// Design Assurance Level (A-E) for the llmosafe cognitive pipeline.
+    ///
+    /// When set, overrides the `RUNTIMO_DAL` env var. Controls how strictly
+    /// the cognitive safety pipeline gates execution:
+    /// - A: No override (strictest)
+    /// - B: Halt → Escalate
+    /// - C: Halt/Escalate → Warn
+    /// - D: Halt/Escalate/Exit → Warn (cap at Warn)
+    /// - E: All decisions → Proceed (permissive)
+    #[serde(default)]
+    pub dal: Option<String>,
+
+    /// Additional dangerous command patterns for ShellExec blocklist.
+    ///
+    /// Each entry is a substring that triggers rejection. Merged with the
+    /// built-in blocklist. Example: `["curl", "wget"]` blocks those commands
+    /// even when `RUNTIMO_ENABLE_NETWORK=1`.
+    #[serde(default)]
+    pub blocklist_overrides: Vec<String>,
+
+    /// Per-capability timeout defaults (seconds).
+    ///
+    /// Maps capability name to default timeout. Overrides the built-in
+    /// defaults (30s for most, 300s for ShellExec). Individual executions
+    /// can still override via `timeout_secs` in args.
+    #[serde(default)]
+    pub capability_timeouts: HashMap<String, u64>,
 }
 
 impl RuntimoConfig {
@@ -112,6 +141,47 @@ impl RuntimoConfig {
         let content = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
         std::fs::write(&path, content).map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// Returns the resolved Design Assurance Level.
+    ///
+    /// Priority (highest to lowest):
+    /// 1. `RUNTIMO_DAL` env var
+    /// 2. Config file `dal` field
+    /// 3. Default: `A`
+    #[must_use]
+    pub fn get_dal() -> String {
+        // Env var takes precedence
+        if let Ok(env_dal) = std::env::var("RUNTIMO_DAL") {
+            return env_dal.to_uppercase();
+        }
+        // Config file
+        let config = Self::load();
+        config.dal.unwrap_or_else(|| "A".to_string())
+    }
+
+    /// Returns the merged blocklist overrides from config.
+    ///
+    /// These are additional substrings that trigger rejection in ShellExec,
+    /// merged on top of the built-in blocklist.
+    #[must_use]
+    pub fn get_blocklist_overrides() -> Vec<String> {
+        let config = Self::load();
+        config.blocklist_overrides
+    }
+
+    /// Returns the default timeout for a capability, or the fallback.
+    ///
+    /// Checks config file `capability_timeouts` map, falls back to the
+    /// provided default if no override is configured.
+    #[must_use]
+    pub fn get_capability_timeout(capability: &str, fallback: u64) -> u64 {
+        let config = Self::load();
+        config
+            .capability_timeouts
+            .get(capability)
+            .copied()
+            .unwrap_or(fallback)
     }
 
     /// Returns merged prefixes: defaults + env var + config file.

@@ -427,8 +427,24 @@ impl<T: TypedCapability> Capability for T {
     fn execute(&self, args: &Value, ctx: &Context) -> Result<Output> {
         let typed_args: T::Args = serde_json::from_value(args.clone())
             .map_err(|e| crate::Error::SchemaValidationFailed(e.to_string()))?;
-        TypedCapability::execute(self, typed_args, ctx)
-            .map_err(|e| crate::Error::ExecutionFailed(e.to_string()))
+        TypedCapability::execute(self, typed_args, ctx).map_err(|e| {
+            // Map CapabilityError variants to structured error with JSON-RPC codes.
+            // This preserves the error variant information that would otherwise be
+            // lost to stringification, enabling programmatic error handling.
+            let (code, variant) = match &e {
+                CapabilityError::PermissionDenied(_) => (-32001, "PermissionDenied"),
+                CapabilityError::NotFound(_) => (-32002, "NotFound"),
+                CapabilityError::InvalidArgs(_) => (-32004, "InvalidArgs"),
+                CapabilityError::Io(_) => (-32005, "Io"),
+                CapabilityError::Git(_) => (-32006, "Git"),
+                CapabilityError::Internal(_) => (-32003, "Internal"),
+            };
+            crate::Error::CapabilityExecutionFailed {
+                msg: e.to_string(),
+                variant,
+                code,
+            }
+        })
     }
 }
 

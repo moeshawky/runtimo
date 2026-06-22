@@ -16,7 +16,7 @@ Runtimo is a Rust workspace providing a **capability execution engine**. Every c
 - **Backup/undo** — Files backed up before mutation, rollback by job ID
 - **Input validation** — Capabilities validate arguments including path traversal, symlink, and null byte protection
 
-**Version:** 0.7.1 | **Rust Edition:** 2021 | **Tests:** 436
+**Version:** 0.7.2 | **Rust Edition:** 2021 | **Tests:** 436
 
 ## Quick Start
 
@@ -69,6 +69,12 @@ runtimo logs
 
 # Undo a job
 runtimo undo -j <job_id>
+
+# Show current configuration
+runtimo config show
+
+# Set DAL level (A=strict, E=permissive)
+runtimo config dal B
 ```
 
 ## Architecture
@@ -338,9 +344,8 @@ cargo clippy --all-targets          # zero warnings required
 | `XDG_DATA_HOME` | `~/.local/share` | Default WAL/backup/session root |
 | `RUNTIMO_ENABLE_PUBLIC_IP` | (unset) | Set to `1` to enable public IP discovery in telemetry |
 | `RUNTIMO_ENABLE_NETWORK` | (unset) | Set to `1` to allow outbound network tools (curl, wget, ssh, etc.) in ShellExec |
-| `RUNTIMO_DAL` | (unset) | Data access layer configuration (future) |
+| `RUNTIMO_DAL` | (unset = A) | Design Assurance Level for cognitive safety pipeline (A-E). A=strict, E=permissive. Also configurable via `runtimo config dal` or config file `dal` field. |
 | `RUNTIMO_STATE_DIR` | `$XDG_DATA_HOME/runtimo` | Override state directory for WAL/backups/sessions |
-| `RUNTIMO_ENABLE_NETWORK` | (unset) | Set to `1` to allow outbound network tools (curl, wget, etc.) in ShellExec |
 
 ## License
 

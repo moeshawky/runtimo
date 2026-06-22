@@ -54,3 +54,9 @@ runtimo_symlink_test
 # Agentic artifacts
 elegantify-report.md
 publishing.md
+.workflows/
+.ap-output/
+.cbp-output/
+.cam-workpaper.yaml
+session-ses_*.md
+.ix/

@@ -19,6 +19,7 @@
 //! })?;
 //! ```
 
+use crate::config::RuntimoConfig;
 use llmosafe::llmosafe_pipeline::STAGE_SIFT;
 use llmosafe::{
     sift_text, CognitivePipeline, EscalationPolicy, EscalationReason, MemoryStats, PidState,
@@ -31,6 +32,21 @@ pub use llmosafe::DesignAssuranceLevel;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+/// Parses a DAL string (e.g., "A", "B", "c") into a `DesignAssuranceLevel`.
+///
+/// Uses `RuntimoConfig::get_dal()` which respects the priority chain:
+/// env var → config file → default "A". This function converts the
+/// resolved string into the typed enum.
+fn dal_from_config() -> DesignAssuranceLevel {
+    match RuntimoConfig::get_dal().as_str() {
+        "B" => DesignAssuranceLevel::B,
+        "C" => DesignAssuranceLevel::C,
+        "D" => DesignAssuranceLevel::D,
+        "E" => DesignAssuranceLevel::E,
+        _ => DesignAssuranceLevel::A,
+    }
+}
 
 /// Rolling resource usage tracker for cooldown enforcement (FINDING #16).
 ///
@@ -218,41 +234,27 @@ fn apply_dal_to_decision(dal: DesignAssuranceLevel, decision: SafetyDecision) ->
 
 impl LlmoSafeGuard {
     /// Creates a guard with the default memory ceiling (80% of system memory).
+    ///
+    /// DAL is resolved via `RuntimoConfig::get_dal()` which checks:
+    /// env var `RUNTIMO_DAL` → config file `dal` field → default `A`.
     #[must_use]
     pub fn new() -> Self {
         let guard = ResourceGuard::auto(0.8);
-        let dal = match std::env::var("RUNTIMO_DAL")
-            .map(|s| s.to_uppercase())
-            .as_deref()
-        {
-            Ok("B") => DesignAssuranceLevel::B,
-            Ok("C") => DesignAssuranceLevel::C,
-            Ok("D") => DesignAssuranceLevel::D,
-            Ok("E") => DesignAssuranceLevel::E,
-            _ => DesignAssuranceLevel::A,
-        };
         Self {
             guard,
-            policy: EscalationPolicy::default().with_dal(dal),
+            policy: EscalationPolicy::default().with_dal(dal_from_config()),
         }
     }
 
     /// Creates a guard with an explicit memory ceiling in bytes.
+    ///
+    /// DAL is resolved via `RuntimoConfig::get_dal()` which checks:
+    /// env var `RUNTIMO_DAL` → config file `dal` field → default `A`.
     #[must_use]
     pub fn with_memory_ceiling_bytes(memory_ceiling_bytes: usize) -> Self {
-        let dal = match std::env::var("RUNTIMO_DAL")
-            .map(|s| s.to_uppercase())
-            .as_deref()
-        {
-            Ok("B") => DesignAssuranceLevel::B,
-            Ok("C") => DesignAssuranceLevel::C,
-            Ok("D") => DesignAssuranceLevel::D,
-            Ok("E") => DesignAssuranceLevel::E,
-            _ => DesignAssuranceLevel::A,
-        };
         Self {
             guard: ResourceGuard::new(memory_ceiling_bytes),
-            policy: EscalationPolicy::default().with_dal(dal),
+            policy: EscalationPolicy::default().with_dal(dal_from_config()),
         }
     }
 

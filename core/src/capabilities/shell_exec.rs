@@ -470,6 +470,18 @@ pub fn is_dangerous_command(cmd: &str) -> Option<&'static str> {
         return Some("chmod command blocked — use FileWrite/Undo capability");
     }
 
+    // ── Config-based blocklist overrides ──
+    // Additional patterns from `~/.config/runtimo/config.toml` [blocklist_overrides].
+    // These are merged on top of the built-in blocklist for site-specific policy.
+    let overrides = crate::config::RuntimoConfig::get_blocklist_overrides();
+    for pattern in &overrides {
+        if !pattern.is_empty()
+            && (cmd_lower.contains(pattern.as_str()) || detok_lower.contains(pattern.as_str()))
+        {
+            return Some("command blocked by config override");
+        }
+    }
+
     None
 }
 

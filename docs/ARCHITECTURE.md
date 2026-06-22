@@ -1,7 +1,7 @@
 # Runtimo Architecture
 
-**Version:** 0.7.1
-**Last Updated:** 2026-05-28
+**Version:** 0.7.2
+**Last Updated:** 2026-06-22
 
 ---
 

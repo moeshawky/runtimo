@@ -133,6 +133,34 @@ pub enum Error {
     #[error("Execution failed: {0}")]
     ExecutionFailed(String),
 
+    /// Execution failed with a structured capability error.
+    ///
+    /// This variant preserves the original `CapabilityError` variant information
+    /// that would otherwise be lost to stringification in the blanket impl at
+    /// `capability.rs:431`. Clients can match on this variant to programmatically
+    /// distinguish `PermissionDenied` from `NotFound`, `InvalidArgs`, etc.
+    ///
+    /// # Fields
+    /// - `msg`: Human-readable error message (for display/logging)
+    /// - `variant`: Machine-readable variant name (for programmatic handling)
+    /// - `code`: JSON-RPC error code in range -32000 to -32099 (server-defined errors)
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// match error {
+    ///     Error::CapabilityExecutionFailed { code, variant, msg } => {
+    ///         eprintln!("Error {}: {} - {}", code, variant, msg);
+    ///     }
+    ///     _ => {}
+    /// }
+    /// ```
+    #[error("Capability execution failed: {variant} - {msg}")]
+    CapabilityExecutionFailed {
+        msg: String,
+        variant: &'static str,
+        code: i32,
+    },
+
     /// Write-Ahead Log operation failed.
     #[error("WAL error: {0}")]
     WalError(String),

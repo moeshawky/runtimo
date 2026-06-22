@@ -14,8 +14,8 @@
 
 use runtimo_core::{
     capabilities::{is_dangerous_command, FileRead, FileWrite, GitExec, Kill, ShellExec, Undo},
-    execute_with_telemetry_and_session, BackupManager, CapabilityRegistry, WalEvent, WalEventType,
-    WalReader, WalWriter,
+    execute_with_telemetry_and_session, BackupManager, CapabilityRegistry, RuntimoConfig, WalEvent,
+    WalEventType, WalReader, WalWriter,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -137,6 +137,15 @@ async fn handle_run(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonR
         };
     };
 
+    // Concurrency Note: This mutex serializes ALL capability execution, not just WAL writes.
+    // Concurrent dispatch calls queue behind this lock — if Client A runs a 30-second capability,
+    // Client B cannot execute ANY capability for 30 seconds.
+    // MAX_CONCURRENT_JOBS=16 is a safety limit, not a throughput target.
+    // The dispatch API gives the illusion of concurrency but delivers serial execution.
+    // Future Work: Narrowing the mutex scope requires redesigning WalWriter::append() to assign
+    // sequence numbers inside the flock-protected section. Currently:
+    // `seq = wal.seq(); wal.append(event)` — the assignment and write are NOT atomic
+    // under concurrency. See: core/src/wal.rs:317-343
     let _guard = state.wal_mutex.lock().unwrap_or_else(|e| e.into_inner());
 
     match execute_with_telemetry_and_session(
@@ -146,7 +155,9 @@ async fn handle_run(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonR
         &state.wal_path,
         None,
         run_params.working_dir.clone().map(PathBuf::from),
-        run_params.timeout_secs.unwrap_or(30),
+        run_params
+            .timeout_secs
+            .unwrap_or_else(|| RuntimoConfig::get_capability_timeout(&run_params.capability, 30)),
     ) {
         Ok(result) => JsonRpcResponse {
             result: Some(serde_json::json!({
@@ -158,14 +169,33 @@ async fn handle_run(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonR
             error: None,
             id,
         },
-        Err(e) => JsonRpcResponse {
-            result: Some(serde_json::json!({
-                "success": false,
-                "error": e.to_string(),
-            })),
-            error: None,
-            id,
-        },
+        Err(e) => {
+            // Extract structured error information if available.
+            // CapabilityExecutionFailed carries variant + code for programmatic handling.
+            match &e {
+                runtimo_core::Error::CapabilityExecutionFailed { code, variant, msg } => {
+                    JsonRpcResponse {
+                        result: Some(serde_json::json!({
+                            "success": false,
+                            "error_code": code,
+                            "error_variant": variant,
+                            "error": msg,
+                        })),
+                        error: None,
+                        id,
+                    }
+                }
+                _ => JsonRpcResponse {
+                    result: Some(serde_json::json!({
+                        "success": false,
+                        "error_code": -32000,
+                        "error": e.to_string(),
+                    })),
+                    error: None,
+                    id,
+                },
+            }
+        }
     }
 }
 
@@ -174,6 +204,10 @@ async fn handle_run(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonR
 /// Returns immediately with a job ID. The job runs on a blocking task via
 /// `tokio::task::spawn_blocking` with the same safety checks, WAL logging,
 /// and telemetry as `handle_run`. Rejects when `MAX_CONCURRENT_JOBS` (16) is reached.
+///
+/// On completion, the job's `result` field is set to the capability's error
+/// message (extracted from `Output.error`) if the execution failed, or `None`
+/// on success.
 ///
 /// The spawn_blocking approach avoids blocking the tokio runtime. WAL mutex and
 /// background job registry use std::sync primitives, so no nested runtime is needed.
@@ -249,7 +283,9 @@ async fn handle_dispatch(state: &Arc<DaemonState>, params: Value, id: Value) -> 
         }
         _ => None,
     };
-    let timeout_secs = run_params.timeout_secs.unwrap_or(30);
+    let timeout_secs = run_params
+        .timeout_secs
+        .unwrap_or_else(|| RuntimoConfig::get_capability_timeout(&run_params.capability, 30));
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -287,7 +323,15 @@ async fn handle_dispatch(state: &Arc<DaemonState>, params: Value, id: Value) -> 
     let t_secs = timeout_secs;
 
     tokio::task::spawn_blocking(move || {
-        // Acquire wal_mutex to serialize WAL writes with handle_run
+        // Concurrency Note: This mutex serializes ALL capability execution, not just WAL writes.
+        // Concurrent dispatch calls queue behind this lock — if Client A runs a 30-second capability,
+        // Client B cannot execute ANY capability for 30 seconds.
+        // MAX_CONCURRENT_JOBS=16 is a safety limit, not a throughput target.
+        // The dispatch API gives the illusion of concurrency but delivers serial execution.
+        // Future Work: Narrowing the mutex scope requires redesigning WalWriter::append() to assign
+        // sequence numbers inside the flock-protected section. Currently:
+        // `seq = wal.seq(); wal.append(event)` — the assignment and write are NOT atomic
+        // under concurrency. See: core/src/wal.rs:317-343
         let _wal_guard = state_arc
             .wal_mutex
             .lock()
@@ -320,7 +364,14 @@ async fn handle_dispatch(state: &Arc<DaemonState>, params: Value, id: Value) -> 
 
         let (status, error_msg) = match &result {
             Ok(Ok(exec_result)) if exec_result.success => ("completed", None),
-            Ok(Ok(_exec_result)) => ("failed", Some("execution reported failure".into())),
+            Ok(Ok(exec_result)) => (
+                "failed",
+                exec_result
+                    .output
+                    .error
+                    .clone()
+                    .or_else(|| Some("execution reported failure".into())),
+            ),
             Ok(Err(e)) => ("failed", Some(e.to_string())),
             Err(panic_info) => {
                 let msg = panic_info
@@ -350,7 +401,8 @@ async fn handle_dispatch(state: &Arc<DaemonState>, params: Value, id: Value) -> 
 /// Handles the `status` RPC method — queries a job by ID.
 ///
 /// Checks the background job registry first, then falls back to scanning the WAL
-/// for `JobStarted`/`JobCompleted`/`JobFailed` events.
+/// for `JobStarted`/`JobCompleted`/`JobFailed` events. The response includes
+/// `result` (error message) when the job has failed.
 #[allow(clippy::unused_async)]
 async fn handle_status(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonRpcResponse {
     let jid: String = match params.get("job_id").and_then(|v| v.as_str()) {
@@ -375,6 +427,7 @@ async fn handle_status(state: &Arc<DaemonState>, params: Value, id: Value) -> Js
                 "capability": bg.capability,
                 "status": bg.status,
                 "started_at": bg.started_at,
+                "result": bg.result,
             })),
             error: None,
             id,

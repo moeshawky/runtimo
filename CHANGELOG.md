@@ -5,6 +5,29 @@ All notable changes to Runtimo are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2] - 2026-06-22
+
+### Added
+
+- **Configurable capabilities** — new config fields: `dal`, `blocklist_overrides` (ShellExec), `capability_timeouts` (per-capability timeout override in seconds). Config is optional; all fields have sensible defaults. (`core/src/config.rs`)
+- **DAL priority chain** — cognitive DAL (defense-in-layers level) now resolved from: `RUNTIMO_DAL` env var → config file `dal` field → default `"A"` (strictest). New `dal_from_config()` helper wired into `LlmoSafeGuard::new()` and `with_memory_ceiling_bytes()`. (`core/src/llmosafe.rs`)
+- **CLI config subcommands** — `runtimo config show` (dump config with defaults) and `runtimo config dal [A-E]` (set/get DAL level). (`cli/src/main.rs`)
+- **Dynamic capability timeouts** — executor now reads `capability_timeouts` from config instead of hardcoding 30s. Both CLI `run` and daemon dispatch use `get_capability_timeout()`. (`core/src/executor.rs`, `cli/src/main.rs`, `daemon/src/engine.rs`)
+- **Blocklist overrides** — `is_dangerous_command()` checks config `blocklist_overrides` before the hardcoded blocklist, allowing operators to add custom dangerous patterns. (`core/src/capabilities/shell_exec.rs`)
+
+### Fixed
+
+- **ShellExec cognitive pipeline bypass** — `ls -la` and similar shell commands no longer trigger false-positive `Halt(CognitiveInstability)` rejections. ShellExec commands now bypass the NLP sifter; blocklist validation handles dangerous command detection. (`core/src/executor.rs`)
+- **CLI `run` timeout ignores config** — `runtimo run` was hardcoding `default_value = "30"` for timeout, bypassing the config-based timeout added in 0.7.1. Now reads from config via `get_capability_timeout()`. (`cli/src/main.rs`)
+- **Background job dispatch returns generic error** — `handle_dispatch` now extracts structured error from `CapabilityExecutionFailed` variant instead of formatting `JobError` as a string. (`daemon/src/engine.rs`)
+- **Background job status omits result** — `handle_status` response now includes `"result": bg.result` field. (`daemon/src/engine.rs`)
+- **README duplicate env var** — removed duplicate `RUNTIMO_ENABLE_NETWORK` entry; added `config show` / `config dal` examples. (`README.md`)
+- **Stale session artifact removed** — deleted 2044-line `session-ses_1370.md` (catastrophic failure transcript from 2026-05, superseded by session summaries in docs). (repo cleanup)
+
+### Changed
+
+- **Version bumped to 0.7.2** — all workspace crates updated. (`Cargo.toml`)
+
 ## [0.7.1] - 2026-06-19
 
 ### Security

@@ -49,6 +49,7 @@
 //! ```
 
 use crate::capability::{Capability, Context, Output};
+use crate::config::RuntimoConfig;
 use crate::job::JobId;
 use crate::processes::{ProcessSnapshot, ProcessSummary};
 use crate::session::SessionManager;
@@ -141,15 +142,9 @@ pub fn execute_with_telemetry(
     dry_run: bool,
     wal_path: &Path,
 ) -> Result<ExecutionResult> {
-    execute_with_telemetry_and_session(
-        capability,
-        args,
-        dry_run,
-        wal_path,
-        None,
-        None,
-        CAPABILITY_TIMEOUT_SECS,
-    )
+    let cap_name = capability.name();
+    let timeout = RuntimoConfig::get_capability_timeout(cap_name, CAPABILITY_TIMEOUT_SECS);
+    execute_with_telemetry_and_session(capability, args, dry_run, wal_path, None, None, timeout)
 }
 
 /// Execute a capability with session tracking and specified timeout.
@@ -264,7 +259,12 @@ pub fn execute_with_telemetry_and_session(
     // URLs, commit messages). Structured inputs (paths, PIDs, job IDs)
     // are skipped — the TF-IDF classifier was trained on manipulation
     // text and produces false positives on structured data.
-    if has_natural_content(args) {
+    //
+    // ShellExec is excluded: its blocklist already validates dangerous
+    // commands, and the NLP sifter produces false positives on shell
+    // command syntax (e.g. `ls -la` flagged as CognitiveInstability).
+    let skip_cognitive = cap_name == "ShellExec";
+    if !skip_cognitive && has_natural_content(args) {
         let pipeline_result = guard
             .check_cognitive_pipeline(
                 capability.description(),
