@@ -23,6 +23,7 @@
 //! - Mount operations: `mount`, `umount`
 //! - Firewall manipulation: `iptables`, `nft`
 //! - Process termination: `kill`, `killall`, `pkill` (use Kill capability instead)
+//! - Shell builtins: `eval`, `exec`, `source`, `.` (arbitrary code execution)
 //! - Interpreters: `python`, `perl`, `ruby`, `node`, `lua`, etc. (opt-in via `RUNTIMO_ENABLE_INTERPRETERS`)
 //! - Outbound network tools: `curl`, `wget`, `nc`, `ncat`, `socat`, `ssh`, `scp`, `telnet`
 //!   (gated behind `RUNTIMO_ENABLE_NETWORK=1` env var)
@@ -421,6 +422,16 @@ pub fn is_dangerous_command(cmd: &str) -> Option<&'static str> {
         || command_matches(&detok_lower, &["kill", "killall", "pkill"])
     {
         return Some("kill command blocked — use Kill capability");
+    }
+
+    // eval, exec, source, . — shell builtins for arbitrary code execution
+    // These bypass the blocklist by loading and executing arbitrary commands
+    // at runtime. eval re-parses its arguments as shell code; exec replaces
+    // the current process; source/. loads a script file into the shell.
+    if command_matches(&cmd_lower, &["eval", "exec", "source", "."])
+        || command_matches(&detok_lower, &["eval", "exec", "source", "."])
+    {
+        return Some("shell builtins (eval/exec/source/.) are blocked");
     }
 
     // rm -rf on system directories (check both)
@@ -1634,6 +1645,82 @@ mod tests {
         )
         .is_err());
         assert!(s.elapsed().as_secs() < 3);
+    }
+
+    #[test]
+    fn blocks_eval_builtin() {
+        let err = Capability::execute(
+            &ShellExec,
+            &serde_json::json!({"cmd": "eval \"echo hello\""}),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::temp_dir(),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("shell builtins"),
+            "eval should be blocked: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn blocks_exec_builtin() {
+        let err = Capability::execute(
+            &ShellExec,
+            &serde_json::json!({"cmd": "exec /bin/sh"}),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::temp_dir(),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("shell builtins"),
+            "exec should be blocked: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn blocks_source_builtin() {
+        let err = Capability::execute(
+            &ShellExec,
+            &serde_json::json!({"cmd": "source /tmp/malicious.sh"}),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::temp_dir(),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("shell builtins"),
+            "source should be blocked: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn blocks_dot_sourcing() {
+        let err = Capability::execute(
+            &ShellExec,
+            &serde_json::json!({"cmd": ". /tmp/malicious.sh"}),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::temp_dir(),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("shell builtins"),
+            ". (dot) sourcing should be blocked: {}",
+            err
+        );
     }
 
     // ── F-013: Detokenizer + Shell Quoting Bypass Tests ─────────────────

@@ -164,7 +164,10 @@ async fn handle_run(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonR
                 "success": result.success,
                 "job_id": result.job_id,
                 "capability": result.capability,
-                "output": serde_json::to_value(&result.output).unwrap_or(Value::Null),
+                "output": serde_json::to_value(&result.output).unwrap_or_else(|e| {
+                log::error!("Failed to serialize capability output: {}", e);
+                Value::Null
+            }),
             })),
             error: None,
             id,
@@ -810,6 +813,9 @@ fn reconcile_orphaned_jobs(wal_path: &std::path::Path) {
 /// Returns an error if socket binding fails, WAL initialization fails, or the
 /// accept loop encounters an unrecoverable error.
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize logging backend — log::error! calls are no-ops without this
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let args = parse_args();

@@ -153,10 +153,13 @@ fn protected_pids() -> Vec<u32> {
 }
 
 /// Input parameters for [`Kill::execute`].
+///
+/// `pid` must be ≤ i32::MAX — the underlying `kill` syscall uses `pid_t`
+/// (`i32`). Larger values are rejected with `CapabilityError::InvalidArgs`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(clippy::exhaustive_structs)] // args struct — fields are the contract
 pub struct KillArgs {
-    /// Process ID to kill.
+    /// Process ID to kill (must be ≤ i32::MAX).
     pub pid: u32,
     /// Signal to send (default: 15 = SIGTERM). Must be valid POSIX: 1-31 or 64.
     pub signal: Option<i32>,
@@ -165,6 +168,7 @@ pub struct KillArgs {
 /// Capability that terminates a process by PID with full audit logging.
 ///
 /// Protected PIDs (init, kthreadd) are refused before the syscall.
+/// PIDs > i32::MAX are rejected to avoid truncation in the kill syscall.
 /// All kill operations are logged to the WAL for forensic review.
 #[allow(clippy::exhaustive_structs)]
 pub struct Kill;
@@ -222,6 +226,15 @@ impl TypedCapability for Kill {
             return Err(CapabilityError::PermissionDenied(format!(
                 "PID {} is a protected system process",
                 args.pid
+            )));
+        }
+
+        // PID range check: pid_t is i32, so PIDs > i32::MAX wrap negative
+        if args.pid > i32::MAX as u32 {
+            return Err(CapabilityError::InvalidArgs(format!(
+                "PID {} exceeds maximum value for kill syscall (max: {})",
+                args.pid,
+                i32::MAX
             )));
         }
 
@@ -644,6 +657,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_pid_range_check_rejects_excessive_pid() {
+        // FINDING #C2: PIDs > i32::MAX wrap negative in kill syscall
+        let cap = Kill;
+        let result = Capability::execute(
+            &cap,
+            &serde_json::json!({ "pid": (i32::MAX as u64) + 1 }),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::current_dir().unwrap(),
+            },
+        );
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds maximum value"));
+    }
+
+    #[test]
+    fn test_pid_range_check_applies_in_dry_run_mode() {
+        // FINDING #C2: PID validation must occur before dry_run guard
+        let cap = Kill;
+        let result = Capability::execute(
+            &cap,
+            &serde_json::json!({ "pid": (i32::MAX as u64) + 1 }),
+            &Context {
+                dry_run: true,
+                job_id: "test".into(),
+                working_dir: std::env::current_dir().unwrap(),
+            },
+        );
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds maximum value"));
     }
 
     #[test]

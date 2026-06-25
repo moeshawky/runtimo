@@ -232,9 +232,15 @@ impl Output {
     ///
     /// All fields are included — this is the canonical JSON representation
     /// written to the WAL and returned to clients.
+    ///
+    /// Returns `Value::Null` on serialization failure (e.g. non-serializable
+    /// data in a custom field) and logs the error via `log::error!`.
     #[must_use]
     pub fn to_json(&self) -> Value {
-        serde_json::to_value(self).unwrap_or(Value::Null)
+        serde_json::to_value(self).unwrap_or_else(|e| {
+            log::error!("Failed to serialize Output to JSON: {}", e);
+            Value::Null
+        })
     }
 }
 

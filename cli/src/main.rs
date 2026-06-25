@@ -216,7 +216,20 @@ enum Commands {
         #[arg(short = 'r', long, default_value = "false")]
         reap: bool,
     },
-    #[command(about = "Manage configuration")]
+    #[command(
+        about = "Manage configuration",
+        after_help = "Config file: ~/.config/runtimo/config.toml\n\
+Supported fields:\n\
+  allowed_paths       Extra path prefixes for FileRead/FileWrite\n\
+  dal                 Design Assurance Level A-E\n\
+  blocklist_overrides Additional ShellExec blocklist patterns\n\
+  capability_timeouts Per-capability timeout overrides\n\
+\nExample:\n\
+  allowed_paths = [\"/srv\", \"/opt\"]\n\
+  dal = \"B\"\n\
+  [capability_timeouts]\n\
+  ShellExec = 120"
+    )]
     Config {
         #[command(subcommand)]
         action: ConfigAction,
@@ -1239,8 +1252,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
             ConfigAction::Show => {
+                let config_path = RuntimoConfig::config_path();
+                let config_exists = config_path.exists();
                 let config = RuntimoConfig::load();
-                println!("Configuration: {}", RuntimoConfig::config_path().display());
+                println!("Configuration: {}", config_path.display());
+                if !config_exists {
+                    println!("  (file does not exist — using defaults)");
+                }
                 println!();
                 println!("Allowed paths (config file): {:?}", config.allowed_paths);
                 println!("DAL (config): {:?}", config.dal);
@@ -1260,6 +1278,26 @@ fn main() -> Result<(), Box<dyn Error>> {
                 println!("  Allowed paths ({} total):", all_prefixes.len());
                 for p in &all_prefixes {
                     println!("    {}", p);
+                }
+                if !config_exists {
+                    println!();
+                    println!("No config file found. To customize, create one at:");
+                    println!("  {}", config_path.display());
+                    println!();
+                    println!("Supported fields:");
+                    println!("  allowed_paths     — Extra path prefixes for FileRead/FileWrite (list of strings)");
+                    println!("  dal               — Design Assurance Level A-E (string)");
+                    println!("  blocklist_overrides — Additional dangerous command patterns (list of strings)");
+                    println!("  capability_timeouts — Per-capability timeout overrides (table of string->number)");
+                    println!();
+                    println!("Example:");
+                    println!("  allowed_paths = [\"/srv\", \"/opt\"]");
+                    println!("  dal = \"B\"");
+                    println!("  blocklist_overrides = [\"curl\", \"wget\"]");
+                    println!();
+                    println!("  [capability_timeouts]");
+                    println!("  ShellExec = 120");
+                    println!("  FileRead = 10");
                 }
             }
             ConfigAction::Dal { level } => {

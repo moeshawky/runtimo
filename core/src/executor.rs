@@ -3,7 +3,7 @@
 //! Wraps every capability execution with:
 //! telemetry capture → resource check → WAL log → validate → execute → WAL log
 //!
-//! Capabilities execute with a 30-second timeout to prevent runaway executions.
+//! Capabilities execute with an advisory 30-second post-hoc timeout check.
 //!
 //! WAL goes to `/tmp` by default since the daemon may not have write access to
 //! `/var/lib` in all deployment environments. Override with `RUNTIMO_WAL_PATH`
@@ -62,8 +62,9 @@ use std::path::{Path, PathBuf};
 
 /// Default timeout for capability execution (seconds).
 ///
-/// **Note:** Timeout is currently advisory only — see [`execute_with_timeout_check`]
-/// for details on the enforcement limitation.
+/// **Note:** This is an advisory post-hoc timeout — the capability runs to
+/// completion and then elapsed time is checked. Pure-Rust capabilities cannot
+/// be forcibly interrupted (see [`execute_with_timeout_check`]).
 const CAPABILITY_TIMEOUT_SECS: u64 = 30;
 
 /// Maximum size of capability arguments in bytes (1MB).

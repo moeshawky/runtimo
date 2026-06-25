@@ -3,6 +3,7 @@
 # Agentic dev artifacts
 AGENTS.md
 references/
+.opencode/
 *.agent/
 .agents/
 .cursor/

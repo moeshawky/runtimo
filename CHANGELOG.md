@@ -5,7 +5,7 @@ All notable changes to Runtimo are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.7.2] - 2026-06-22
+## [0.7.2] - 2026-06-25
 
 ### Added
 
@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **CLI config subcommands** — `runtimo config show` (dump config with defaults) and `runtimo config dal [A-E]` (set/get DAL level). (`cli/src/main.rs`)
 - **Dynamic capability timeouts** — executor now reads `capability_timeouts` from config instead of hardcoding 30s. Both CLI `run` and daemon dispatch use `get_capability_timeout()`. (`core/src/executor.rs`, `cli/src/main.rs`, `daemon/src/engine.rs`)
 - **Blocklist overrides** — `is_dangerous_command()` checks config `blocklist_overrides` before the hardcoded blocklist, allowing operators to add custom dangerous patterns. (`core/src/capabilities/shell_exec.rs`)
+- **Config discoverability** — `runtimo config show` now detects when config file doesn't exist and prints a help block with file path, supported fields, and TOML example. (`cli/src/main.rs`)
+- **Logging backend** — daemon now initializes `env_logger` on startup, making `log::error!` calls observable. (`daemon/src/engine.rs`, `daemon/Cargo.toml`)
+- **ShellExec blocklist hardened** — `eval`, `exec`, `source`, and `.` (dot sourcing) added to blocklist to prevent arbitrary code execution via shell builtins. (`core/src/capabilities/shell_exec.rs`)
 
 ### Fixed
 
@@ -23,10 +26,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Background job status omits result** — `handle_status` response now includes `"result": bg.result` field. (`daemon/src/engine.rs`)
 - **README duplicate env var** — removed duplicate `RUNTIMO_ENABLE_NETWORK` entry; added `config show` / `config dal` examples. (`README.md`)
 - **Stale session artifact removed** — deleted 2044-line `session-ses_1370.md` (catastrophic failure transcript from 2026-05, superseded by session summaries in docs). (repo cleanup)
+- **Serialization errors now logged** — `Output::to_json()` and daemon dispatch now log serialization failures via `log::error!` before returning `Value::Null`. (`core/src/capability.rs`, `daemon/src/engine.rs`)
+- **PID range check before dry_run guard** — Kill capability validates PID ≤ i32::MAX before the dry_run shortcut, ensuring PID overflow is rejected even in dry-run mode. (`core/src/capabilities/kill.rs`)
+- **Timeout doc corrected** — executor timeout documentation updated from "30-second enforced" to "advisory post-hoc" to match actual behavior. (`core/src/executor.rs`)
 
 ### Changed
 
 - **Version bumped to 0.7.2** — all workspace crates updated. (`Cargo.toml`)
+
+### Testing
+
+- **ShellExec blocklist tests** — 4 new tests for eval, exec, source, and dot-sourcing blocklist entries. (`core/src/capabilities/shell_exec.rs`)
+- **Kill PID range tests** — 2 new tests verifying PID overflow rejection in normal and dry-run modes. (`core/src/capabilities/kill.rs`)
 
 ## [0.7.1] - 2026-06-19
 
