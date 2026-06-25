@@ -16,7 +16,7 @@ Runtimo is a Rust workspace providing a **capability execution engine**. Every c
 - **Backup/undo** — Files backed up before mutation, rollback by job ID
 - **Input validation** — Capabilities validate arguments including path traversal, symlink, and null byte protection
 
-**Version:** 0.7.2 | **Rust Edition:** 2021 | **Tests:** 436
+**Version:** 0.7.3 | **Rust Edition:** 2021 | **Tests:** 443
 
 ## Quick Start
 

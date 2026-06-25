@@ -3,7 +3,7 @@
 **Last Updated:** 2026-06-22
 **Build:** `cargo clippy --all-targets` — clean, 0 warnings
 **Tests:** 431 (all passing)
-**Version:** 0.7.2
+**Version:** 0.7.3
 
 ---
 
