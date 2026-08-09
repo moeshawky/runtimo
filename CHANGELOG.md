@@ -5,6 +5,25 @@ All notable changes to Runtimo are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Delete capability** — deletes a file with backup-before-delete, restoring via `Undo` by job ID. Path is validated against the allowed-prefix whitelist (`require_exists` + `require_file`), directories and critical files (`.env`, `.ssh/*`, dotfiles) are rejected, and the parent directory is `fsync`ed for durability. The audited alternative to `rm`, which remains hard-blocked in ShellExec. (`core/src/capabilities/delete.rs`)
+- **Config `[env]` table** — `RUNTIMO_*` opt-in flags (`RUNTIMO_ENABLE_NETWORK`, `RUNTIMO_ENABLE_INTERPRETERS`, `RUNTIMO_ENABLE_PUBLIC_IP`) can now be persisted in `config.toml` instead of requiring a process env var or PATH wrapper. Config values take precedence over the process environment for gates and are merged into ShellExec child environments (still subject to sensitive-var stripping; `PATH` stays sanitized). GitExec is not merged — it inherits the process environment and its network access is gated by URL validation/SSRF blocking. Unknown top-level config keys now warn on load. (`core/src/config.rs`, `core/src/capabilities/shell_exec.rs`)
+- **Executor timeout injection** — `inject_timeout()` now injects the executor-level `timeout_secs` into capability args before execution, so the configured/CLI timeout is honored by ShellExec/GitExec internal kill logic instead of being advisory. (`core/src/executor.rs`)
+
+### Changed
+
+- **ShellExec timeout cap raised 300 → 3600s** — long-running work (e.g. XLA/vLLM first-time compilation, 20–30 min) no longer hits the hard kill. `timeout_secs` (or the new `timeout` alias) accepts 1–3600; values above 3600 are rejected with a clear error. CLI `--timeout` range widened to 1–3600. (`core/src/capabilities/shell_exec.rs`, `cli/src/main.rs`)
+- **GitExec `timeout` alias** — `timeout_secs` now also accepts `timeout` as a serde alias, matching ShellExec. (`core/src/capabilities/git_exec.rs`)
+
+### Testing
+
+- **Delete capability tests** — 7 tests: allowed-prefix delete with backup, traversal rejection, outside-prefix rejection, missing-file rejection, directory rejection, critical-file rejection, dry-run no-op. (`core/src/capabilities/delete.rs`)
+- **Delete→Undo integration test** — end-to-end delete-then-restore roundtrip via the backup manager. (`core/tests/integration.rs`)
+- **Timeout alias tests** — ShellExec and GitExec both verify `timeout` deserializes into `timeout_secs`; ShellExec verifies values above the 3600s cap are rejected. (`core/src/capabilities/shell_exec.rs`, `core/src/capabilities/git_exec.rs`)
+
 ## [0.7.3] - 2026-06-25
 
 ### Added

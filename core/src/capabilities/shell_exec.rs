@@ -205,6 +205,8 @@ pub struct ShellExecArgs {
     #[serde(alias = "command")]
     pub cmd: String,
     /// Maximum seconds before the process is killed (default: 30).
+    /// Accepts `timeout` as an alias — `{"cmd": "...", "timeout": 60}`.
+    #[serde(alias = "timeout")]
     pub timeout_secs: Option<u64>,
     /// Working directory for the command (default: executor CWD).
     pub cwd: Option<String>,
@@ -515,10 +517,12 @@ pub fn is_network_command(cmd: &str) -> bool {
 
 /// Checks whether outbound network commands are permitted.
 ///
-/// Returns `true` when network tools are allowed (env var set to `"1"`).
+/// Returns `true` when network tools are allowed. Honors the config `[env]`
+/// table first (e.g. `[env] RUNTIMO_ENABLE_NETWORK = "1"`), then the
+/// `RUNTIMO_ENABLE_NETWORK` process env var.
 #[must_use]
 pub fn network_enabled() -> bool {
-    std::env::var("RUNTIMO_ENABLE_NETWORK").as_deref() == Ok("1")
+    crate::config::RuntimoConfig::env_var("RUNTIMO_ENABLE_NETWORK").as_deref() == Some("1")
 }
 
 /// Tests whether a command invokes a scripting language interpreter.
@@ -544,12 +548,14 @@ pub fn is_interpreter_command(cmd: &str) -> bool {
 
 /// Checks whether interpreter commands are permitted.
 ///
-/// Returns `true` when interpreters are allowed (env var set to `"1"`).
+/// Returns `true` when interpreters are allowed. Honors the config `[env]`
+/// table first (e.g. `[env] RUNTIMO_ENABLE_INTERPRETERS = "1"`), then the
+/// `RUNTIMO_ENABLE_INTERPRETERS` process env var.
 /// Default is blocked — agents should use ShellExec for shell commands,
 /// not arbitrary interpreter invocations.
 #[must_use]
 pub fn interpreters_enabled() -> bool {
-    std::env::var("RUNTIMO_ENABLE_INTERPRETERS").as_deref() == Ok("1")
+    crate::config::RuntimoConfig::env_var("RUNTIMO_ENABLE_INTERPRETERS").as_deref() == Some("1")
 }
 
 // ── F-013: Shell detokenizer ──────────────────────────────────────────────
@@ -1261,7 +1267,7 @@ impl TypedCapability for ShellExec {
             "type": "object",
             "properties": {
                 "cmd": { "type": "string", "description": "Command to execute via sh -c (max 65536 bytes)", "minLength": 1, "maxLength": 65536 },
-                "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 300 },
+                "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 3600 },
                 "cwd": { "type": "string" },
                 "stdin": { "type": "string" }
             },
@@ -1273,17 +1279,20 @@ impl TypedCapability for ShellExec {
         args: ShellExecArgs,
         ctx: &Context,
     ) -> std::result::Result<Output, CapabilityError> {
-        // Timeout from JSON args, falling back to default
-        // Enforce range: minimum 1, maximum 300 (matching schema declaration)
+        // Timeout from JSON args, falling back to config capability_timeouts,
+        // then the built-in default. Enforce range: minimum 1, maximum 3600
+        // (matching schema declaration).
         if let Some(secs) = args.timeout_secs {
-            if !(1..=300).contains(&secs) {
+            if !(1..=3600).contains(&secs) {
                 return Err(CapabilityError::InvalidArgs(format!(
-                    "timeout_secs must be between 1 and 300, got {}",
+                    "timeout_secs must be between 1 and 3600, got {}",
                     secs
                 )));
             }
         }
-        let timeout = args.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
+        let timeout = args.timeout_secs.unwrap_or_else(|| {
+            RuntimoConfig::get_capability_timeout("ShellExec", DEFAULT_TIMEOUT_SECS)
+        });
 
         let max_cmd_len: usize = 65536;
 
@@ -1356,6 +1365,16 @@ impl TypedCapability for ShellExec {
         for (key, value) in &safe_env {
             // PATH is set explicitly above; skip to avoid duplicate
             if key == "PATH" {
+                continue;
+            }
+            cmd.env(key, value);
+        }
+
+        // Config `[env]` table — persist opt-in flags (and other vars) in
+        // config.toml. Still subject to sensitive-var stripping; PATH stays
+        // sanitized. Config values override inherited ones (explicit intent).
+        for (key, value) in crate::config::RuntimoConfig::env_map() {
+            if key == "PATH" || is_sensitive_env_var(&key) {
                 continue;
             }
             cmd.env(key, value);
@@ -1434,6 +1453,49 @@ mod tests {
             },
         )
         .unwrap();
+        assert_eq!(r.status, "ok");
+    }
+    #[test]
+    fn timeout_alias_is_accepted() {
+        // `timeout` is a serde alias for `timeout_secs` — it must not be
+        // silently dropped (which would fall back to the 30s default).
+        let args: ShellExecArgs = serde_json::from_value(serde_json::json!({
+            "cmd": "echo hi",
+            "timeout": 45
+        }))
+        .expect("alias should deserialize");
+        assert_eq!(args.timeout_secs, Some(45));
+    }
+    #[test]
+    fn timeout_above_new_cap_rejected() {
+        let err = Capability::execute(
+            &ShellExec,
+            &serde_json::json!({"cmd": "true", "timeout_secs": 3601}),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::temp_dir(),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("between 1 and 3600"),
+            "got: {}",
+            err
+        );
+    }
+    #[test]
+    fn timeout_at_new_cap_ok() {
+        let r = Capability::execute(
+            &ShellExec,
+            &serde_json::json!({"cmd": "true", "timeout_secs": 3600}),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::temp_dir(),
+            },
+        )
+        .expect("3600s timeout should be accepted");
         assert_eq!(r.status, "ok");
     }
     #[test]
@@ -2780,5 +2842,32 @@ mod tests {
         let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
         assert!(keys.contains(&"HOME"), "HOME should be preserved");
         assert!(keys.contains(&"USER"), "USER should be preserved");
+    }
+
+    #[test]
+    fn config_env_enables_network_gate() {
+        // Writing a config `[env]` table must flip the network gate without a
+        // process-level env var (the PATH-wrapper workaround is no longer needed).
+        static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = std::env::temp_dir().join("runtimo_test_shell_env_gate");
+        let config_dir = tmp.join("runtimo");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "[env]\nRUNTIMO_ENABLE_NETWORK = \"1\"\n",
+        )
+        .unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+        std::env::remove_var("RUNTIMO_ENABLE_NETWORK");
+
+        assert!(
+            network_enabled(),
+            "config [env] must enable the network gate"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("XDG_CONFIG_HOME");
     }
 }

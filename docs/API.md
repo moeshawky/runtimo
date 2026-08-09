@@ -191,6 +191,38 @@ let args = json!({
 let result = execute_with_telemetry(&cap, &args, false, Path::new("/tmp/wal.jsonl"))?;
 ```
 
+### Delete
+
+**Purpose:** Delete a file with backup-before-delete for undo support
+
+**Schema:**
+```json
+{
+  "type": "object",
+  "properties": {
+    "path": { "type": "string" }
+  },
+  "required": ["path"]
+}
+```
+
+**Features:**
+- Backs up the file before deletion — `Undo` restores it by job ID
+- Requires an existing regular file under an allowed prefix
+- Rejects directories, symlink escapes, and critical files
+
+**Security:**
+- Path validated through `validation/path.rs` allowed-prefix whitelist (same
+  gate as FileRead/FileWrite)
+- Critical files (`.env`, `.ssh/*`, dotfiles) blocked via the shared
+  `CRITICAL_FILES` denylist
+- The audited alternative to `rm` (which remains hard-blocked in ShellExec)
+
+**Example:**
+```bash
+runtimo run -c Delete -a '{"path":"/tmp/libtpu_lockfile"}'
+```
+
 ### ShellExec (← since 0.7.1)
 
 **Purpose:** Execute shell commands via `sh -c` with timeout, isolation, and audit trail
@@ -201,13 +233,14 @@ let result = execute_with_telemetry(&cap, &args, false, Path::new("/tmp/wal.json
   "type": "object",
   "properties": {
     "cmd": { "type": "string" },
-    "timeout_secs": { "type": "integer" }
+    "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 3600 }
   },
   "required": ["cmd"]
 }
 ```
 
-> The `cmd` field also accepts `command` as a serde alias.
+> The `cmd` field also accepts `command` as a serde alias; `timeout_secs`
+> also accepts `timeout` as an alias. Both are seconds.
 
 **Security (multi-layer defense):**
 

@@ -97,7 +97,7 @@ pub mod validation;
 pub mod wal;
 
 pub use backup::BackupManager;
-pub use capabilities::{FileRead, FileWrite, GitExec, Kill, ShellExec, Undo};
+pub use capabilities::{Delete, FileRead, FileWrite, GitExec, Kill, ShellExec, Undo};
 pub use capability::{
     Capability, CapabilityError, CapabilityRegistry, Context, Output, TypedCapability,
 };

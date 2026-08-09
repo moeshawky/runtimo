@@ -302,8 +302,17 @@ pub fn execute_with_telemetry_and_session(
     // separate validation step is redundant and has been removed.
     // Direct Capability implementers should perform validation in execute().
 
-    // Execute capability with timeout enforcement
-    let output = match execute_with_timeout_check(capability, args, &ctx, timeout_secs) {
+    // Execute capability with timeout enforcement. The executor-level timeout
+    // is injected into the args so subprocess-based capabilities (ShellExec,
+    // GitExec) honor it in their internal kill logic — without this, the
+    // internal enforcement falls back to each capability's hardcoded default
+    // and the configured `timeout_secs` is only advisory.
+    let output = match execute_with_timeout_check(
+        capability,
+        &inject_timeout(args, timeout_secs),
+        &ctx,
+        timeout_secs,
+    ) {
         Ok(out) => out,
         Err(e) => {
             let telemetry_after = Telemetry::capture_lightweight();
@@ -566,6 +575,26 @@ fn identify_spawned_pids(before: &ProcessSnapshot, after: &ProcessSnapshot) -> V
         .collect()
 }
 
+/// Injects the executor-level timeout into capability args when they do not
+/// already specify one.
+///
+/// Subprocess-based capabilities (ShellExec, GitExec) enforce timeouts
+/// internally from their args' `timeout_secs` field. Without injection the
+/// executor-level `timeout_secs` (CLI `--timeout`, config
+/// `capability_timeouts`) is only advisory, and the internal kill falls back
+/// to each capability's hardcoded default. Injection is a no-op for
+/// capabilities whose args struct ignores the key (serde drops unknown keys).
+#[must_use]
+fn inject_timeout(args: &Value, timeout_secs: u64) -> Value {
+    let mut value = args.clone();
+    if let Some(obj) = value.as_object_mut() {
+        if !obj.contains_key("timeout_secs") {
+            obj.insert("timeout_secs".to_string(), Value::from(timeout_secs));
+        }
+    }
+    value
+}
+
 /// Execute a capability inline and check if it exceeded the timeout.
 ///
 /// Runs the capability and measures elapsed time. For subprocess-based
@@ -664,6 +693,27 @@ mod tests {
     /// Mutex to serialize tests that set `RUNTIMO_DAL` env var.
     /// Without this, concurrent tests fight over the process-global env var.
     static DAL_TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn inject_timeout_adds_missing_key() {
+        let args = json!({"cmd": "ls"});
+        let injected = inject_timeout(&args, 3600);
+        assert_eq!(injected["timeout_secs"], 3600);
+        assert_eq!(injected["cmd"], "ls");
+    }
+
+    #[test]
+    fn inject_timeout_preserves_existing_key() {
+        let args = json!({"cmd": "ls", "timeout_secs": 90});
+        let injected = inject_timeout(&args, 3600);
+        assert_eq!(injected["timeout_secs"], 90, "explicit arg must win");
+    }
+
+    #[test]
+    fn inject_timeout_noop_for_non_object_args() {
+        let args = json!("just a string");
+        assert_eq!(inject_timeout(&args, 3600), json!("just a string"));
+    }
 
     fn unique_test_dir() -> PathBuf {
         let ns = std::time::SystemTime::now()

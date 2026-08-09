@@ -264,7 +264,7 @@ impl TypedCapability for FileWrite {
     }
 }
 
-fn is_critical_file(path: &std::path::Path) -> bool {
+pub fn is_critical_file(path: &std::path::Path) -> bool {
     let path_str = path.to_string_lossy();
     let filename = path
         .file_name()

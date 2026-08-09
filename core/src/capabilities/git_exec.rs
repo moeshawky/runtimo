@@ -48,6 +48,7 @@
 
 use crate::backup::BackupManager;
 use crate::capability::{CapabilityError, Context, Output, TypedCapability};
+use crate::config::RuntimoConfig;
 use crate::processes::ProcessSnapshot;
 use crate::telemetry::Telemetry;
 use crate::validation::path::{validate_path, PathContext};
@@ -77,7 +78,16 @@ pub struct GitExecArgs {
     /// Commit SHA to revert to (for revert).
     pub commit_sha: Option<String>,
     /// Timeout in seconds (default: 300).
+    /// Accepts `timeout` as an alias — `{"operation": "...", "timeout": 60}`.
+    #[serde(alias = "timeout")]
     pub timeout_secs: Option<u64>,
+}
+
+/// Resolves the effective git timeout: explicit arg → config
+/// `capability_timeouts["GitExec"]` → 300s built-in default.
+#[must_use]
+fn resolve_timeout(args_timeout: Option<u64>) -> u64 {
+    args_timeout.unwrap_or_else(|| RuntimoConfig::get_capability_timeout("GitExec", 300))
 }
 
 /// Git state before/after operation.
@@ -550,7 +560,7 @@ impl GitExec {
     /// Executes git clone operation.
     fn op_clone(&self, args: &GitExecArgs, ctx: &Context) -> Result<Output> {
         let _ = self;
-        let timeout_secs = args.timeout_secs.unwrap_or(300);
+        let timeout_secs = resolve_timeout(args.timeout_secs);
         let url = args
             .url
             .as_ref()
@@ -664,7 +674,7 @@ impl GitExec {
 
     /// Executes git pull operation.
     fn op_pull(&self, args: &GitExecArgs, ctx: &Context, repo_path: &Path) -> Result<Output> {
-        let timeout_secs = args.timeout_secs.unwrap_or(300);
+        let timeout_secs = resolve_timeout(args.timeout_secs);
 
         if !repo_path.exists() {
             return Err(Error::ExecutionFailed(format!(
@@ -707,7 +717,7 @@ impl GitExec {
 
     /// Executes git commit operation.
     fn op_commit(&self, args: &GitExecArgs, ctx: &Context, repo_path: &Path) -> Result<Output> {
-        let timeout_secs = args.timeout_secs.unwrap_or(300);
+        let timeout_secs = resolve_timeout(args.timeout_secs);
 
         if !repo_path.exists() {
             return Err(Error::ExecutionFailed(format!(
@@ -787,7 +797,7 @@ impl GitExec {
 
     /// Executes git revert operation.
     fn op_revert(&self, args: &GitExecArgs, ctx: &Context, repo_path: &Path) -> Result<Output> {
-        let timeout_secs = args.timeout_secs.unwrap_or(300);
+        let timeout_secs = resolve_timeout(args.timeout_secs);
 
         if !repo_path.exists() {
             return Err(Error::ExecutionFailed(format!(
@@ -843,7 +853,7 @@ impl GitExec {
 
     /// Executes git clean operation.
     fn op_clean(&self, args: &GitExecArgs, ctx: &Context, repo_path: &Path) -> Result<Output> {
-        let timeout_secs = args.timeout_secs.unwrap_or(300);
+        let timeout_secs = resolve_timeout(args.timeout_secs);
 
         if !repo_path.exists() {
             return Err(Error::ExecutionFailed(format!(
@@ -905,7 +915,7 @@ impl GitExec {
     /// Executes git status operation.
     #[allow(clippy::unused_self, clippy::used_underscore_binding)]
     fn op_status(&self, _args: &GitExecArgs, _ctx: &Context, repo_path: &Path) -> Result<Output> {
-        let timeout_secs = _args.timeout_secs.unwrap_or(300);
+        let timeout_secs = resolve_timeout(_args.timeout_secs);
 
         if !repo_path.exists() {
             return Err(Error::ExecutionFailed(format!(
@@ -1111,6 +1121,23 @@ mod tests {
         assert!(GitExec::validate_url("").is_err());
 
         std::fs::remove_dir_all(test_backup_dir()).ok();
+    }
+
+    #[test]
+    fn timeout_alias_is_accepted() {
+        let args: GitExecArgs = serde_json::from_value(serde_json::json!({
+            "operation": "status",
+            "timeout": 120
+        }))
+        .expect("timeout alias should deserialize");
+        assert_eq!(args.timeout_secs, Some(120));
+    }
+
+    #[test]
+    fn resolve_timeout_prefers_explicit_arg() {
+        assert_eq!(resolve_timeout(Some(50)), 50);
+        // No config override present in the test environment → built-in default.
+        assert_eq!(resolve_timeout(None), 300);
     }
 
     #[test]

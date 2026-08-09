@@ -1418,6 +1418,47 @@ fn test_run_params_deserialization_empty_object() {
     );
 }
 
+/// End-to-end Delete: validate → backup → delete → Undo restore.
+#[test]
+fn test_delete_then_undo_roundtrip() {
+    let dir = setup();
+    let p = make_file(&dir, "lockfile", "stale tpu lock");
+
+    // Point backup_dir()/wal_path() at the test dir so backup + WAL are
+    // isolated. Mirrors the repo convention of setting XDG_DATA_HOME in tests
+    // (CI runs with --test-threads=1, so env mutation is safe).
+    std::env::set_var("XDG_DATA_HOME", &dir);
+    std::env::set_var("RUNTIMO_WAL_PATH", wal_path(&dir));
+
+    let delete = runtimo_core::capabilities::Delete::new().expect("Delete");
+    let result = execute_with_telemetry(
+        &delete,
+        &json!({ "path": p.to_str().unwrap() }),
+        false,
+        &wal_path(&dir),
+    );
+    assert!(result.is_ok(), "delete failed: {:?}", result.err());
+    assert!(!p.exists(), "file must be gone after Delete");
+
+    // Undo restores the file from the pre-delete backup.
+    let mut registry = CapabilityRegistry::new();
+    registry.register(runtimo_core::capabilities::Undo);
+    let undo = registry.get("Undo").unwrap();
+    let ctx = ctx("delete-undo");
+    let job_id = result.unwrap().job_id;
+    let undo_result = undo.execute(&json!({ "job_id": job_id }), &ctx);
+    assert!(undo_result.is_ok(), "undo failed: {:?}", undo_result.err());
+    assert_eq!(
+        fs::read_to_string(&p).unwrap(),
+        "stale tpu lock",
+        "file must be restored by Undo"
+    );
+
+    std::env::remove_var("XDG_DATA_HOME");
+    std::env::remove_var("RUNTIMO_WAL_PATH");
+    cleanup(&dir);
+}
+
 /// Concurrent dispatch job ID uniqueness.
 #[test]
 fn test_concurrent_job_id_uniqueness() {

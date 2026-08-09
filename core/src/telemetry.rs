@@ -550,11 +550,29 @@ impl SystemInfo {
 
 // ── HardwareInfo capture — vendor tools (no /proc equivalent) ────────────
 
+/// Default timeout (seconds) for JAX/XLA import probes.
+///
+/// JAX eagerly initializes the XLA runtime on `import jax`; on TPU/GPU boxes
+/// this can take well over 10 seconds, so a short probe reports false
+/// negatives (`jax_available: false` on machines that actually have TPUs).
+/// Overridable via `RUNTIMO_TELEMETRY_PROBE_TIMEOUT` (config `[env]` or
+/// process env).
+const DEFAULT_JAX_PROBE_TIMEOUT_SECS: u64 = 60;
+
+/// Returns the JAX probe timeout, honoring `RUNTIMO_TELEMETRY_PROBE_TIMEOUT`.
+#[must_use]
+fn jax_probe_timeout() -> u64 {
+    crate::config::RuntimoConfig::env_var("RUNTIMO_TELEMETRY_PROBE_TIMEOUT")
+        .and_then(|v| v.parse().ok())
+        .filter(|t| *t >= 1)
+        .unwrap_or(DEFAULT_JAX_PROBE_TIMEOUT_SECS)
+}
+
 impl HardwareInfo {
     fn capture() -> Self {
         let mut accelerators = Vec::new();
 
-        // TPU devices via /dev/accel*
+        // TPU devices via /dev/accel* (Coral / on-host TPUs)
         let tpu_count: usize = run_cmd("ls /dev/accel* 2>/dev/null | wc -l")
             .unwrap_or_default()
             .parse()
@@ -565,6 +583,22 @@ impl HardwareInfo {
                 count: tpu_count,
                 vendor: Some("google".into()),
                 model: None,
+            });
+        }
+
+        // Cloud TPU v4/v5 expose as PCIe devices (no /dev/accel on host) —
+        // detect via lspci so `accelerators` is not empty on TPU VMs.
+        let tpu_pcie_count: usize = run_cmd("lspci 2>/dev/null | grep -ci tpu")
+            .unwrap_or_default()
+            .trim()
+            .parse()
+            .unwrap_or(0);
+        if tpu_pcie_count > 0 {
+            accelerators.push(AcceleratorInfo {
+                kind: "tpu".into(),
+                count: tpu_pcie_count,
+                vendor: None,
+                model: Some("tpu-pcie".into()),
             });
         }
 
@@ -616,23 +650,32 @@ impl HardwareInfo {
             }
         }
 
-        let jax_available =
-            run_cmd("timeout 10 python3 -c 'import jax' 2>/dev/null && echo yes || echo no")
-                .unwrap_or_default()
-                == "yes";
+        let probe_timeout = jax_probe_timeout();
+        let jax_available = run_cmd(&format!(
+            "timeout {} python3 -c 'import jax' 2>/dev/null && echo yes || echo no",
+            probe_timeout
+        ))
+        .unwrap_or_default()
+            == "yes";
         let jax_version = if jax_available {
             Some(
-                run_cmd("timeout 10 python3 -c 'import jax; print(jax.__version__)'")
-                    .unwrap_or_default(),
+                run_cmd(&format!(
+                    "timeout {} python3 -c 'import jax; print(jax.__version__)'",
+                    probe_timeout
+                ))
+                .unwrap_or_default(),
             )
         } else {
             None
         };
         let jax_device_count = if jax_available {
-            run_cmd("timeout 10 python3 -c 'import jax; print(len(jax.devices()))'")
-                .unwrap_or_default()
-                .parse()
-                .ok()
+            run_cmd(&format!(
+                "timeout {} python3 -c 'import jax; print(len(jax.devices()))'",
+                probe_timeout
+            ))
+            .unwrap_or_default()
+            .parse()
+            .ok()
         } else {
             None
         };
@@ -660,7 +703,10 @@ impl NetworkInfo {
     /// (max 16 chars), never the command line — this eliminates the self-match
     /// bug where `pgrep -fa cloudflared` matches its own shell invocation.
     fn capture() -> Self {
-        let public_ip = if std::env::var("RUNTIMO_ENABLE_PUBLIC_IP").as_deref() == Ok("1") {
+        let public_ip = if crate::config::RuntimoConfig::env_var("RUNTIMO_ENABLE_PUBLIC_IP")
+            .as_deref()
+            == Some("1")
+        {
             run_cmd(
                 "curl -s --connect-timeout 5 --max-time 5 ifconfig.me 2>/dev/null || echo 'unknown'",
             )
@@ -1106,5 +1152,19 @@ mod tests {
         let parsed: NetworkInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.listening_ports, vec![22, 11434, 3389]);
         assert!(!parsed.tunnel_running);
+    }
+
+    #[test]
+    fn test_jax_probe_timeout_default_and_override() {
+        // Default is 60s (raised from 10s — 10s was a false-negative on TPU
+        // boxes where JAX/XLA init takes longer than 10s).
+        assert_eq!(jax_probe_timeout(), DEFAULT_JAX_PROBE_TIMEOUT_SECS);
+
+        std::env::set_var("RUNTIMO_TELEMETRY_PROBE_TIMEOUT", "120");
+        assert_eq!(jax_probe_timeout(), 120);
+        std::env::set_var("RUNTIMO_TELEMETRY_PROBE_TIMEOUT", "0");
+        // Invalid (0) → falls back to default, never a zero/kill-now timeout.
+        assert_eq!(jax_probe_timeout(), DEFAULT_JAX_PROBE_TIMEOUT_SECS);
+        std::env::remove_var("RUNTIMO_TELEMETRY_PROBE_TIMEOUT");
     }
 }

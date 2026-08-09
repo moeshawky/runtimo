@@ -87,9 +87,10 @@ runtimo config dal B
                            │
                            ▼
 ┌────────────────────────────────────────────────────────────────┐
-│ CapabilityRegistry                                             │
-│ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────┐ ┌──────┐ ┌─────────┐│
-│ │ FileRead │ │FileWrite │ │ShellExec │ │ Undo │ │ Kill │ │ GitExec ││
+│ CapabilityRegistry                                                       │
+│ ┌──────────┐ ┌──────────┐ ┌────────┐ ┌──────────┐ ┌──────┐ ┌──────┐ ┌─────────┐│
+│ │ FileRead │ │FileWrite │ │ Delete │ │ShellExec │ │ Undo │ │ Kill │ │ GitExec ││
+│ └──────────┘ └──────────┘ └────────┘ └──────────┘ └──────┘ └──────┘ └─────────┘│
 │ └──────────┘ └──────────┘ └──────────┘ └──────┘ └──────┘ └─────────┘│
 └──────────────────────────┬─────────────────────────────────────┘
                            │
@@ -145,6 +146,24 @@ runtimo run -c FileWrite -a '{"path":"/tmp/out.txt","content":"hello"}'
 runtimo run -c FileWrite -a '{"path":"/tmp/log.txt","content":"\nline 2","append":true}'
 ```
 
+### Delete
+
+Delete a file with backup-before-delete. Path is validated against the
+allowed-prefix whitelist, critical files (`.bashrc`, `.ssh/*`, `.env`, …) are
+blocked, and a backup is created so `Undo` can restore the file by job. This is
+the audited alternative to `rm`, which remains hard-blocked in ShellExec (use it
+for stale lockfiles like `/tmp/libtpu_lockfile`).
+
+| Field | Type | Required? |
+|-------|------|-----------|
+| `path` | string | yes |
+
+```bash
+runtimo run -c Delete -a '{"path":"/tmp/libtpu_lockfile"}'
+# find the job ID with `runtimo jobs`, then restore with:
+runtimo run -c Undo -a '{"job_id":"<id>"}'
+```
+
 ### ShellExec
 
 Execute shell commands via `sh -c`. Supports pipes, redirects, chaining, variables. Enforces timeout and multi-layer dangerous command blocklist with quoting-bypass detection.
@@ -152,7 +171,7 @@ Execute shell commands via `sh -c`. Supports pipes, redirects, chaining, variabl
 | Field | Type | Required? |
 |-------|------|-----------|
 | `cmd` | string | yes |
-| `timeout_secs` | integer (1–300) | no |
+| `timeout_secs` | integer (1–3600) | no |
 
 **Multi-layer security:**
 | Layer | What it blocks |
@@ -161,9 +180,15 @@ Execute shell commands via `sh -c`. Supports pipes, redirects, chaining, variabl
 | **Quoting bypass** | Normalizes `r"m"`, `$'rm'`, backslash escapes before blocklist check |
 | **Regex patterns** | Catches `rm -rf /`, `rm --recursive /`, `rm -r --no-preserve-root` regardless of flag order |
 | **PATH sanitization** | Forced `PATH=/usr/local/bin:/usr/bin:/bin` before spawn |
-| **Network gating** | `curl`, `wget`, `nc`, `ssh`, etc. blocked — opt-in via `RUNTIMO_ENABLE_NETWORK=1` |
-| **Process isolation** | Process group, `SIGKILL` fallback on timeout (default 30s, max 300s), PID tracking |
+| **Network gating** | `curl`, `wget`, `nc`, `ssh`, etc. blocked — opt-in via `RUNTIMO_ENABLE_NETWORK=1` (or config `[env]`) |
+| **Process isolation** | Process group, `SIGKILL` fallback on timeout (default 30s, max 3600s), PID tracking |
 | **Output caps** | Stdout/stderr capped at 10 MB |
+
+> **Note:** The ShellExec timeout (default 30s, max 3600s) is the hard kill. The
+> executor-level timeout (`--timeout`, config `[capability_timeouts] ShellExec`)
+> is also honored — a value > 3600s is rejected by ShellExec with a clear error.
+> Long XLA work (e.g. vLLM's 20-30 min first compile) needs an explicit
+> `timeout_secs` (or `timeout`) argument up to 3600s.
 
 ```bash
 runtimo run -c ShellExec -a '{"cmd":"uptime"}'

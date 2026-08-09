@@ -13,7 +13,9 @@
 //! Uses `status` and `jobs` RPC methods for queriable job history.
 
 use runtimo_core::{
-    capabilities::{is_dangerous_command, FileRead, FileWrite, GitExec, Kill, ShellExec, Undo},
+    capabilities::{
+        is_dangerous_command, Delete, FileRead, FileWrite, GitExec, Kill, ShellExec, Undo,
+    },
     execute_with_telemetry_and_session, BackupManager, CapabilityRegistry, RuntimoConfig, WalEvent,
     WalEventType, WalReader, WalWriter,
 };
@@ -57,6 +59,10 @@ impl DaemonState {
         let file_write = FileWrite::new()
             .map_err(|e| format!("Failed to create FileWrite capability: {}", e))?;
         registry.register(file_write);
+
+        let delete =
+            Delete::new().map_err(|e| format!("Failed to create Delete capability: {}", e))?;
+        registry.register(delete);
 
         let backup_dir = runtimo_core::utils::backup_dir();
         let git_exec = GitExec::new(backup_dir)
@@ -1335,11 +1341,12 @@ mod tests {
         let wal_path = dir.join("test.wal");
         let state = DaemonState::new(&wal_path).expect("DaemonState::new should succeed");
 
-        // Registry should have all 6 capabilities
+        // Registry should have all 7 capabilities
         let caps = state.registry.list();
-        assert_eq!(caps.len(), 6, "Registry should have 6 capabilities");
+        assert_eq!(caps.len(), 7, "Registry should have 7 capabilities");
         assert!(caps.contains(&"FileRead"));
         assert!(caps.contains(&"FileWrite"));
+        assert!(caps.contains(&"Delete"));
         assert!(caps.contains(&"GitExec"));
         assert!(caps.contains(&"ShellExec"));
         assert!(caps.contains(&"Kill"));
@@ -1356,7 +1363,7 @@ mod tests {
     }
 
     #[test]
-    fn test_daemon_state_registry_has_exact_six_capabilities() {
+    fn test_daemon_state_registry_has_exact_seven_capabilities() {
         let _guard = ENV_MUTEX.lock().unwrap();
         let dir = unique_test_dir();
         std::fs::create_dir_all(&dir).unwrap();
@@ -1366,7 +1373,7 @@ mod tests {
         let state = DaemonState::new(&wal_path).unwrap();
 
         let caps = state.registry.list();
-        assert_eq!(caps.len(), 6);
+        assert_eq!(caps.len(), 7);
 
         // Verify names are distinct
         let mut sorted = caps.clone();

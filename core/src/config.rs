@@ -49,9 +49,36 @@ pub struct RuntimoConfig {
     /// can still override via `timeout_secs` in args.
     #[serde(default)]
     pub capability_timeouts: HashMap<String, u64>,
+
+    /// Environment variables applied to capability child processes and
+    /// consulted by Runtimo's runtime gates.
+    ///
+    /// These mirror the `RUNTIMO_*` opt-in env vars (`RUNTIMO_ENABLE_NETWORK`,
+    /// `RUNTIMO_ENABLE_INTERPRETERS`, `RUNTIMO_ENABLE_PUBLIC_IP`) so opt-in
+    /// features can be persisted in the config file instead of requiring a
+    /// process-level env var or a PATH wrapper. Values are merged into
+    /// ShellExec child environments (still subject to the sensitive-var
+    /// stripping; `PATH` stays sanitized) and take precedence over the process
+    /// environment for gates. GitExec is not merged — it inherits the process
+    /// environment and its network access is gated by URL validation/SSRF
+    /// blocking, not by these flags.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 }
 
 impl RuntimoConfig {
+    /// Known top-level config keys. Any other top-level key is a config
+    /// error — it would otherwise be silently ignored by serde. Surfacing
+    /// it catches typos like a bare `enable_network = true` instead of
+    /// `[env] RUNTIMO_ENABLE_NETWORK = "1"`.
+    const KNOWN_TOP_LEVEL_KEYS: &'static [&'static str] = &[
+        "allowed_paths",
+        "dal",
+        "blocklist_overrides",
+        "capability_timeouts",
+        "env",
+    ];
+
     /// Returns the config file path following XDG spec.
     ///
     /// Uses `XDG_CONFIG_HOME` if set, otherwise `~/.config/runtimo/config.toml`.
@@ -120,10 +147,30 @@ impl RuntimoConfig {
         if path.exists() {
             let content = std::fs::read_to_string(&path)
                 .map_err(|e| format!("Cannot read config file '{}': {}", path.display(), e))?;
-            toml::from_str(&content)
+            let value: toml::Value = toml::from_str(&content)
+                .map_err(|e| format!("Cannot parse config file '{}': {}", path.display(), e))?;
+            Self::warn_unknown_keys(&value, &path);
+            Self::deserialize(value)
                 .map_err(|e| format!("Cannot parse config file '{}': {}", path.display(), e))
         } else {
             Ok(Self::default())
+        }
+    }
+
+    /// Prints a warning to stderr for any top-level config key that is not
+    /// recognized. Unknown keys are silently ignored by serde — surfacing
+    /// them catches typos before they cause silent behavior changes.
+    fn warn_unknown_keys(value: &toml::Value, path: &std::path::Path) {
+        if let toml::Value::Table(table) = value {
+            for key in table.keys() {
+                if !Self::KNOWN_TOP_LEVEL_KEYS.contains(&key.as_str()) {
+                    eprintln!(
+                        "[runtimo] Warning: unknown config key `{}` in {} (ignored)",
+                        key,
+                        path.display()
+                    );
+                }
+            }
         }
     }
 
@@ -158,6 +205,29 @@ impl RuntimoConfig {
         // Config file
         let config = Self::load();
         config.dal.unwrap_or_else(|| "A".to_string())
+    }
+
+    /// Resolves an environment variable, preferring the config `[env]` table
+    /// over the process environment.
+    ///
+    /// This lets `RUNTIMO_*` opt-in flags be persisted in `config.toml`
+    /// (e.g. `[env] RUNTIMO_ENABLE_INTERPRETERS = "1"`) instead of requiring
+    /// a process-level env var or a PATH wrapper.
+    #[must_use]
+    pub fn env_var(name: &str) -> Option<String> {
+        let config = Self::load();
+        if let Some(value) = config.env.get(name) {
+            return Some(value.clone());
+        }
+        std::env::var(name).ok()
+    }
+
+    /// Returns the config `[env]` table (empty when unconfigured).
+    ///
+    /// Used to merge persisted env vars into capability child processes.
+    #[must_use]
+    pub fn env_map() -> HashMap<String, String> {
+        Self::load().env
     }
 
     /// Returns the merged blocklist overrides from config.
@@ -355,6 +425,95 @@ mod tests {
             config.allowed_paths.is_empty(),
             "Missing section should return defaults"
         );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn env_var_prefers_config_env_over_process_env() {
+        let _guard = CONFIG_TEST_MUTEX.lock().unwrap();
+        let tmp = std::env::temp_dir().join("runtimo_test_config_env");
+        let config_dir = tmp.join("runtimo");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+
+        std::fs::write(&config_path, "[env]\nRUNTIMO_ENABLE_NETWORK = \"1\"\n").unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+        std::env::set_var("RUNTIMO_ENABLE_NETWORK", "0");
+
+        assert_eq!(
+            RuntimoConfig::env_var("RUNTIMO_ENABLE_NETWORK").as_deref(),
+            Some("1"),
+            "config [env] must take precedence over process env"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::env::remove_var("RUNTIMO_ENABLE_NETWORK");
+    }
+
+    #[test]
+    fn env_map_returns_config_table() {
+        let _guard = CONFIG_TEST_MUTEX.lock().unwrap();
+        let tmp = std::env::temp_dir().join("runtimo_test_config_env_map");
+        let config_dir = tmp.join("runtimo");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+
+        std::fs::write(&config_path, "[env]\nRUNTIMO_ENABLE_INTERPRETERS = \"1\"\n").unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+
+        let map = RuntimoConfig::env_map();
+        assert_eq!(
+            map.get("RUNTIMO_ENABLE_INTERPRETERS").map(String::as_str),
+            Some("1")
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn unknown_top_level_key_ignored_but_loads() {
+        let _guard = CONFIG_TEST_MUTEX.lock().unwrap();
+        let tmp = std::env::temp_dir().join("runtimo_test_config_unknown_key");
+        let config_dir = tmp.join("runtimo");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+
+        // A typo'd top-level key must not break loading (but warns to stderr).
+        std::fs::write(
+            &config_path,
+            "enable_network = true\nallowed_paths = [\"/srv\"]\n",
+        )
+        .unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+
+        let config = RuntimoConfig::load_result().expect("should load despite unknown key");
+        assert_eq!(config.allowed_paths, vec!["/srv".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn capability_timeout_reads_config() {
+        let _guard = CONFIG_TEST_MUTEX.lock().unwrap();
+        let tmp = std::env::temp_dir().join("runtimo_test_config_timeout");
+        let config_dir = tmp.join("runtimo");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+
+        std::fs::write(&config_path, "[capability_timeouts]\nShellExec = 500\n").unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+
+        assert_eq!(RuntimoConfig::get_capability_timeout("ShellExec", 30), 500);
+        assert_eq!(RuntimoConfig::get_capability_timeout("FileRead", 30), 30);
 
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("XDG_CONFIG_HOME");

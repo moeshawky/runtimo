@@ -5,7 +5,9 @@ mod format;
 use clap::{Parser, Subcommand};
 use format::wall_to_markdown;
 use runtimo_core::{
-    capabilities::{is_dangerous_command, FileRead, FileWrite, GitExec, Kill, ShellExec, Undo},
+    capabilities::{
+        is_dangerous_command, Delete, FileRead, FileWrite, GitExec, Kill, ShellExec, Undo,
+    },
     execute_with_telemetry_and_session, CapabilityRegistry, ProcessSnapshot, RuntimoConfig,
     Telemetry, WalReader,
 };
@@ -33,7 +35,7 @@ const MAX_ARGS_SIZE_BYTES: usize = 130 * 1024;
     long_about = "runtimo — capability runtime with telemetry, WAL, and process tracking\n\n\
 Every exec: telemetry + process snapshot + WAL audit\n\
 Background: dispatch jobs to daemon, check status later",
-    after_help = "USAGE:\n runtimo run -c <Capability> -a '<json>'\n runtimo dispatch -c <Capability> -a '<json>'\n runtimo jobs\n runtimo wait -j <job_id>\n runtimo list\n runtimo logs\n runtimo telemetry\n runtimo processes\n\nCAPABILITIES:\n FileRead  Read file. Path validated (allowed dirs only). No dirs, no traversal.\n FileWrite Write file. Auto-backup for undo. Append mode ok.\n ShellExec Exec via sh -c. Blocks many dangerous commands (see `runtimo list` for full blocklist). Network tools and interpreters are opt-in.\n GitExec   Git ops: clone|pull|commit|revert|clean|status.\n Kill      Kill process by PID. Protected: init, kthreadd, self, parent, session/group leaders, systemd services.\n Undo      Restore from backup. Find job IDs with `runtimo jobs` or `runtimo logs`.\n\nTIP: Use `runtimo run -c <Cap> --schema` to see the JSON args a capability expects.\nTIP: Use `runtimo list --schemas` to see all schemas at once.\nTIP: ShellExec timeout range is 1–300 seconds (default: 30).\n\nDaemon starts on first dispatch if runtimo-daemon is installed.",
+    after_help = "USAGE:\n runtimo run -c <Capability> -a '<json>'\n runtimo dispatch -c <Capability> -a '<json>'\n runtimo jobs\n runtimo wait -j <job_id>\n runtimo list\n runtimo logs\n runtimo telemetry\n runtimo processes\n\nCAPABILITIES:\n FileRead  Read file. Path validated (allowed dirs only). No dirs, no traversal.\n FileWrite Write file. Auto-backup for undo. Append mode ok.\n Delete    Delete a file. Auto-backup for undo. Path-validated (no rm bypass).\n ShellExec Exec via sh -c. Blocks many dangerous commands (see `runtimo list` for full blocklist). Network tools and interpreters are opt-in.\n GitExec   Git ops: clone|pull|commit|revert|clean|status.\n Kill      Kill process by PID. Protected: init, kthreadd, self, parent, session/group leaders, systemd services.\n Undo      Restore from backup. Find job IDs with `runtimo jobs` or `runtimo logs`.\n\nTIP: Use `runtimo run -c <Cap> --schema` to see the JSON args a capability expects.\nTIP: Use `runtimo list --schemas` to see all schemas at once.\nTIP: ShellExec timeout range is 1–3600 seconds (default: 30).\n\nDaemon starts on first dispatch if runtimo-daemon is installed.",
     version
 )]
 struct Cli {
@@ -73,8 +75,8 @@ enum Commands {
         /// Print the capability's JSON Schema and exit
         #[arg(long)]
         schema: bool,
-        /// Execution timeout in seconds (1–300). Defaults to config value, then 30s.
-        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=300))]
+        /// Execution timeout in seconds (1–3600). Defaults to config value, then 30s.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout: Option<u64>,
     },
     /// Dispatch job to background daemon (returns immediately)
@@ -287,6 +289,7 @@ fn make_registry() -> Result<CapabilityRegistry, String> {
     let mut reg = CapabilityRegistry::new();
     reg.register(FileRead);
     reg.register(FileWrite::new().map_err(|e| format!("FileWrite init failed: {}", e))?);
+    reg.register(Delete::new().map_err(|e| format!("Delete init failed: {}", e))?);
     reg.register(GitExec::new(backup_dir()).map_err(|e| format!("GitExec init failed: {}", e))?);
     reg.register(ShellExec);
     reg.register(Kill);
@@ -1254,7 +1257,18 @@ fn main() -> Result<(), Box<dyn Error>> {
             ConfigAction::Show => {
                 let config_path = RuntimoConfig::config_path();
                 let config_exists = config_path.exists();
-                let config = RuntimoConfig::load();
+                let config = match RuntimoConfig::load_result() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!();
+                        eprintln!("[runtimo] Config parse error: {}", e);
+                        eprintln!(
+                            "[runtimo] Showing defaults — fix the config file to apply settings."
+                        );
+                        eprintln!();
+                        RuntimoConfig::default()
+                    }
+                };
                 println!("Configuration: {}", config_path.display());
                 if !config_exists {
                     println!("  (file does not exist — using defaults)");
@@ -1269,6 +1283,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                     println!("Capability timeouts:");
                     for (cap, timeout) in &config.capability_timeouts {
                         println!("  {}: {}s", cap, timeout);
+                    }
+                }
+                if config.env.is_empty() {
+                    println!("Env [env]: (none configured)");
+                } else {
+                    println!("Env [env]:");
+                    for (key, value) in &config.env {
+                        println!("  {} = {}", key, value);
                     }
                 }
                 println!();
@@ -1289,6 +1311,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     println!("  dal               — Design Assurance Level A-E (string)");
                     println!("  blocklist_overrides — Additional dangerous command patterns (list of strings)");
                     println!("  capability_timeouts — Per-capability timeout overrides (table of string->number)");
+                    println!("  env               — Environment vars for ShellExec children + runtime gates (table)");
                     println!();
                     println!("Example:");
                     println!("  allowed_paths = [\"/srv\", \"/opt\"]");
@@ -1298,6 +1321,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                     println!("  [capability_timeouts]");
                     println!("  ShellExec = 120");
                     println!("  FileRead = 10");
+                    println!();
+                    println!("  [env]");
+                    println!("  RUNTIMO_ENABLE_INTERPRETERS = \"1\"");
+                    println!("  RUNTIMO_ENABLE_NETWORK = \"1\"");
                 }
             }
             ConfigAction::Dal { level } => {
