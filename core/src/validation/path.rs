@@ -197,17 +197,23 @@ pub fn validate_path(path_str: &str, ctx: &PathContext) -> Result<PathBuf, Strin
         ));
     }
 
-    // Check allowed prefixes against the resolved path
+    // Check allowed prefixes against the resolved path. The whitelist is a
+    // forced defense — operators who want unrestricted access (no difference
+    // from a plain shell) can disable it via config `path_restriction_enabled
+    // = false`. Input-hygiene checks above (null bytes, control characters,
+    // traversal) always apply.
     let resolved_str = resolved.to_string_lossy();
-    let allowed = get_allowed_prefixes(ctx);
-    if !allowed
-        .iter()
-        .any(|prefix| path_in_prefix(&resolved_str, prefix))
-    {
-        return Err(format!(
-            "path outside allowed directories: {}",
-            truncate_path(&resolved.to_string_lossy())
-        ));
+    if crate::config::RuntimoConfig::path_restriction_enabled() {
+        let allowed = get_allowed_prefixes(ctx);
+        if !allowed
+            .iter()
+            .any(|prefix| path_in_prefix(&resolved_str, prefix))
+        {
+            return Err(format!(
+                "path outside allowed directories: {}",
+                truncate_path(&resolved.to_string_lossy())
+            ));
+        }
     }
 
     Ok(resolved)

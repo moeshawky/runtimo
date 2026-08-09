@@ -64,6 +64,41 @@ pub struct RuntimoConfig {
     /// blocking, not by these flags.
     #[serde(default)]
     pub env: HashMap<String, String>,
+
+    /// Enable the ShellExec dangerous-command blocklist (default: enabled).
+    ///
+    /// When `false`, `is_dangerous_command()` always returns `None` — ShellExec
+    /// behaves like a plain `sh -c` with no command filtering. The blocklist
+    /// catches `rm`, `shred`, `mkfs`, fork bombs, env dumpers, etc.; disabling
+    /// it surrenders that defense deliberately. Network and interpreter
+    /// gating are separate and unaffected by this flag.
+    #[serde(default)]
+    pub blocklist_enabled: Option<bool>,
+
+    /// Enable the critical-files denylist in FileWrite/Delete (default: enabled).
+    ///
+    /// When `false`, files in the `CRITICAL_FILES` denylist (`.bashrc`,
+    /// `.env`, `.ssh/*`, etc.) can be written and deleted without the
+    /// critical-file rejection.
+    #[serde(default)]
+    pub critical_files_enabled: Option<bool>,
+
+    /// Enable the allowed-prefix path whitelist (default: enabled).
+    ///
+    /// When `false`, `validate_path()` skips the allowed-prefix check, so
+    /// FileRead/FileWrite/Delete can operate on any path. This is the
+    /// strongest opt-out — it removes the "only /tmp, /var/tmp, /home and
+    /// configured prefixes" constraint entirely.
+    #[serde(default)]
+    pub path_restriction_enabled: Option<bool>,
+
+    /// Force `PATH=/usr/local/bin:/usr/bin:/bin` on ShellExec children
+    /// (default: enabled).
+    ///
+    /// When `false`, child processes inherit the caller's `PATH`, allowing
+    /// custom binaries outside the sanitized trio to resolve.
+    #[serde(default)]
+    pub path_sanitization_enabled: Option<bool>,
 }
 
 impl RuntimoConfig {
@@ -77,6 +112,10 @@ impl RuntimoConfig {
         "blocklist_overrides",
         "capability_timeouts",
         "env",
+        "blocklist_enabled",
+        "critical_files_enabled",
+        "path_restriction_enabled",
+        "path_sanitization_enabled",
     ];
 
     /// Returns the config file path following XDG spec.
@@ -238,6 +277,42 @@ impl RuntimoConfig {
     pub fn get_blocklist_overrides() -> Vec<String> {
         let config = Self::load();
         config.blocklist_overrides
+    }
+
+    /// Whether the ShellExec dangerous-command blocklist is enabled.
+    ///
+    /// Defaults to enabled when unconfigured. `blocklist_enabled = false` in
+    /// config.toml makes ShellExec behave like plain `sh -c`.
+    #[must_use]
+    pub fn blocklist_enabled() -> bool {
+        Self::load().blocklist_enabled.unwrap_or(true)
+    }
+
+    /// Whether the FileWrite/Delete critical-files denylist is enabled.
+    ///
+    /// Defaults to enabled when unconfigured.
+    #[must_use]
+    pub fn critical_files_enabled() -> bool {
+        Self::load().critical_files_enabled.unwrap_or(true)
+    }
+
+    /// Whether the allowed-prefix path whitelist is enabled.
+    ///
+    /// Defaults to enabled when unconfigured. `path_restriction_enabled =
+    /// false` removes the "only /tmp, /var/tmp, /home and configured
+    /// prefixes" constraint for FileRead/FileWrite/Delete.
+    #[must_use]
+    pub fn path_restriction_enabled() -> bool {
+        Self::load().path_restriction_enabled.unwrap_or(true)
+    }
+
+    /// Whether ShellExec children get a forced `PATH` (default: enabled).
+    ///
+    /// When `false`, children inherit the caller's `PATH`, resolving custom
+    /// binaries outside `/usr/local/bin:/usr/bin:/bin`.
+    #[must_use]
+    pub fn path_sanitization_enabled() -> bool {
+        Self::load().path_sanitization_enabled.unwrap_or(true)
     }
 
     /// Returns the default timeout for a capability, or the fallback.
@@ -514,6 +589,49 @@ mod tests {
 
         assert_eq!(RuntimoConfig::get_capability_timeout("ShellExec", 30), 500);
         assert_eq!(RuntimoConfig::get_capability_timeout("FileRead", 30), 30);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn defense_toggles_default_enabled() {
+        let _guard = CONFIG_TEST_MUTEX.lock().unwrap();
+        let tmp = std::env::temp_dir().join("runtimo_test_config_toggles");
+        let config_dir = tmp.join("runtimo");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+
+        assert!(RuntimoConfig::blocklist_enabled());
+        assert!(RuntimoConfig::critical_files_enabled());
+        assert!(RuntimoConfig::path_restriction_enabled());
+        assert!(RuntimoConfig::path_sanitization_enabled());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn defense_toggles_can_be_disabled_via_config() {
+        let _guard = CONFIG_TEST_MUTEX.lock().unwrap();
+        let tmp = std::env::temp_dir().join("runtimo_test_config_toggles_off");
+        let config_dir = tmp.join("runtimo");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+
+        std::fs::write(
+            &config_path,
+            "blocklist_enabled = false\ncritical_files_enabled = false\npath_restriction_enabled = false\npath_sanitization_enabled = false\n",
+        )
+        .unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+
+        assert!(!RuntimoConfig::blocklist_enabled());
+        assert!(!RuntimoConfig::critical_files_enabled());
+        assert!(!RuntimoConfig::path_restriction_enabled());
+        assert!(!RuntimoConfig::path_sanitization_enabled());
 
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("XDG_CONFIG_HOME");

@@ -42,6 +42,15 @@ use serde_json::Value;
 pub struct DeleteArgs {
     /// Absolute path to the file to delete.
     pub path: String,
+
+    /// Skip the backup-before-delete (default: `false`).
+    ///
+    /// When `true`, the file is deleted without creating an undo backup.
+    /// Intended for large files (hundreds of GB of models) where copying the
+    /// target to `data_dir()/backups` would double disk usage under pressure.
+    /// The operation is then irreversible.
+    #[serde(default)]
+    pub no_backup: bool,
 }
 
 /// Capability that deletes a file with backup-before-delete.
@@ -74,14 +83,15 @@ impl TypedCapability for Delete {
     }
 
     fn description(&self) -> &'static str {
-        "delete file. auto-backup for undo. path-validated (no rm bypass)."
+        "delete file. auto-backup for undo unless no_backup. path-validated (no rm bypass)."
     }
 
     fn schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string" }
+                "path": { "type": "string" },
+                "no_backup": { "type": "boolean", "default": false, "description": "Skip backup-before-delete (irreversible)" }
             },
             "required": ["path"]
         })
@@ -104,7 +114,7 @@ impl TypedCapability for Delete {
         let path = validate_path(&args.path, &delete_ctx)
             .map_err(|e| CapabilityError::PermissionDenied(format!("path validation: {}", e)))?;
 
-        if is_critical_file(&path) {
+        if crate::config::RuntimoConfig::critical_files_enabled() && is_critical_file(&path) {
             return Err(CapabilityError::PermissionDenied(format!(
                 "critical file denied: {}",
                 path.display()
@@ -116,6 +126,7 @@ impl TypedCapability for Delete {
             out.data = Some(serde_json::json!({
                 "path": path.display().to_string(),
                 "dry_run": true,
+                "no_backup": args.no_backup,
                 "backup_path": null,
                 "telemetry_before": serde_json::to_value(&telemetry_before).unwrap_or(Value::Null),
                 "process_before_count": process_before.summary.total_processes,
@@ -123,10 +134,15 @@ impl TypedCapability for Delete {
             return Ok(out);
         }
 
-        let backup_path = self
-            .backup_mgr
-            .create_backup(&path, &ctx.job_id)
-            .map_err(|e| CapabilityError::Internal(format!("backup: {}", e)))?;
+        // Backup unless explicitly skipped (no_backup) — large-file deletion
+        // under disk pressure is the opt-out case.
+        let backup_path = if args.no_backup {
+            std::path::PathBuf::new()
+        } else {
+            self.backup_mgr
+                .create_backup(&path, &ctx.job_id)
+                .map_err(|e| CapabilityError::Internal(format!("backup: {}", e)))?
+        };
 
         std::fs::remove_file(&path).map_err(|e| {
             CapabilityError::Io(std::io::Error::other(format!(
@@ -150,7 +166,12 @@ impl TypedCapability for Delete {
         let mut out = Output::ok(format!("Deleted {}", path.display()));
         out.data = Some(serde_json::json!({
             "path": path.display().to_string(),
-            "backup_path": backup_path.to_string_lossy().to_string(),
+            "backup_path": if backup_path.as_os_str().is_empty() {
+                Value::Null
+            } else {
+                Value::String(backup_path.to_string_lossy().to_string())
+            },
+            "no_backup": args.no_backup,
             "telemetry_before": serde_json::to_value(&telemetry_before).unwrap_or(Value::Null),
             "telemetry_after": serde_json::to_value(&telemetry_after).unwrap_or(Value::Null),
             "process_before_count": process_before.summary.total_processes,
@@ -191,6 +212,7 @@ mod tests {
             &cap,
             DeleteArgs {
                 path: target.to_str().unwrap().to_string(),
+                no_backup: false,
             },
             &test_ctx("d1"),
         )
@@ -215,6 +237,7 @@ mod tests {
             &cap,
             DeleteArgs {
                 path: "../../../etc/passwd".to_string(),
+                no_backup: false,
             },
             &test_ctx("d2"),
         )
@@ -230,6 +253,7 @@ mod tests {
             &cap,
             DeleteArgs {
                 path: "/etc/shadow".to_string(),
+                no_backup: false,
             },
             &test_ctx("d3"),
         )
@@ -246,6 +270,7 @@ mod tests {
             &cap,
             DeleteArgs {
                 path: missing.to_str().unwrap().to_string(),
+                no_backup: false,
             },
             &test_ctx("d4"),
         )
@@ -265,6 +290,7 @@ mod tests {
             &cap,
             DeleteArgs {
                 path: dir.to_str().unwrap().to_string(),
+                no_backup: false,
             },
             &test_ctx("d5"),
         )
@@ -283,6 +309,7 @@ mod tests {
             &cap,
             DeleteArgs {
                 path: target.to_str().unwrap().to_string(),
+                no_backup: false,
             },
             &test_ctx("d6"),
         )
@@ -302,6 +329,7 @@ mod tests {
             &cap,
             DeleteArgs {
                 path: target.to_str().unwrap().to_string(),
+                no_backup: false,
             },
             &dry_ctx("d7"),
         )
@@ -312,6 +340,37 @@ mod tests {
         assert!(result.data.as_ref().unwrap()["dry_run"].as_bool().unwrap());
 
         std::fs::remove_file(&target).ok();
+        std::fs::remove_dir_all(crate::utils::backup_dir()).ok();
+    }
+
+    #[test]
+    fn no_backup_skips_backup_creation() {
+        let target = std::env::temp_dir().join("runtimo_del_nobak.bin");
+        std::fs::write(&target, "big model bytes").unwrap();
+        let cap = Delete::new().unwrap();
+
+        let result = TypedCapability::execute(
+            &cap,
+            DeleteArgs {
+                path: target.to_str().unwrap().to_string(),
+                no_backup: true,
+            },
+            &test_ctx("d8"),
+        )
+        .expect("Execution failed");
+
+        assert_eq!(result.status, "ok");
+        assert!(!target.exists(), "file should be deleted");
+        let backup_path = result.data.as_ref().unwrap()["backup_path"].clone();
+        assert!(
+            backup_path.is_null(),
+            "no_backup must not create a backup, got: {}",
+            backup_path
+        );
+        assert!(result.data.as_ref().unwrap()["no_backup"]
+            .as_bool()
+            .unwrap());
+
         std::fs::remove_dir_all(crate::utils::backup_dir()).ok();
     }
 }

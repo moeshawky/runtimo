@@ -35,7 +35,7 @@ const MAX_ARGS_SIZE_BYTES: usize = 130 * 1024;
     long_about = "runtimo — capability runtime with telemetry, WAL, and process tracking\n\n\
 Every exec: telemetry + process snapshot + WAL audit\n\
 Background: dispatch jobs to daemon, check status later",
-    after_help = "USAGE:\n runtimo run -c <Capability> -a '<json>'\n runtimo dispatch -c <Capability> -a '<json>'\n runtimo jobs\n runtimo wait -j <job_id>\n runtimo list\n runtimo logs\n runtimo telemetry\n runtimo processes\n\nCAPABILITIES:\n FileRead  Read file. Path validated (allowed dirs only). No dirs, no traversal.\n FileWrite Write file. Auto-backup for undo. Append mode ok.\n Delete    Delete a file. Auto-backup for undo. Path-validated (no rm bypass).\n ShellExec Exec via sh -c. Blocks many dangerous commands (see `runtimo list` for full blocklist). Network tools and interpreters are opt-in.\n GitExec   Git ops: clone|pull|commit|revert|clean|status.\n Kill      Kill process by PID. Protected: init, kthreadd, self, parent, session/group leaders, systemd services.\n Undo      Restore from backup. Find job IDs with `runtimo jobs` or `runtimo logs`.\n\nTIP: Use `runtimo run -c <Cap> --schema` to see the JSON args a capability expects.\nTIP: Use `runtimo list --schemas` to see all schemas at once.\nTIP: ShellExec timeout range is 1–3600 seconds (default: 30).\n\nDaemon starts on first dispatch if runtimo-daemon is installed.",
+    after_help = "USAGE:\n runtimo run -c <Capability> -a '<json>'\n runtimo dispatch -c <Capability> -a '<json>'\n runtimo jobs\n runtimo wait -j <job_id>\n runtimo list\n runtimo logs\n runtimo telemetry\n runtimo processes\n\nCAPABILITIES:\n FileRead  Read file. Path validated (allowed dirs only). No dirs, no traversal.\n FileWrite Write file. Auto-backup for undo. Append mode ok.\n Delete    Delete a file. Auto-backup for undo unless no_backup=true. Path-validated (no rm bypass).\n ShellExec Exec via sh -c. Blocks many dangerous commands (see `runtimo list` for full blocklist). Network tools and interpreters are opt-in.\n GitExec   Git ops: clone|pull|commit|revert|clean|status.\n Kill      Kill process by PID. Protected: init, kthreadd, self, parent, session/group leaders, systemd services.\n Undo      Restore from backup. Find job IDs with `runtimo jobs` or `runtimo logs`.\n\nTIP: Use `runtimo run -c <Cap> --schema` to see the JSON args a capability expects.\nTIP: Use `runtimo list --schemas` to see all schemas at once.\nTIP: ShellExec timeout has no upper bound (default: 30).\n\nDaemon starts on first dispatch if runtimo-daemon is installed.",
     version
 )]
 struct Cli {
@@ -75,8 +75,8 @@ enum Commands {
         /// Print the capability's JSON Schema and exit
         #[arg(long)]
         schema: bool,
-        /// Execution timeout in seconds (1–3600). Defaults to config value, then 30s.
-        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        /// Execution timeout in seconds (no upper bound). Defaults to config value, then 30s.
+        #[arg(long, value_parser = clap::value_parser!(u64))]
         timeout: Option<u64>,
     },
     /// Dispatch job to background daemon (returns immediately)
@@ -303,6 +303,15 @@ fn make_registry() -> Result<CapabilityRegistry, String> {
 const MAX_CLI_CONCURRENT: usize = 16;
 /// Global counter of currently-running CLI jobs.
 static CLI_ACTIVE_JOBS: AtomicUsize = AtomicUsize::new(0);
+
+/// Returns "enabled"/"disabled" for config-show output.
+fn on_off(v: bool) -> &'static str {
+    if v {
+        "enabled"
+    } else {
+        "disabled"
+    }
+}
 
 /// Attempts to acquire a concurrency slot for a CLI `run` command.
 ///
@@ -1296,6 +1305,22 @@ fn main() -> Result<(), Box<dyn Error>> {
                 println!();
                 println!("Effective settings (with env var + defaults):");
                 println!("  DAL: {}", RuntimoConfig::get_dal());
+                println!(
+                    "  ShellExec blocklist: {}",
+                    on_off(RuntimoConfig::blocklist_enabled())
+                );
+                println!(
+                    "  Critical-files denylist: {}",
+                    on_off(RuntimoConfig::critical_files_enabled())
+                );
+                println!(
+                    "  Path whitelist: {}",
+                    on_off(RuntimoConfig::path_restriction_enabled())
+                );
+                println!(
+                    "  PATH sanitization: {}",
+                    on_off(RuntimoConfig::path_sanitization_enabled())
+                );
                 let all_prefixes = RuntimoConfig::get_allowed_prefixes();
                 println!("  Allowed paths ({} total):", all_prefixes.len());
                 for p in &all_prefixes {
@@ -1312,6 +1337,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                     println!("  blocklist_overrides — Additional dangerous command patterns (list of strings)");
                     println!("  capability_timeouts — Per-capability timeout overrides (table of string->number)");
                     println!("  env               — Environment vars for ShellExec children + runtime gates (table)");
+                    println!("  blocklist_enabled — Disable ShellExec dangerous-command blocklist (bool, default true)");
+                    println!("  critical_files_enabled — Disable critical-files denylist in FileWrite/Delete (bool, default true)");
+                    println!("  path_restriction_enabled — Disable allowed-prefix path whitelist (bool, default true)");
+                    println!("  path_sanitization_enabled — Disable forced PATH on ShellExec children (bool, default true)");
                     println!();
                     println!("Example:");
                     println!("  allowed_paths = [\"/srv\", \"/opt\"]");

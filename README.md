@@ -157,11 +157,15 @@ for stale lockfiles like `/tmp/libtpu_lockfile`).
 | Field | Type | Required? |
 |-------|------|-----------|
 | `path` | string | yes |
+| `no_backup` | boolean (default `false`) | no |
 
 ```bash
 runtimo run -c Delete -a '{"path":"/tmp/libtpu_lockfile"}'
 # find the job ID with `runtimo jobs`, then restore with:
 runtimo run -c Undo -a '{"job_id":"<id>"}'
+
+# Skip backup for huge files under disk pressure (irreversible):
+runtimo run -c Delete -a '{"path":"/models/llama-70b.safetensors","no_backup":true}'
 ```
 
 ### ShellExec
@@ -171,7 +175,7 @@ Execute shell commands via `sh -c`. Supports pipes, redirects, chaining, variabl
 | Field | Type | Required? |
 |-------|------|-----------|
 | `cmd` | string | yes |
-| `timeout_secs` | integer (1–3600) | no |
+| `timeout_secs` | integer (≥1, no upper bound) | no |
 
 **Multi-layer security:**
 | Layer | What it blocks |
@@ -181,14 +185,20 @@ Execute shell commands via `sh -c`. Supports pipes, redirects, chaining, variabl
 | **Regex patterns** | Catches `rm -rf /`, `rm --recursive /`, `rm -r --no-preserve-root` regardless of flag order |
 | **PATH sanitization** | Forced `PATH=/usr/local/bin:/usr/bin:/bin` before spawn |
 | **Network gating** | `curl`, `wget`, `nc`, `ssh`, etc. blocked — opt-in via `RUNTIMO_ENABLE_NETWORK=1` (or config `[env]`) |
-| **Process isolation** | Process group, `SIGKILL` fallback on timeout (default 30s, max 3600s), PID tracking |
+| **Process isolation** | Process group, `SIGKILL` fallback on timeout (default 30s, no upper bound), PID tracking |
 | **Output caps** | Stdout/stderr capped at 10 MB |
 
-> **Note:** The ShellExec timeout (default 30s, max 3600s) is the hard kill. The
-> executor-level timeout (`--timeout`, config `[capability_timeouts] ShellExec`)
-> is also honored — a value > 3600s is rejected by ShellExec with a clear error.
-> Long XLA work (e.g. vLLM's 20-30 min first compile) needs an explicit
-> `timeout_secs` (or `timeout`) argument up to 3600s.
+> **Note:** The ShellExec timeout (default 30s) is the hard kill — it has no
+> upper bound, so long-running jobs (training, inference, XLA/vLLM first
+> compile) can set any value ≥ 1. The executor-level timeout (`--timeout`,
+> config `[capability_timeouts] ShellExec`) is also honored.
+>
+> **Defense opt-outs** (config.toml, all default to enabled): `blocklist_enabled
+> = false` turns ShellExec into plain `sh -c` with no dangerous-command
+> filtering; `path_sanitization_enabled = false` inherits the caller's `PATH`.
+> `path_restriction_enabled = false` removes the allowed-prefix whitelist and
+> ShellExec path scan; `critical_files_enabled = false` allows writing/deleting
+> critical files. Safe defaults apply when unset. See `runtimo config show`.
 
 ```bash
 runtimo run -c ShellExec -a '{"cmd":"uptime"}'

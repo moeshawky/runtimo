@@ -174,7 +174,7 @@ impl TypedCapability for FileWrite {
             )));
         }
 
-        if is_critical_file(&path) {
+        if crate::config::RuntimoConfig::critical_files_enabled() && is_critical_file(&path) {
             return Err(CapabilityError::PermissionDenied(format!(
                 "critical file denied: {}",
                 path.display()

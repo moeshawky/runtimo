@@ -200,7 +200,8 @@ let result = execute_with_telemetry(&cap, &args, false, Path::new("/tmp/wal.json
 {
   "type": "object",
   "properties": {
-    "path": { "type": "string" }
+    "path": { "type": "string" },
+    "no_backup": { "type": "boolean", "default": false, "description": "Skip backup-before-delete (irreversible)" }
   },
   "required": ["path"]
 }
@@ -210,6 +211,8 @@ let result = execute_with_telemetry(&cap, &args, false, Path::new("/tmp/wal.json
 - Backs up the file before deletion — `Undo` restores it by job ID
 - Requires an existing regular file under an allowed prefix
 - Rejects directories, symlink escapes, and critical files
+- `no_backup: true` skips the backup entirely (irreversible) — for huge files
+  under disk pressure
 
 **Security:**
 - Path validated through `validation/path.rs` allowed-prefix whitelist (same
@@ -221,6 +224,7 @@ let result = execute_with_telemetry(&cap, &args, false, Path::new("/tmp/wal.json
 **Example:**
 ```bash
 runtimo run -c Delete -a '{"path":"/tmp/libtpu_lockfile"}'
+runtimo run -c Delete -a '{"path":"/models/llama-70b.safetensors","no_backup":true}'
 ```
 
 ### ShellExec (← since 0.7.1)
@@ -233,7 +237,7 @@ runtimo run -c Delete -a '{"path":"/tmp/libtpu_lockfile"}'
   "type": "object",
   "properties": {
     "cmd": { "type": "string" },
-    "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 3600 }
+    "timeout_secs": { "type": "integer", "minimum": 1, "description": "Seconds — no upper bound (default 30)" }
   },
   "required": ["cmd"]
 }

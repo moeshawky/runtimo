@@ -1267,7 +1267,7 @@ impl TypedCapability for ShellExec {
             "type": "object",
             "properties": {
                 "cmd": { "type": "string", "description": "Command to execute via sh -c (max 65536 bytes)", "minLength": 1, "maxLength": 65536 },
-                "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 3600 },
+                "timeout_secs": { "type": "integer", "minimum": 1, "description": "Timeout in seconds (no upper bound; 0/default falls back to config or 30s)" },
                 "cwd": { "type": "string" },
                 "stdin": { "type": "string" }
             },
@@ -1280,12 +1280,13 @@ impl TypedCapability for ShellExec {
         ctx: &Context,
     ) -> std::result::Result<Output, CapabilityError> {
         // Timeout from JSON args, falling back to config capability_timeouts,
-        // then the built-in default. Enforce range: minimum 1, maximum 3600
-        // (matching schema declaration).
+        // then the built-in default. No upper bound — operators run long-lived
+        // jobs (training, inference) and set their own limits via config.
+        // Minimum is 1 second to keep 0/negative out.
         if let Some(secs) = args.timeout_secs {
-            if !(1..=3600).contains(&secs) {
+            if secs < 1 {
                 return Err(CapabilityError::InvalidArgs(format!(
-                    "timeout_secs must be between 1 and 3600, got {}",
+                    "timeout_secs must be at least 1, got {}",
                     secs
                 )));
             }
@@ -1314,11 +1315,16 @@ impl TypedCapability for ShellExec {
 
         // F-013: Blocklist check (original + detokenized) — runs BEFORE dry_run
         // so dangerous commands are rejected even in dry-run mode (F-017).
-        if let Some(reason) = is_dangerous_command(&args.cmd) {
-            return Err(CapabilityError::PermissionDenied(format!(
-                "dangerous command blocked: {}",
-                reason
-            )));
+        // Opt-out: config `blocklist_enabled = false` disables this layer,
+        // making ShellExec behave like plain `sh -c` with no command filtering.
+        // Network and interpreter gating are separate and stay active.
+        if crate::config::RuntimoConfig::blocklist_enabled() {
+            if let Some(reason) = is_dangerous_command(&args.cmd) {
+                return Err(CapabilityError::PermissionDenied(format!(
+                    "dangerous command blocked: {}",
+                    reason
+                )));
+            }
         }
 
         // F-015: Block env-dumping commands (checked in is_dangerous_command
@@ -1338,9 +1344,13 @@ impl TypedCapability for ShellExec {
             ));
         }
 
-        // F-014: Path restriction check — scan for paths outside allowed prefixes
-        if let Some(reason) = check_command_paths(&args.cmd) {
-            return Err(CapabilityError::PermissionDenied(reason));
+        // F-014: Path restriction check — scan for paths outside allowed
+        // prefixes. Opt-out: config `path_restriction_enabled = false` skips
+        // this scan, letting commands reference arbitrary paths.
+        if crate::config::RuntimoConfig::path_restriction_enabled() {
+            if let Some(reason) = check_command_paths(&args.cmd) {
+                return Err(CapabilityError::PermissionDenied(reason));
+            }
         }
 
         // Dry-run check AFTER security validation — ensures dangerous commands
@@ -1355,8 +1365,11 @@ impl TypedCapability for ShellExec {
         // PATH sanitization: limit executable resolution to trusted system dirs.
         // This is defense-in-depth — the blocklist catches known-dangerous
         // commands, but this prevents invocation of custom binaries in
-        // non-standard locations.
-        cmd.env("PATH", "/usr/local/bin:/usr/bin:/bin");
+        // non-standard locations. Opt-out: config `path_sanitization_enabled
+        // = false` inherits the caller's PATH so custom binaries resolve.
+        if crate::config::RuntimoConfig::path_sanitization_enabled() {
+            cmd.env("PATH", "/usr/local/bin:/usr/bin:/bin");
+        }
 
         // F-015: Sanitized environment — strip sensitive env vars before spawning.
         // Only safe system variables survive; secrets (API keys, tokens, passwords)
@@ -1467,10 +1480,10 @@ mod tests {
         assert_eq!(args.timeout_secs, Some(45));
     }
     #[test]
-    fn timeout_above_new_cap_rejected() {
+    fn timeout_zero_or_negative_rejected() {
         let err = Capability::execute(
             &ShellExec,
-            &serde_json::json!({"cmd": "true", "timeout_secs": 3601}),
+            &serde_json::json!({"cmd": "true", "timeout_secs": 0}),
             &Context {
                 dry_run: false,
                 job_id: "test".into(),
@@ -1478,14 +1491,24 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(
-            err.to_string().contains("between 1 and 3600"),
-            "got: {}",
-            err
-        );
+        assert!(err.to_string().contains("at least 1"), "got: {}", err);
     }
     #[test]
-    fn timeout_at_new_cap_ok() {
+    fn timeout_above_3600_unbounded() {
+        let r = Capability::execute(
+            &ShellExec,
+            &serde_json::json!({"cmd": "true", "timeout_secs": 72000}),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::temp_dir(),
+            },
+        )
+        .expect("timeout_secs above 3600 is allowed (no upper bound)");
+        assert_eq!(r.status, "ok");
+    }
+    #[test]
+    fn timeout_at_3600_ok() {
         let r = Capability::execute(
             &ShellExec,
             &serde_json::json!({"cmd": "true", "timeout_secs": 3600}),
