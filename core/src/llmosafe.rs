@@ -33,11 +33,13 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// Parses a DAL string (e.g., "A", "B", "c") into a `DesignAssuranceLevel`.
+/// Parses a DAL string into a `DesignAssuranceLevel`.
 ///
-/// Uses `RuntimoConfig::get_dal()` which respects the priority chain:
-/// env var → config file → default "A". This function converts the
-/// resolved string into the typed enum.
+/// Reads `RuntimoConfig::get_dal()`, which uppercases the value from either
+/// source (env var `RUNTIMO_DAL` or config file `dal`), so `dal = "b"` and
+/// `RUNTIMO_DAL=b` both resolve to `"B"`. Exact-matches `"B"` through `"E"`
+/// to their level; any unknown or absent value resolves to the strictest
+/// `DesignAssuranceLevel::A`.
 fn dal_from_config() -> DesignAssuranceLevel {
     match RuntimoConfig::get_dal().as_str() {
         "B" => DesignAssuranceLevel::B,

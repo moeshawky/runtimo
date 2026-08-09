@@ -114,9 +114,11 @@ impl SessionManager {
     /// Loads a session from disk by ID.
     ///
     /// # Errors
-    /// Returns `SessionError` if the session file cannot be read or parsed.
+    /// Returns `SessionError` if the session ID is invalid (empty, contains
+    /// `/`, `\`, a NUL byte, or `..`), if the session file cannot be read,
+    /// or if the session file cannot be parsed as JSON.
     pub fn load_session(&self, session_id: &str) -> Result<Session> {
-        let path = self.session_path(session_id);
+        let path = self.session_path(session_id)?;
         let content = std::fs::read_to_string(&path).map_err(|e| {
             crate::Error::SessionError(format!("Session not found {}: {}", session_id, e))
         })?;
@@ -127,7 +129,9 @@ impl SessionManager {
     /// Adds a job to a session.
     ///
     /// # Errors
-    /// Returns `SessionError` if the session cannot be loaded or saved.
+    /// Returns `SessionError` if the session ID is invalid (empty, contains
+    /// `/`, `\`, a NUL byte, or `..`), if the session cannot be loaded, or
+    /// if the session cannot be saved.
     pub fn add_job(&mut self, session_id: &str, job_id: &str) -> Result<()> {
         let mut session = self.load_session(session_id)?;
         session.job_ids.push(job_id.to_string());
@@ -169,12 +173,57 @@ impl SessionManager {
         Ok(sessions)
     }
 
-    fn session_path(&self, session_id: &str) -> PathBuf {
-        self.sessions_dir.join(format!("{}.json", session_id))
+    /// Validates a session ID before it is interpolated into a filesystem path.
+    ///
+    /// # Input
+    ///
+    /// `session_id: &str` — any caller-supplied identifier.
+    ///
+    /// # Output
+    ///
+    /// `Ok(())` when the ID is safe for `format!("{}.json", session_id)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SessionError` when the ID is empty, contains a path separator
+    /// (`/` or `\`), contains a NUL byte, or contains `..`.
+    fn validate_session_id(session_id: &str) -> Result<()> {
+        let invalid = session_id.is_empty()
+            || session_id.contains('/')
+            || session_id.contains('\\')
+            || session_id.contains('\0')
+            || session_id.contains("..");
+        if invalid {
+            return Err(crate::Error::SessionError(format!(
+                "Invalid session ID '{}': must be non-empty without '/', '\\', NUL, or '..'",
+                session_id
+            )));
+        }
+        Ok(())
+    }
+
+    /// Resolves the on-disk path for a session ID.
+    ///
+    /// # Input
+    ///
+    /// `session_id: &str` — validates and maps to
+    /// `<sessions_dir>/<session_id>.json`.
+    ///
+    /// # Output
+    ///
+    /// `Ok(PathBuf)` pointing at the session's JSON file.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SessionError` from [`Self::validate_session_id`] when the ID
+    /// would escape `<sessions_dir>`.
+    fn session_path(&self, session_id: &str) -> Result<PathBuf> {
+        Self::validate_session_id(session_id)?;
+        Ok(self.sessions_dir.join(format!("{}.json", session_id)))
     }
 
     fn save_session(&self, session: &Session) -> Result<()> {
-        let path = self.session_path(&session.id);
+        let path = self.session_path(&session.id)?;
         let content = serde_json::to_string_pretty(session).map_err(|e| {
             crate::Error::SessionError(format!("Failed to serialize session: {}", e))
         })?;
@@ -227,5 +276,41 @@ mod tests {
 
         let sessions = mgr.list_sessions().unwrap();
         assert_eq!(sessions.len(), 2);
+    }
+
+    #[test]
+    fn rejects_traversal_session_ids() {
+        let dir = tmp_dir("rejects_traversal");
+        let mut mgr = SessionManager::new(dir).unwrap();
+        for id in [
+            "../victim",
+            "..",
+            "a/b",
+            "a\\b",
+            "/etc/passwd",
+            "..\\..",
+            "bad\0id",
+        ] {
+            assert!(
+                mgr.load_session(id).is_err(),
+                "'{}' must be rejected on load",
+                id
+            );
+            assert!(
+                mgr.add_job(id, "job-1").is_err(),
+                "'{}' must be rejected on add_job",
+                id
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_traversal_session_id_on_save() {
+        let dir = tmp_dir("rejects_traversal_save");
+        let mut mgr = SessionManager::new(dir).unwrap();
+        let mut session = mgr.create_session(None).unwrap();
+        session.id = "../victim".to_string();
+        let result = mgr.save_session(&session);
+        assert!(result.is_err(), "save_session must reject traversal ids");
     }
 }

@@ -16,7 +16,7 @@ Runtimo is a Rust workspace providing a **capability execution engine**. Every c
 - **Backup/undo** — Files backed up before mutation, rollback by job ID
 - **Input validation** — Capabilities validate arguments including path traversal, symlink, and null byte protection
 
-**Version:** 0.7.3 | **Rust Edition:** 2021 | **Tests:** 443
+**Version:** 0.8.0 | **Rust Edition:** 2021 | **Tests:** 401
 
 ## Quick Start
 
@@ -261,7 +261,7 @@ runtimo run -c GitExec -a '{"operation":"clone","url":"https://github.com/user/r
 
 | Layer | Mechanism | What it does |
 |-------|-----------|--------------|
-| **Path validation** | `validate_path()` | Rejects traversal (`..`), null bytes, non-ASCII, symlink escapes. Enforces allowed prefix whitelist (`/tmp`, `/var/tmp`, `/home` + config). |
+| **Path validation** | `validate_path()` | Rejects traversal (`..`), null bytes, non-ASCII, symlink escapes. Enforces allowed prefix whitelist (`/tmp`, `/var/tmp` + config). |
 | **Critical file deny** | `is_critical_file()` | Blocks `.bashrc`, `.ssh/authorized_keys`, `.gitconfig`, `.netrc`, etc. |
 | **Resource guard** | `LlmoSafeGuard` | Reads `/proc/stat` + `/proc/self/status`. Rejects execution when pressure > 80%. Rolling average over 30s. Cooldown persists across restarts. |
 | **Zombie guard** | Executor pre-check | Rejects execution if zombie count > 10. |
@@ -341,30 +341,37 @@ runtimo/
 │   │       ├── mod.rs
 │   │       ├── file_read.rs
 │   │       ├── file_write.rs
+│   │       ├── delete.rs
 │   │       ├── shell_exec.rs
 │   │       ├── kill.rs
 │   │       ├── git_exec.rs
 │   │       └── undo.rs
 │   ├── tests/
-│   │   ├── integration.rs  # 31 integration tests
-│   │   └── robust.rs       # 31 property-based tests (6 G-categories)
+│   │   ├── integration.rs  # 58 integration tests
+│   │   └── robust.rs       # 46 property-based tests (6 G-categories)
 │   └── examples/
-├── cli/                    # runtimo binary
+├── cli/                    # runtimo binary (+ runtimo-daemon)
 │   └── src/
-│       └── main.rs         # CLI commands via clap
-└── daemon/                 # runtimo-daemon binary
+│       ├── main.rs         # CLI commands via clap
+│       └── daemon_bin.rs   # runtimo-daemon binary entrypoint
+└── daemon/                 # runtimo-daemon library
     └── src/
-        └── main.rs         # JSON-RPC server
+        ├── engine.rs       # daemon state + event loop
+        ├── rpc.rs          # JSON-RPC message types
+        ├── jobs.rs         # background jobs
+        ├── auth.rs         # Unix-socket peer auth
+        ├── config.rs       # daemon config
+        └── dispatch.rs     # capability dispatch
 ```
 
 ## Testing
 
 ```bash
 cargo test                           # all tests
-cargo test -p runtimo-core --lib    # 120 unit tests
-cargo test -p runtimo-core --test integration  # 31 integration tests
-cargo test -p runtimo-core --test robust       # 31 property-based tests
-cargo test -p runtimo-core --doc    # 24 doc tests
+cargo test -p runtimo-core --lib    # 291 unit tests
+cargo test -p runtimo-core --test integration  # 58 integration tests
+cargo test -p runtimo-core --test robust       # 46 property-based tests
+cargo test -p runtimo-core --doc    # 6 doc tests
 cargo clippy --all-targets          # zero warnings required
 ```
 

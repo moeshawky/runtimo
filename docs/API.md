@@ -1,8 +1,8 @@
 # Runtimo Core API Reference
 
-**Version:** 0.7.3
-**Updated:** 2026-06-22
-**Documentation:** [docs.rs/runtimo-core](https://docs.rs/runtimo-core/0.7.3)
+**Version:** 0.8.0
+**Updated:** 2026-08-09
+**Documentation:** [docs.rs/runtimo-core](https://docs.rs/runtimo-core/0.8.0)
 
 ## Quick Links
 

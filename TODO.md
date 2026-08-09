@@ -1,9 +1,9 @@
 # Runtimo Status
 
-**Last Updated:** 2026-06-22
+**Last Updated:** 2026-08-09
 **Build:** `cargo clippy --all-targets` — clean, 0 warnings
-**Tests:** 431 (all passing)
-**Version:** 0.7.3
+**Tests:** 401 (all passing)
+**Version:** 0.8.0
 
 ---
 

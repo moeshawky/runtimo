@@ -7,17 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-09
+
 ### Added
 
 - **Delete capability** — deletes a file with backup-before-delete, restoring via `Undo` by job ID. Path is validated against the allowed-prefix whitelist (`require_exists` + `require_file`), directories and critical files (`.env`, `.ssh/*`, dotfiles) are rejected, and the parent directory is `fsync`ed for durability. The audited alternative to `rm`, which remains hard-blocked in ShellExec. The `no_backup = true` arg skips backup-before-delete for large-file deletion under disk pressure (irreversible). (`core/src/capabilities/delete.rs`)
 - **Config `[env]` table** — `RUNTIMO_*` opt-in flags (`RUNTIMO_ENABLE_NETWORK`, `RUNTIMO_ENABLE_INTERPRETERS`, `RUNTIMO_ENABLE_PUBLIC_IP`) can now be persisted in `config.toml` instead of requiring a process env var or PATH wrapper. Config values take precedence over the process environment for gates and are merged into ShellExec child environments (still subject to sensitive-var stripping; `PATH` stays sanitized). GitExec is not merged — it inherits the process environment and its network access is gated by URL validation/SSRF blocking. Unknown top-level config keys now warn on load. (`core/src/config.rs`, `core/src/capabilities/shell_exec.rs`)
 - **Executor timeout injection** — `inject_timeout()` now injects the executor-level `timeout_secs` into capability args before execution, so the configured/CLI timeout is honored by ShellExec/GitExec internal kill logic instead of being advisory. (`core/src/executor.rs`)
+- **Session ID validation** — `SessionManager::load_session` and `add_job` now reject session IDs containing `/`, `\`, a NUL byte, or `..` before interpolating them into filesystem paths, closing a path-traversal hole in session storage. (`core/src/session.rs`)
+- **Config `dal` field** — the DAL (Design Assurance Level) can now be set in `config.toml` via `dal = "B"`, case-insensitive on both the config file and the `RUNTIMO_DAL` env var; unknown values resolve to the strictest level `A`. (`core/src/config.rs`, `core/src/llmosafe.rs`)
 
 ### Changed
 
 - **ShellExec timeout cap removed** — `timeout_secs` (or the `timeout` alias) now accepts any value ≥ 1 with no upper bound, so operators can run long-lived jobs (training, inference, compilation) without a hard ceiling. CLI `--timeout` likewise has no upper bound. Default remains 30s. (`core/src/capabilities/shell_exec.rs`, `cli/src/main.rs`)
 - **Defense opt-out toggles** — new config fields disable individual forced defenses while keeping safe defaults when unset: `blocklist_enabled = false` turns ShellExec into plain `sh -c` (no dangerous-command filtering), `critical_files_enabled = false` allows writing/deleting critical files, `path_restriction_enabled = false` removes the allowed-prefix whitelist for FileRead/FileWrite/Delete and the ShellExec path scan, `path_sanitization_enabled = false` inherits the caller's `PATH`. Shown in `runtimo config show`. (`core/src/config.rs`, `core/src/validation/path.rs`, `core/src/capabilities/shell_exec.rs`, `core/src/capabilities/file_write.rs`, `core/src/capabilities/delete.rs`, `cli/src/main.rs`)
 - **GitExec `timeout` alias** — `timeout_secs` now also accepts `timeout` as a serde alias, matching ShellExec. (`core/src/capabilities/git_exec.rs`)
+- **Default allowed prefixes tightened** — built-in defaults are now `/tmp` and `/var/tmp` only; `/home` is no longer allowed by default and must be explicitly configured. (`core/src/config.rs`)
+
+### Fixed
+
+- **ShellExec dangerous-command screening bypassed by wrappers** — `command_matches` screened only each segment's leading token, so the dangerous binary was reachable in a non-leading position: `xargs rm /tmp/evil`, `echo / | xargs rm -rf`, `timeout 5 nc host 80`, `busybox nc evil 80`, `env nc evil 80`, `timeout 3 wget http://evil`. Screening now covers every whitespace-delimited token in each `|`/`&`/`;` segment. (`core/src/capabilities/shell_exec.rs`)
+- **ShellExec read of critical files via allowed prefix** — `check_command_paths` now denies `.env`, `.ssh/*`, `.bashrc`, and other critical files via the existing `is_critical_file` denylist even when they resolve inside an allowed prefix, matching FileWrite/Delete semantics. (`core/src/capabilities/shell_exec.rs`)
+- **ShellExec oversized-stdin spawn-then-reject** — the `stdin_content.len() > MAX_STDIN_BYTES` check ran *after* `cmd.spawn()`, leaving a child running with truncated/pending input; it is now validated before spawn so no process is ever created for an oversized stdin. (`core/src/capabilities/shell_exec.rs`)
 
 ### Testing
 
@@ -25,6 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Delete→Undo integration test** — end-to-end delete-then-restore roundtrip via the backup manager. (`core/tests/integration.rs`)
 - **Timeout alias tests** — ShellExec and GitExec both verify `timeout` deserializes into `timeout_secs`; ShellExec verifies values above 3600 are now accepted (no upper bound) and 0 is rejected. (`core/src/capabilities/shell_exec.rs`, `core/src/capabilities/git_exec.rs`)
 - **Defense toggle tests** — config tests verify all four opt-out toggles default to enabled and flip to disabled when set in `config.toml`. (`core/src/config.rs`)
+- **ShellExec security regression tests** — 4 tests: wrapped network commands (`timeout/busybox/env nc`, `timeout wget`), wrapped destructive commands (`xargs rm`, `echo / | xargs rm -rf`, `timeout rm -rf`), critical-file reads via allowed prefix, and oversized-stdin marker-file probe proving no child spawns. (`core/src/capabilities/shell_exec.rs`)
+- **Session traversal tests** — `load_session`, `add_job`, and `save_session` reject traversal session IDs. (`core/src/session.rs`)
+- **DAL and prefix tests** — config `dal` case-insensitivity on both sources; allowed prefixes include defaults and exclude `/home`. (`core/src/config.rs`)
 
 ## [0.7.3] - 2026-06-25
 

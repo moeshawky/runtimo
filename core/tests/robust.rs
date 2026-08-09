@@ -534,7 +534,7 @@ fn ctx_env_var_and_config_both_active() {
     // Verify defaults are always present
     let defaults = RuntimoConfig::get_allowed_prefixes();
     assert!(defaults.contains(&"/tmp".to_string()));
-    assert!(defaults.contains(&"/home".to_string()));
+    assert!(!defaults.contains(&"/home".to_string()));
 
     let _ = fs::remove_dir_all(&tmp);
 }
@@ -568,7 +568,7 @@ fn ctx_path_validation_uses_config() {
     // and can be extended via env var
     let defaults = RuntimoConfig::get_allowed_prefixes();
     assert!(defaults.contains(&"/tmp".to_string()));
-    assert!(defaults.contains(&"/home".to_string()));
+    assert!(!defaults.contains(&"/home".to_string()));
     assert!(defaults.contains(&"/var/tmp".to_string()));
 
     // Test that env var extends prefixes

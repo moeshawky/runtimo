@@ -2,7 +2,7 @@
 //!
 //! Reads/writes a TOML config file at `~/.config/runtimo/config.toml`.
 //! Allowed path prefixes are merged from three sources (lowest to highest priority):
-//! 1. Built-in defaults (`/tmp`, `/var/tmp`, `/home`)
+//! 1. Built-in defaults (`/tmp`, `/var/tmp`)
 //! 2. `RUNTIMO_ALLOWED_PATHS` env var (colon-separated)
 //! 3. Config file `allowed_paths` array
 //! 4. Context-specific prefixes (programmatic override)
@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Built-in default allowed prefixes.
-const DEFAULT_PREFIXES: &[&str] = &["/tmp", "/var/tmp", "/home"];
+const DEFAULT_PREFIXES: &[&str] = &["/tmp", "/var/tmp"];
 
 /// Runtimo persistent configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -24,7 +24,8 @@ pub struct RuntimoConfig {
 
     /// Design Assurance Level (A-E) for the llmosafe cognitive pipeline.
     ///
-    /// When set, overrides the `RUNTIMO_DAL` env var. Controls how strictly
+    /// When set, overrides the `RUNTIMO_DAL` env var. Case-insensitive —
+    /// `get_dal()` uppercases the resolved value. Controls how strictly
     /// the cognitive safety pipeline gates execution:
     /// - A: No override (strictest)
     /// - B: Halt → Escalate
@@ -87,7 +88,7 @@ pub struct RuntimoConfig {
     ///
     /// When `false`, `validate_path()` skips the allowed-prefix check, so
     /// FileRead/FileWrite/Delete can operate on any path. This is the
-    /// strongest opt-out — it removes the "only /tmp, /var/tmp, /home and
+    /// strongest opt-out — it removes the "only /tmp, /var/tmp and
     /// configured prefixes" constraint entirely.
     #[serde(default)]
     pub path_restriction_enabled: Option<bool>,
@@ -235,6 +236,9 @@ impl RuntimoConfig {
     /// 1. `RUNTIMO_DAL` env var
     /// 2. Config file `dal` field
     /// 3. Default: `A`
+    ///
+    /// The env var and config-file branches both uppercase the value, so
+    /// `dal = "b"` and `RUNTIMO_DAL=b` resolve identically to `B`.
     #[must_use]
     pub fn get_dal() -> String {
         // Env var takes precedence
@@ -243,7 +247,7 @@ impl RuntimoConfig {
         }
         // Config file
         let config = Self::load();
-        config.dal.unwrap_or_else(|| "A".to_string())
+        config.dal.unwrap_or_else(|| "A".to_string()).to_uppercase()
     }
 
     /// Resolves an environment variable, preferring the config `[env]` table
@@ -299,7 +303,7 @@ impl RuntimoConfig {
     /// Whether the allowed-prefix path whitelist is enabled.
     ///
     /// Defaults to enabled when unconfigured. `path_restriction_enabled =
-    /// false` removes the "only /tmp, /var/tmp, /home and configured
+    /// false` removes the "only /tmp, /var/tmp and configured
     /// prefixes" constraint for FileRead/FileWrite/Delete.
     #[must_use]
     pub fn path_restriction_enabled() -> bool {
@@ -401,11 +405,11 @@ mod tests {
     }
 
     #[test]
-    fn get_allowed_prefixes_includes_defaults() {
+    fn get_allowed_prefixes_includes_defaults_excludes_home() {
         let prefixes = RuntimoConfig::get_allowed_prefixes();
         assert!(prefixes.iter().any(|p| p == "/tmp"));
         assert!(prefixes.iter().any(|p| p == "/var/tmp"));
-        assert!(prefixes.iter().any(|p| p == "/home"));
+        assert!(!prefixes.iter().any(|p| p == "/home"));
     }
 
     #[test]
@@ -635,5 +639,38 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn dal_config_file_value_is_case_insensitive() {
+        let _guard = CONFIG_TEST_MUTEX.lock().unwrap();
+        let tmp = std::env::temp_dir().join("runtimo_test_config_dal_case");
+        let config_dir = tmp.join("runtimo");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+
+        std::fs::write(&config_path, "dal = \"b\"\n").unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+
+        assert_eq!(
+            RuntimoConfig::get_dal(),
+            "B",
+            "config dal = \"b\" must resolve to uppercase B"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn dal_env_var_value_is_case_insensitive() {
+        std::env::set_var("RUNTIMO_DAL", "e");
+        assert_eq!(
+            RuntimoConfig::get_dal(),
+            "E",
+            "RUNTIMO_DAL=e must resolve to uppercase E"
+        );
+        std::env::remove_var("RUNTIMO_DAL");
     }
 }
