@@ -167,6 +167,15 @@ pub fn execute_with_telemetry(
 /// for TF-IDF + keyword bias detection. Structured-only capabilities (paths,
 /// PIDs, job IDs) skip the check to avoid NLP false positives.
 ///
+/// # Backup Audit
+///
+/// For mutating capabilities that create a backup before writing (FileWrite,
+/// Delete, GitExec), this function emits a [`WalEventType::BackupCreated`] WAL
+/// event between `JobStarted` and `JobCompleted`, carrying the original `path`
+/// and `backup_path` from `output.data`. The event is written before the
+/// fallible `JobCompleted` append so the backup remains auditable (and `undo`-able)
+/// even if `JobCompleted` never lands, preventing an orphaned backup.
+///
 /// # Arguments
 ///
 /// * `capability` — The capability to execute
@@ -252,6 +261,7 @@ pub fn execute_with_telemetry_and_session(
         cmd_corrected: None,
         oov_ratio: None,
         detection_flags: None,
+        backup_path: None,
     })?;
 
     // Cognitive safety check — runs llmosafe's CognitivePipeline
@@ -348,6 +358,50 @@ pub fn execute_with_telemetry_and_session(
     let telemetry_after = Telemetry::capture_lightweight();
     let process_after = ProcessSnapshot::capture();
 
+    // RC1 fix (CBP B2): record the backup path in a durable WAL event BEFORE the
+    // fallible JobCompleted append. The backup is created inside the capability
+    // (between JobStarted and JobCompleted); if the JobCompleted append fails, the
+    // backup would otherwise be orphaned and `undo` could not locate it. Emitting
+    // BackupCreated here — using the capability's reported `backup_path` and original
+    // `path` from `output.data` — guarantees the backup is audited even when
+    // JobCompleted never lands. Covers FileWrite, Delete, and GitExec uniformly.
+    if let Some(data) = output.data.as_ref() {
+        if let (Some(bp), Some(orig)) = (
+            data.get("backup_path").and_then(Value::as_str),
+            data.get("path").and_then(Value::as_str),
+        ) {
+            if !bp.is_empty() {
+                let backup_seq = wal.seq();
+                wal.append(WalEvent {
+                    seq: backup_seq,
+                    ts: telemetry_after.timestamp,
+                    event_type: WalEventType::BackupCreated,
+                    job_id: job_id_str.clone(),
+                    capability: Some(cap_name.clone()),
+                    output: Some(serde_json::json!({
+                        "data": {
+                            "path": orig,
+                            "backup_path": bp
+                        }
+                    })),
+                    error: None,
+                    telemetry_before: None,
+                    telemetry_after: None,
+                    process_before: None,
+                    process_after: None,
+                    cmd: None,
+                    cmd_stdout: None,
+                    cmd_stderr: None,
+                    cmd_exit_code: None,
+                    cmd_corrected: None,
+                    oov_ratio: None,
+                    detection_flags: None,
+                    backup_path: Some(std::path::PathBuf::from(bp)),
+                })?;
+            }
+        }
+    }
+
     // Identify spawned PIDs by comparing before/after process lists
     let spawned_pids = identify_spawned_pids(&process_before, &process_after);
     if !spawned_pids.is_empty() {
@@ -387,6 +441,7 @@ pub fn execute_with_telemetry_and_session(
         cmd_corrected: None,
         oov_ratio: None,
         detection_flags: None,
+        backup_path: None,
     })?;
 
     // Dev-only: log shell command executions separately for error absorption analysis.
@@ -446,6 +501,7 @@ pub fn execute_with_telemetry_and_session(
             cmd_corrected: None,
             oov_ratio: None,
             detection_flags: None,
+            backup_path: None,
         }) {
             log::error!("WAL CommandExecuted append failed: {}", e);
         }
@@ -554,6 +610,7 @@ fn log_job_failed_with_snapshots(
         cmd_corrected: None,
         oov_ratio,
         detection_flags,
+        backup_path: None,
     })
 }
 

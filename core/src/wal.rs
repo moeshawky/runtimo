@@ -89,6 +89,15 @@ fn read_last_seq(path: &Path, tail_bytes: usize) -> Option<u64> {
 /// capture the shell command, its output, and any auto-correction applied.
 /// These events are only written in debug builds (`#[cfg(debug_assertions)]`),
 /// but the variant exists in release builds for reading old WALs.
+///
+/// # Backup Events
+///
+/// When `event_type` is [`WalEventType::BackupCreated`], the `backup_path` field
+/// records the on-disk backup location created before a mutating capability wrote
+/// to the target. The executor emits this event between `JobStarted` and
+/// `JobCompleted` so the backup is audited even if the `JobCompleted` append fails
+/// (preventing an orphaned backup that `undo` cannot locate). The `output.data`
+/// carries `path` (original target) and `backup_path` (backup location).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[allow(clippy::exhaustive_structs)]
 pub struct WalEvent {
@@ -143,6 +152,13 @@ pub struct WalEvent {
     /// Detection flags from LLMOSafe (for CognitiveSafetyViolation).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detection_flags: Option<u8>,
+    /// Backup path recorded for a mutation, populated only on [`WalEventType::BackupCreated`].
+    ///
+    /// `None` for every other event type. Serialized only when present
+    /// (`#[serde(default, skip_serializing_if = "Option::is_none")]`) so legacy WAL
+    /// lines written before this field existed still deserialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_path: Option<std::path::PathBuf>,
 }
 
 /// Types of WAL events, corresponding to job lifecycle stages
@@ -168,6 +184,12 @@ pub enum WalEventType {
     JobRolledBack,
     /// Shell command executed (dev-only logging for error absorption).
     CommandExecuted,
+    /// A backup was created before a mutating capability wrote to disk.
+    ///
+    /// Emitted by the executor between `JobStarted` and `JobCompleted` so the
+    /// backup is audited even if the `JobCompleted` append fails. The `output.data`
+    /// carries `path` (original target) and `backup_path` (backup location).
+    BackupCreated,
 }
 
 /// Append-only WAL writer.

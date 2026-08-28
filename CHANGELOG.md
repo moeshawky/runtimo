@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Fixed
+- **WAL backup audit (CBP B2 / RC1)** — executor now emits `WalEventType::BackupCreated` with `backup_path` between `JobStarted` and `JobCompleted` so mutating capabilities (FileWrite, Delete, GitExec) remain auditable and undo-able even when `JobCompleted` fails (prevents orphaned backup). Adds `backup_path: Option<PathBuf>` to `WalEvent` (serde default for backward compat) and new variant `WalEventType::BackupCreated`. (`core/src/wal.rs`, `core/src/executor.rs`)
+- **Kill PID reuse polarity (G-SEM / RC2)** — `pid_was_reused` now correctly distinguishes a reaped successful kill (target gone, `process_still_exists==false` ⇒ not reused) from a recycled PID with unreadable start time (`process_still_exists==true` ⇒ reused). Fixes `killed_success` misreport for every successful kill. Extracted `pid_was_reused()` with 6 table-driven cases. (`core/src/capabilities/kill.rs`)
+### Testing
+- **BackupCreated WAL test** — `test_backup_created_event_emitted_for_delete` proves `BackupCreated` is emitted with correct `backup_path` under derived `backups/` dir. (`core/tests/integration.rs`)
+- **Kill reuse logic test** — `test_pid_was_reused_logic` covers all 6 match arms. (`core/src/capabilities/kill.rs`)
 
 ## [0.8.0] - 2026-08-09
 

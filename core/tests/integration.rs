@@ -1575,3 +1575,72 @@ fn test_wal_events_monotonic_sequence() {
 
     cleanup(&dir);
 }
+
+#[test]
+fn test_backup_created_event_emitted_for_delete() {
+    // RC1 (CBP B2): a mutating capability that creates a backup must emit a
+    // BackupCreated WAL event so the backup is audited even if JobCompleted fails.
+    // This guarantees `undo` can locate the backup when JobCompleted never lands.
+    // Delete takes structured path args (executor skips the cognitive-safety check)
+    // and still creates a pre-delete backup, so it verifies the emission without
+    // tripping the llmosafe guard on natural-language content.
+    let dir = setup();
+    let wp = wal_path(&dir);
+    let target = make_file(&dir, "bak.txt", "original content to be deleted");
+
+    // Isolate backup dir + WAL under the test dir (mirrors test_delete_then_undo_roundtrip).
+    std::env::set_var("XDG_DATA_HOME", &dir);
+    std::env::set_var("RUNTIMO_WAL_PATH", &wp);
+
+    let delete = runtimo_core::capabilities::Delete::new().expect("Delete");
+    let result = execute_with_telemetry(
+        &delete,
+        &json!({ "path": target.to_str().unwrap() }),
+        false,
+        &wp,
+    )
+    .expect("delete");
+    assert!(result.success, "Delete failed: {:?}", result.output);
+
+    let reader = WalReader::load(&wp).expect("read WAL");
+    let events = reader.events();
+
+    let backup_evt = events
+        .iter()
+        .find(|e| e.job_id == result.job_id && matches!(e.event_type, WalEventType::BackupCreated));
+    assert!(
+        backup_evt.is_some(),
+        "WAL must contain a BackupCreated event for job {}",
+        result.job_id
+    );
+
+    let evt = backup_evt.unwrap();
+    let bp = evt
+        .backup_path
+        .as_ref()
+        .expect("BackupCreated must carry backup_path");
+    assert!(
+        !bp.as_os_str().is_empty(),
+        "BackupCreated backup_path must be non-empty"
+    );
+    // The backup must live under the derived backups dir (ADR-C28).
+    assert!(
+        bp.to_string_lossy().contains("backups"),
+        "backup_path must reside under the derived backups dir: {}",
+        bp.display()
+    );
+    // output.data must carry both original path and backup_path for undo.
+    let data = evt
+        .output
+        .as_ref()
+        .expect("BackupCreated must carry output.data");
+    assert_eq!(data["data"]["path"], target.to_str().unwrap());
+    assert_eq!(
+        data["data"]["backup_path"],
+        bp.to_string_lossy().to_string()
+    );
+
+    std::env::remove_var("XDG_DATA_HOME");
+    std::env::remove_var("RUNTIMO_WAL_PATH");
+    cleanup(&dir);
+}

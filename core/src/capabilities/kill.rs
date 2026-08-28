@@ -7,7 +7,11 @@
 //!
 //! After sending a signal, the capability verifies the killed process is the
 //! same one by comparing start times from `/proc/{pid}/stat` field 22. This
-//! prevents PID reuse races where a new process inherits the killed PID.
+//! prevents PID reuse races where a new process inherits the killed PID. The
+//! decision is delegated to [`pid_was_reused`]: a reaped successful kill (target
+//! gone, no live process holding the PID) is reported as *not* reused, while a
+//! recycled PID that is live but has an unreadable start time is reported as
+//! reused.
 //!
 //! # Protected Processes
 //!
@@ -65,6 +69,47 @@ fn get_process_start_time_retry(pid: u32) -> Option<u64> {
         }
     }
     None
+}
+
+/// Determines whether a PID was reused by a different process after a kill attempt.
+///
+/// This isolates the PID-reuse decision (FINDING #1) from the live `/proc` reads so
+/// it can be unit-tested deterministically. The logic resolves the three observed
+/// post-kill states:
+///
+/// * `(Some(before), Some(after))` — a process with the PID still exists; reuse is
+///   true only when its start time changed (`before != after`). A surviving zombie
+///   keeps the same start time, so it is correctly reported as *not* reused.
+/// * `(None, _)` — the target was already absent before the kill; nothing was reused.
+/// * `(Some(_), None)` — the target's `/proc/{pid}/stat` is gone after the kill. If no
+///   live (non-zombie) process holds the PID, the original was killed and not recycled
+///   (`process_still_exists == false` ⇒ not reused). If a live process still holds the
+///   PID but its start time was unreadable, the PID was recycled by a new process
+///   (`process_still_exists == true` ⇒ reused).
+///
+/// # Arguments
+///
+/// * `start_time_before` — Start time (clock ticks) read before the kill; `None` if the
+///   target was already absent.
+/// * `start_time_after` — Start time read after the kill; `None` if `/proc/{pid}/stat` is
+///   no longer readable (process gone or unreadable).
+/// * `process_still_exists` — `true` if a live (non-zombie) process with the PID is present
+///   in the post-kill snapshot.
+///
+/// # Returns
+///
+/// `true` if the PID now belongs to a different process than the one targeted.
+#[must_use]
+fn pid_was_reused(
+    start_time_before: Option<u64>,
+    start_time_after: Option<u64>,
+    process_still_exists: bool,
+) -> bool {
+    match (start_time_before, start_time_after) {
+        (Some(before), Some(after)) => before != after,
+        (None, _) => false,
+        (Some(_), None) => process_still_exists,
+    }
 }
 
 /// Reads the cgroup of a process from `/proc/{pid}/cgroup`.
@@ -320,12 +365,16 @@ impl TypedCapability for Kill {
             .processes
             .iter()
             .any(|p| p.pid == args.pid && !p.stat.starts_with('Z'));
-        // Verify PID was not reused — check start time matches (FINDING #1)
-        let pid_reused = match (start_time_before, get_process_start_time_retry(args.pid)) {
-            (Some(before_time), Some(after_time)) => before_time != after_time,
-            (None, _) => false,
-            (Some(_), None) => true,
-        };
+        // Verify PID was not reused — check start time matches (FINDING #1).
+        // The decision is delegated to `pid_was_reused` so the polarity is
+        // unit-tested: a reaped successful kill yields `process_still_exists ==
+        // false` ⇒ not reused; a recycled PID with an unreadable start time yields
+        // `process_still_exists == true` ⇒ reused.
+        let pid_reused = pid_was_reused(
+            start_time_before,
+            get_process_start_time_retry(args.pid),
+            process_still_exists,
+        );
 
         let killed_success = success && !process_still_exists && !pid_reused;
 
@@ -380,6 +429,21 @@ mod tests {
     use crate::capability::Capability;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn test_pid_was_reused_logic() {
+        // Successful kill: target existed, now reaped (no live process) → not reused.
+        assert!(!pid_was_reused(Some(100), None, false));
+        // Successful kill where the process is a surviving zombie (same start time) → not reused.
+        assert!(!pid_was_reused(Some(100), Some(100), false));
+        // PID recycled by a new process with a different start time → reused.
+        assert!(pid_was_reused(Some(100), Some(200), false));
+        // PID recycled by a new process whose start time is unreadable but is live → reused.
+        assert!(pid_was_reused(Some(100), None, true));
+        // Target was already absent before the kill → never reused.
+        assert!(!pid_was_reused(None, None, false));
+        assert!(!pid_was_reused(None, Some(100), true));
+    }
 
     #[test]
     fn test_kill_schema() {
