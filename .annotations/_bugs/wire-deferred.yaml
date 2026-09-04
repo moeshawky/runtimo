@@ -1,0 +1,40 @@
+source: wire-dispatch-scope
+bugs:
+  - target: "dispatch-deferred F9/F11/F12"
+    line: 0
+    severity: info
+    confidence: tentative
+    proof_scope: local
+    verification:
+      status: unverified
+      method: null
+    category: other
+    description: |
+      The wire dispatch explicitly deferred findings F9/F11/F12 to _bugs/
+      quarantine (out of fix scope: telemetry contract + cache + RPC/stub +
+      early-Err + quiet gates only). Their content was not specified in the
+      dispatch beyond the IDs, so no code claim is made here; routed for
+      AD follow-up, never inline.
+    evidence:
+      - "dispatch text: 'Defer F9/F11/F12 to _bugs/ quarantine'"
+    impact: "None on this patch; tracks deferred scope so it is not lost."
+    suggested_fix: "AD to specify F9/F11/F12 content and file candidates."
+  - target: "core/src/executor.rs early-Err WAL write"
+    line: 262
+    severity: info
+    confidence: moderate
+    proof_scope: local
+    verification:
+      status: unverified
+      method: null
+    category: error-handling
+    description: |
+      Early-Err JobFailed appends use `let _ =` (write errors ignored) so a
+      guard rejection never fails because auditing failed. If the WAL itself
+      is unwritable, the rejection is still returned but unaudited. Accepted
+      trade-off for the minimal fix; a future change could surface WAL errors
+      on the reject path.
+    evidence:
+      - "core/src/executor.rs: early-Err blocks call log_job_failed_with_snapshots with `let _ =`"
+    impact: "Unaudited rejection only when the WAL file itself is unwritable."
+    suggested_fix: "Return the WAL error chained with the guard error if auditability must be strict."
