@@ -15,6 +15,23 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::path::PathBuf;
 
+/// Returns the telemetry delta for a freshly constructed [`Output`].
+///
+/// Captures lightweight telemetry when enabled via resolved config, else
+/// returns [`Telemetry::empty`] without any `/proc` reads or subprocess
+/// probes. Keeps the `telemetry_enabled == false` contract (no capture,
+/// no WAL telemetry) for outputs built outside the executor path.
+fn output_telemetry_delta() -> Telemetry {
+    if crate::config::RuntimoConfig::load()
+        .resolved()
+        .telemetry_enabled
+    {
+        Telemetry::capture_lightweight()
+    } else {
+        Telemetry::empty()
+    }
+}
+
 /// Error type for capability execution failures.
 ///
 /// # Variants
@@ -193,7 +210,7 @@ impl Output {
             backup_path: None,
             error: None,
             duration_ms: 0,
-            telemetry_delta: Telemetry::capture_lightweight(),
+            telemetry_delta: output_telemetry_delta(),
             artifacts: Vec::new(),
         }
     }
@@ -223,7 +240,7 @@ impl Output {
             backup_path: None,
             error: Some(error),
             duration_ms: 0,
-            telemetry_delta: Telemetry::capture_lightweight(),
+            telemetry_delta: output_telemetry_delta(),
             artifacts: Vec::new(),
         }
     }

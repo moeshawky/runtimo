@@ -1,12 +1,16 @@
 //! runtimo CLI — Agent capability runtime with background dispatch
 
 mod format;
+mod output;
+mod session_parser;
+mod session_run;
 
 use clap::{Parser, Subcommand};
-use format::wall_to_markdown;
+use output::OutputMode;
 use runtimo_core::{
     capabilities::{
-        is_dangerous_command, Delete, FileRead, FileWrite, GitExec, Kill, ShellExec, Undo,
+        is_dangerous_command, is_network_command, network_enabled, Delete, FileRead, FileWrite,
+        GitExec, Kill, ShellExec, Undo,
     },
     execute_with_telemetry_and_session, CapabilityRegistry, ProcessSnapshot, RuntimoConfig,
     Telemetry, WalReader,
@@ -38,7 +42,32 @@ Background: dispatch jobs to daemon, check status later",
     after_help = "USAGE:\n runtimo run -c <Capability> -a '<json>'\n runtimo dispatch -c <Capability> -a '<json>'\n runtimo jobs\n runtimo wait -j <job_id>\n runtimo list\n runtimo logs\n runtimo telemetry\n runtimo processes\n\nCAPABILITIES:\n FileRead  Read file. Path validated (allowed dirs only). No dirs, no traversal.\n FileWrite Write file. Auto-backup for undo. Append mode ok.\n Delete    Delete a file. Auto-backup for undo unless no_backup=true. Path-validated (no rm bypass).\n ShellExec Exec via sh -c. Blocks many dangerous commands (see `runtimo list` for full blocklist). Network tools and interpreters are opt-in.\n GitExec   Git ops: clone|pull|commit|revert|clean|status.\n Kill      Kill process by PID. Protected: init, kthreadd, self, parent, session/group leaders, systemd services.\n Undo      Restore from backup. Find job IDs with `runtimo jobs` or `runtimo logs`.\n\nTIP: Use `runtimo run -c <Cap> --schema` to see the JSON args a capability expects.\nTIP: Use `runtimo list --schemas` to see all schemas at once.\nTIP: ShellExec timeout has no upper bound (default: 30).\n\nDaemon starts on first dispatch if runtimo-daemon is installed.",
     version
 )]
+#[allow(clippy::struct_excessive_bools)] // 6 bools map to 3 orthogonal flag pairs (color/no_color, emoji/no_emoji, timestamps/no_timestamps); enum refactor would churn CLI without safety gain
 struct Cli {
+    /// Output format: human|json|plain|quiet
+    #[arg(long, global = true, value_name = "FORMAT")]
+    output: Option<String>,
+    /// Enable ANSI color (requires tty, honored only when explicitly set; --no-color wins, NO_COLOR env forces off)
+    #[arg(long, global = true)]
+    color: bool,
+    /// Disable ANSI color (wins over --color and NO_COLOR)
+    #[arg(long, global = true)]
+    no_color: bool,
+    /// Enable emoji (off by default; --no-emoji wins)
+    #[arg(long, global = true)]
+    emoji: bool,
+    /// Disable emoji
+    #[arg(long, global = true)]
+    no_emoji: bool,
+    /// Table style: plain|markdown|box|csv
+    #[arg(long, global = true, value_name = "STYLE")]
+    table_style: Option<String>,
+    /// Enable timestamps
+    #[arg(long, global = true)]
+    timestamps: bool,
+    /// Disable timestamps (wins over --timestamps)
+    #[arg(long, global = true)]
+    no_timestamps: bool,
     #[command(subcommand)]
     command: Commands,
 }
@@ -236,6 +265,55 @@ Supported fields:\n\
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// Session step-runner — deterministic bounded execution from a prompt file
+    #[command(about = "Session step-runner (MVP)")]
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionCommand {
+    /// Run steps from a prompt file as a bounded session
+    Run {
+        /// Prompt file containing JSONL or markdown ```runtimo blocks
+        #[arg(long, value_name = "PATH")]
+        prompt_file: PathBuf,
+        /// Session name (human-readable) — reuses existing session if name or id matches, else creates a new one
+        #[arg(long)]
+        session: Option<String>,
+        /// Maximum number of steps to execute (default: from ResolvedConfig — 20 ephemeral, 100 service/minimal)
+        #[arg(long)]
+        max_steps: Option<u32>,
+        /// Maximum total seconds for the session run (default: from ResolvedConfig — 300 ephemeral, 3600 service)
+        #[arg(long)]
+        max_seconds: Option<u64>,
+        /// Behavior on step failure: continue|stop (default: from ResolvedConfig — continue ephemeral, stop service)
+        #[arg(long, value_name = "POLICY")]
+        on_failure: Option<String>,
+        /// Validate prompt file and policy only; do not execute or create a session
+        #[arg(long, default_value = "false")]
+        dry_run: bool,
+        /// Stub: dispatch each step via daemon RPC instead of local execution
+        #[arg(long, default_value = "false")]
+        via_daemon: bool,
+    },
+    /// List sessions persisted under the sessions directory
+    List {
+        /// Output raw JSON
+        #[arg(long, default_value = "false")]
+        json: bool,
+    },
+    /// Show a single session by id
+    Show {
+        /// Session ID to show
+        #[arg(long, value_name = "SESSION_ID")]
+        session_id: String,
+        /// Output raw JSON
+        #[arg(long, default_value = "false")]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -255,6 +333,22 @@ enum ConfigAction {
     Dal {
         /// New DAL level to set (A, B, C, D, or E). Omit to show current value.
         level: Option<String>,
+    },
+    /// Initialize config file from profile template
+    #[command(about = "Initialize config file from profile template (minimal/ephemeral/service)")]
+    Init {
+        /// Profile to use (minimal, ephemeral, service). Use --minimal as alias for minimal.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Overwrite existing config
+        #[arg(long, default_value = "false")]
+        force: bool,
+        /// Alias for --profile minimal
+        #[arg(long, default_value = "false")]
+        minimal: bool,
+        /// Custom path for config file (default: XDG config path)
+        #[arg(long)]
+        path: Option<PathBuf>,
     },
 }
 
@@ -584,11 +678,134 @@ fn send_rpc(method: &str, params: Value) -> Result<Value, String> {
     Ok(resp.get("result").cloned().unwrap_or(Value::Null))
 }
 
+/// Sentinel WAL sequence for a dispatched step with no completion record.
+///
+/// Real WAL sequences start at 0, so `u64::MAX` is distinct from every real
+/// `wal_seq` — it marks "unknown", never a forged success marker like 0.
+const DISPATCH_UNKNOWN_WAL_SEQ: u64 = u64::MAX;
+
+/// Emits a session-loop diagnostic respecting the output mode.
+///
+/// In JSON mode prints a single-line JSON object to stdout (keeps stdout
+/// parseable, stderr clean); in quiet mode suppresses loop progress noise;
+/// otherwise writes the text to stderr as before.
+fn emit_session_note(mode: &crate::output::OutputMode, value: Value, text: &str) {
+    if mode.is_json() {
+        println!(
+            "{}",
+            serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
+        );
+    } else if !mode.is_quiet() {
+        eprintln!("{}", text);
+    }
+}
+
+/// Resolves the WAL sequence of a dispatched job via the daemon `logs` RPC.
+///
+/// Returns the `seq` of the terminal (`job_completed`/`job_failed`) event,
+/// or [`DISPATCH_UNKNOWN_WAL_SEQ`] when no completion record exists yet.
+fn fetch_job_wal_seq(job_id: &str) -> u64 {
+    if let Ok(v) = send_rpc("logs", serde_json::json!({ "job_id": job_id, "limit": 50 })) {
+        if let Some(events) = v.get("events").and_then(|e| e.as_array()) {
+            for ev in events {
+                let is_terminal = ev
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .is_some_and(|t| t == "job_completed" || t == "job_failed");
+                if is_terminal {
+                    if let Some(seq) = ev.get("seq").and_then(|s| s.as_u64()) {
+                        return seq;
+                    }
+                }
+            }
+        }
+    }
+    DISPATCH_UNKNOWN_WAL_SEQ
+}
+
+/// Polls the daemon `status` RPC until a dispatched job reaches a terminal
+/// state or the time budget expires.
+///
+/// # Inputs
+///
+/// `job_id` — daemon job ID from `dispatch`. `budget_secs` — max seconds
+/// to poll (caller passes the session's remaining `--max-seconds` budget).
+///
+/// # Outputs
+///
+/// `(success, error, wal_seq)` from the daemon's real terminal state —
+/// never a synthesized success. `wal_seq` comes from the `logs` RPC, or
+/// [`DISPATCH_UNKNOWN_WAL_SEQ`] when no completion record exists.
+fn poll_dispatched_step(job_id: &str, budget_secs: u64) -> (bool, Option<String>, u64) {
+    let start = std::time::Instant::now();
+    let budget = std::time::Duration::from_secs(budget_secs.max(1));
+    while start.elapsed() < budget {
+        match send_rpc("status", serde_json::json!({ "job_id": job_id })) {
+            Ok(v) => match v.get("status").and_then(|s| s.as_str()) {
+                Some("completed") => return (true, None, fetch_job_wal_seq(job_id)),
+                Some("failed") => {
+                    let err = v
+                        .get("result")
+                        .and_then(|r| r.as_str())
+                        .map(str::to_string)
+                        .or_else(|| Some("execution reported failure".to_string()));
+                    return (false, err, fetch_job_wal_seq(job_id));
+                }
+                _ => std::thread::sleep(std::time::Duration::from_secs(2)),
+            },
+            Err(_) => break,
+        }
+    }
+    // Budget expired or daemon unreachable: check the daemon WAL via logs RPC
+    // once before giving up (job may have completed between polls).
+    let wal_seq = fetch_job_wal_seq(job_id);
+    if wal_seq != DISPATCH_UNKNOWN_WAL_SEQ {
+        if let Ok(v) = send_rpc("status", serde_json::json!({ "job_id": job_id })) {
+            match v.get("status").and_then(|s| s.as_str()) {
+                Some("completed") => return (true, None, wal_seq),
+                Some("failed") => {
+                    let err = v
+                        .get("result")
+                        .and_then(|r| r.as_str())
+                        .map(str::to_string)
+                        .or_else(|| Some("execution reported failure".to_string()));
+                    return (false, err, wal_seq);
+                }
+                _ => {}
+            }
+        }
+    }
+    (
+        false,
+        Some("dispatch poll timed out before terminal status".to_string()),
+        wal_seq,
+    )
+}
+
 // ── Main ────────────────────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_lines, clippy::indexing_slicing)] // JSON Value indexing is intentional
+#[allow(
+    clippy::too_many_lines,
+    clippy::indexing_slicing,
+    clippy::redundant_else,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::arithmetic_side_effects
+)]
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
+    let resolved = RuntimoConfig::load().resolved();
+    let base_mode = OutputMode::from_cli(
+        &resolved,
+        cli.output.as_deref(),
+        cli.color,
+        cli.no_color,
+        cli.emoji,
+        cli.no_emoji,
+        cli.table_style.as_deref(),
+        cli.timestamps,
+        cli.no_timestamps,
+    );
 
     match cli.command {
         Commands::Run {
@@ -648,21 +865,45 @@ fn main() -> Result<(), Box<dyn Error>> {
             release_cli_slot();
             let result = result?;
             if !result.success {
-                eprintln!("{}", result.output.output);
+                // Failure must respect the output mode: JSON stays parseable
+                // on stdout, quiet stays silent (exit code carries the signal).
+                let fail_is_json = json || base_mode.is_json();
+                let fail_is_quiet = !fail_is_json && (quiet || base_mode.is_quiet());
+                if fail_is_json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"success": false, "capability": capability, "output": result.output})
+                    );
+                } else if !fail_is_quiet {
+                    eprintln!("{}", result.output.output);
+                }
                 std::process::exit(1);
             }
             let output = result.output;
-            if json {
+            // Resolve effective mode: subcommand --json/--quiet override global --output
+            let mode = if json {
+                base_mode.with_format("json")
+            } else if quiet {
+                base_mode.with_format("quiet")
+            } else {
+                base_mode
+            };
+            if mode.is_json() {
                 println!("{}", serde_json::to_string_pretty(&output)?);
-            } else if !quiet {
-                println!("{}", output.output);
+            } else if mode.is_quiet() {
+                // silent — preserve --quiet contract
+            } else {
+                println!("{}", mode.render_text(&output.output));
                 if let Some(ref data) = output.data {
                     let text = if let Some(s) = data.as_str() {
                         s.to_string()
                     } else {
                         data.to_string()
                     };
-                    println!("{}", wall_to_markdown(&text));
+                    let rendered = mode.render_text(&text);
+                    if !rendered.trim().is_empty() {
+                        println!("{}", rendered);
+                    }
                 }
             }
         }
@@ -842,19 +1083,29 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         Commands::List { schemas, json } => {
             let reg = make_registry().map_err(|e| format!("Registry init failed: {}", e))?;
-            if json {
-                let caps: Vec<Value> = reg.list().iter().map(|name| {
-                    if let Some(cap) = reg.get(name) {
+            // Effective mode: global --output json or local --json forces json
+            let mode = if json {
+                base_mode.with_format("json")
+            } else {
+                base_mode
+            };
+            if mode.is_json() {
+                let caps: Vec<Value> = reg
+                    .list()
+                    .iter()
+                    .filter_map(|name| {
+                        reg.get(name).map(|cap| {
                         serde_json::json!({
                             "name": name,
                             "description": cap.description(),
                             "schema": if schemas { Some(cap.schema().to_string()) } else { None },
                         })
-                    } else {
-                        Value::Null
-                    }
-                }).filter(|v| !v.is_null()).collect();
+                    })
+                    })
+                    .collect();
                 println!("{}", serde_json::to_string_pretty(&caps)?);
+            } else if mode.is_quiet() {
+                // silent
             } else {
                 for name in reg.list() {
                     if let Some(cap) = reg.get(name) {
@@ -870,21 +1121,38 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
 
         Commands::Status { job_id, json } => {
+            let mode = if json {
+                base_mode.with_format("json")
+            } else {
+                base_mode
+            };
             if let Some(jid) = job_id {
                 // Try daemon RPC first
                 if let Ok(result) = send_rpc("status", serde_json::json!({ "job_id": &jid })) {
-                    if json {
+                    if mode.is_json() {
                         println!("{}", serde_json::to_string_pretty(&result)?);
+                    } else if mode.is_quiet() {
+                        // silent
                     } else {
-                        println!(
-                            "Job: {}  Status: {}  Capability: {}",
-                            result.get("job_id").and_then(|v| v.as_str()).unwrap_or("?"),
-                            result.get("status").and_then(|v| v.as_str()).unwrap_or("?"),
+                        let headers = ["JOB_ID", "STATUS", "CAPABILITY"];
+                        let rows = vec![vec![
+                            result
+                                .get("job_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("?")
+                                .to_string(),
+                            result
+                                .get("status")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("?")
+                                .to_string(),
                             result
                                 .get("capability")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("?")
-                        );
+                                .to_string(),
+                        ]];
+                        println!("{}", mode.render_table(&headers, &rows));
                     }
                     return Ok(());
                 }
@@ -895,15 +1163,35 @@ fn main() -> Result<(), Box<dyn Error>> {
                     let by_job: Vec<_> = events.iter().filter(|e| e.job_id == jid).collect();
                     if by_job.is_empty() {
                         println!("Job not found: {}", jid);
+                    } else if mode.is_quiet() {
+                        // silent
+                    } else if mode.is_json() {
+                        println!("{}", serde_json::to_string_pretty(&by_job)?);
                     } else {
-                        for e in &by_job {
-                            println!(
-                                "{:?}  {:>15}  {:?}",
-                                e.event_type,
-                                e.capability.as_deref().unwrap_or("-"),
-                                e.ts
-                            );
-                        }
+                        let headers = if mode.timestamps {
+                            vec!["EVENT", "CAPABILITY", "TS"]
+                        } else {
+                            vec!["EVENT", "CAPABILITY"]
+                        };
+                        let rows: Vec<Vec<String>> = by_job
+                            .iter()
+                            .map(|e| {
+                                if mode.timestamps {
+                                    vec![
+                                        e.event_type.as_str().to_string(),
+                                        e.capability.as_deref().unwrap_or("-").to_string(),
+                                        e.ts.to_string(),
+                                    ]
+                                } else {
+                                    vec![
+                                        e.event_type.as_str().to_string(),
+                                        e.capability.as_deref().unwrap_or("-").to_string(),
+                                    ]
+                                }
+                            })
+                            .collect();
+                        let hdr_refs: Vec<&str> = headers.clone();
+                        println!("{}", mode.render_table(&hdr_refs, &rows));
                     }
                 } else {
                     println!("Cannot read WAL");
@@ -911,17 +1199,29 @@ fn main() -> Result<(), Box<dyn Error>> {
             } else {
                 // List all jobs via daemon
                 if let Ok(result) = send_rpc("jobs", serde_json::json!({ "limit": 50 })) {
-                    if json {
+                    if mode.is_json() {
                         println!("{}", serde_json::to_string_pretty(&result)?);
+                    } else if mode.is_quiet() {
+                        // silent
                     } else {
                         let jobs = result["jobs"].as_array().cloned().unwrap_or_default();
-                        for job in &jobs {
-                            println!(
-                                "  {}  {:>8}  {}",
-                                job["job_id"].as_str().unwrap_or("?"),
-                                job["status"].as_str().unwrap_or("?"),
-                                job["capability"].as_str().unwrap_or("?")
-                            );
+                        if jobs.is_empty() {
+                            println!("No jobs found.");
+                        } else {
+                            let headers = ["JOB_ID", "STATUS", "CAPABILITY"];
+                            let rows: Vec<Vec<String>> = jobs
+                                .iter()
+                                .map(|job| {
+                                    let status = job["status"].as_str().unwrap_or("?");
+                                    let icon = mode.status_icon(status);
+                                    vec![
+                                        job["job_id"].as_str().unwrap_or("?").to_string(),
+                                        format!("{}{}", icon, status),
+                                        job["capability"].as_str().unwrap_or("?").to_string(),
+                                    ]
+                                })
+                                .collect();
+                            println!("{}", mode.render_table(&headers, &rows));
                         }
                     }
                 } else {
@@ -930,18 +1230,48 @@ fn main() -> Result<(), Box<dyn Error>> {
                         let events = reader.events();
                         let mut seen: std::collections::HashSet<&String> =
                             std::collections::HashSet::new();
+                        let mut rows: Vec<Vec<String>> = Vec::new();
                         for e in events.iter().rev() {
                             if seen.contains(&e.job_id) {
                                 continue;
                             }
                             seen.insert(&e.job_id);
-                            println!(
-                                "{:?}  {}  {:?}  {}",
-                                e.event_type,
-                                e.job_id,
-                                e.capability.as_deref().unwrap_or("-"),
-                                e.ts
-                            );
+                            rows.push(vec![
+                                e.job_id.clone(),
+                                e.event_type.as_str().to_string(),
+                                e.capability.as_deref().unwrap_or("-").to_string(),
+                            ]);
+                            if rows.len() >= 50 {
+                                break;
+                            }
+                        }
+                        if rows.is_empty() {
+                            println!("No jobs found.");
+                        } else if mode.is_quiet() {
+                            // silent
+                        } else if mode.is_json() {
+                            println!("{}", serde_json::to_string_pretty(&rows)?);
+                        } else {
+                            let headers = ["JOB_ID", "EVENT", "CAPABILITY"];
+                            if mode.timestamps {
+                                // include ts if timestamps enabled
+                                let rows_ts: Vec<Vec<String>> = rows
+                                    .iter()
+                                    .map(|r| {
+                                        // find ts for this job id
+                                        let ts = events
+                                            .iter()
+                                            .find(|ev| ev.job_id == r[0])
+                                            .map(|ev| ev.ts.to_string())
+                                            .unwrap_or_default();
+                                        vec![r[0].clone(), r[1].clone(), r[2].clone(), ts]
+                                    })
+                                    .collect();
+                                let hdr = ["JOB_ID", "EVENT", "CAPABILITY", "TS"];
+                                println!("{}", mode.render_table(&hdr, &rows_ts));
+                            } else {
+                                println!("{}", mode.render_table(&headers, &rows));
+                            }
                         }
                     }
                 }
@@ -949,33 +1279,38 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
 
         Commands::Jobs { limit, json } => {
+            let mode = if json {
+                base_mode.with_format("json")
+            } else {
+                base_mode
+            };
             // Try daemon RPC first
             let result = send_rpc("jobs", serde_json::json!({ "limit": limit }));
             match result {
                 Ok(data) => {
-                    if json {
+                    if mode.is_json() {
                         println!("{}", serde_json::to_string_pretty(&data)?);
+                    } else if mode.is_quiet() {
+                        // silent
                     } else {
                         let jobs = data["jobs"].as_array().cloned().unwrap_or_default();
                         if jobs.is_empty() {
                             println!("No jobs found.");
                         } else {
-                            let md_lines: Vec<String> = jobs
+                            let headers = ["JOB_ID", "CAPABILITY", "STATUS"];
+                            let rows: Vec<Vec<String>> = jobs
                                 .iter()
                                 .map(|j| {
-                                    let jid = j["job_id"].as_str().unwrap_or("?");
-                                    let cap = j["capability"].as_str().unwrap_or("?");
                                     let status = j["status"].as_str().unwrap_or("?");
-                                    let icon = match status {
-                                        "running" => "🔄",
-                                        "completed" => "✅",
-                                        "failed" => "❌",
-                                        _ => "❓",
-                                    };
-                                    format!("- {} **{}**  {}  {}", icon, jid, cap, status)
+                                    let icon = mode.status_icon(status);
+                                    vec![
+                                        j["job_id"].as_str().unwrap_or("?").to_string(),
+                                        j["capability"].as_str().unwrap_or("?").to_string(),
+                                        format!("{}{}", icon, status),
+                                    ]
                                 })
                                 .collect();
-                            println!("## Recent Jobs ({})\n{}", jobs.len(), md_lines.join("\n"));
+                            println!("{}", mode.render_table(&headers, &rows));
                         }
                     }
                 }
@@ -994,33 +1329,40 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 break;
                             }
                             seen.insert(&e.job_id);
+                            let status = match e.event_type {
+                                runtimo_core::WalEventType::JobStarted => "started",
+                                runtimo_core::WalEventType::JobCompleted => "completed",
+                                runtimo_core::WalEventType::JobFailed => "failed",
+                                _ => "unknown",
+                            };
                             jobs.push(serde_json::json!({
                                 "job_id": e.job_id,
                                 "capability": e.capability,
-                                "status": match e.event_type {
-                                    runtimo_core::WalEventType::JobStarted => "started",
-                                    runtimo_core::WalEventType::JobCompleted => "completed",
-                                    runtimo_core::WalEventType::JobFailed => "failed",
-                                    _ => "unknown",
-                                },
+                                "status": status,
                                 "started_at": e.ts,
                             }));
                         }
                         if jobs.is_empty() {
                             println!("No jobs found.");
+                        } else if mode.is_json() {
+                            println!("{}", serde_json::to_string_pretty(&jobs)?);
+                        } else if mode.is_quiet() {
+                            // silent
                         } else {
-                            for j in &jobs {
-                                let jid = j["job_id"].as_str().unwrap_or("?");
-                                let cap = j["capability"].as_str().unwrap_or("?");
-                                let status = j["status"].as_str().unwrap_or("?");
-                                let icon = match status {
-                                    "running" | "started" => "🔄",
-                                    "completed" => "✅",
-                                    "failed" => "❌",
-                                    _ => "❓",
-                                };
-                                println!("  {} {}  {:>15}  {}", icon, jid, cap, status);
-                            }
+                            let headers = ["JOB_ID", "CAPABILITY", "STATUS"];
+                            let rows: Vec<Vec<String>> = jobs
+                                .iter()
+                                .map(|j| {
+                                    let status = j["status"].as_str().unwrap_or("?");
+                                    let icon = mode.status_icon(status);
+                                    vec![
+                                        j["job_id"].as_str().unwrap_or("?").to_string(),
+                                        j["capability"].as_str().unwrap_or("?").to_string(),
+                                        format!("{}{}", icon, status),
+                                    ]
+                                })
+                                .collect();
+                            println!("{}", mode.render_table(&headers, &rows));
                         }
                     } else {
                         eprintln!("Cannot read WAL. Is the daemon running?");
@@ -1034,22 +1376,46 @@ fn main() -> Result<(), Box<dyn Error>> {
             limit,
             json,
         } => {
+            let mode = if json {
+                base_mode.with_format("json")
+            } else {
+                base_mode
+            };
             // Try daemon RPC first
             let mut params = serde_json::json!({ "limit": limit });
             if let Some(ref jid) = job_id {
                 params["job_id"] = serde_json::json!(jid);
             }
             if let Ok(result) = send_rpc("logs", params) {
-                if json {
+                if mode.is_json() {
                     println!("{}", serde_json::to_string_pretty(&result)?);
+                } else if mode.is_quiet() {
+                    // silent
                 } else {
                     let events = result["events"].as_array().cloned().unwrap_or_default();
-                    for e in &events {
-                        let ts = e["ts"].as_u64().unwrap_or(0);
-                        let et = e["event_type"].as_str().unwrap_or("?");
-                        let jid = e["job_id"].as_str().unwrap_or("?");
-                        let cap = e["capability"].as_str().unwrap_or("-");
-                        println!("{:?}  {}  {}  {:>15}", et, ts, jid, cap);
+                    if events.is_empty() {
+                        println!("No events found.");
+                    } else {
+                        let headers: Vec<&str> = if mode.timestamps {
+                            vec!["TS", "JOB_ID", "EVENT", "CAPABILITY"]
+                        } else {
+                            vec!["JOB_ID", "EVENT", "CAPABILITY"]
+                        };
+                        let rows: Vec<Vec<String>> = events
+                            .iter()
+                            .map(|e| {
+                                let ts = e["ts"].as_u64().unwrap_or(0).to_string();
+                                let et = e["event_type"].as_str().unwrap_or("?").to_string();
+                                let jid = e["job_id"].as_str().unwrap_or("?").to_string();
+                                let cap = e["capability"].as_str().unwrap_or("-").to_string();
+                                if mode.timestamps {
+                                    vec![ts, jid, et, cap]
+                                } else {
+                                    vec![jid, et, cap]
+                                }
+                            })
+                            .collect();
+                        println!("{}", mode.render_table(&headers, &rows));
                     }
                 }
             } else if let Ok(reader) = WalReader::load_all(&wal_path()) {
@@ -1060,18 +1426,38 @@ fn main() -> Result<(), Box<dyn Error>> {
                     events.iter().collect()
                 };
                 let recent: Vec<_> = filtered.iter().rev().take(limit).rev().collect();
-                if json {
+                if mode.is_json() {
                     println!("{}", serde_json::to_string_pretty(&recent)?);
+                } else if mode.is_quiet() {
+                    // silent
+                } else if recent.is_empty() {
+                    println!("No events found.");
                 } else {
-                    for e in &recent {
-                        println!(
-                            "{:?}  {}  {:?}  {}",
-                            e.event_type,
-                            e.job_id,
-                            e.capability.as_deref().unwrap_or("-"),
-                            e.ts
-                        );
-                    }
+                    let headers: Vec<&str> = if mode.timestamps {
+                        vec!["TS", "JOB_ID", "EVENT", "CAPABILITY"]
+                    } else {
+                        vec!["JOB_ID", "EVENT", "CAPABILITY"]
+                    };
+                    let rows: Vec<Vec<String>> = recent
+                        .iter()
+                        .map(|e| {
+                            if mode.timestamps {
+                                vec![
+                                    e.ts.to_string(),
+                                    e.job_id.clone(),
+                                    e.event_type.as_str().to_string(),
+                                    e.capability.as_deref().unwrap_or("-").to_string(),
+                                ]
+                            } else {
+                                vec![
+                                    e.job_id.clone(),
+                                    e.event_type.as_str().to_string(),
+                                    e.capability.as_deref().unwrap_or("-").to_string(),
+                                ]
+                            }
+                        })
+                        .collect();
+                    println!("{}", mode.render_table(&headers, &rows));
                 }
             }
         }
@@ -1090,9 +1476,32 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
 
         Commands::Telemetry { json, verbose } => {
+            let mode = if json {
+                base_mode.with_format("json")
+            } else {
+                base_mode
+            };
+            // Telemetry gate (RC1): when disabled, skip capture entirely —
+            // no /proc reads, no subprocess probes, no display emitters.
+            if !resolved.telemetry_enabled {
+                if mode.is_json() {
+                    println!(
+                        "{}",
+                        serde_json::json!({"telemetry_enabled": false, "telemetry": null})
+                    );
+                } else if !mode.is_quiet() {
+                    println!(
+                        "{}",
+                        mode.render_text("Telemetry disabled (telemetry.enabled = false).")
+                    );
+                }
+                return Ok(());
+            }
             let tel = Telemetry::capture();
-            if json {
+            if mode.is_json() {
                 println!("{}", serde_json::to_string_pretty(&tel)?);
+            } else if mode.is_quiet() {
+                // silent
             } else {
                 // Listening ports: shown only with --verbose flag
                 let ports_str = if verbose && !tel.network.listening_ports.is_empty() {
@@ -1126,14 +1535,21 @@ fn main() -> Result<(), Box<dyn Error>> {
                     },
                     ports_str,
                 );
-                println!("{}", wall_to_markdown(&text));
+                println!("{}", mode.render_text(&text));
             }
         }
 
         Commands::Processes { json } => {
+            let mode = if json {
+                base_mode.with_format("json")
+            } else {
+                base_mode
+            };
             let snap = ProcessSnapshot::capture();
-            if json {
+            if mode.is_json() {
                 println!("{}", serde_json::to_string_pretty(&snap)?);
+            } else if mode.is_quiet() {
+                // silent
             } else {
                 let zombie_lines = {
                     let zs = snap.zombies();
@@ -1165,7 +1581,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     snap.top_by_cpu(5).iter().map(|p| format!("- {} {} {} {}% CPU", p.pid, p.command.chars().take(40).collect::<String>(), p.stat, p.cpu_percent)).collect::<Vec<_>>().join("\n"),
                     snap.top_by_mem(5).iter().map(|p| format!("- {} {} {} {}% MEM", p.pid, p.command.chars().take(40).collect::<String>(), p.stat, p.mem_percent)).collect::<Vec<_>>().join("\n"),
                 );
-                println!("{}", wall_to_markdown(&text));
+                println!("{}", mode.render_text(&text));
             }
         }
 
@@ -1264,6 +1680,31 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
             ConfigAction::Show => {
+                // Respect global --output json/quiet
+                if base_mode.is_quiet() {
+                    return Ok(());
+                }
+                if base_mode.is_json() {
+                    let config_path = RuntimoConfig::config_path();
+                    let config = RuntimoConfig::load();
+                    let resolved = config.resolved();
+                    let out = serde_json::json!({
+                        "config_path": config_path.display().to_string(),
+                        "profile": resolved.profile,
+                        "dal": resolved.dal,
+                        "wal_mode": resolved.wal_mode,
+                        "backup_enabled": resolved.backup_enabled,
+                        "output_format": resolved.output_format,
+                        "output_renderer": resolved.output_renderer,
+                        "blocklist_enabled": resolved.blocklist_enabled,
+                        "session_max": resolved.session_max,
+                        "session_timeout": resolved.session_timeout,
+                        "session_on_limit": resolved.session_on_limit,
+                        "telemetry_enabled": resolved.telemetry_enabled,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&out)?);
+                    return Ok(());
+                }
                 let config_path = RuntimoConfig::config_path();
                 let config_exists = config_path.exists();
                 let config = match RuntimoConfig::load_result() {
@@ -1282,6 +1723,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                 if !config_exists {
                     println!("  (file does not exist — using defaults)");
                 }
+                // Profile line (Gate 1 seam)
+                let profile_name = config
+                    .profile
+                    .clone()
+                    .unwrap_or_else(|| "minimal".to_string());
+                println!("Profile: {}", profile_name);
                 println!();
                 println!("Allowed paths (config file): {:?}", config.allowed_paths);
                 println!("DAL (config): {:?}", config.dal);
@@ -1302,12 +1749,48 @@ fn main() -> Result<(), Box<dyn Error>> {
                         println!("  {} = {}", key, value);
                     }
                 }
+                // Show profile-derived tables if present
+                if config.profile.is_some() {
+                    println!(
+                        "Output: format={:?} renderer={:?}",
+                        config.output.format, config.output.renderer
+                    );
+                    println!(
+                        "WAL: mode={:?} enabled={:?}",
+                        config.wal.mode, config.wal.enabled
+                    );
+                    println!("Backup: enabled={:?}", config.backup.enabled);
+                    println!(
+                        "Guards: dal={:?} blocklist_enabled={:?}",
+                        config.guards.dal, config.guards.blocklist_enabled
+                    );
+                    println!(
+                        "Session: max={:?} timeout={:?} on_limit={:?}",
+                        config.session.max_sessions,
+                        config.session.timeout_secs,
+                        config.session.on_limit
+                    );
+                    println!("Telemetry: enabled={:?}", config.telemetry.enabled);
+                }
                 println!();
                 println!("Effective settings (with env var + defaults):");
-                println!("  DAL: {}", RuntimoConfig::get_dal());
+                let resolved = config.resolved();
+                println!("  Profile: {}", resolved.profile);
+                println!("  DAL: {}", resolved.dal);
+                println!("  WAL mode: {}", resolved.wal_mode);
+                println!("  Backup: {}", on_off(resolved.backup_enabled));
+                println!(
+                    "  Output: {}/{}",
+                    resolved.output_format, resolved.output_renderer
+                );
+                println!(
+                    "  Session: {}/{}s {}",
+                    resolved.session_max, resolved.session_timeout, resolved.session_on_limit
+                );
+                println!("  DAL (legacy get_dal): {}", RuntimoConfig::get_dal());
                 println!(
                     "  ShellExec blocklist: {}",
-                    on_off(RuntimoConfig::blocklist_enabled())
+                    on_off(resolved.blocklist_enabled)
                 );
                 println!(
                     "  Critical-files denylist: {}",
@@ -1326,6 +1809,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                 for p in &all_prefixes {
                     println!("    {}", p);
                 }
+                // Guards off warning (Gate 1)
+                if RuntimoConfig::guards_off_via_profile(&resolved)
+                    && resolved.profile == "ephemeral"
+                {
+                    eprintln!(
+                        "[runtimo] WARNING: guards off via profile {} — not for service machines",
+                        resolved.profile
+                    );
+                }
                 if !config_exists {
                     println!();
                     println!("No config file found. To customize, create one at:");
@@ -1341,11 +1833,19 @@ fn main() -> Result<(), Box<dyn Error>> {
                     println!("  critical_files_enabled — Disable critical-files denylist in FileWrite/Delete (bool, default true)");
                     println!("  path_restriction_enabled — Disable allowed-prefix path whitelist (bool, default true)");
                     println!("  path_sanitization_enabled — Disable forced PATH on ShellExec children (bool, default true)");
+                    println!("  profile           — Profile name: minimal|ephemeral|service");
+                    println!("  [output]          — format, renderer");
+                    println!("  [wal]             — mode, enabled");
+                    println!("  [backup]          — enabled");
+                    println!("  [guards]          — dal, blocklist_enabled, etc.");
+                    println!("  [session]         — max_sessions, timeout_secs, on_limit");
+                    println!("  [telemetry]       — enabled");
                     println!();
                     println!("Example:");
                     println!("  allowed_paths = [\"/srv\", \"/opt\"]");
                     println!("  dal = \"B\"");
                     println!("  blocklist_overrides = [\"curl\", \"wget\"]");
+                    println!("  profile = \"ephemeral\"");
                     println!();
                     println!("  [capability_timeouts]");
                     println!("  ShellExec = 120");
@@ -1384,6 +1884,662 @@ fn main() -> Result<(), Box<dyn Error>> {
                         }
                     };
                     println!("Current DAL: {} (source: {})", current, source);
+                }
+            }
+            ConfigAction::Init {
+                profile,
+                force,
+                minimal,
+                path,
+            } => {
+                let effective_profile = if minimal {
+                    Some("minimal".to_string())
+                } else {
+                    profile
+                };
+                let prof_ref = effective_profile.as_deref();
+                let target = path.as_deref();
+                match RuntimoConfig::init_at(target, prof_ref, force) {
+                    Ok(written) => {
+                        println!("Config written to {}", written.display());
+                        println!("Next: runtimo config show");
+                    }
+                    Err(e) => {
+                        if e.contains("already exists") {
+                            eprintln!("{}", e);
+                        } else {
+                            eprintln!("Config init failed: {}", e);
+                        }
+                        std::process::exit(1);
+                    }
+                }
+            }
+        },
+        Commands::Session { command } => match command {
+            SessionCommand::Run {
+                prompt_file,
+                session,
+                max_steps,
+                max_seconds,
+                on_failure,
+                dry_run,
+                via_daemon,
+            } => {
+                // Inherit bounded policy from frozen ResolvedConfig.
+                let effective_max_steps = max_steps.unwrap_or(resolved.session_max);
+                let effective_max_seconds = max_seconds.unwrap_or(resolved.session_timeout);
+                let effective_on_failure = on_failure
+                    .as_deref()
+                    .unwrap_or(&resolved.session_on_limit)
+                    .to_lowercase();
+                if effective_on_failure != "continue" && effective_on_failure != "stop" {
+                    eprintln!(
+                        "Invalid --on-failure '{}': must be continue|stop",
+                        effective_on_failure
+                    );
+                    std::process::exit(1);
+                }
+                if effective_max_steps == 0 {
+                    eprintln!("--max-steps must be >0");
+                    std::process::exit(1);
+                }
+
+                let reg = make_registry().map_err(|e| format!("Registry init failed: {}", e))?;
+
+                // Parse prompt file (validates size, steps>0, capability exists, traversal).
+                let steps = match session_parser::parse_prompt_file(&prompt_file, &reg) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("Prompt parse failed: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+
+                if u32::try_from(steps.len()).unwrap_or(u32::MAX) > effective_max_steps {
+                    eprintln!(
+                        "Prompt has {} steps but --max-steps is {}",
+                        steps.len(),
+                        effective_max_steps
+                    );
+                    std::process::exit(1);
+                }
+
+                // --dry-run validates only.
+                if dry_run {
+                    if base_mode.is_json() {
+                        let out = serde_json::json!({
+                            "dry_run": true,
+                            "steps": steps.len(),
+                            "max_steps": effective_max_steps,
+                            "max_seconds": effective_max_seconds,
+                            "on_failure": effective_on_failure,
+                            "profile": resolved.profile,
+                            "wal_mode": resolved.wal_mode,
+                        });
+                        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+                    } else if !base_mode.is_quiet() {
+                        println!(
+                            "dry-run: prompt '{}' valid ({} steps, max_steps={}, max_seconds={}, on_failure={})",
+                            prompt_file.display(),
+                            steps.len(),
+                            effective_max_steps,
+                            effective_max_seconds,
+                            effective_on_failure
+                        );
+                    }
+                    return Ok(());
+                }
+
+                // Resolve sessions directory (honors RUNTIMO_SESSIONS_DIR).
+                let sdir = session_run::sessions_dir();
+                std::fs::create_dir_all(&sdir)
+                    .map_err(|e| format!("create sessions dir: {}", e))?;
+
+                // Create or resume session by name/id.
+                let session_id = if let Some(ref name) = session {
+                    if let Some(existing) = session_run::find_session_by_name_or_id(&sdir, name) {
+                        existing.id
+                    } else {
+                        // Create new with this name.
+                        let mut mgr = runtimo_core::session::SessionManager::new(sdir.clone())
+                            .map_err(|e| format!("SessionManager: {}", e))?;
+                        let s = mgr
+                            .create_session(Some(name))
+                            .map_err(|e| format!("create_session: {}", e))?;
+                        s.id
+                    }
+                } else {
+                    let mut mgr = runtimo_core::session::SessionManager::new(sdir.clone())
+                        .map_err(|e| format!("SessionManager: {}", e))?;
+                    let s = mgr
+                        .create_session(None)
+                        .map_err(|e| format!("create_session: {}", e))?;
+                    s.id
+                };
+
+                // Load session for display (need its name/id).
+                let mgr_ro = runtimo_core::session::SessionManager::new(sdir.clone())
+                    .map_err(|e| format!("SessionManager: {}", e))?;
+                let sess = mgr_ro
+                    .load_session(&session_id)
+                    .map_err(|e| format!("load_session: {}", e))?;
+
+                if !base_mode.is_quiet() {
+                    if base_mode.is_json() {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "session_id": sess.id,
+                                "session_name": sess.name,
+                                "profile": resolved.profile,
+                                "wal_mode": resolved.wal_mode,
+                                "backup_enabled": resolved.backup_enabled,
+                                "steps": steps.len(),
+                            }))
+                            .unwrap()
+                        );
+                    } else {
+                        println!(
+                            "Session {} (name: {}) — profile={}, wal_mode={}, steps={}",
+                            sess.id,
+                            sess.name.as_deref().unwrap_or("-"),
+                            resolved.profile,
+                            resolved.wal_mode,
+                            steps.len()
+                        );
+                    }
+                }
+
+                let start = std::time::Instant::now();
+                let mut executed: usize = 0;
+                let mut had_failure = false;
+                let mut terminated = false;
+
+                for (idx, step) in steps.iter().enumerate() {
+                    let step_no = idx + 1;
+
+                    // Overall time guard (bounded).
+                    if start.elapsed().as_secs() > effective_max_seconds {
+                        emit_session_note(
+                            &base_mode,
+                            serde_json::json!({"session_id": session_id, "step": step_no, "total": steps.len(), "error": "max-seconds exceeded", "terminated": true}),
+                            &format!(
+                                "Session {} exceeded --max-seconds {}s at step {}/{} — terminating",
+                                session_id,
+                                effective_max_seconds,
+                                step_no,
+                                steps.len()
+                            ),
+                        );
+                        had_failure = true;
+                        terminated = true;
+                        break;
+                    }
+
+                    // Resource guard per step.
+                    let guard = runtimo_core::LlmoSafeGuard::new();
+                    if let Err(e) = guard.check() {
+                        let msg = format!(
+                            "resource guard tripped at step {}/{}: {}",
+                            step_no,
+                            steps.len(),
+                            e
+                        );
+                        emit_session_note(
+                            &base_mode,
+                            serde_json::json!({"step": step_no, "total": steps.len(), "capability": step.capability, "error": msg}),
+                            &msg,
+                        );
+                        had_failure = true;
+                        if effective_on_failure == "stop" {
+                            terminated = true;
+                            break;
+                        } else {
+                            continue;
+                        }
+                    }
+
+                    // Dangerous command + network gating per step (ShellExec).
+                    if step.capability == "ShellExec" {
+                        if let Some(cmd) = step.args.get("cmd").and_then(|v| v.as_str()) {
+                            if let Some(reason) = is_dangerous_command(cmd) {
+                                let msg = format!(
+                                    "step {}/{} dangerous command blocked: {}",
+                                    step_no,
+                                    steps.len(),
+                                    reason
+                                );
+                                emit_session_note(
+                                    &base_mode,
+                                    serde_json::json!({"step": step_no, "total": steps.len(), "capability": step.capability, "error": msg}),
+                                    &msg,
+                                );
+                                had_failure = true;
+                                if effective_on_failure == "stop" {
+                                    terminated = true;
+                                    break;
+                                } else {
+                                    continue;
+                                }
+                            }
+                            if !network_enabled() && is_network_command(cmd) {
+                                let msg = format!(
+                                    "step {}/{} network command blocked at step {} — set RUNTIMO_ENABLE_NETWORK=1 to enable",
+                                    step_no,
+                                    steps.len(),
+                                    step_no
+                                );
+                                emit_session_note(
+                                    &base_mode,
+                                    serde_json::json!({"step": step_no, "total": steps.len(), "capability": step.capability, "error": msg}),
+                                    &msg,
+                                );
+                                had_failure = true;
+                                if effective_on_failure == "stop" {
+                                    terminated = true;
+                                    break;
+                                } else {
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
+                    // Acquire concurrency slot (reuse run's guard).
+                    if !acquire_cli_slot() {
+                        emit_session_note(
+                            &base_mode,
+                            serde_json::json!({"step": step_no, "total": steps.len(), "error": "too many concurrent CLI runs"}),
+                            &format!(
+                                "Too many concurrent CLI runs (max {}) at step {}/{}",
+                                MAX_CLI_CONCURRENT,
+                                step_no,
+                                steps.len()
+                            ),
+                        );
+                        had_failure = true;
+                        if effective_on_failure == "stop" {
+                            terminated = true;
+                            break;
+                        } else {
+                            continue;
+                        }
+                    }
+
+                    // Execute step: local or via-daemon stub.
+                    let result: Result<runtimo_core::executor::ExecutionResult, String> =
+                        if via_daemon {
+                            // Stub: dispatch via daemon RPC.
+                            if let Err(e) = ensure_daemon_running() {
+                                release_cli_slot();
+                                emit_session_note(
+                                    &base_mode,
+                                    serde_json::json!({"step": step_no, "total": steps.len(), "error": format!("failed to start daemon: {}", e)}),
+                                    &format!(
+                                        "via-daemon step {}/{} failed to start daemon: {}",
+                                        step_no,
+                                        steps.len(),
+                                        e
+                                    ),
+                                );
+                                had_failure = true;
+                                if effective_on_failure == "stop" {
+                                    terminated = true;
+                                    break;
+                                } else {
+                                    continue;
+                                }
+                            }
+                            let params = serde_json::json!({
+                                "capability": step.capability,
+                                "args": step.args,
+                                "dry_run": false,
+                                "working_dir": std::env::current_dir().unwrap_or_default().to_string_lossy(),
+                            });
+                            match send_rpc("dispatch", params) {
+                                Ok(v) => {
+                                    // No forgery: poll the daemon for the real
+                                    // terminal status instead of assuming success.
+                                    // The WAL audit stays daemon-side; snapshots
+                                    // below are local placeholders with cleared
+                                    // caches so before/after always differ.
+                                    let jid =
+                                        v.get("job_id").and_then(|x| x.as_str()).unwrap_or("?");
+                                    // Track job_id in session even when dispatched via daemon (stub).
+                                    if let Ok(mut mgr) = runtimo_core::session::SessionManager::new(
+                                        session_run::sessions_dir(),
+                                    ) {
+                                        let _ = mgr.add_job(&session_id, jid);
+                                    }
+                                    let remaining = effective_max_seconds
+                                        .saturating_sub(start.elapsed().as_secs());
+                                    let (success, err_msg, wal_seq) =
+                                        poll_dispatched_step(jid, remaining);
+                                    let out = match err_msg {
+                                        None => runtimo_core::capability::Output::ok(format!(
+                                            "dispatched via daemon: {}",
+                                            jid
+                                        )),
+                                        Some(err) => runtimo_core::capability::Output::error(
+                                            format!("via-daemon step failed: {}", err),
+                                            err,
+                                        ),
+                                    };
+                                    runtimo_core::Telemetry::clear_cache();
+                                    let tel_before = if resolved.telemetry_enabled {
+                                        runtimo_core::Telemetry::capture_lightweight()
+                                    } else {
+                                        runtimo_core::Telemetry::empty()
+                                    };
+                                    runtimo_core::Telemetry::clear_lightweight_cache();
+                                    runtimo_core::ProcessSnapshot::clear_cache();
+                                    let tel_after = if resolved.telemetry_enabled {
+                                        runtimo_core::Telemetry::capture_lightweight()
+                                    } else {
+                                        runtimo_core::Telemetry::empty()
+                                    };
+                                    let proc_before =
+                                        runtimo_core::ProcessSnapshot::capture().summary;
+                                    runtimo_core::ProcessSnapshot::clear_cache();
+                                    let proc_after =
+                                        runtimo_core::ProcessSnapshot::capture().summary;
+                                    Ok(runtimo_core::executor::ExecutionResult {
+                                        job_id: jid.to_string(),
+                                        capability: step.capability.clone(),
+                                        success,
+                                        output: out,
+                                        telemetry_before: tel_before,
+                                        telemetry_after: tel_after,
+                                        process_before: proc_before,
+                                        process_after: proc_after,
+                                        wal_seq,
+                                    })
+                                }
+                                Err(e) => Err(format!("via-daemon dispatch failed: {}", e)),
+                            }
+                        } else {
+                            // Local deterministic execution with session binding.
+                            let Some(cap) = reg.get(&step.capability) else {
+                                // Unknown capability — treat as step failure per on_failure policy.
+                                let msg = format!("unknown capability '{}'", step.capability);
+                                emit_session_note(
+                                    &base_mode,
+                                    serde_json::json!({"step": step_no, "total": steps.len(), "capability": step.capability, "error": msg}),
+                                    &format!("step {}/{} {}", step_no, steps.len(), msg),
+                                );
+                                release_cli_slot();
+                                had_failure = true;
+                                if effective_on_failure == "stop" {
+                                    terminated = true;
+                                    break;
+                                }
+                                continue;
+                            };
+                            let timeout =
+                                RuntimoConfig::get_capability_timeout(&step.capability, 30);
+                            let res = execute_with_telemetry_and_session(
+                                cap,
+                                &step.args,
+                                false,
+                                &wal_path(),
+                                Some(&session_id),
+                                None,
+                                timeout,
+                            )
+                            .map_err(|e| format!("{}", e))?;
+                            Ok(res)
+                        };
+
+                    release_cli_slot();
+
+                    match result {
+                        Ok(exec) => {
+                            executed += 1;
+                            if !exec.success {
+                                had_failure = true;
+                                // Stream failure.
+                                if base_mode.is_json() {
+                                    println!(
+                                        "{}",
+                                        serde_json::to_string_pretty(&serde_json::json!({
+                                            "step": step_no,
+                                            "total": steps.len(),
+                                            "capability": step.capability,
+                                            "success": false,
+                                            "output": exec.output,
+                                            "job_id": exec.job_id,
+                                        }))
+                                        .unwrap()
+                                    );
+                                } else if !base_mode.is_quiet() {
+                                    eprintln!(
+                                        "step {}/{} {} failed: {}",
+                                        step_no,
+                                        steps.len(),
+                                        step.capability,
+                                        exec.output.output
+                                    );
+                                }
+                                if effective_on_failure == "stop" {
+                                    terminated = true;
+                                    break;
+                                }
+                            } else if base_mode.is_json() {
+                                println!("{}", serde_json::to_string_pretty(&exec.output).unwrap());
+                            } else if !base_mode.is_quiet() {
+                                let rendered = base_mode.render_text(&exec.output.output);
+                                if rendered.trim().is_empty() {
+                                    println!(
+                                        "step {}/{} {}: ok",
+                                        step_no,
+                                        steps.len(),
+                                        step.capability
+                                    );
+                                } else {
+                                    println!(
+                                        "step {}/{} {}: {}",
+                                        step_no,
+                                        steps.len(),
+                                        step.capability,
+                                        rendered
+                                    );
+                                }
+                                if let Some(ref data) = exec.output.data {
+                                    let text = if let Some(s) = data.as_str() {
+                                        s.to_string()
+                                    } else {
+                                        data.to_string()
+                                    };
+                                    if !text.trim().is_empty() && text != "null" {
+                                        let r2 = base_mode.render_text(&text);
+                                        if !r2.trim().is_empty() {
+                                            println!("{}", r2);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            executed += 1;
+                            had_failure = true;
+                            emit_session_note(
+                                &base_mode,
+                                serde_json::json!({"step": step_no, "total": steps.len(), "capability": step.capability, "error": e}),
+                                &format!(
+                                    "step {}/{} {} error: {}",
+                                    step_no,
+                                    steps.len(),
+                                    step.capability,
+                                    e
+                                ),
+                            );
+                            if effective_on_failure == "stop" {
+                                terminated = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // Mark terminal status deterministically.
+                let final_status = if terminated || (had_failure && effective_on_failure == "stop")
+                {
+                    runtimo_core::session::SessionStatus::Terminated
+                } else if had_failure && effective_on_failure == "continue" {
+                    // Completed even though some steps failed — the session itself completed.
+                    runtimo_core::session::SessionStatus::Completed
+                } else {
+                    runtimo_core::session::SessionStatus::Completed
+                };
+                if let Err(e) = session_run::update_session_status(&sdir, &session_id, final_status)
+                {
+                    emit_session_note(
+                        &base_mode,
+                        serde_json::json!({"session_id": session_id, "error": format!("failed to update session status: {}", e)}),
+                        &format!("Failed to update session status: {}", e),
+                    );
+                }
+
+                // Summary via OutputMode.
+                if base_mode.is_json() {
+                    #[allow(clippy::redundant_clone)]
+                    // sdir cloned for json branch so else-if can still move sdir; removing clone would move in one branch and break the other
+                    let mgr = runtimo_core::session::SessionManager::new(sdir.clone())
+                        .map_err(|e| format!("SessionManager: {}", e))?;
+                    let final_sess = mgr
+                        .load_session(&session_id)
+                        .map_err(|e| format!("{}", e))?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "session_id": final_sess.id,
+                            "status": format!("{:?}", final_sess.status),
+                            "job_ids": final_sess.job_ids,
+                            "executed": executed,
+                            "total": steps.len(),
+                        }))
+                        .unwrap()
+                    );
+                } else if !base_mode.is_quiet() {
+                    let mgr = runtimo_core::session::SessionManager::new(sdir).ok();
+                    let final_sess = mgr.and_then(|m| m.load_session(&session_id).ok());
+                    if let Some(fs) = final_sess {
+                        println!(
+                            "Session {} status={:?} jobs={}/{} job_ids={:?}",
+                            fs.id,
+                            fs.status,
+                            fs.job_ids.len(),
+                            steps.len(),
+                            fs.job_ids
+                        );
+                    }
+                }
+            }
+            SessionCommand::List { json } => {
+                let mode = if json {
+                    base_mode.with_format("json")
+                } else {
+                    base_mode
+                };
+                let sdir = session_run::sessions_dir();
+                let mgr = runtimo_core::session::SessionManager::new(sdir)
+                    .map_err(|e| format!("SessionManager: {}", e))?;
+                let sessions = mgr.list_sessions().map_err(|e| format!("{}", e))?;
+                if mode.is_json() {
+                    println!("{}", serde_json::to_string_pretty(&sessions).unwrap());
+                } else if mode.is_quiet() {
+                    // silent
+                } else if sessions.is_empty() {
+                    println!("No sessions found.");
+                } else {
+                    let headers = ["ID", "NAME", "STATUS", "JOBS", "UPDATED"];
+                    let rows: Vec<Vec<String>> = sessions
+                        .iter()
+                        .map(|s| {
+                            vec![
+                                s.id.clone(),
+                                s.name.clone().unwrap_or_else(|| "-".to_string()),
+                                format!("{:?}", s.status),
+                                s.job_ids.len().to_string(),
+                                s.updated_at.to_string(),
+                            ]
+                        })
+                        .collect();
+                    println!("{}", mode.render_table(&headers, &rows));
+                }
+            }
+            SessionCommand::Show { session_id, json } => {
+                let mode = if json {
+                    base_mode.with_format("json")
+                } else {
+                    base_mode
+                };
+                let sdir = session_run::sessions_dir();
+                let mgr = runtimo_core::session::SessionManager::new(sdir)
+                    .map_err(|e| format!("SessionManager: {}", e))?;
+                let sess = mgr
+                    .load_session(&session_id)
+                    .map_err(|e| format!("{}", e))?;
+                // Pull WAL events for the session's job_ids.
+                let wal_events: Vec<Value> = if let Ok(reader) = WalReader::load_all(&wal_path()) {
+                    let set: std::collections::HashSet<&String> = sess.job_ids.iter().collect();
+                    reader
+                        .events()
+                        .iter()
+                        .filter(|e| set.contains(&e.job_id))
+                        .map(|e| serde_json::to_value(e).unwrap_or(Value::Null))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                if mode.is_json() {
+                    let out = serde_json::json!({
+                        "session": sess,
+                        "wal_events": wal_events,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&out).unwrap());
+                } else if mode.is_quiet() {
+                    // silent
+                } else {
+                    let info = format!(
+                        "Session {} (name: {})\nStatus: {:?}\nCreated: {}\nUpdated: {}\nJobs ({}): {}\nWAL events: {}",
+                        sess.id,
+                        sess.name.as_deref().unwrap_or("-"),
+                        sess.status,
+                        sess.created_at,
+                        sess.updated_at,
+                        sess.job_ids.len(),
+                        if sess.job_ids.is_empty() {
+                            "(none)".to_string()
+                        } else {
+                            sess.job_ids.join(", ")
+                        },
+                        wal_events.len()
+                    );
+                    println!("{}", mode.render_text(&info));
+                    if !wal_events.is_empty() {
+                        let headers = ["SEQ", "EVENT", "JOB_ID"];
+                        let rows: Vec<Vec<String>> = wal_events
+                            .iter()
+                            .map(|v| {
+                                vec![
+                                    v.get("seq")
+                                        .and_then(|x| x.as_u64())
+                                        .unwrap_or(0)
+                                        .to_string(),
+                                    v.get("type")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("?")
+                                        .to_string(),
+                                    v.get("job_id")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("?")
+                                        .to_string(),
+                                ]
+                            })
+                            .collect();
+                        println!("{}", mode.render_table(&headers, &rows));
+                    }
                 }
             }
         },

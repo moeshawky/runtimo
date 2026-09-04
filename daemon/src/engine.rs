@@ -116,6 +116,15 @@ async fn handle_request(state: &Arc<DaemonState>, req: JsonRpcRequest) -> JsonRp
 ///
 /// Acquires the WAL mutex, executes the capability, and returns the result.
 /// Times out at `timeout_secs` (default 30s).
+///
+/// # Outputs
+///
+/// The `Ok` result payload carries the full execution record (no field
+/// stripping): `success`, `job_id`, `capability`, `output`,
+/// `telemetry_before`/`telemetry_after`, `process_before`/`process_after`,
+/// `wal_seq`, and `error` (from `output.error`, null on success). When
+/// telemetry is disabled via resolved config, the telemetry fields carry
+/// the executor's zeroed snapshot and the WAL holds `None`.
 #[allow(clippy::unused_async)]
 async fn handle_run(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonRpcResponse {
     let run_params: RunParams = match serde_json::from_value(params) {
@@ -174,6 +183,12 @@ async fn handle_run(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonR
                 log::error!("Failed to serialize capability output: {}", e);
                 Value::Null
             }),
+                "telemetry_before": result.telemetry_before,
+                "telemetry_after": result.telemetry_after,
+                "process_before": result.process_before,
+                "process_after": result.process_after,
+                "wal_seq": result.wal_seq,
+                "error": result.output.error,
             })),
             error: None,
             id,
@@ -739,6 +754,12 @@ fn parse_args() -> Args {
 ///
 /// This ensures every job has a definitive terminal state in the audit
 /// trail — no permanently "unknown" jobs after recovery.
+///
+/// Lossy by design: the reconciled `JobFailed` events carry `None` for
+/// telemetry, process, capability, and output snapshots — no snapshots
+/// exist at restart time, and re-probing the current machine would forge
+/// data about a past execution. Consumers must treat missing snapshots
+/// on reconciled events as "unknown", not "empty".
 fn reconcile_orphaned_jobs(wal_path: &std::path::Path) {
     let Ok(reader) = WalReader::load_all(wal_path) else {
         return; // No WAL yet — nothing to reconcile

@@ -54,12 +54,19 @@ use unicode_normalization::UnicodeNormalization;
 /// Context for path validation.
 ///
 /// Controls which checks are applied. [`Default`] performs all checks
-/// with built-in prefixes (`/tmp`, `/var/tmp`, `/home`), extended by
+/// with built-in prefixes (`/tmp`, `/var/tmp`), extended by
 /// `RUNTIMO_ALLOWED_PATHS` env var and config file if set.
+///
+///
+/// `allowed_prefixes` are owned strings to avoid `'static` leaks — callers
+/// (e.g. CLI prompt validation) can pass contextual directories without
+/// `Box::leak`. The list is merged with global defaults inside
+/// `get_allowed_prefixes`.
 #[allow(clippy::exhaustive_structs)]
 pub struct PathContext {
     /// Additional allowed directory prefixes (merged with defaults + env var + config).
-    pub allowed_prefixes: &'static [&'static str],
+    /// Owned to avoid unbounded `'static` leaks via `Box::leak`.
+    pub allowed_prefixes: Vec<String>,
     /// If true, the path must already exist on disk.
     pub require_exists: bool,
     /// If true, the path must be a regular file (not a directory).
@@ -69,7 +76,7 @@ pub struct PathContext {
 impl Default for PathContext {
     fn default() -> Self {
         Self {
-            allowed_prefixes: &[],
+            allowed_prefixes: Vec::new(),
             require_exists: true,
             require_file: true,
         }
@@ -84,7 +91,7 @@ fn get_allowed_prefixes(ctx: &PathContext) -> Vec<String> {
     let mut prefixes = crate::config::RuntimoConfig::get_allowed_prefixes();
 
     // Add context-specific prefixes
-    for p in ctx.allowed_prefixes {
+    for p in &ctx.allowed_prefixes {
         let trimmed = p.trim().to_string();
         if !prefixes.contains(&trimmed) {
             prefixes.push(trimmed);

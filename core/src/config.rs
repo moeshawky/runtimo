@@ -9,10 +9,119 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Built-in default allowed prefixes.
 const DEFAULT_PREFIXES: &[&str] = &["/tmp", "/var/tmp"];
+
+/// Output rendering configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[allow(clippy::exhaustive_structs)]
+pub struct OutputConfig {
+    /// Output format: `human` or `json`.
+    #[serde(default)]
+    pub format: Option<String>,
+    /// Renderer: `markdown` or `plain`.
+    #[serde(default)]
+    pub renderer: Option<String>,
+}
+
+/// WAL configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[allow(clippy::exhaustive_structs)]
+pub struct WalConfig {
+    /// WAL mode: `always` or `batch`.
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Whether WAL is enabled.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+/// Backup configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[allow(clippy::exhaustive_structs)]
+pub struct BackupConfig {
+    /// Whether backup is enabled.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+/// Guards configuration (DAL and defense toggles).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[allow(clippy::exhaustive_structs)]
+pub struct GuardsConfig {
+    /// Design Assurance Level for this profile.
+    #[serde(default)]
+    pub dal: Option<String>,
+    /// Whether blocklist is enabled.
+    #[serde(default)]
+    pub blocklist_enabled: Option<bool>,
+    /// Whether critical-files denylist is enabled.
+    #[serde(default)]
+    pub critical_files_enabled: Option<bool>,
+    /// Whether path whitelist is enabled.
+    #[serde(default)]
+    pub path_restriction_enabled: Option<bool>,
+    /// Whether PATH sanitization is enabled.
+    #[serde(default)]
+    pub path_sanitization_enabled: Option<bool>,
+}
+
+/// Session configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[allow(clippy::exhaustive_structs)]
+pub struct SessionConfig {
+    /// Maximum concurrent sessions.
+    #[serde(default)]
+    pub max_sessions: Option<u32>,
+    /// Session timeout in seconds.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    /// Behavior on limit: `continue` or `stop`.
+    #[serde(default)]
+    pub on_limit: Option<String>,
+}
+
+/// Telemetry configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[allow(clippy::exhaustive_structs)]
+pub struct TelemetryConfig {
+    /// Whether telemetry is enabled.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+/// Resolved effective configuration after merging precedence.
+///
+/// Precedence (highest to lowest): CLI > env > file > profile > builtin.
+/// Provisionals for Gate 1: bare DAL = E, no transient --profile flag, ephemeral WAL = batch.
+#[derive(Debug, Clone)]
+#[allow(clippy::exhaustive_structs)]
+pub struct ResolvedConfig {
+    /// Effective profile name.
+    pub profile: String,
+    /// Effective DAL (A-E).
+    pub dal: String,
+    /// Effective WAL mode.
+    pub wal_mode: String,
+    /// Whether backup is enabled.
+    pub backup_enabled: bool,
+    /// Effective output format.
+    pub output_format: String,
+    /// Effective output renderer.
+    pub output_renderer: String,
+    /// Whether blocklist is enabled.
+    pub blocklist_enabled: bool,
+    /// Effective max sessions.
+    pub session_max: u32,
+    /// Effective session timeout.
+    pub session_timeout: u64,
+    /// Effective on-limit behavior.
+    pub session_on_limit: String,
+    /// Whether telemetry is enabled.
+    pub telemetry_enabled: bool,
+}
 
 /// Runtimo persistent configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -100,6 +209,34 @@ pub struct RuntimoConfig {
     /// custom binaries outside the sanitized trio to resolve.
     #[serde(default)]
     pub path_sanitization_enabled: Option<bool>,
+
+    /// Profile name: `minimal`, `ephemeral`, or `service`.
+    #[serde(default)]
+    pub profile: Option<String>,
+
+    /// Output rendering table.
+    #[serde(default)]
+    pub output: OutputConfig,
+
+    /// WAL table.
+    #[serde(default)]
+    pub wal: WalConfig,
+
+    /// Backup table.
+    #[serde(default)]
+    pub backup: BackupConfig,
+
+    /// Guards table.
+    #[serde(default)]
+    pub guards: GuardsConfig,
+
+    /// Session table.
+    #[serde(default)]
+    pub session: SessionConfig,
+
+    /// Telemetry table.
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
 }
 
 impl RuntimoConfig {
@@ -117,6 +254,13 @@ impl RuntimoConfig {
         "critical_files_enabled",
         "path_restriction_enabled",
         "path_sanitization_enabled",
+        "profile",
+        "output",
+        "wal",
+        "backup",
+        "guards",
+        "session",
+        "telemetry",
     ];
 
     /// Returns the config file path following XDG spec.
@@ -144,6 +288,322 @@ impl RuntimoConfig {
             );
             PathBuf::from("/tmp/runtimo/config.toml")
         }
+    }
+
+    /// Returns a commented TOML template for the given profile.
+    ///
+    /// Profiles:
+    /// - `minimal`: passthrough - no overrides, builtin defaults.
+    /// - `ephemeral`: json/plain, backup=false, wal batch, DAL=E, blocklist off, max 20/300 continue.
+    /// - `service`: human/markdown, backup=true, wal always, DAL=A strict, max 100/3600 stop.
+    #[must_use]
+    pub fn init_template(profile: Option<&str>) -> String {
+        let p = profile.unwrap_or("minimal").to_lowercase();
+        match p.as_str() {
+            "ephemeral" => r#"# Runtimo config - profile: ephemeral
+# Optimized for short-lived, throwaway environments (notebooks, CI).
+# Guards are relaxed - not for service machines.
+profile = "ephemeral"
+
+# ephemeral profile - json/plain, WAL batch, guards off
+
+[output]
+# json/plain - machine-readable, no decoration
+format = "json"
+renderer = "plain"
+
+[wal]
+# batch - fewer fsyncs for ephemeral speed
+mode = "batch"
+enabled = true
+
+[backup]
+# no backup for ephemeral - speed over safety
+enabled = false
+
+[guards]
+# DAL=E permissive, blocklist off for ephemeral
+dal = "E"
+blocklist_enabled = false
+
+[session]
+max_sessions = 20
+timeout_secs = 300
+on_limit = "continue"
+
+[telemetry]
+enabled = false
+"#
+            .to_string(),
+            "service" => r#"# Runtimo config - profile: service
+# Optimized for long-running service machines.
+# Strict guards - do not disable.
+profile = "service"
+
+[output]
+# human/markdown - readable service logs
+format = "human"
+renderer = "markdown"
+
+[wal]
+# always - fsync every event for durability
+mode = "always"
+enabled = true
+
+[backup]
+enabled = true
+
+[guards]
+# DAL=A strict, blocklist on for service
+dal = "A"
+blocklist_enabled = true
+critical_files_enabled = true
+path_restriction_enabled = true
+
+[session]
+max_sessions = 100
+timeout_secs = 3600
+on_limit = "stop"
+
+[telemetry]
+enabled = true
+"#
+            .to_string(),
+            _ => r#"# Runtimo config - profile: minimal
+# Minimal passthrough - no overrides, use builtins.
+# Uncomment to customize.
+profile = "minimal"
+
+# allowed_paths = ["/srv", "/opt"]
+# dal = "A"
+
+# [output]
+# format = "human"
+# renderer = "markdown"
+
+# [wal]
+# mode = "always"
+# enabled = true
+
+# [backup]
+# enabled = true
+
+# [guards]
+# dal = "A"
+# blocklist_enabled = true
+
+# [session]
+# max_sessions = 100
+# timeout_secs = 3600
+# on_limit = "stop"
+
+# [telemetry]
+# enabled = true
+"#
+            .to_string(),
+        }
+    }
+
+    /// Writes a profile template to `target` path.
+    ///
+    /// Respects XDG config path when `target` is `None`. Errors if the file
+    /// exists and `force` is false. Creates parent directories, writes the
+    /// template, validates via parse round-trip, and removes the file on parse
+    /// failure.
+    ///
+    /// Misapplication guard: if `profile` is `ephemeral` and target is outside
+    /// `/tmp`, `/var/tmp`, `/kaggle/working`, or `$XDG_CONFIG_HOME`, emits a
+    /// stderr warning but still allows the write.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the target already exists and `force` is false,
+    /// if parent directories cannot be created, if the file cannot be written,
+    /// or if the generated config fails to parse.
+    pub fn init_at(
+        target: Option<&Path>,
+        profile: Option<&str>,
+        force: bool,
+    ) -> Result<PathBuf, String> {
+        let path = target.map_or_else(Self::config_path, PathBuf::from);
+
+        // Misapplication guard - ephemeral outside expected dirs
+        if profile.is_some_and(|p| p.to_lowercase() == "ephemeral") {
+            let path_str = path.to_string_lossy();
+            let xdg_home = std::env::var("XDG_CONFIG_HOME").unwrap_or_default();
+            let in_tmp = path_str.starts_with("/tmp/") || path_str == "/tmp";
+            let in_var_tmp = path_str.starts_with("/var/tmp/");
+            let in_kaggle = path_str.starts_with("/kaggle/working/");
+            let in_xdg = !xdg_home.is_empty() && path_str.starts_with(xdg_home.as_str());
+            let in_home_config = path_str.contains(".config/runtimo");
+            if !(in_tmp || in_var_tmp || in_kaggle || in_xdg || in_home_config) {
+                eprintln!(
+                    "[runtimo] WARNING: ephemeral profile target '{}' is outside /tmp, /var/tmp, /kaggle/working, or $XDG_CONFIG_HOME - ephemeral is for throwaway environments",
+                    path.display()
+                );
+            }
+        }
+
+        if path.exists() && !force {
+            return Err(format!(
+                "config already exists at {} - use --force to overwrite",
+                path.display()
+            ));
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let content = Self::init_template(profile);
+        std::fs::write(&path, &content).map_err(|e| e.to_string())?;
+
+        // Validate via round-trip parse
+        let written = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let value: toml::Value = toml::from_str(&written).map_err(|e| {
+            let _ = std::fs::remove_file(&path);
+            format!("generated config failed to parse: {}", e)
+        })?;
+        Self::deserialize(value).map_err(|e| {
+            let _ = std::fs::remove_file(&path);
+            format!("generated config failed to validate: {}", e)
+        })?;
+
+        // Also verify load_result when target is the default config_path
+        if target.is_none() || target == Some(Self::config_path().as_path()) {
+            if let Err(e) = Self::load_result() {
+                let _ = std::fs::remove_file(&path);
+                return Err(format!("generated config failed load_result: {}", e));
+            }
+        }
+
+        Ok(path)
+    }
+
+    /// Returns the resolved effective configuration.
+    ///
+    /// Precedence (highest to lowest): CLI > env > file > profile > builtin.
+    /// For Gate 1 provisionals: CLI is not yet wired (no transient --profile flag),
+    /// so env is the highest effective source. Bare DAL defaults to E, and
+    /// ephemeral WAL defaults to batch.
+    #[must_use]
+    pub fn resolved(&self) -> ResolvedConfig {
+        // Profile determination: file profile > builtin minimal
+        let profile = self
+            .profile
+            .clone()
+            .unwrap_or_else(|| "minimal".to_string())
+            .to_lowercase();
+        let profile = match profile.as_str() {
+            "ephemeral" | "service" | "minimal" => profile,
+            _ => "minimal".to_string(),
+        };
+
+        // DAL: env > file dal > file guards.dal > profile > builtin(E)
+        let dal = if let Ok(v) = std::env::var("RUNTIMO_DAL") {
+            v.to_uppercase()
+        } else if let Some(d) = &self.dal {
+            d.to_uppercase()
+        } else if let Some(d) = &self.guards.dal {
+            d.to_uppercase()
+        } else if profile == "service" {
+            "A".to_string()
+        } else {
+            "E".to_string()
+        };
+
+        // WAL mode: file wal.mode > profile > builtin
+        let wal_mode = if let Some(m) = &self.wal.mode {
+            m.clone()
+        } else if profile == "ephemeral" {
+            "batch".to_string()
+        } else {
+            "always".to_string()
+        };
+
+        // Backup: file backup.enabled > profile > builtin(true)
+        let backup_enabled = if let Some(b) = self.backup.enabled {
+            b
+        } else {
+            profile != "ephemeral"
+        };
+        // Output: file output > profile > builtin - ephemeral is json, others human
+        let output_format = if let Some(f) = &self.output.format {
+            f.clone()
+        } else if profile == "ephemeral" {
+            "json".to_string()
+        } else {
+            "human".to_string()
+        };
+        let output_renderer = if let Some(r) = &self.output.renderer {
+            r.clone()
+        } else if profile == "ephemeral" {
+            "plain".to_string()
+        } else {
+            "markdown".to_string()
+        };
+
+        // Blocklist: top-level > guards > profile > builtin(true)
+        let blocklist_enabled = if let Some(b) = self.blocklist_enabled {
+            b
+        } else if let Some(b) = self.guards.blocklist_enabled {
+            b
+        } else {
+            profile != "ephemeral"
+        };
+
+        // Session: file session > profile > builtin
+        let session_max = if let Some(m) = self.session.max_sessions {
+            m
+        } else if profile == "ephemeral" {
+            20
+        } else {
+            100
+        };
+        let session_timeout = if let Some(t) = self.session.timeout_secs {
+            t
+        } else if profile == "ephemeral" {
+            300
+        } else {
+            3600
+        };
+        let session_on_limit = if let Some(o) = &self.session.on_limit {
+            o.clone()
+        } else if profile == "ephemeral" {
+            "continue".to_string()
+        } else {
+            "stop".to_string()
+        };
+
+        let telemetry_enabled = if let Some(e) = self.telemetry.enabled {
+            e
+        } else {
+            profile != "ephemeral"
+        };
+
+        ResolvedConfig {
+            profile,
+            dal,
+            wal_mode,
+            backup_enabled,
+            output_format,
+            output_renderer,
+            blocklist_enabled,
+            session_max,
+            session_timeout,
+            session_on_limit,
+            telemetry_enabled,
+        }
+    }
+
+    /// Convenience: load file and return resolved config.
+    #[must_use]
+    pub fn resolved_from_file() -> ResolvedConfig {
+        Self::load().resolved()
+    }
+
+    /// Returns true if guards are considered off via the resolved profile.
+    #[must_use]
+    pub fn guards_off_via_profile(resolved: &ResolvedConfig) -> bool {
+        !resolved.blocklist_enabled || resolved.dal == "E"
     }
 
     /// Loads config from disk, returning defaults if the file doesn't exist or is invalid.
@@ -671,6 +1131,190 @@ mod tests {
             "E",
             "RUNTIMO_DAL=e must resolve to uppercase E"
         );
+        std::env::remove_var("RUNTIMO_DAL");
+    }
+
+    // ── Gate 1: profile seam tests ─────────────────────────────────
+
+    #[test]
+    fn init_template_roundtrip_minimal() {
+        let _guard = CONFIG_TEST_MUTEX.lock().unwrap();
+        let tmp = std::env::temp_dir().join("runtimo_test_init_minimal");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+        let content = RuntimoConfig::init_template(Some("minimal"));
+        let val: toml::Value = toml::from_str(&content).expect("minimal template must parse");
+        let cfg = RuntimoConfig::deserialize(val).expect("minimal template must deserialize");
+        assert_eq!(cfg.profile.as_deref(), Some("minimal"));
+        let resolved = cfg.resolved();
+        assert_eq!(resolved.profile, "minimal");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn init_template_roundtrip_ephemeral() {
+        let _guard = CONFIG_TEST_MUTEX.lock().unwrap();
+        let tmp = std::env::temp_dir().join("runtimo_test_init_ephemeral");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+        let content = RuntimoConfig::init_template(Some("ephemeral"));
+        let val: toml::Value = toml::from_str(&content).expect("ephemeral template must parse");
+        let cfg = RuntimoConfig::deserialize(val).expect("ephemeral template must deserialize");
+        assert_eq!(cfg.profile.as_deref(), Some("ephemeral"));
+        assert_eq!(cfg.output.format.as_deref(), Some("json"));
+        assert_eq!(cfg.output.renderer.as_deref(), Some("plain"));
+        assert_eq!(cfg.backup.enabled, Some(false));
+        assert_eq!(cfg.wal.mode.as_deref(), Some("batch"));
+        assert_eq!(cfg.guards.dal.as_deref(), Some("E"));
+        assert_eq!(cfg.guards.blocklist_enabled, Some(false));
+        assert_eq!(cfg.session.max_sessions, Some(20));
+        assert_eq!(cfg.session.timeout_secs, Some(300));
+        assert_eq!(cfg.session.on_limit.as_deref(), Some("continue"));
+        let resolved = cfg.resolved();
+        assert_eq!(resolved.dal, "E");
+        assert_eq!(resolved.wal_mode, "batch");
+        assert!(!resolved.backup_enabled);
+        assert_eq!(resolved.session_max, 20);
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn init_template_roundtrip_service() {
+        let _guard = CONFIG_TEST_MUTEX.lock().unwrap();
+        let tmp = std::env::temp_dir().join("runtimo_test_init_service");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+        let content = RuntimoConfig::init_template(Some("service"));
+        let val: toml::Value = toml::from_str(&content).expect("service template must parse");
+        let cfg = RuntimoConfig::deserialize(val).expect("service template must deserialize");
+        assert_eq!(cfg.profile.as_deref(), Some("service"));
+        assert_eq!(cfg.output.format.as_deref(), Some("human"));
+        assert_eq!(cfg.output.renderer.as_deref(), Some("markdown"));
+        assert_eq!(cfg.backup.enabled, Some(true));
+        assert_eq!(cfg.wal.mode.as_deref(), Some("always"));
+        assert_eq!(cfg.guards.dal.as_deref(), Some("A"));
+        assert_eq!(cfg.guards.blocklist_enabled, Some(true));
+        assert_eq!(cfg.session.max_sessions, Some(100));
+        assert_eq!(cfg.session.timeout_secs, Some(3600));
+        assert_eq!(cfg.session.on_limit.as_deref(), Some("stop"));
+        let resolved = cfg.resolved();
+        assert_eq!(resolved.dal, "A");
+        assert_eq!(resolved.wal_mode, "always");
+        assert!(resolved.backup_enabled);
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn init_at_exists_without_force_fails() {
+        let _guard = CONFIG_TEST_MUTEX.lock().unwrap();
+        let tmp = std::env::temp_dir().join("runtimo_test_init_exists");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+        let path = tmp.join("runtimo/config.toml");
+        RuntimoConfig::init_at(None, Some("minimal"), false).expect("first init should succeed");
+        assert!(path.exists());
+        let err = RuntimoConfig::init_at(None, Some("minimal"), false).unwrap_err();
+        assert!(
+            err.contains("already exists") && err.contains("--force"),
+            "error must mention already exists and --force, got: {}",
+            err
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn init_at_force_overwrites() {
+        let _guard = CONFIG_TEST_MUTEX.lock().unwrap();
+        let tmp = std::env::temp_dir().join("runtimo_test_init_force");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+        RuntimoConfig::init_at(None, Some("minimal"), false).expect("init minimal");
+        RuntimoConfig::init_at(None, Some("ephemeral"), true).expect("force overwrite");
+        let cfg = RuntimoConfig::load_result().expect("should load after force");
+        assert_eq!(cfg.profile.as_deref(), Some("ephemeral"));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn init_at_roundtrip_via_load_result() {
+        let _guard = CONFIG_TEST_MUTEX.lock().unwrap();
+        let tmp = std::env::temp_dir().join("runtimo_test_init_roundtrip");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+        for profile in ["minimal", "ephemeral", "service"] {
+            let _ = std::fs::remove_dir_all(&tmp);
+            std::fs::create_dir_all(tmp.join("runtimo")).ok();
+            std::env::set_var("XDG_CONFIG_HOME", &tmp);
+            RuntimoConfig::init_at(None, Some(profile), true).expect("init_at");
+            let cfg = RuntimoConfig::load_result().expect("load_result after init_at");
+            assert_eq!(cfg.profile.as_deref(), Some(profile));
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn resolved_precedence_env_over_file_over_profile() {
+        let _guard = CONFIG_TEST_MUTEX.lock().unwrap();
+        let tmp = std::env::temp_dir().join("runtimo_test_resolved_prec");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("runtimo")).unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+        let content = "profile = \"ephemeral\"\ndal = \"C\"\n[guards]\ndal = \"C\"\n";
+        std::fs::write(tmp.join("runtimo/config.toml"), content).unwrap();
+        std::env::remove_var("RUNTIMO_DAL");
+        let cfg = RuntimoConfig::load().resolved();
+        assert_eq!(cfg.dal, "C", "file DAL should beat profile E");
+        std::env::set_var("RUNTIMO_DAL", "B");
+        let cfg2 = RuntimoConfig::load().resolved();
+        assert_eq!(cfg2.dal, "B", "env DAL should beat file C");
+        std::env::remove_var("RUNTIMO_DAL");
+        std::fs::write(tmp.join("runtimo/config.toml"), "profile = \"ephemeral\"\n").unwrap();
+        let cfg3 = RuntimoConfig::load().resolved();
+        assert_eq!(cfg3.dal, "E", "profile ephemeral should give E");
+        std::fs::write(tmp.join("runtimo/config.toml"), "").unwrap();
+        let cfg4 = RuntimoConfig::load().resolved();
+        assert_eq!(cfg4.dal, "E", "bare should be E per provisional");
+        std::fs::write(
+            tmp.join("runtimo/config.toml"),
+            "profile = \"ephemeral\"\n[wal]\nmode = \"always\"\n",
+        )
+        .unwrap();
+        let cfg5 = RuntimoConfig::load().resolved();
+        assert_eq!(
+            cfg5.wal_mode, "always",
+            "file wal should beat profile batch"
+        );
+        std::fs::write(tmp.join("runtimo/config.toml"), "profile = \"ephemeral\"\n").unwrap();
+        let cfg6 = RuntimoConfig::load().resolved();
+        assert_eq!(cfg6.wal_mode, "batch", "ephemeral WAL must be batch");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::env::remove_var("RUNTIMO_DAL");
+    }
+
+    #[test]
+    fn resolved_cli_over_env_placeholder() {
+        let _guard = CONFIG_TEST_MUTEX.lock().unwrap();
+        let tmp = std::env::temp_dir().join("runtimo_test_cli_prec");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("runtimo")).unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+        std::fs::write(
+            tmp.join("runtimo/config.toml"),
+            "profile = \"service\"\n[guards]\ndal = \"A\"\n",
+        )
+        .unwrap();
+        std::env::set_var("RUNTIMO_DAL", "E");
+        let cfg = RuntimoConfig::load().resolved();
+        assert_eq!(cfg.dal, "E");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("XDG_CONFIG_HOME");
         std::env::remove_var("RUNTIMO_DAL");
     }
 }

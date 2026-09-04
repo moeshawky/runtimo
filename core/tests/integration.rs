@@ -14,6 +14,13 @@ use serde_json::json;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Mutex;
+
+/// Serializes tests that mutate process-global env vars (`XDG_DATA_HOME`,
+/// `RUNTIMO_WAL_PATH`, `RUNTIMO_DAL`). Without this, parallel
+/// `cargo test` invocations race on the same env keys and cause flakes.
+/// Mirrors `CONFIG_TEST_MUTEX` pattern in `core/src/config.rs`.
+static ENV_GUARD: Mutex<()> = Mutex::new(());
 
 fn unique_test_dir() -> PathBuf {
     let ns = std::time::SystemTime::now()
@@ -1283,6 +1290,7 @@ fn dispatch_pipeline_multiple_jobs_have_unique_ids() {
 
 #[test]
 fn test_dal_e_permissive_mode() {
+    let _guard = ENV_GUARD.lock().unwrap();
     let dir = setup();
     let wp = wal_path(&dir);
     let p = make_file(
@@ -1314,6 +1322,7 @@ fn test_dal_e_permissive_mode() {
 
 #[test]
 fn test_dal_a_shell_exec_cognitive_safety() {
+    let _guard = ENV_GUARD.lock().unwrap();
     let dir = setup();
     let wp = wal_path(&dir);
 
@@ -1421,6 +1430,9 @@ fn test_run_params_deserialization_empty_object() {
 /// End-to-end Delete: validate → backup → delete → Undo restore.
 #[test]
 fn test_delete_then_undo_roundtrip() {
+    // Serialize env mutation — see ENV_GUARD docs. Isolated WAL/sessions dir
+    // per test (`setup()` + XDG_DATA_HOME) prevents cross-test WAL pollution.
+    let _guard = ENV_GUARD.lock().unwrap();
     let dir = setup();
     let p = make_file(&dir, "lockfile", "stale tpu lock");
 
@@ -1584,6 +1596,7 @@ fn test_backup_created_event_emitted_for_delete() {
     // Delete takes structured path args (executor skips the cognitive-safety check)
     // and still creates a pre-delete backup, so it verifies the emission without
     // tripping the llmosafe guard on natural-language content.
+    let _guard = ENV_GUARD.lock().unwrap();
     let dir = setup();
     let wp = wal_path(&dir);
     let target = make_file(&dir, "bak.txt", "original content to be deleted");

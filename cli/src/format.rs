@@ -9,6 +9,204 @@
 
 #![allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
 
+use std::fmt::Write;
+
+/// Render a table with headers and rows in the given style.
+///
+/// `headers` and each row's cells are rendered in four styles:
+/// - `plain`: fixed-width columns padded with spaces, header separator line.
+/// - `markdown`: GitHub Flavored Markdown `| header |` with `| --- |` separator.
+/// - `box`: ASCII box `+---+` borders.
+/// - `csv`: comma-separated with quoting for cells containing `,`, `"`, or newline.
+///
+/// Unknown style falls back to `plain`.
+///
+/// # Parameters
+/// - `headers`: column headers
+/// - `rows`: table body, each inner `Vec<String>` is a row
+/// - `style`: one of `plain`|`markdown`|`box`|`csv` (case-insensitive)
+///
+/// # Returns
+/// Rendered table string; empty when both headers and rows are empty.
+#[must_use]
+pub fn format_table(headers: &[&str], rows: &[Vec<String>], style: &str) -> String {
+    if headers.is_empty() && rows.is_empty() {
+        return String::new();
+    }
+    match style.to_lowercase().as_str() {
+        "markdown" => format_table_markdown(headers, rows),
+        "box" => format_table_box(headers, rows),
+        "csv" => format_table_csv(headers, rows),
+        _ => format_table_plain(headers, rows),
+    }
+}
+
+/// Plain table: padded columns, header separator.
+fn format_table_plain(headers: &[&str], rows: &[Vec<String>]) -> String {
+    let cols = headers.len();
+    if cols == 0 {
+        return rows
+            .iter()
+            .map(|r| r.join("  "))
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate().take(cols) {
+            if i < widths.len() && cell.len() > widths[i] {
+                widths[i] = cell.len();
+            }
+        }
+    }
+    let mut out = String::new();
+    // Header
+    for (i, h) in headers.iter().enumerate() {
+        if i > 0 {
+            out.push_str("  ");
+        }
+        let w = widths.get(i).copied().unwrap_or(0);
+        let _ = write!(out, "{h:<w$}", w = w);
+    }
+    out.push('\n');
+    // Separator
+    for (i, w) in widths.iter().enumerate() {
+        if i > 0 {
+            out.push_str("  ");
+        }
+        out.push_str(&"-".repeat(*w));
+    }
+    if !rows.is_empty() {
+        out.push('\n');
+    }
+    for (ri, row) in rows.iter().enumerate() {
+        for i in 0..cols {
+            if i > 0 {
+                out.push_str("  ");
+            }
+            let cell = row.get(i).map_or("", String::as_str);
+            let w = widths.get(i).copied().unwrap_or(0);
+            let _ = write!(out, "{cell:<w$}", w = w);
+        }
+        if ri + 1 < rows.len() {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Markdown table: `| h |` / `| --- |` / `| c |`.
+fn format_table_markdown(headers: &[&str], rows: &[Vec<String>]) -> String {
+    if headers.is_empty() {
+        return rows
+            .iter()
+            .map(|r| format!("| {} |", r.join(" | ")))
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    let mut out = String::new();
+    let _ = write!(out, "| {} |", headers.join(" | "));
+    out.push('\n');
+    let _ = write!(
+        out,
+        "| {} |",
+        headers
+            .iter()
+            .map(|_| "---")
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
+    for row in rows {
+        out.push('\n');
+        let cells: Vec<String> = (0..headers.len())
+            .map(|i| row.get(i).cloned().unwrap_or_default())
+            .collect();
+        let _ = write!(out, "| {} |", cells.join(" | "));
+    }
+    out
+}
+
+/// Box table: `+---+` borders with `| cell |`.
+fn format_table_box(headers: &[&str], rows: &[Vec<String>]) -> String {
+    let cols = headers.len();
+    if cols == 0 {
+        return String::new();
+    }
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate().take(cols) {
+            if i < widths.len() && cell.len() > widths[i] {
+                widths[i] = cell.len();
+            }
+        }
+    }
+    let border = {
+        let mut b = String::from("+");
+        for w in &widths {
+            b.push_str(&"-".repeat(w + 2));
+            b.push('+');
+        }
+        b
+    };
+    let mut out = String::new();
+    out.push_str(&border);
+    out.push('\n');
+    // Header row
+    out.push('|');
+    for (i, h) in headers.iter().enumerate() {
+        let w = widths.get(i).copied().unwrap_or(0);
+        let _ = write!(out, " {h:<w$} |", w = w);
+    }
+    out.push('\n');
+    out.push_str(&border);
+    out.push('\n');
+    for row in rows {
+        out.push('|');
+        for i in 0..cols {
+            let cell = row.get(i).map_or("", String::as_str);
+            let w = widths.get(i).copied().unwrap_or(0);
+            let _ = write!(out, " {cell:<w$} |", w = w);
+        }
+        out.push('\n');
+    }
+    out.push_str(&border);
+    out
+}
+
+/// CSV table: comma-separated, quoted when needed.
+fn format_table_csv(headers: &[&str], rows: &[Vec<String>]) -> String {
+    let mut out = String::new();
+    if !headers.is_empty() {
+        out.push_str(
+            &headers
+                .iter()
+                .map(|h| csv_escape(h))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        if !rows.is_empty() {
+            out.push('\n');
+        }
+    }
+    for (ri, row) in rows.iter().enumerate() {
+        let cells: Vec<String> = row.iter().map(|c| csv_escape(c)).collect();
+        out.push_str(&cells.join(","));
+        if ri + 1 < rows.len() {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn csv_escape(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\n') {
+        let escaped = s.replace('"', "\"\"");
+        format!("\"{escaped}\"")
+    } else {
+        s.to_string()
+    }
+}
+
 /// Convert raw wall-of-text into Markdown.
 ///
 /// Detects headings (all-caps lines, `Title:` patterns), bullet/numbered

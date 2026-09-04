@@ -192,6 +192,29 @@ pub enum WalEventType {
     BackupCreated,
 }
 
+impl WalEventType {
+    /// Returns the wire string for this event type (snake_case).
+    ///
+    /// Matches the `#[serde(rename_all = "snake_case")]` representation so
+    /// logs and JSON stay consistent without using `Debug`.
+    ///
+    /// # Returns
+    /// Static string like `"job_started"` or `"job_completed"`.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::JobSubmitted => "job_submitted",
+            Self::JobValidated => "job_validated",
+            Self::JobStarted => "job_started",
+            Self::JobCompleted => "job_completed",
+            Self::JobFailed => "job_failed",
+            Self::JobRolledBack => "job_rolled_back",
+            Self::CommandExecuted => "command_executed",
+            Self::BackupCreated => "backup_created",
+        }
+    }
+}
+
 /// Append-only WAL writer.
 ///
 /// Opens (or creates) a file in append mode and writes one JSONL line per

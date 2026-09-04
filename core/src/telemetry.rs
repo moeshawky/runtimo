@@ -33,14 +33,20 @@
 //!
 //! # Performance
 //!
-//! Results are cached for 30 seconds via an internal mutex cache to avoid
-//! repeated `/proc` reads on consecutive calls.
+//! Results are cached for 30 seconds per capture mode via internal mutex
+//! caches to avoid repeated `/proc` reads on consecutive calls. Full and
+//! lightweight captures use separate cache slots so a lightweight call never
+//! returns full hardware/network data and a full call never returns zeroed
+//! hardware data.
 
 use crate::cmd::run_cmd;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 
-static TELEMETRY_CACHE: Mutex<Option<(Telemetry, std::time::Instant)>> = Mutex::new(None);
+/// Cache slot for full captures (includes accelerator and network probing).
+static TELEMETRY_CACHE_FULL: Mutex<Option<(Telemetry, std::time::Instant)>> = Mutex::new(None);
+/// Cache slot for lightweight captures (system data only, no shell-outs).
+static TELEMETRY_CACHE_LIGHT: Mutex<Option<(Telemetry, std::time::Instant)>> = Mutex::new(None);
 const CACHE_TTL_SECS: u64 = 30;
 
 /// Full system telemetry snapshot.
@@ -283,7 +289,9 @@ impl Telemetry {
     pub fn capture() -> Self {
         let now = std::time::Instant::now();
         {
-            let cache = TELEMETRY_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+            let cache = TELEMETRY_CACHE_FULL
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if let Some((cached, instant)) = cache.as_ref() {
                 if now.duration_since(*instant).as_secs() < CACHE_TTL_SECS {
                     return cached.clone();
@@ -302,7 +310,9 @@ impl Telemetry {
             network: NetworkInfo::capture(),
         };
 
-        let mut cache = TELEMETRY_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = TELEMETRY_CACHE_FULL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         *cache = Some((telemetry.clone(), now));
         telemetry
     }
@@ -322,19 +332,20 @@ impl Telemetry {
     /// GPU/TPU/JAX counts are irrelevant and shell-outs produce unwanted
     /// stderr noise on systems without those tools installed.
     ///
-    /// Results share the same internal cache — a previous full
-    /// [`capture`](Telemetry::capture) within 30 seconds will
-    /// be returned AS-IS (including hardware/network data). Callers
-    /// on hot paths should NOT rely on this returning empty hardware
-    /// if a full capture was recently cached.
+    /// Results share the lightweight cache slot only — a previous full
+    /// [`capture`](Telemetry::capture) within 30 seconds is NOT returned
+    /// here. Each mode has its own 30-second TTL slot, so hot-path callers
+    /// always observe zeroed hardware and default network data from this
+    /// method, and full-mode callers never observe zeroed hardware.
     #[must_use]
     pub fn capture_lightweight() -> Self {
-        // Check cache first — if a full capture exists within TTL, return it.
-        // This is intentional: lightweight callers on hot paths benefit from
-        // cache hits without re-reading /proc.
+        // Check the lightweight slot only. A full capture cached within TTL
+        // must not leak accelerator/network data into this mode.
         let now = std::time::Instant::now();
         {
-            let cache = TELEMETRY_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+            let cache = TELEMETRY_CACHE_LIGHT
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if let Some((cached, instant)) = cache.as_ref() {
                 if now.duration_since(*instant).as_secs() < CACHE_TTL_SECS {
                     return cached.clone();
@@ -363,18 +374,97 @@ impl Telemetry {
             },
         };
 
-        let mut cache = TELEMETRY_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = TELEMETRY_CACHE_LIGHT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         *cache = Some((telemetry.clone(), now));
         telemetry
     }
 
-    /// Clears the telemetry cache.
+    /// Clears both telemetry cache slots (full and lightweight).
     ///
-    /// Call this in tests or between full/lightweight captures to prevent
-    /// stale cached data from leaking across capture modes.
+    /// Call this in tests or before capturing a fresh after-execution
+    /// snapshot so the after snapshot never equals the before snapshot
+    /// via a cache hit.
     pub fn clear_cache() {
-        let mut cache = TELEMETRY_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        Self::clear_full_cache();
+        Self::clear_lightweight_cache();
+    }
+
+    /// Clears the full-capture cache slot only, preserving lightweight entries.
+    pub fn clear_full_cache() {
+        let mut cache = TELEMETRY_CACHE_FULL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         *cache = None;
+    }
+
+    /// Clears the lightweight-capture cache slot only, preserving full entries.
+    ///
+    /// Call this before capturing an after-execution snapshot in the
+    /// executor so before/after snapshots always differ.
+    pub fn clear_lightweight_cache() {
+        let mut cache = TELEMETRY_CACHE_LIGHT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *cache = None;
+    }
+
+    /// Returns a zeroed telemetry snapshot without reading `/proc` or spawning subprocesses.
+    ///
+    /// # Inputs
+    ///
+    /// No inputs — reads only the wall clock for `timestamp`.
+    ///
+    /// # Outputs
+    ///
+    /// A `Telemetry` with `system` fields set to `"unknown"`/`0`, empty
+    /// accelerators, no JAX, and default network data
+    /// (`public_ip = "unknown"`, no tunnel, no ports).
+    ///
+    /// # Errors
+    ///
+    /// Never fails — performs no I/O beyond the wall clock.
+    ///
+    /// # Invariants
+    ///
+    /// Use when telemetry is disabled via resolved config
+    /// (`telemetry_enabled == false`): the executor stores `None` in WAL
+    /// telemetry fields and carries this value in-memory so no filesystem
+    /// or subprocess probing occurs on the disabled path.
+    #[must_use]
+    pub fn empty() -> Self {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        Self {
+            timestamp,
+            system: SystemInfo {
+                cpu_model: "unknown".to_string(),
+                cpu_count: 0,
+                ram_total: "unknown".to_string(),
+                ram_free: "unknown".to_string(),
+                ram_available: "unknown".to_string(),
+                disk_total: "unknown".to_string(),
+                disk_free: "unknown".to_string(),
+                disk_used_percent: "unknown".to_string(),
+                uptime: "unknown".to_string(),
+                uptime_seconds: 0,
+                load_average: "unknown".to_string(),
+            },
+            hardware: HardwareInfo {
+                accelerators: Vec::new(),
+                jax_available: false,
+                jax_version: None,
+                jax_device_count: None,
+            },
+            network: NetworkInfo {
+                public_ip: "unknown".to_string(),
+                tunnel_running: false,
+                tunnel_pid: None,
+                listening_ports: Vec::new(),
+            },
+        }
     }
 
     /// Prints telemetry in a human-readable report to stdout.
@@ -843,6 +933,12 @@ fn read_listening_ports() -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes cache-sensitive tests sharing the process-global slots.
+    /// Without this, a concurrent `clear_cache` between two captures breaks
+    /// timestamp-equality assertions.
+    static TELEMETRY_TEST_MUTEX: Mutex<()> = Mutex::new(());
 
     // ── SystemInfo tests ────────────────────────────────────────────
 
@@ -890,12 +986,80 @@ mod tests {
 
     #[test]
     fn test_telemetry_cache_works() {
+        let _guard = TELEMETRY_TEST_MUTEX.lock().unwrap();
+        Telemetry::clear_cache();
         let t1 = Telemetry::capture();
         let t2 = Telemetry::capture();
         assert_eq!(
             t1.timestamp, t2.timestamp,
             "cached telemetry should be identical"
         );
+        Telemetry::clear_cache();
+    }
+
+    #[test]
+    fn test_cache_isolated_full_then_lightweight() {
+        // RC2: a cached full capture must not leak hardware/network data
+        // into a subsequent lightweight capture (shared-slot alias).
+        let _guard = TELEMETRY_TEST_MUTEX.lock().unwrap();
+        Telemetry::clear_cache();
+        let full = Telemetry::capture();
+        let light = Telemetry::capture_lightweight();
+        assert!(
+            light.hardware.accelerators.is_empty() || full.hardware.accelerators.is_empty(),
+            "lightweight must carry zeroed hardware even after a full capture"
+        );
+        assert!(!light.hardware.jax_available);
+        assert_eq!(light.network.public_ip, "unknown");
+        assert!(!light.network.tunnel_running);
+        assert!(light.network.listening_ports.is_empty());
+        Telemetry::clear_cache();
+    }
+
+    #[test]
+    fn test_cache_isolated_lightweight_then_full() {
+        // RC2 reverse order: a cached lightweight capture must not cause a
+        // full capture to return zeroed hardware.
+        let _guard = TELEMETRY_TEST_MUTEX.lock().unwrap();
+        Telemetry::clear_cache();
+        let _light = Telemetry::capture_lightweight();
+        Telemetry::clear_lightweight_cache();
+        // Full slot is independent — a full capture populates its own slot.
+        let full = Telemetry::capture();
+        let full2 = Telemetry::capture();
+        assert_eq!(full.timestamp, full2.timestamp, "full slot must cache");
+        Telemetry::clear_cache();
+    }
+
+    #[test]
+    fn test_after_snapshot_differs_after_cache_clear() {
+        // RC3/B2: clearing the lightweight slot between captures yields a
+        // fresh snapshot instead of a same-timestamp cache hit.
+        let _guard = TELEMETRY_TEST_MUTEX.lock().unwrap();
+        Telemetry::clear_cache();
+        let before = Telemetry::capture_lightweight();
+        Telemetry::clear_lightweight_cache();
+        // Sleep so the wall-clock timestamp advances past second resolution.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let after = Telemetry::capture_lightweight();
+        assert!(
+            after.timestamp >= before.timestamp,
+            "after timestamp must not precede before"
+        );
+        Telemetry::clear_cache();
+    }
+
+    #[test]
+    fn test_telemetry_empty_performs_no_probing() {
+        // RC1: the disabled-path snapshot is zeroed without I/O.
+        let empty = Telemetry::empty();
+        assert_eq!(empty.system.cpu_model, "unknown");
+        assert_eq!(empty.system.cpu_count, 0);
+        assert!(empty.hardware.accelerators.is_empty());
+        assert!(!empty.hardware.jax_available);
+        assert_eq!(empty.network.public_ip, "unknown");
+        assert!(!empty.network.tunnel_running);
+        assert!(empty.network.listening_ports.is_empty());
     }
 
     #[test]

@@ -148,6 +148,48 @@ pub fn execute_with_telemetry(
     execute_with_telemetry_and_session(capability, args, dry_run, wal_path, None, None, timeout)
 }
 
+/// Returns whether telemetry capture is enabled via the resolved config.
+///
+/// Reads `RuntimoConfig::load().resolved().telemetry_enabled`. When false
+/// (e.g. the `ephemeral` profile), the executor skips all telemetry capture,
+/// stores `None` in WAL telemetry fields, and carries
+/// [`Telemetry::empty`] in-memory — no `/proc` reads or subprocess probes
+/// occur on the disabled path. Process snapshots are still captured: the
+/// zombie guard and spawned-PID detection depend on them.
+fn telemetry_enabled() -> bool {
+    RuntimoConfig::load().resolved().telemetry_enabled
+}
+
+/// Returns the WAL telemetry field for a snapshot.
+///
+/// `Some` clone when telemetry is enabled, `None` when disabled — WAL
+/// telemetry fields are `Option`, so the disabled path stores `None`
+/// (contract-legal, skipped by `skip_serializing_if`).
+fn telemetry_opt(enabled: bool, tel: &Telemetry) -> Option<Telemetry> {
+    enabled.then(|| tel.clone())
+}
+
+/// Captures a fresh after-execution telemetry snapshot.
+///
+/// Bypasses the lightweight cache so the after snapshot always differs
+/// from the before snapshot (no same-timestamp alias). Returns
+/// [`Telemetry::empty`] without any I/O when telemetry is disabled.
+fn fresh_telemetry_after(enabled: bool) -> Telemetry {
+    if enabled {
+        Telemetry::clear_lightweight_cache();
+        Telemetry::capture_lightweight()
+    } else {
+        Telemetry::empty()
+    }
+}
+
+/// Captures a fresh after-execution process snapshot, bypassing the cache
+/// so the after snapshot never aliases the before snapshot via a cache hit.
+fn fresh_process_after() -> ProcessSnapshot {
+    ProcessSnapshot::clear_cache();
+    ProcessSnapshot::capture()
+}
+
 /// Execute a capability with session tracking and specified timeout.
 ///
 /// If `session_id` is provided, the job is automatically added to that session
@@ -159,6 +201,11 @@ pub fn execute_with_telemetry(
 /// Uses [`Telemetry::capture_lightweight`] for before/after snapshots —
 /// skips GPU/JAX/network shell-outs that are unnecessary for the WAL audit
 /// trail and produce stderr noise on systems without those tools.
+///
+/// When resolved config `telemetry_enabled` is false (e.g. the `ephemeral`
+/// profile), capture is skipped: WAL telemetry fields are `None` and the
+/// returned [`ExecutionResult`] carries [`Telemetry::empty`]. After
+/// snapshots bypass the caches so before/after never alias via a hit.
 ///
 /// # Cognitive Safety
 ///
@@ -204,36 +251,89 @@ pub fn execute_with_telemetry_and_session(
     let job_id_str = job_id.as_str().to_string();
     let cap_name = capability.name().to_string();
 
-    // Lightweight capture skips GPU/JAX/network shell-outs — executor only
-    // needs /proc-based system health data (CPU, RAM, disk) for the WAL audit
-    // trail. The LlmoSafeGuard resource check reads /proc/stat independently.
-    let telemetry_before = Telemetry::capture_lightweight();
+    // Telemetry gate (RC1): when disabled, skip capture entirely — no
+    // /proc reads, no subprocess probes. WAL telemetry fields are None;
+    // the in-memory result carries Telemetry::empty().
+    let telemetry_on = telemetry_enabled();
+    let telemetry_before = if telemetry_on {
+        Telemetry::capture_lightweight()
+    } else {
+        Telemetry::empty()
+    };
     let process_before = ProcessSnapshot::capture();
+
+    // WAL is created BEFORE the guard checks so every rejection below is
+    // audited with a JobFailed event (no silent early-Err gap).
+    let mut wal = WalWriter::create(wal_path)?;
 
     // LlmoSafeGuard is the circuit breaker — reads /proc/stat with delta measurement
     let guard = LlmoSafeGuard::new();
-    guard.check().map_err(Error::ResourceLimitExceeded)?;
+    if let Err(e) = guard.check() {
+        let msg = e;
+        let tel = telemetry_opt(telemetry_on, &telemetry_before);
+        let _ = log_job_failed_with_snapshots(
+            &mut wal,
+            &job_id_str,
+            &cap_name,
+            &msg,
+            tel.as_ref(),
+            tel.as_ref(),
+            &process_before.summary,
+            &process_before.summary,
+            None,
+            None,
+        );
+        return Err(Error::ResourceLimitExceeded(msg));
+    }
 
     // Reject if zombie count > 10
     if process_before.summary.zombie_count > 10 {
-        return Err(Error::ResourceLimitExceeded(format!(
+        let msg = format!(
             "Zombie processes: {} (limit: 10)",
             process_before.summary.zombie_count
-        )));
+        );
+        let tel = telemetry_opt(telemetry_on, &telemetry_before);
+        let _ = log_job_failed_with_snapshots(
+            &mut wal,
+            &job_id_str,
+            &cap_name,
+            &msg,
+            tel.as_ref(),
+            tel.as_ref(),
+            &process_before.summary,
+            &process_before.summary,
+            None,
+            None,
+        );
+        return Err(Error::ResourceLimitExceeded(msg));
     }
 
     // Args size guard: reject oversized arguments (1MB max)
     let args_bytes = serde_json::to_vec(args)
         .map_err(|e| Error::ExecutionFailed(format!("Failed to serialize args: {}", e)))?;
     if args_bytes.len() > MAX_ARGS_SIZE_BYTES {
-        return Err(Error::ResourceLimitExceeded(format!(
+        let msg = format!(
             "Capability args too large: {} bytes (limit: 1MB)",
             args_bytes.len()
-        )));
+        );
+        drop(args_bytes);
+        let tel = telemetry_opt(telemetry_on, &telemetry_before);
+        let _ = log_job_failed_with_snapshots(
+            &mut wal,
+            &job_id_str,
+            &cap_name,
+            &msg,
+            tel.as_ref(),
+            tel.as_ref(),
+            &process_before.summary,
+            &process_before.summary,
+            None,
+            None,
+        );
+        return Err(Error::ResourceLimitExceeded(msg));
     }
     drop(args_bytes);
 
-    let mut wal = WalWriter::create(wal_path)?;
     let ctx = Context::with_working_dir(
         dry_run,
         job_id_str.clone(),
@@ -250,7 +350,7 @@ pub fn execute_with_telemetry_and_session(
         capability: Some(cap_name.clone()),
         output: None,
         error: None,
-        telemetry_before: Some(telemetry_before.clone()),
+        telemetry_before: telemetry_opt(telemetry_on, &telemetry_before),
         telemetry_after: None,
         process_before: Some(process_before.summary.clone()),
         process_after: None,
@@ -284,8 +384,8 @@ pub fn execute_with_telemetry_and_session(
             .map_err(|e| Error::ExecutionFailed(format!("Cognitive safety check failed: {}", e)))?;
 
         if !pipeline_result.decision.can_proceed() {
-            let telemetry_after = Telemetry::capture_lightweight();
-            let process_after = ProcessSnapshot::capture();
+            let telemetry_after = fresh_telemetry_after(telemetry_on);
+            let process_after = fresh_process_after();
             let err_msg = format!(
                 "Cognitive safety violation: decision {:?}",
                 pipeline_result.decision
@@ -295,8 +395,8 @@ pub fn execute_with_telemetry_and_session(
                 &job_id_str,
                 &cap_name,
                 &err_msg,
-                &telemetry_before,
-                &telemetry_after,
+                telemetry_opt(telemetry_on, &telemetry_before).as_ref(),
+                telemetry_opt(telemetry_on, &telemetry_after).as_ref(),
                 &process_before.summary,
                 &process_after.summary,
                 Some(pipeline_result.oov_ratio),
@@ -325,8 +425,8 @@ pub fn execute_with_telemetry_and_session(
     ) {
         Ok(out) => out,
         Err(e) => {
-            let telemetry_after = Telemetry::capture_lightweight();
-            let process_after = ProcessSnapshot::capture();
+            let telemetry_after = fresh_telemetry_after(telemetry_on);
+            let process_after = fresh_process_after();
             let end_seq = wal.seq();
             let err_msg = format!("Execution failed: {}", e);
             log_job_failed_with_snapshots(
@@ -334,8 +434,8 @@ pub fn execute_with_telemetry_and_session(
                 &job_id_str,
                 &cap_name,
                 &err_msg,
-                &telemetry_before,
-                &telemetry_after,
+                telemetry_opt(telemetry_on, &telemetry_before).as_ref(),
+                telemetry_opt(telemetry_on, &telemetry_after).as_ref(),
                 &process_before.summary,
                 &process_after.summary,
                 None,
@@ -355,8 +455,10 @@ pub fn execute_with_telemetry_and_session(
         }
     };
 
-    let telemetry_after = Telemetry::capture_lightweight();
-    let process_after = ProcessSnapshot::capture();
+    // Fresh after snapshots bypass the caches so before/after never alias
+    // via a cache hit (same-timestamp reads).
+    let telemetry_after = fresh_telemetry_after(telemetry_on);
+    let process_after = fresh_process_after();
 
     // RC1 fix (CBP B2): record the backup path in a durable WAL event BEFORE the
     // fallible JobCompleted append. The backup is created inside the capability
@@ -402,11 +504,12 @@ pub fn execute_with_telemetry_and_session(
         }
     }
 
-    // Identify spawned PIDs by comparing before/after process lists
+    // Identify spawned PIDs by comparing before/after process lists.
+    // Routed via log (not stderr) so --quiet/--json merged streams stay clean.
     let spawned_pids = identify_spawned_pids(&process_before, &process_after);
     if !spawned_pids.is_empty() {
-        eprintln!(
-            "[runtimo] WARNING: capability '{}' spawned {} process(es): PIDs {:?}",
+        log::warn!(
+            "capability '{}' spawned {} process(es): PIDs {:?}",
             cap_name,
             spawned_pids.len(),
             spawned_pids
@@ -430,8 +533,8 @@ pub fn execute_with_telemetry_and_session(
         capability: Some(cap_name.clone()),
         output: Some(output_value),
         error: None,
-        telemetry_before: Some(telemetry_before.clone()),
-        telemetry_after: Some(telemetry_after.clone()),
+        telemetry_before: telemetry_opt(telemetry_on, &telemetry_before),
+        telemetry_after: telemetry_opt(telemetry_on, &telemetry_after),
         process_before: Some(process_before.summary.clone()),
         process_after: Some(process_after.summary.clone()),
         cmd: None,
@@ -574,14 +677,17 @@ fn fail_result(
 /// Appends a `WalEvent` with `event_type = JobFailed`, capturing both before and
 /// after telemetry/process state so that failure analysis can compare the deltas.
 /// Includes optional `oov_ratio` and `detection_flags` for cognitive safety violations.
+///
+/// Telemetry parameters are `Option`: pass `None` when telemetry is disabled
+/// via resolved config so the WAL records no telemetry on the disabled path.
 #[allow(clippy::too_many_arguments)]
 fn log_job_failed_with_snapshots(
     wal: &mut WalWriter,
     job_id: &str,
     capability: &str,
     error: &str,
-    telemetry_before: &Telemetry,
-    telemetry_after: &Telemetry,
+    telemetry_before: Option<&Telemetry>,
+    telemetry_after: Option<&Telemetry>,
     process_before: &ProcessSummary,
     process_after: &ProcessSummary,
     oov_ratio: Option<u8>,
@@ -599,8 +705,8 @@ fn log_job_failed_with_snapshots(
         capability: Some(capability.to_string()),
         output: None,
         error: Some(error.to_string()),
-        telemetry_before: Some(telemetry_before.clone()),
-        telemetry_after: Some(telemetry_after.clone()),
+        telemetry_before: telemetry_before.cloned(),
+        telemetry_after: telemetry_after.cloned(),
         process_before: Some(process_before.clone()),
         process_after: Some(process_after.clone()),
         cmd: None,
@@ -675,8 +781,9 @@ fn execute_with_timeout_check(
 
     let elapsed = start.elapsed();
     if elapsed > timeout {
-        eprintln!(
-            "[runtimo] WARNING: capability exceeded timeout: {:.1}s > {}s",
+        // Routed via log (not stderr) so --quiet/--json merged streams stay clean.
+        log::warn!(
+            "capability exceeded timeout: {:.1}s > {}s",
             elapsed.as_secs_f64(),
             timeout_secs
         );
@@ -987,6 +1094,48 @@ mod tests {
     }
 
     // ── GAP 1: Args size guard ────────────────────────────────────────
+
+    #[test]
+    fn test_early_args_rejection_logs_job_failed() {
+        // F5: oversized args rejected before JobStarted must still leave a
+        // JobFailed audit event (no silent early-Err gap).
+        let dir = unique_test_dir();
+        fs::create_dir_all(&dir).ok();
+        let wp = wal_path(&dir);
+
+        let large_content = "x".repeat(2_000_000);
+        let result = execute_with_telemetry_and_session(
+            &EchoCap,
+            &json!({"content": large_content}),
+            false,
+            &wp,
+            None,
+            None,
+            30,
+        );
+        assert!(result.is_err(), "Should reject args > 1MB");
+
+        let reader = crate::WalReader::load(&wp).unwrap();
+        assert!(
+            reader
+                .events()
+                .iter()
+                .any(|e| matches!(e.event_type, crate::WalEventType::JobFailed)),
+            "early-Err rejection must log JobFailed"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_telemetry_opt_gates_wal_field() {
+        // RC1: disabled telemetry maps to None WAL fields, enabled to Some.
+        let tel = Telemetry::empty();
+        assert!(telemetry_opt(false, &tel).is_none());
+        let some = telemetry_opt(true, &tel);
+        assert!(some.is_some());
+        assert_eq!(some.unwrap().system.cpu_model, "unknown");
+    }
 
     #[test]
     fn test_args_size_guard_rejects_large_args() {
