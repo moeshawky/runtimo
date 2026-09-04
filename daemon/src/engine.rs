@@ -91,7 +91,10 @@ impl DaemonState {
 
 /// Routes an incoming JSON-RPC request to the appropriate handler.
 ///
-/// Supported methods: `run`, `dispatch`, `status`, `jobs`, `list`, `logs`.
+/// Supported methods: `run`, `dispatch`, `status`, `jobs`, `list`, `logs`,
+/// plus `observe_start`, `observe_status`, `observe_verify` (and `observe_burst`
+/// deferred with note — P2B file-watch burst is not trivial under 80 lines,
+/// so we surface `observe_burst` as unimplemented with a clear note).
 /// Returns a `JsonRpcResponse` with `error.code = -32601` for unknown methods.
 async fn handle_request(state: &Arc<DaemonState>, req: JsonRpcRequest) -> JsonRpcResponse {
     match req.method.as_str() {
@@ -101,6 +104,17 @@ async fn handle_request(state: &Arc<DaemonState>, req: JsonRpcRequest) -> JsonRp
         "jobs" => handle_jobs(state, req.params, req.id).await,
         "list" => handle_list(state, req.id),
         "logs" => handle_logs(state, req.params, req.id),
+        "observe_start" => handle_observe_start(state, req.params, req.id).await,
+        "observe_status" => handle_observe_status(state, req.params, req.id).await,
+        "observe_verify" => handle_observe_verify(state, req.params, req.id).await,
+        "observe_burst" => JsonRpcResponse {
+            result: None,
+            error: Some(JsonRpcError {
+                code: -32601,
+                message: "observe_burst deferred: P2B file-watch burst not yet implemented (use out-of-process polling; see audit.rs)".into(),
+            }),
+            id: req.id,
+        },
         _ => JsonRpcResponse {
             result: None,
             error: Some(JsonRpcError {
@@ -638,6 +652,259 @@ async fn handle_jobs(state: &Arc<DaemonState>, params: Value, id: Value) -> Json
 
     JsonRpcResponse {
         result: Some(serde_json::json!({ "jobs": jobs_list, "total": jobs_list.len() })),
+        error: None,
+        id,
+    }
+}
+
+// ── Observe handlers ─────────────────────────────────────────────────────
+
+/// Handles `observe_start` — spawns a sibling collector.
+///
+/// Mirrors `handle_run` WAL mutex pattern: validates params, resolves `out`
+/// via `validation::path` (default `data_dir/bundles/<run_id>.jsonl`),
+/// reserves a `BackgroundJob` slot, inserts `running`, and `spawn_blocking`
+/// the `ObserveSupervisor` loop. The target (`pid` or `cmd` sibling) is never
+/// signalled on collector failure — watermark only.
+#[allow(clippy::unused_async)]
+async fn handle_observe_start(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonRpcResponse {
+    use crate::rpc::ObserveStartParams;
+    let p: ObserveStartParams = match serde_json::from_value(params) {
+        Ok(v) => v,
+        Err(e) => {
+            return JsonRpcResponse {
+                result: None,
+                error: Some(JsonRpcError { code: -32602, message: format!("Invalid params: {e}") }),
+                id,
+            }
+        }
+    };
+
+    // Resolve out path: validated via allowed prefixes + data_dir.
+    let run_id = p.run_id.unwrap_or_else(runtimo_core::utils::generate_id);
+    let dal = p.dal.unwrap_or_else(runtimo_core::RuntimoConfig::get_dal);
+    let hz = p.sample_rate_hz.unwrap_or_else(|| runtimo_core::RuntimoConfig::load().effective_observe_sample_hz(None));
+    // P2B burst (file-watch) is deferred — acknowledge but do not implement under 80-line budget.
+    if p.burst.unwrap_or(false) {
+        eprintln!("[runtimo] note: observe burst (P2B bundle-path watch) deferred — using polling");
+    }
+
+    let out_path = if let Some(out) = p.out {
+        let mut allowed = runtimo_core::RuntimoConfig::get_allowed_prefixes();
+        allowed.push(runtimo_core::utils::data_dir().to_string_lossy().to_string());
+        let ctx = runtimo_core::validation::path::PathContext {
+            allowed_prefixes: allowed,
+            require_exists: false,
+            require_file: false,
+        };
+        match runtimo_core::validation::path::validate_path(&out, &ctx) {
+            Ok(valid) => valid,
+            Err(e) => {
+                return JsonRpcResponse {
+                    result: None,
+                    error: Some(JsonRpcError { code: -32602, message: format!("Invalid out path: {e}") }),
+                    id,
+                }
+            }
+        }
+    } else {
+        runtimo_core::observe::bundle_path(&run_id)
+    };
+
+    // Resolve target pid: explicit pid or spawn cmd as sibling.
+    let target_pid: Option<u32> = if let Some(pid) = p.pid {
+        Some(pid)
+    } else if let Some(ref cmd) = p.cmd {
+        // Spawn as sibling (not child of collector) — parent is daemon.
+        match std::process::Command::new("sh").arg("-c").arg(cmd).spawn() {
+            Ok(child) => Some(child.id()),
+            Err(e) => {
+                return JsonRpcResponse {
+                    result: None,
+                    error: Some(JsonRpcError { code: -32000, message: format!("Failed to spawn target cmd: {e}") }),
+                    id,
+                }
+            }
+        }
+    } else {
+        None
+    };
+
+    if !state.bg_jobs.try_reserve() {
+        return JsonRpcResponse {
+            result: None,
+            error: Some(JsonRpcError { code: -32000, message: format!("too many concurrent jobs (max {})", MAX_CONCURRENT_JOBS) }),
+            id,
+        }
+    }
+
+    let job_id = run_id.clone();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    state.bg_jobs.insert(BackgroundJob {
+        job_id: job_id.clone(),
+        capability: "Observe".into(),
+        status: "running".into(),
+        started_at: now,
+        finished_at: None,
+        result: None,
+    });
+
+    let state_arc = Arc::clone(state);
+    let jid = job_id.clone();
+    let out_clone = out_path.clone();
+    let dal_clone = dal.clone();
+
+    // Reuse BackgroundJob spawn pattern: spawn_blocking with WAL mutex discipline.
+    tokio::task::spawn_blocking(move || {
+        let _wal_guard = state_arc.wal_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut sup = runtimo_core::observe::ObserveSupervisor::new_at_path(&jid, hz, &dal_clone, Some(out_clone.clone()))
+                .map_err(|e| format!("supervisor create: {e}"))?;
+            if let Some(pid) = target_pid {
+                sup.attach(pid);
+            }
+            // Short collection window (2s or 100 ticks) — sibling; target never signalled.
+            let interval = sup.sampler_interval();
+            #[allow(clippy::arithmetic_side_effects)]
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let mut ticks = 0;
+            while std::time::Instant::now() < deadline && ticks < 100 {
+                let _ = sup.gated_tick();
+                std::thread::sleep(interval.min(std::time::Duration::from_millis(20)));
+                #[allow(clippy::arithmetic_side_effects)]
+                {
+                    ticks += 1;
+                }
+            }
+            sup.finalize().map_err(|e| format!("finalize: {e}"))?;
+            Ok::<_, String>(sup.watermark().clone())
+        }));
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let (status, msg) = match &result {
+            Ok(Ok(_wm)) => ("completed", None),
+            Ok(Err(e)) => ("failed", Some(e.clone())),
+            Err(_) => ("failed", Some("collector panic".to_string())),
+        };
+        state_arc.bg_jobs.update(&jid, status, msg, now);
+        state_arc.bg_jobs.release();
+    });
+
+    JsonRpcResponse {
+        result: Some(serde_json::json!({
+            "dispatched": true,
+            "run_id": run_id,
+            "job_id": job_id,
+            "bundle": out_path.display().to_string(),
+            "dal": dal,
+            "sample_rate_hz": hz,
+        })),
+        error: None,
+        id,
+    }
+}
+
+/// Handles `observe_status` — queries observe jobs (bg registry + WAL fallback).
+#[allow(clippy::unused_async)]
+async fn handle_observe_status(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonRpcResponse {
+    use crate::rpc::ObserveStatusParams;
+    let p: ObserveStatusParams = match serde_json::from_value(params) {
+        Ok(v) => v,
+        Err(e) => {
+            return JsonRpcResponse {
+                result: None,
+                error: Some(JsonRpcError { code: -32602, message: format!("Invalid params: {e}") }),
+                id,
+            }
+        }
+    };
+    if let Some(ref rid) = p.run_id {
+        if let Some(bg) = state.bg_jobs.get(rid) {
+            return JsonRpcResponse {
+                result: Some(serde_json::json!({
+                    "run_id": bg.job_id,
+                    "status": bg.status,
+                    "started_at": bg.started_at,
+                    "result": bg.result,
+                })),
+                error: None,
+                id,
+            };
+        }
+        // WAL fallback: look for ObserveStarted/Completed events for this run_id.
+        if let Ok(reader) = WalReader::load_all(&state.wal_path) {
+            let events = reader.events();
+            let started = events.iter().find(|e| e.job_id == *rid && matches!(e.event_type, WalEventType::ObserveStarted));
+            let completed = events.iter().find(|e| e.job_id == *rid && matches!(e.event_type, WalEventType::ObserveCompleted));
+            if let Some(s) = started {
+                let status = if completed.is_some() { "completed" } else { "unknown" };
+                return JsonRpcResponse {
+                    result: Some(serde_json::json!({ "run_id": rid, "status": status, "started_at": s.ts })),
+                    error: None,
+                    id,
+                };
+            }
+        }
+        return JsonRpcResponse {
+            result: None,
+            error: Some(JsonRpcError { code: -32602, message: format!("observe run not found: {rid}") }),
+            id,
+        };
+    }
+    // List recent observe jobs (registry + WAL).
+    let mut list: Vec<Value> = Vec::new();
+    for bg in state.bg_jobs.list(p.limit) {
+        if bg.capability == "Observe" {
+            list.push(serde_json::json!({ "run_id": bg.job_id, "status": bg.status, "started_at": bg.started_at }));
+        }
+    }
+    JsonRpcResponse {
+        result: Some(serde_json::json!({ "observe_jobs": list, "total": list.len() })),
+        error: None,
+        id,
+    }
+}
+
+/// Handles `observe_verify` — offline bundle verification.
+///
+/// Calls `bundle::verify_bundle` synchronously (no WAL mutex needed — read-only).
+#[allow(clippy::unused_async)]
+async fn handle_observe_verify(_state: &Arc<DaemonState>, params: Value, id: Value) -> JsonRpcResponse {
+    use crate::rpc::ObserveVerifyParams;
+    let p: ObserveVerifyParams = match serde_json::from_value(params) {
+        Ok(v) => v,
+        Err(e) => {
+            return JsonRpcResponse {
+                result: None,
+                error: Some(JsonRpcError { code: -32602, message: format!("Invalid params: {e}") }),
+                id,
+            }
+        }
+    };
+    let path = PathBuf::from(&p.path);
+    // Validate path is inside allowed prefixes or data_dir.
+    let mut allowed = runtimo_core::RuntimoConfig::get_allowed_prefixes();
+    allowed.push(runtimo_core::utils::data_dir().to_string_lossy().to_string());
+    let ctx = runtimo_core::validation::path::PathContext {
+        allowed_prefixes: allowed,
+        require_exists: true,
+        require_file: true,
+    };
+    if let Err(e) = runtimo_core::validation::path::validate_path(&p.path, &ctx) {
+        return JsonRpcResponse {
+            result: None,
+            error: Some(JsonRpcError { code: -32602, message: format!("Invalid bundle path: {e}") }),
+            id,
+        }
+    }
+    let v = runtimo_core::observe::verify_bundle(&path);
+    JsonRpcResponse {
+        result: Some(serde_json::json!({
+            "path": p.path,
+            "total": v.total,
+            "truncated_gaps": v.truncated_gaps,
+            "hash_ok": v.hash_ok,
+            "error": v.error,
+        })),
         error: None,
         id,
     }

@@ -271,6 +271,57 @@ Supported fields:\n\
         #[command(subcommand)]
         command: SessionCommand,
     },
+    /// Observe — low-overhead sampling without modifying the target
+    ///
+    /// Sampling is out-of-process (P1A remote-read, sibling supervision only).
+    /// No in-target code, no stop-the-target >1 ms, no LD_PRELOAD.
+    /// Bundles are WAL-backed, hash-chained, with bounded 512-cap drop-newest
+    /// and TRUNCATED markers — never silent.
+    ///
+    /// CUT WARNING: this is L1 sampling only (stack snapshots at 50 Hz default,
+    /// plus exhaustive low-volume audit for imports/spawns/raises/dynamic loads).
+    /// It does NOT provide L2 line/branch coverage — do not use for line-level
+    /// CUT decisions. Use `audit` events for import/spawn topology and `verify`
+    /// for bundle integrity.
+    #[command(
+        about = "Observe — sampling without modifying the target (L1 sampling only, not L2 line/branch CUT)",
+        long_about = "Observe — out-of-process sampling (P1A) with sibling supervision.\n\
+No in-target code, no LD_PRELOAD, no stop >1 ms.\n\
+Bundles are WAL-backed with hash chains and TRUNCATED markers.\n\n\
+CUT WARNING: L1 sampling only — not L2 line/branch coverage.\n\
+Use --self-test to verify the pipeline and --verify to check bundle integrity.\n\
+Default out: {data_dir}/bundles/<run_id>.jsonl (7d retention).\n\
+Rate from --sample-rate-hz or RUNTIMO_OBSERVE_SAMPLE_HZ or config observe.sample_rate_hz (default 50 Hz)."
+    )]
+    Observe {
+        /// Target pid to sample (alternative to --cmd).
+        #[arg(long)]
+        pid: Option<u32>,
+        /// Command to spawn as sibling target (alternative to --pid, e.g. "python app.py").
+        #[arg(long)]
+        cmd: Option<String>,
+        /// Bundle output path (default: {data_dir}/bundles/<run_id>.jsonl, validated via allowed prefixes).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Samples per second (default 50 Hz, via ObserveConfig).
+        #[arg(long)]
+        sample_rate_hz: Option<u64>,
+        /// Enable burst file-watch (P2B — bundle-path watch; deferred if non-trivial, currently no-op with note).
+        #[arg(long, default_value = "false")]
+        burst: bool,
+        /// DAL A–E (default from config, controls watermark on shed).
+        #[arg(long)]
+        dal: Option<String>,
+        /// Run self-test and exit 0/1.
+        #[arg(long, default_value = "false")]
+        self_test: bool,
+        /// Verify a bundle file offline and print trailer (hash chain + truncated gaps).
+        #[arg(long)]
+        verify: Option<PathBuf>,
+        /// Output as JSON.
+        #[arg(long, default_value = "false")]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2540,6 +2591,145 @@ fn main() -> Result<(), Box<dyn Error>> {
                             .collect();
                         println!("{}", mode.render_table(&headers, &rows));
                     }
+                }
+            }
+        },
+        Commands::Observe { pid, cmd, out, sample_rate_hz, burst, dal, self_test, verify, json } => {
+            let mode = if json { base_mode.with_format("json") } else { base_mode };
+            if self_test {
+                let code = runtimo_core::observe::self_test::run();
+                std::process::exit(code);
+            }
+            if let Some(vpath) = verify {
+                let mut allowed = RuntimoConfig::get_allowed_prefixes();
+                allowed.push(runtimo_core::utils::data_dir().to_string_lossy().to_string());
+                let ctx = runtimo_core::validation::path::PathContext {
+                    allowed_prefixes: allowed,
+                    require_exists: true,
+                    require_file: true,
+                };
+                let vstr = vpath.to_string_lossy().to_string();
+                if let Err(e) = runtimo_core::validation::path::validate_path(&vstr, &ctx) {
+                    eprintln!("verify: invalid bundle path: {e}");
+                    std::process::exit(1);
+                }
+                let res = runtimo_core::observe::verify_bundle(&vpath);
+                if mode.is_json() {
+                    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                        "path": vpath.display().to_string(),
+                        "total": res.total,
+                        "truncated_gaps": res.truncated_gaps,
+                        "hash_ok": res.hash_ok,
+                        "error": res.error,
+                    })).unwrap());
+                } else {
+                    println!("verify {}: total={} truncated_gaps={} hash_ok={} error={:?}", vpath.display(), res.total, res.truncated_gaps, res.hash_ok, res.error);
+                    println!("trailer: bundle {} — hash chain {} — watermark {}", vpath.display(), if res.hash_ok { "ok" } else { "FAIL" }, if res.truncated_gaps > 0 { "TRUNCATED" } else { "Complete" });
+                }
+                #[allow(clippy::bool_to_int_with_if)]
+                {
+                    std::process::exit(if res.hash_ok && res.error.is_none() { 0 } else { 1 });
+                }
+            }
+            if burst {
+                eprintln!("note: --burst file-watch burst (P2B bundle-path watch) deferred — not yet trivial; using polling");
+            }
+            // Resolve out path (validated, data_dir default)
+            let run_id = runtimo_core::utils::generate_id();
+            let bundle_path = if let Some(p) = out {
+                let s = p.to_string_lossy().to_string();
+                let mut allowed = RuntimoConfig::get_allowed_prefixes();
+                allowed.push(runtimo_core::utils::data_dir().to_string_lossy().to_string());
+                let ctx = runtimo_core::validation::path::PathContext {
+                    allowed_prefixes: allowed,
+                    require_exists: false,
+                    require_file: false,
+                };
+                match runtimo_core::validation::path::validate_path(&s, &ctx) {
+                    Ok(valid) => valid,
+                    Err(e) => {
+                        eprintln!("--out invalid: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                runtimo_core::observe::bundle_path(&run_id)
+            };
+            let hz = sample_rate_hz.unwrap_or_else(|| RuntimoConfig::load().effective_observe_sample_hz(None));
+            let dal_str = dal.unwrap_or_else(RuntimoConfig::get_dal);
+            // Try daemon first if running; else run locally.
+            if daemon_is_running() {
+                let mut params = serde_json::json!({
+                    "run_id": run_id,
+                    "sample_rate_hz": hz,
+                    "dal": dal_str,
+                    "out": bundle_path.display().to_string(),
+                });
+                if let Some(p) = pid { params["pid"] = serde_json::json!(p); }
+                if let Some(ref c) = cmd { params["cmd"] = serde_json::json!(c); }
+                match send_rpc("observe_start", params) {
+                    Ok(v) => {
+                        if mode.is_json() {
+                            println!("{}", serde_json::to_string_pretty(&v).unwrap());
+                        } else {
+                            println!("observe dispatched: run_id={} bundle={} hz={} dal={}", v["run_id"].as_str().unwrap_or("?"), v["bundle"].as_str().unwrap_or("?"), hz, dal_str);
+                            println!("bundle: {}", bundle_path.display());
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("observe_start failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                // Local synchronous collection (sibling — caller is parent, collector + target share parent).
+                let target_pid = if let Some(p) = pid { p } else if let Some(ref c) = cmd {
+                    match std::process::Command::new("sh").arg("-c").arg(c).spawn() {
+                        Ok(child) => child.id(),
+                        Err(e) => {
+                            eprintln!("failed to spawn --cmd: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    eprintln!("observe requires --pid or --cmd (or --self-test / --verify)");
+                    std::process::exit(1);
+                };
+                let mut sup = match runtimo_core::observe::ObserveSupervisor::new_at_path(&run_id, hz, &dal_str, Some(bundle_path.clone())) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("supervisor create failed: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                sup.attach(target_pid);
+                // Short burst collection (demo: 50 ticks or 2s).
+                let interval = sup.sampler_interval();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                let mut ticks = 0;
+                while std::time::Instant::now() < deadline && ticks < 50 {
+                    let _ = sup.gated_tick();
+                    std::thread::sleep(interval.min(std::time::Duration::from_millis(20)));
+                    ticks += 1;
+                }
+                if let Err(e) = sup.finalize() {
+                    eprintln!("finalize failed: {e}");
+                    std::process::exit(1);
+                }
+                let v = runtimo_core::observe::verify_bundle(&bundle_path);
+                if mode.is_json() {
+                    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                        "run_id": run_id,
+                        "bundle": bundle_path.display().to_string(),
+                        "ticks": ticks,
+                        "hz": hz,
+                        "dal": dal_str,
+                        "watermark": format!("{:?}", sup.watermark()),
+                        "verify": { "total": v.total, "truncated_gaps": v.truncated_gaps, "hash_ok": v.hash_ok }
+                    })).unwrap());
+                } else {
+                    println!("observe complete: run_id={run_id} bundle={} ticks={ticks} hz={hz} dal={dal_str} watermark={:?}", bundle_path.display(), sup.watermark());
+                    println!("verify: total={} truncated_gaps={} hash_ok={}", v.total, v.truncated_gaps, v.hash_ok);
                 }
             }
         },

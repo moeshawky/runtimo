@@ -467,38 +467,35 @@ pub fn verify_bundle(path: &Path) -> VerifyResult {
     let mut idx = 0;
     while idx < events.len() {
         let current_hash = events[idx].bundle_hash.clone().unwrap_or_default();
-        // Collect batch: contiguous events with same hash, excluding the trailing TRUNCATED if its hash matches.
+        // Collect batch: contiguous events with same hash.
         let mut batch_end = idx;
         while batch_end < events.len()
             && events[batch_end].bundle_hash.as_deref() == Some(current_hash.as_str())
         {
             batch_end += 1;
-            // If we hit a TRUNCATED that shares hash, include it as part of batch (it was added after hash).
-            // But our writer stamps TRUNCATED with same hash, so stop after including it.
-            if batch_end > idx && events[batch_end - 1].event_type == WalEventType::ObserveTruncated {
-                break;
-            }
         }
         if batch_end == idx {
             // No hash — check if events without hash are allowed (legacy). Treat as ok.
             idx += 1;
             continue;
         }
+        // Detect whether last event in batch is a writer-injected drop TRUNCATED marker.
+        // That marker is appended AFTER hash computation (output contains "dropped"), so it
+        // must be excluded from hash recompute. Sampler TRUNCATED samples (frames) are part
+        // of the batch and must NOT be excluded — only drop markers have "dropped".
+        let has_trailing_drop = batch_end > idx + 1
+            && events[batch_end - 1].event_type == WalEventType::ObserveTruncated
+            && events[batch_end - 1]
+                .output
+                .as_ref()
+                .is_some_and(|v| v.get("dropped").is_some());
+        let hash_end = if has_trailing_drop { batch_end - 1 } else { batch_end };
         // For verification, recompute hash over the batch events WITHOUT their bundle_hash (as writer did before stamping).
         // Writer computed hash before stamping, over events without bundle_hash.
         // So we need to clone and clear bundle_hash for hashing.
         let mut hasher = Sha256::new();
         hasher.update(prev_hash.as_bytes());
-        for ev in &events[idx..batch_end] {
-            // Special handling: TRUNCATED was not part of original batch hash (it was appended after).
-            // In writer, truncated was added AFTER hash, so should be excluded from hash recompute.
-            // Detect: if last in batch is TRUNCATED, exclude it.
-            let is_trailing_truncated = ev.event_type == WalEventType::ObserveTruncated
-                && batch_end - idx > 1
-                && ev.seq == events[batch_end - 1].seq;
-            if is_trailing_truncated {
-                continue;
-            }
+        for ev in &events[idx..hash_end] {
             let mut tmp = ev.clone();
             tmp.bundle_hash = None;
             // Also clear mono/wall ns? No — writer included them, so keep them as-is.

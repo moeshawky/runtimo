@@ -83,6 +83,54 @@ fn default_limit() -> usize {
     10
 }
 
+/// Parameters for `observe_start`.
+#[derive(Debug, Deserialize)]
+pub struct ObserveStartParams {
+    /// Target pid to sample (if None, `cmd` must be set — CLI spawns sibling).
+    #[serde(default)]
+    pub pid: Option<u32>,
+    /// Command to spawn as sibling target (alternative to `pid`).
+    #[serde(default)]
+    pub cmd: Option<String>,
+    /// Bundle output path (validated; default is `data_dir/bundles/<run_id>.jsonl`).
+    #[serde(default)]
+    pub out: Option<String>,
+    /// Sample rate in Hz (default 50, via `ObserveConfig`).
+    #[serde(default)]
+    pub sample_rate_hz: Option<u64>,
+    /// Design Assurance Level `A`–`E` (default from config).
+    #[serde(default)]
+    pub dal: Option<String>,
+    /// Whether burst file-watch is enabled (P2B — deferred if non-trivial).
+    #[serde(default)]
+    pub burst: Option<bool>,
+    /// Explicit run id (default: generated).
+    #[serde(default)]
+    pub run_id: Option<String>,
+}
+
+/// Parameters for `observe_status`.
+#[derive(Debug, Deserialize)]
+pub struct ObserveStatusParams {
+    /// Run/bundle id to query (omit to list recent).
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// Limit for list mode (default 20).
+    #[serde(default = "default_observe_limit")]
+    pub limit: usize,
+}
+
+fn default_observe_limit() -> usize {
+    20
+}
+
+/// Parameters for `observe_verify`.
+#[derive(Debug, Deserialize)]
+pub struct ObserveVerifyParams {
+    /// Bundle path to verify (validated; must be inside allowed prefixes or data_dir).
+    pub path: String,
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
