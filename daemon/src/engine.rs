@@ -667,14 +667,21 @@ async fn handle_jobs(state: &Arc<DaemonState>, params: Value, id: Value) -> Json
 /// the `ObserveSupervisor` loop. The target (`pid` or `cmd` sibling) is never
 /// signalled on collector failure — watermark only.
 #[allow(clippy::unused_async)]
-async fn handle_observe_start(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonRpcResponse {
+async fn handle_observe_start(
+    state: &Arc<DaemonState>,
+    params: Value,
+    id: Value,
+) -> JsonRpcResponse {
     use crate::rpc::ObserveStartParams;
     let p: ObserveStartParams = match serde_json::from_value(params) {
         Ok(v) => v,
         Err(e) => {
             return JsonRpcResponse {
                 result: None,
-                error: Some(JsonRpcError { code: -32602, message: format!("Invalid params: {e}") }),
+                error: Some(JsonRpcError {
+                    code: -32602,
+                    message: format!("Invalid params: {e}"),
+                }),
                 id,
             }
         }
@@ -683,7 +690,9 @@ async fn handle_observe_start(state: &Arc<DaemonState>, params: Value, id: Value
     // Resolve out path: validated via allowed prefixes + data_dir.
     let run_id = p.run_id.unwrap_or_else(runtimo_core::utils::generate_id);
     let dal = p.dal.unwrap_or_else(runtimo_core::RuntimoConfig::get_dal);
-    let hz = p.sample_rate_hz.unwrap_or_else(|| runtimo_core::RuntimoConfig::load().effective_observe_sample_hz(None));
+    let hz = p
+        .sample_rate_hz
+        .unwrap_or_else(|| runtimo_core::RuntimoConfig::load().effective_observe_sample_hz(None));
     // P2B burst (file-watch) is deferred — acknowledge but do not implement under 80-line budget.
     if p.burst.unwrap_or(false) {
         eprintln!("[runtimo] note: observe burst (P2B bundle-path watch) deferred — using polling");
@@ -691,7 +700,11 @@ async fn handle_observe_start(state: &Arc<DaemonState>, params: Value, id: Value
 
     let out_path = if let Some(out) = p.out {
         let mut allowed = runtimo_core::RuntimoConfig::get_allowed_prefixes();
-        allowed.push(runtimo_core::utils::data_dir().to_string_lossy().to_string());
+        allowed.push(
+            runtimo_core::utils::data_dir()
+                .to_string_lossy()
+                .to_string(),
+        );
         let ctx = runtimo_core::validation::path::PathContext {
             allowed_prefixes: allowed,
             require_exists: false,
@@ -702,7 +715,10 @@ async fn handle_observe_start(state: &Arc<DaemonState>, params: Value, id: Value
             Err(e) => {
                 return JsonRpcResponse {
                     result: None,
-                    error: Some(JsonRpcError { code: -32602, message: format!("Invalid out path: {e}") }),
+                    error: Some(JsonRpcError {
+                        code: -32602,
+                        message: format!("Invalid out path: {e}"),
+                    }),
                     id,
                 }
             }
@@ -721,7 +737,10 @@ async fn handle_observe_start(state: &Arc<DaemonState>, params: Value, id: Value
             Err(e) => {
                 return JsonRpcResponse {
                     result: None,
-                    error: Some(JsonRpcError { code: -32000, message: format!("Failed to spawn target cmd: {e}") }),
+                    error: Some(JsonRpcError {
+                        code: -32000,
+                        message: format!("Failed to spawn target cmd: {e}"),
+                    }),
                     id,
                 }
             }
@@ -733,13 +752,19 @@ async fn handle_observe_start(state: &Arc<DaemonState>, params: Value, id: Value
     if !state.bg_jobs.try_reserve() {
         return JsonRpcResponse {
             result: None,
-            error: Some(JsonRpcError { code: -32000, message: format!("too many concurrent jobs (max {})", MAX_CONCURRENT_JOBS) }),
+            error: Some(JsonRpcError {
+                code: -32000,
+                message: format!("too many concurrent jobs (max {})", MAX_CONCURRENT_JOBS),
+            }),
             id,
-        }
+        };
     }
 
     let job_id = run_id.clone();
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     state.bg_jobs.insert(BackgroundJob {
         job_id: job_id.clone(),
         capability: "Observe".into(),
@@ -756,10 +781,18 @@ async fn handle_observe_start(state: &Arc<DaemonState>, params: Value, id: Value
 
     // Reuse BackgroundJob spawn pattern: spawn_blocking with WAL mutex discipline.
     tokio::task::spawn_blocking(move || {
-        let _wal_guard = state_arc.wal_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        let _wal_guard = state_arc
+            .wal_mutex
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut sup = runtimo_core::observe::ObserveSupervisor::new_at_path(&jid, hz, &dal_clone, Some(out_clone.clone()))
-                .map_err(|e| format!("supervisor create: {e}"))?;
+            let mut sup = runtimo_core::observe::ObserveSupervisor::new_at_path(
+                &jid,
+                hz,
+                &dal_clone,
+                Some(out_clone.clone()),
+            )
+            .map_err(|e| format!("supervisor create: {e}"))?;
             if let Some(pid) = target_pid {
                 sup.attach(pid);
             }
@@ -779,7 +812,10 @@ async fn handle_observe_start(state: &Arc<DaemonState>, params: Value, id: Value
             sup.finalize().map_err(|e| format!("finalize: {e}"))?;
             Ok::<_, String>(sup.watermark().clone())
         }));
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let (status, msg) = match &result {
             Ok(Ok(_wm)) => ("completed", None),
             Ok(Err(e)) => ("failed", Some(e.clone())),
@@ -805,14 +841,21 @@ async fn handle_observe_start(state: &Arc<DaemonState>, params: Value, id: Value
 
 /// Handles `observe_status` — queries observe jobs (bg registry + WAL fallback).
 #[allow(clippy::unused_async)]
-async fn handle_observe_status(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonRpcResponse {
+async fn handle_observe_status(
+    state: &Arc<DaemonState>,
+    params: Value,
+    id: Value,
+) -> JsonRpcResponse {
     use crate::rpc::ObserveStatusParams;
     let p: ObserveStatusParams = match serde_json::from_value(params) {
         Ok(v) => v,
         Err(e) => {
             return JsonRpcResponse {
                 result: None,
-                error: Some(JsonRpcError { code: -32602, message: format!("Invalid params: {e}") }),
+                error: Some(JsonRpcError {
+                    code: -32602,
+                    message: format!("Invalid params: {e}"),
+                }),
                 id,
             }
         }
@@ -833,12 +876,22 @@ async fn handle_observe_status(state: &Arc<DaemonState>, params: Value, id: Valu
         // WAL fallback: look for ObserveStarted/Completed events for this run_id.
         if let Ok(reader) = WalReader::load_all(&state.wal_path) {
             let events = reader.events();
-            let started = events.iter().find(|e| e.job_id == *rid && matches!(e.event_type, WalEventType::ObserveStarted));
-            let completed = events.iter().find(|e| e.job_id == *rid && matches!(e.event_type, WalEventType::ObserveCompleted));
+            let started = events
+                .iter()
+                .find(|e| e.job_id == *rid && matches!(e.event_type, WalEventType::ObserveStarted));
+            let completed = events.iter().find(|e| {
+                e.job_id == *rid && matches!(e.event_type, WalEventType::ObserveCompleted)
+            });
             if let Some(s) = started {
-                let status = if completed.is_some() { "completed" } else { "unknown" };
+                let status = if completed.is_some() {
+                    "completed"
+                } else {
+                    "unknown"
+                };
                 return JsonRpcResponse {
-                    result: Some(serde_json::json!({ "run_id": rid, "status": status, "started_at": s.ts })),
+                    result: Some(
+                        serde_json::json!({ "run_id": rid, "status": status, "started_at": s.ts }),
+                    ),
                     error: None,
                     id,
                 };
@@ -846,7 +899,10 @@ async fn handle_observe_status(state: &Arc<DaemonState>, params: Value, id: Valu
         }
         return JsonRpcResponse {
             result: None,
-            error: Some(JsonRpcError { code: -32602, message: format!("observe run not found: {rid}") }),
+            error: Some(JsonRpcError {
+                code: -32602,
+                message: format!("observe run not found: {rid}"),
+            }),
             id,
         };
     }
@@ -868,14 +924,21 @@ async fn handle_observe_status(state: &Arc<DaemonState>, params: Value, id: Valu
 ///
 /// Calls `bundle::verify_bundle` synchronously (no WAL mutex needed — read-only).
 #[allow(clippy::unused_async)]
-async fn handle_observe_verify(_state: &Arc<DaemonState>, params: Value, id: Value) -> JsonRpcResponse {
+async fn handle_observe_verify(
+    _state: &Arc<DaemonState>,
+    params: Value,
+    id: Value,
+) -> JsonRpcResponse {
     use crate::rpc::ObserveVerifyParams;
     let p: ObserveVerifyParams = match serde_json::from_value(params) {
         Ok(v) => v,
         Err(e) => {
             return JsonRpcResponse {
                 result: None,
-                error: Some(JsonRpcError { code: -32602, message: format!("Invalid params: {e}") }),
+                error: Some(JsonRpcError {
+                    code: -32602,
+                    message: format!("Invalid params: {e}"),
+                }),
                 id,
             }
         }
@@ -883,7 +946,11 @@ async fn handle_observe_verify(_state: &Arc<DaemonState>, params: Value, id: Val
     let path = PathBuf::from(&p.path);
     // Validate path is inside allowed prefixes or data_dir.
     let mut allowed = runtimo_core::RuntimoConfig::get_allowed_prefixes();
-    allowed.push(runtimo_core::utils::data_dir().to_string_lossy().to_string());
+    allowed.push(
+        runtimo_core::utils::data_dir()
+            .to_string_lossy()
+            .to_string(),
+    );
     let ctx = runtimo_core::validation::path::PathContext {
         allowed_prefixes: allowed,
         require_exists: true,
@@ -892,9 +959,12 @@ async fn handle_observe_verify(_state: &Arc<DaemonState>, params: Value, id: Val
     if let Err(e) = runtimo_core::validation::path::validate_path(&p.path, &ctx) {
         return JsonRpcResponse {
             result: None,
-            error: Some(JsonRpcError { code: -32602, message: format!("Invalid bundle path: {e}") }),
+            error: Some(JsonRpcError {
+                code: -32602,
+                message: format!("Invalid bundle path: {e}"),
+            }),
             id,
-        }
+        };
     }
     let v = runtimo_core::observe::verify_bundle(&path);
     JsonRpcResponse {

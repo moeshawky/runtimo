@@ -1667,46 +1667,76 @@ fn test_backup_created_event_emitted_for_delete() {
 #[test]
 fn observe_fixture_a_integration() {
     let checks = runtimo_core::observe::self_test::checks();
-    let c = checks.iter().find(|c| c.name == "fixture A exactness").expect("fixture A");
+    let c = checks
+        .iter()
+        .find(|c| c.name == "fixture A exactness")
+        .expect("fixture A");
     assert!(c.passed, "fixture A exactness must pass: {}", c.detail);
 }
 
 #[test]
 fn observe_fixture_b_integration() {
     let checks = runtimo_core::observe::self_test::checks();
-    let c = checks.iter().find(|c| c.name == "fixture B sampling bounds").expect("fixture B");
-    assert!(c.passed, "fixture B sampling bounds must pass: {}", c.detail);
+    let c = checks
+        .iter()
+        .find(|c| c.name == "fixture B sampling bounds")
+        .expect("fixture B");
+    assert!(
+        c.passed,
+        "fixture B sampling bounds must pass: {}",
+        c.detail
+    );
 }
 
 #[test]
 fn observe_dal_a_gate_integration() {
     let checks = runtimo_core::observe::self_test::checks();
-    let c = checks.iter().find(|c| c.name == "DAL-A gate").expect("DAL-A gate");
-    assert!(c.passed, "DAL-A gate must be Incomplete on induced drop: {}", c.detail);
+    let c = checks
+        .iter()
+        .find(|c| c.name == "DAL-A gate")
+        .expect("DAL-A gate");
+    assert!(
+        c.passed,
+        "DAL-A gate must be Incomplete on induced drop: {}",
+        c.detail
+    );
     assert!(!c.detail.contains("COMPLETE") || c.detail.contains("never COMPLETE"));
 }
 
 #[test]
 fn observe_tamper_integration() {
     let checks = runtimo_core::observe::self_test::checks();
-    let c = checks.iter().find(|c| c.name == "tamper detection").expect("tamper");
+    let c = checks
+        .iter()
+        .find(|c| c.name == "tamper detection")
+        .expect("tamper");
     assert!(c.passed, "tamper must be detected: {}", c.detail);
 }
 
 #[test]
 fn observe_self_test_run_exits_zero() {
-    assert_eq!(runtimo_core::observe::self_test::run(), 0, "observe self-test must exit 0 on healthy");
+    assert_eq!(
+        runtimo_core::observe::self_test::run(),
+        0,
+        "observe self-test must exit 0 on healthy"
+    );
 }
 
 #[test]
 fn observe_bundle_verify_roundtrip_integration() {
-    use runtimo_core::observe::{BundleWriter, verify_bundle};
+    use runtimo_core::observe::{verify_bundle, BundleWriter};
     use runtimo_core::wal::{WalEvent, WalEventType};
     let dir = setup();
     let path = dir.join("observe_verify.jsonl");
     let mut w = BundleWriter::create_at(&path).unwrap();
     for i in 0..5 {
-        w.append(WalEvent { ts: 1000 + i, event_type: WalEventType::ObserveBatch, job_id: format!("obs-{i}"), ..Default::default() }).unwrap();
+        w.append(WalEvent {
+            ts: 1000 + i,
+            event_type: WalEventType::ObserveBatch,
+            job_id: format!("obs-{i}"),
+            ..Default::default()
+        })
+        .unwrap();
     }
     w.finalize().unwrap();
     let v = verify_bundle(&path);

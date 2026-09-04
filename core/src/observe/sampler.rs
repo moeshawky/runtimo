@@ -73,7 +73,10 @@ impl SampleEvent {
             .iter()
             .map(|f| {
                 let lower = f.to_ascii_lowercase();
-                if lower.contains("auth_token") || lower.contains("bearer") || lower.contains("api_key") {
+                if lower.contains("auth_token")
+                    || lower.contains("bearer")
+                    || lower.contains("api_key")
+                {
                     "REDACTED".to_string()
                 } else {
                     // Truncate long frame to 512 chars to bound WAL.
@@ -94,7 +97,10 @@ impl SampleEvent {
         });
         if let Some(ref e) = self.error {
             let lower = e.to_ascii_lowercase();
-            let safe_e = if lower.contains("auth_token") || lower.contains("bearer") || lower.contains("api_key") {
+            let safe_e = if lower.contains("auth_token")
+                || lower.contains("bearer")
+                || lower.contains("api_key")
+            {
                 "REDACTED".to_string()
             } else {
                 e.clone()
@@ -388,7 +394,10 @@ impl StackSampler for OutOfProcessSampler {
                 // To preserve guard.execute contract, return Err only for non-pressure errors.
                 // Here all guard errors are pressure-related, so map to Ok(None).
                 // Keep Err for unexpected.
-                if e.contains("suspended") || e.contains("Resource pressure") || e.contains("pressure") {
+                if e.contains("suspended")
+                    || e.contains("Resource pressure")
+                    || e.contains("pressure")
+                {
                     // Record suspended as a lightweight marker? Spec says ObserveSuspended event
                     // will be emitted by supervisor; sampler itself just suspends tick.
                     Ok(None)
@@ -490,7 +499,13 @@ mod tests {
         // 2 + 1 TRUNCATED marker
         assert_eq!(drained.len(), 3);
         assert!(drained.last().unwrap().truncated);
-        assert!(drained.last().unwrap().error.as_ref().unwrap().contains("TRUNCATED"));
+        assert!(drained
+            .last()
+            .unwrap()
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("TRUNCATED"));
         assert_eq!(s.dropped(), 0);
     }
 
@@ -547,6 +562,9 @@ mod tests {
             "LD_PRELOAD mentions should be doc-only (forbidden in code), got {count_preload}"
         );
         let ptrace_uses = src.matches("ptrace").count();
-        assert!(ptrace_uses <= 12, "ptrace mentions should be doc-only, got {ptrace_uses}");
+        assert!(
+            ptrace_uses <= 12,
+            "ptrace mentions should be doc-only, got {ptrace_uses}"
+        );
     }
 }

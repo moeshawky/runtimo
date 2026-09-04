@@ -18,9 +18,7 @@
 use crate::observe::audit::{AuditHook, AuditKind};
 use crate::observe::bundle::{BundleWriter, VerifyResult};
 use crate::observe::sampler::{OutOfProcessSampler, StackSampler};
-use crate::observe::supervisor::{
-    BundleWatermark, CollectorFailure, ObserveSupervisor,
-};
+use crate::observe::supervisor::{BundleWatermark, CollectorFailure, ObserveSupervisor};
 use crate::wal::{WalEvent, WalEventType};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -67,7 +65,10 @@ pub fn run() -> i32 {
         }
     }
     if any_fail {
-        eprintln!("observe self-test: FAILED ({} checks, at least one FAIL)", cs.len());
+        eprintln!(
+            "observe self-test: FAILED ({} checks, at least one FAIL)",
+            cs.len()
+        );
         1
     } else {
         println!("observe self-test: ok ({} checks)", cs.len());
@@ -96,7 +97,11 @@ fn fixture_a_exactness() -> SelfTestCheck {
     let events = hook.drain();
     let total = n_imports + n_spawns + 1 + 1;
     let count_ok = events.len() == total;
-    let imports_ok = events.iter().filter(|e| e.kind == AuditKind::Import).count() == n_imports;
+    let imports_ok = events
+        .iter()
+        .filter(|e| e.kind == AuditKind::Import)
+        .count()
+        == n_imports;
     let spawns_ok = events.iter().filter(|e| e.kind == AuditKind::Spawn).count() == n_spawns;
     let truncated_ok = events.iter().all(|e| !e.truncated) && hook.dropped() == 0;
     let passed = count_ok && imports_ok && spawns_ok && truncated_ok;
@@ -188,27 +193,32 @@ fn dal_a_gate() -> SelfTestCheck {
     let cp = PathBuf::from(format!("{}.checkpoint", path.display()));
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&cp);
-    let mut sup = match ObserveSupervisor::new_at_path("selftest-dal-a", 50, "A", Some(path.clone())) {
-        Ok(s) => s,
-        Err(e) => {
-            return SelfTestCheck {
-                name: "DAL-A gate",
-                passed: false,
-                detail: format!("supervisor create failed: {e}"),
+    let mut sup =
+        match ObserveSupervisor::new_at_path("selftest-dal-a", 50, "A", Some(path.clone())) {
+            Ok(s) => s,
+            Err(e) => {
+                return SelfTestCheck {
+                    name: "DAL-A gate",
+                    passed: false,
+                    detail: format!("supervisor create failed: {e}"),
+                }
             }
-        }
-    };
+        };
     sup.attach(std::process::id());
     // Induce a drop (simulates overflow) then tick once.
     sup.inject_drop_next();
     let _ = sup.gated_tick();
     // Also exercise the honest-mark path directly.
     let wm = sup.on_failure(CollectorFailure::PressureSpike);
-    let passed = wm == BundleWatermark::Incomplete && *sup.watermark() == BundleWatermark::Incomplete;
+    let passed =
+        wm == BundleWatermark::Incomplete && *sup.watermark() == BundleWatermark::Incomplete;
     let detail = if passed {
         format!("DAL A Halt ⇒ {wm:?} (never COMPLETE), target never signalled")
     } else {
-        format!("expected Incomplete, got {wm:?} watermark {:?} (FAIL: must never be Complete on drop)", sup.watermark())
+        format!(
+            "expected Incomplete, got {wm:?} watermark {:?} (FAIL: must never be Complete on drop)",
+            sup.watermark()
+        )
     };
     let _ = sup.finalize();
     let _ = std::fs::remove_file(&path);
@@ -278,9 +288,15 @@ fn tamper_detection() -> SelfTestCheck {
         v.total != 3
     };
     let detail = if passed {
-        format!("corruption detected (hash_ok={} total={} gaps={} err={:?})", v.hash_ok, v.total, v.truncated_gaps, v.error)
+        format!(
+            "corruption detected (hash_ok={} total={} gaps={} err={:?})",
+            v.hash_ok, v.total, v.truncated_gaps, v.error
+        )
     } else {
-        format!("FAIL: tamper not detected (hash_ok={} total={} gaps={} err={:?})", v.hash_ok, v.total, v.truncated_gaps, v.error)
+        format!(
+            "FAIL: tamper not detected (hash_ok={} total={} gaps={} err={:?})",
+            v.hash_ok, v.total, v.truncated_gaps, v.error
+        )
     };
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&cp);
@@ -300,7 +316,11 @@ mod tests {
     fn self_test_fixtures_pass_on_healthy() {
         let cs = checks();
         for c in &cs {
-            assert!(c.passed, "self-test check failed: {} — {}", c.name, c.detail);
+            assert!(
+                c.passed,
+                "self-test check failed: {} — {}",
+                c.name, c.detail
+            );
         }
         assert_eq!(run(), 0, "run() should exit 0 on healthy");
     }

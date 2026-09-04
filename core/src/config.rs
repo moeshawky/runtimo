@@ -631,14 +631,8 @@ profile = "minimal"
         } else {
             self.observe.sample_rate_hz.unwrap_or(50)
         };
-        let observe_pressure_suspend_ms = self
-            .observe
-            .pressure_suspend_ms
-            .unwrap_or(1000);
-        let observe_max_bundle_bytes = self
-            .observe
-            .max_bundle_bytes
-            .unwrap_or(10 * 1024 * 1024);
+        let observe_pressure_suspend_ms = self.observe.pressure_suspend_ms.unwrap_or(1000);
+        let observe_max_bundle_bytes = self.observe.max_bundle_bytes.unwrap_or(10 * 1024 * 1024);
 
         ResolvedConfig {
             profile,

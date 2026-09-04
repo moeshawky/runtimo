@@ -111,7 +111,11 @@ impl ObserveBudget {
         #[allow(clippy::cast_precision_loss)]
         {
             let count = self.measurements.len() as f64;
-            self.measurements.iter().map(|(_, p)| f64::from(*p)).sum::<f64>() / count
+            self.measurements
+                .iter()
+                .map(|(_, p)| f64::from(*p))
+                .sum::<f64>()
+                / count
         }
     }
 

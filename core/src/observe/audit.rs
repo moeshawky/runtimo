@@ -232,7 +232,11 @@ impl AuditHook {
         let mut inner = self.inner.lock().unwrap();
         let mut out: Vec<AuditEvent> = inner.queue.drain(..).collect();
         if inner.dropped > 0 {
-            let mut marker = AuditEvent::new(inner.next_id, AuditKind::Raise, format!("TRUNCATED dropped={}", inner.dropped));
+            let mut marker = AuditEvent::new(
+                inner.next_id,
+                AuditKind::Raise,
+                format!("TRUNCATED dropped={}", inner.dropped),
+            );
             marker.truncated = true;
             inner.next_id += 1;
             out.push(marker);
@@ -272,7 +276,8 @@ mod tests {
         for i in 0..10 {
             hook.record(AuditKind::Import, format!("mod_{i}")).unwrap();
         }
-        hook.record(AuditKind::Spawn, "subprocess.Popen(['ls'])").unwrap();
+        hook.record(AuditKind::Spawn, "subprocess.Popen(['ls'])")
+            .unwrap();
         hook.record(AuditKind::Spawn, "fork()").unwrap();
         hook.record(AuditKind::Raise, "ValueError").unwrap();
         hook.record(AuditKind::DynamicLoad, "ctypes.CDLL('libfoo.so')")
@@ -280,7 +285,10 @@ mod tests {
         let events = hook.drain();
         assert_eq!(events.len(), 14, "fixture must be exactly 14 events");
         assert_eq!(
-            events.iter().filter(|e| e.kind == AuditKind::Import).count(),
+            events
+                .iter()
+                .filter(|e| e.kind == AuditKind::Import)
+                .count(),
             10
         );
         assert_eq!(
@@ -345,7 +353,14 @@ mod tests {
     fn audit_secret_redaction_replaces_with_redacted() {
         // Always-on redaction: targets containing auth_token/bearer/api_key
         // (case-insensitive) must be replaced with REDACTED in both new() and to_wal_event().
-        let patterns = ["auth_token=abc", "AUTH_TOKEN=xyz", "Bearer secret", "BEARER token", "api_key=123", "API_KEY=xyz"];
+        let patterns = [
+            "auth_token=abc",
+            "AUTH_TOKEN=xyz",
+            "Bearer secret",
+            "BEARER token",
+            "api_key=123",
+            "API_KEY=xyz",
+        ];
         for pat in patterns {
             let ev = AuditEvent::new(0, AuditKind::Import, pat);
             assert_eq!(
@@ -389,6 +404,9 @@ mod tests {
         // Non-secret targets must not be redacted
         let clean = AuditEvent::new(1, AuditKind::Import, "os");
         assert_eq!(clean.target, "os");
-        assert_eq!(clean.to_wal_event().output.as_ref().unwrap()["target"], "os");
+        assert_eq!(
+            clean.to_wal_event().output.as_ref().unwrap()["target"],
+            "os"
+        );
     }
 }

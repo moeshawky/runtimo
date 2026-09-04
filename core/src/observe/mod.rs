@@ -25,6 +25,6 @@ pub mod supervisor;
 
 pub use audit::{AuditEvent, AuditHook};
 pub use budget::ObserveBudget;
-pub use bundle::{BundleWriter, VerifyResult, bundle_path, verify_bundle};
+pub use bundle::{bundle_path, verify_bundle, BundleWriter, VerifyResult};
 pub use sampler::{OutOfProcessSampler, SampleEvent, StackSampler, SAMPLER_CHANNEL_CAP};
 pub use supervisor::ObserveSupervisor;

@@ -168,7 +168,11 @@ impl ObserveSupervisor {
         } else {
             BundleWriter::create(run_id)?
         };
-        let hz = if sample_rate_hz == 0 { 50 } else { sample_rate_hz.min(1000) };
+        let hz = if sample_rate_hz == 0 {
+            50
+        } else {
+            sample_rate_hz.min(1000)
+        };
         // Pid is set later via `attach`; start with 0 (fallback marker until attached).
         let sampler = OutOfProcessSampler::new(0, hz);
         let dal_level = match dal.to_ascii_uppercase().as_str() {
@@ -410,16 +414,25 @@ mod tests {
     fn supervisor_new_uses_llmosafe_new() {
         // Guard must be LlmoSafeGuard::new() (80% ceiling), not ResourceGuard::auto duplication.
         let src = include_str!("supervisor.rs");
-        assert!(src.contains("LlmoSafeGuard::new()"), "must own LlmoSafeGuard::new()");
+        assert!(
+            src.contains("LlmoSafeGuard::new()"),
+            "must own LlmoSafeGuard::new()"
+        );
         // Ensure no duplicate ResourceGuard::auto call in code (docs mention it as forbidden, so allow doc occurrences).
         // Build needle via concatenation so test literal itself doesn't add a hit.
         let needle = format!("{}{}{}", "ResourceGuard", "::", "auto");
         let count = src.matches(&needle).count();
         // Docs mention it once as forbidden; actual code must not call it — allow up to 2 doc mentions.
-        assert!(count <= 5, "must not duplicate ResourceGuard auto in code, got {count} hits");
+        assert!(
+            count <= 5,
+            "must not duplicate ResourceGuard auto in code, got {count} hits"
+        );
         // Also ensure the actual guard construction is LlmoSafeGuard::new, not ResourceGuard new in this file's logic.
         let new_calls = src.matches("LlmoSafeGuard::new()").count();
-        assert!(new_calls >= 1, "LlmoSafeGuard::new() must be used at least once");
+        assert!(
+            new_calls >= 1,
+            "LlmoSafeGuard::new() must be used at least once"
+        );
     }
 
     #[test]
@@ -430,7 +443,11 @@ mod tests {
         let mut sup = ObserveSupervisor::new_at_path("gated", 50, "A", Some(path.clone())).unwrap();
         sup.attach(std::process::id());
         let res = sup.gated_tick();
-        assert!(res.is_ok(), "gated_tick should not error on healthy system: {:?}", res.err());
+        assert!(
+            res.is_ok(),
+            "gated_tick should not error on healthy system: {:?}",
+            res.err()
+        );
         let _ = sup.finalize();
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(PathBuf::from(format!("{}.checkpoint", path.display())));
@@ -445,15 +462,25 @@ mod tests {
         let _ = std::fs::remove_file(PathBuf::from(format!("{}.checkpoint", path_a.display())));
         let _ = std::fs::remove_file(PathBuf::from(format!("{}.checkpoint", path_e.display())));
 
-        let mut sup_a = ObserveSupervisor::new_at_path("honest-a", 50, "A", Some(path_a.clone())).unwrap();
+        let mut sup_a =
+            ObserveSupervisor::new_at_path("honest-a", 50, "A", Some(path_a.clone())).unwrap();
         let wm_a = sup_a.on_failure(CollectorFailure::PressureSpike);
-        assert_eq!(wm_a, BundleWatermark::Incomplete, "DAL A must Halt ⇒ Incomplete");
+        assert_eq!(
+            wm_a,
+            BundleWatermark::Incomplete,
+            "DAL A must Halt ⇒ Incomplete"
+        );
         // Documented: collector Halt never kills target — watermark is the only effect.
         let _ = sup_a.finalize();
 
-        let mut sup_e = ObserveSupervisor::new_at_path("honest-e", 50, "E", Some(path_e.clone())).unwrap();
+        let mut sup_e =
+            ObserveSupervisor::new_at_path("honest-e", 50, "E", Some(path_e.clone())).unwrap();
         let wm_e = sup_e.on_failure(CollectorFailure::PressureSpike);
-        assert_eq!(wm_e, BundleWatermark::Truncated, "DAL E must Proceed ⇒ Truncated with markers");
+        assert_eq!(
+            wm_e,
+            BundleWatermark::Truncated,
+            "DAL E must Proceed ⇒ Truncated with markers"
+        );
         let _ = sup_e.finalize();
 
         let _ = std::fs::remove_file(&path_a);
@@ -468,7 +495,8 @@ mod tests {
         let path = tmp_bundle("never_kill");
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(PathBuf::from(format!("{}.checkpoint", path.display())));
-        let mut sup = ObserveSupervisor::new_at_path("never-kill", 50, "A", Some(path.clone())).unwrap();
+        let mut sup =
+            ObserveSupervisor::new_at_path("never-kill", 50, "A", Some(path.clone())).unwrap();
         let target_pid = std::process::id();
         sup.attach(target_pid);
         for f in [
@@ -481,7 +509,10 @@ mod tests {
             let _ = sup.on_failure(f);
             // Target must still be alive (we never signal it).
             let alive = std::path::Path::new(&format!("/proc/{target_pid}")).exists();
-            assert!(alive, "target pid {target_pid} must never be killed by collector failure");
+            assert!(
+                alive,
+                "target pid {target_pid} must never be killed by collector failure"
+            );
         }
         let _ = sup.finalize();
         let _ = std::fs::remove_file(&path);
@@ -496,7 +527,10 @@ mod tests {
         let needle = format!("{}{}", "shm", "_open");
         let shm_hits = src.matches(&needle).count();
         // Docs/test may mention it as forbidden; allow up to 2 doc mentions, no actual code use.
-        assert!(shm_hits <= 2, "channels must stay inside collector, got shm_open hits {shm_hits}");
+        assert!(
+            shm_hits <= 2,
+            "channels must stay inside collector, got shm_open hits {shm_hits}"
+        );
         // Fan-out shape from nexus-runtime dispatch should be present as gated_tick fan-out.
         assert!(src.contains("gated_tick"), "must have gated_tick fan-out");
     }

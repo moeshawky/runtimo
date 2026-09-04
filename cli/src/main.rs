@@ -2594,15 +2594,33 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
         },
-        Commands::Observe { pid, cmd, out, sample_rate_hz, burst, dal, self_test, verify, json } => {
-            let mode = if json { base_mode.with_format("json") } else { base_mode };
+        Commands::Observe {
+            pid,
+            cmd,
+            out,
+            sample_rate_hz,
+            burst,
+            dal,
+            self_test,
+            verify,
+            json,
+        } => {
+            let mode = if json {
+                base_mode.with_format("json")
+            } else {
+                base_mode
+            };
             if self_test {
                 let code = runtimo_core::observe::self_test::run();
                 std::process::exit(code);
             }
             if let Some(vpath) = verify {
                 let mut allowed = RuntimoConfig::get_allowed_prefixes();
-                allowed.push(runtimo_core::utils::data_dir().to_string_lossy().to_string());
+                allowed.push(
+                    runtimo_core::utils::data_dir()
+                        .to_string_lossy()
+                        .to_string(),
+                );
                 let ctx = runtimo_core::validation::path::PathContext {
                     allowed_prefixes: allowed,
                     require_exists: true,
@@ -2615,20 +2633,44 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
                 let res = runtimo_core::observe::verify_bundle(&vpath);
                 if mode.is_json() {
-                    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                        "path": vpath.display().to_string(),
-                        "total": res.total,
-                        "truncated_gaps": res.truncated_gaps,
-                        "hash_ok": res.hash_ok,
-                        "error": res.error,
-                    })).unwrap());
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "path": vpath.display().to_string(),
+                            "total": res.total,
+                            "truncated_gaps": res.truncated_gaps,
+                            "hash_ok": res.hash_ok,
+                            "error": res.error,
+                        }))
+                        .unwrap()
+                    );
                 } else {
-                    println!("verify {}: total={} truncated_gaps={} hash_ok={} error={:?}", vpath.display(), res.total, res.truncated_gaps, res.hash_ok, res.error);
-                    println!("trailer: bundle {} — hash chain {} — watermark {}", vpath.display(), if res.hash_ok { "ok" } else { "FAIL" }, if res.truncated_gaps > 0 { "TRUNCATED" } else { "Complete" });
+                    println!(
+                        "verify {}: total={} truncated_gaps={} hash_ok={} error={:?}",
+                        vpath.display(),
+                        res.total,
+                        res.truncated_gaps,
+                        res.hash_ok,
+                        res.error
+                    );
+                    println!(
+                        "trailer: bundle {} — hash chain {} — watermark {}",
+                        vpath.display(),
+                        if res.hash_ok { "ok" } else { "FAIL" },
+                        if res.truncated_gaps > 0 {
+                            "TRUNCATED"
+                        } else {
+                            "Complete"
+                        }
+                    );
                 }
                 #[allow(clippy::bool_to_int_with_if)]
                 {
-                    std::process::exit(if res.hash_ok && res.error.is_none() { 0 } else { 1 });
+                    std::process::exit(if res.hash_ok && res.error.is_none() {
+                        0
+                    } else {
+                        1
+                    });
                 }
             }
             if burst {
@@ -2639,7 +2681,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             let bundle_path = if let Some(p) = out {
                 let s = p.to_string_lossy().to_string();
                 let mut allowed = RuntimoConfig::get_allowed_prefixes();
-                allowed.push(runtimo_core::utils::data_dir().to_string_lossy().to_string());
+                allowed.push(
+                    runtimo_core::utils::data_dir()
+                        .to_string_lossy()
+                        .to_string(),
+                );
                 let ctx = runtimo_core::validation::path::PathContext {
                     allowed_prefixes: allowed,
                     require_exists: false,
@@ -2655,7 +2701,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             } else {
                 runtimo_core::observe::bundle_path(&run_id)
             };
-            let hz = sample_rate_hz.unwrap_or_else(|| RuntimoConfig::load().effective_observe_sample_hz(None));
+            let hz = sample_rate_hz
+                .unwrap_or_else(|| RuntimoConfig::load().effective_observe_sample_hz(None));
             let dal_str = dal.unwrap_or_else(RuntimoConfig::get_dal);
             // Try daemon first if running; else run locally.
             if daemon_is_running() {
@@ -2665,14 +2712,24 @@ fn main() -> Result<(), Box<dyn Error>> {
                     "dal": dal_str,
                     "out": bundle_path.display().to_string(),
                 });
-                if let Some(p) = pid { params["pid"] = serde_json::json!(p); }
-                if let Some(ref c) = cmd { params["cmd"] = serde_json::json!(c); }
+                if let Some(p) = pid {
+                    params["pid"] = serde_json::json!(p);
+                }
+                if let Some(ref c) = cmd {
+                    params["cmd"] = serde_json::json!(c);
+                }
                 match send_rpc("observe_start", params) {
                     Ok(v) => {
                         if mode.is_json() {
                             println!("{}", serde_json::to_string_pretty(&v).unwrap());
                         } else {
-                            println!("observe dispatched: run_id={} bundle={} hz={} dal={}", v["run_id"].as_str().unwrap_or("?"), v["bundle"].as_str().unwrap_or("?"), hz, dal_str);
+                            println!(
+                                "observe dispatched: run_id={} bundle={} hz={} dal={}",
+                                v["run_id"].as_str().unwrap_or("?"),
+                                v["bundle"].as_str().unwrap_or("?"),
+                                hz,
+                                dal_str
+                            );
                             println!("bundle: {}", bundle_path.display());
                         }
                     }
@@ -2683,7 +2740,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             } else {
                 // Local synchronous collection (sibling — caller is parent, collector + target share parent).
-                let target_pid = if let Some(p) = pid { p } else if let Some(ref c) = cmd {
+                let target_pid = if let Some(p) = pid {
+                    p
+                } else if let Some(ref c) = cmd {
                     match std::process::Command::new("sh").arg("-c").arg(c).spawn() {
                         Ok(child) => child.id(),
                         Err(e) => {
@@ -2695,7 +2754,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                     eprintln!("observe requires --pid or --cmd (or --self-test / --verify)");
                     std::process::exit(1);
                 };
-                let mut sup = match runtimo_core::observe::ObserveSupervisor::new_at_path(&run_id, hz, &dal_str, Some(bundle_path.clone())) {
+                let mut sup = match runtimo_core::observe::ObserveSupervisor::new_at_path(
+                    &run_id,
+                    hz,
+                    &dal_str,
+                    Some(bundle_path.clone()),
+                ) {
                     Ok(s) => s,
                     Err(e) => {
                         eprintln!("supervisor create failed: {e}");
@@ -2729,10 +2793,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                     })).unwrap());
                 } else {
                     println!("observe complete: run_id={run_id} bundle={} ticks={ticks} hz={hz} dal={dal_str} watermark={:?}", bundle_path.display(), sup.watermark());
-                    println!("verify: total={} truncated_gaps={} hash_ok={}", v.total, v.truncated_gaps, v.hash_ok);
+                    println!(
+                        "verify: total={} truncated_gaps={} hash_ok={}",
+                        v.total, v.truncated_gaps, v.hash_ok
+                    );
                 }
             }
-        },
+        }
     }
 
     Ok(())

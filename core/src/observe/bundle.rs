@@ -46,7 +46,9 @@ pub fn bundle_path(run_id: &str) -> PathBuf {
         !run_id.ends_with("wal.jsonl"),
         "bundle path must never end in wal.jsonl (run_id={run_id})"
     );
-    let p = utils::data_dir().join("bundles").join(format!("{run_id}.jsonl"));
+    let p = utils::data_dir()
+        .join("bundles")
+        .join(format!("{run_id}.jsonl"));
     let s = p.to_string_lossy().to_string();
     assert!(
         !s.ends_with("wal.jsonl"),
@@ -489,7 +491,11 @@ pub fn verify_bundle(path: &Path) -> VerifyResult {
                 .output
                 .as_ref()
                 .is_some_and(|v| v.get("dropped").is_some());
-        let hash_end = if has_trailing_drop { batch_end - 1 } else { batch_end };
+        let hash_end = if has_trailing_drop {
+            batch_end - 1
+        } else {
+            batch_end
+        };
         // For verification, recompute hash over the batch events WITHOUT their bundle_hash (as writer did before stamping).
         // Writer computed hash before stamping, over events without bundle_hash.
         // So we need to clone and clear bundle_hash for hashing.
@@ -564,7 +570,11 @@ mod tests {
         assert_eq!(v.total, 10);
         assert!(v.hash_ok, "hash chain should verify");
         // Checkpoint must preserve extension (.jsonl.checkpoint)
-        assert!(cp.exists(), "checkpoint sidecar should exist at {}", cp.display());
+        assert!(
+            cp.exists(),
+            "checkpoint sidecar should exist at {}",
+            cp.display()
+        );
         assert!(!path.with_extension("checkpoint").exists() || cp.exists());
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&cp);
@@ -597,7 +607,10 @@ mod tests {
             .filter_map(|l| serde_json::from_str(l).ok())
             .collect();
         // Last event should be TRUNCATED marker
-        assert_eq!(events.last().unwrap().event_type, WalEventType::ObserveTruncated);
+        assert_eq!(
+            events.last().unwrap().event_type,
+            WalEventType::ObserveTruncated
+        );
         assert_eq!(
             events.last().unwrap().output.as_ref().unwrap()["dropped"],
             2
