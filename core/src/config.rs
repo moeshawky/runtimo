@@ -92,6 +92,35 @@ pub struct TelemetryConfig {
     pub enabled: Option<bool>,
 }
 
+/// Observe (sampling) configuration.
+///
+/// Controls the `runtimo observe` sampling pipeline. Values are resolved
+/// with precedence CLI > env(RUNTIMO_OBSERVE_SAMPLE_HZ) > file > profile > default.
+///
+/// # Fields
+/// * `sample_rate_hz` — samples per second for the sampler (default 50)
+/// * `pressure_suspend_ms` — how long to suspend sampling under high pressure (default 1000 ms)
+/// * `max_bundle_bytes` — maximum bundle file size before rotation (default 10 MiB)
+///
+/// # Nexus survey
+/// * Q3 default sample Hz: nexus `config.rs` and docs contain no sampling rate;
+///   provisional 50 Hz adopted (`ASSUMPTION: 50 Hz default — nexus silent, provisional`).
+/// * Q4 bundle retention: nexus uses 90 days for store (`nexus-reference.md:193 NEXUS_STORE_RETENTION_DAYS=90`);
+///   for observe bundles reuse 7 days provisional per task (`ASSUMPTION: 7d bundle retention — nexus store uses 90d, observe provisional 7d`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[allow(clippy::exhaustive_structs)]
+pub struct ObserveConfig {
+    /// Samples per second.
+    #[serde(default)]
+    pub sample_rate_hz: Option<u64>,
+    /// Suspension window under pressure in milliseconds.
+    #[serde(default)]
+    pub pressure_suspend_ms: Option<u64>,
+    /// Maximum bundle file size in bytes.
+    #[serde(default)]
+    pub max_bundle_bytes: Option<u64>,
+}
+
 /// Resolved effective configuration after merging precedence.
 ///
 /// Precedence (highest to lowest): CLI > env > file > profile > builtin.
@@ -121,6 +150,12 @@ pub struct ResolvedConfig {
     pub session_on_limit: String,
     /// Whether telemetry is enabled.
     pub telemetry_enabled: bool,
+    /// Effective observe sample rate in Hz (resolved via CLI > env > file > profile > default(50)).
+    pub observe_sample_hz: u64,
+    /// Effective pressure suspend window in milliseconds.
+    pub observe_pressure_suspend_ms: u64,
+    /// Effective max bundle bytes.
+    pub observe_max_bundle_bytes: u64,
 }
 
 /// Runtimo persistent configuration.
@@ -237,6 +272,10 @@ pub struct RuntimoConfig {
     /// Telemetry table.
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+
+    /// Observe (sampling) table.
+    #[serde(default)]
+    pub observe: ObserveConfig,
 }
 
 impl RuntimoConfig {
@@ -261,6 +300,7 @@ impl RuntimoConfig {
         "guards",
         "session",
         "telemetry",
+        "observe",
     ];
 
     /// Returns the config file path following XDG spec.
@@ -579,6 +619,27 @@ profile = "minimal"
             profile != "ephemeral"
         };
 
+        // Observe: env(RUNTIMO_OBSERVE_SAMPLE_HZ) > file observe.sample_rate_hz > profile > builtin(50)
+        // ASSUMPTION: 50 Hz default — nexus silent, provisional per task Q3.
+        // Mirrors effective_observe_sample_hz: malformed env falls through to file, not unwrap_or(50).
+        let observe_sample_hz = if let Ok(v) = std::env::var("RUNTIMO_OBSERVE_SAMPLE_HZ") {
+            if let Ok(n) = v.parse::<u64>() {
+                n
+            } else {
+                self.observe.sample_rate_hz.unwrap_or(50)
+            }
+        } else {
+            self.observe.sample_rate_hz.unwrap_or(50)
+        };
+        let observe_pressure_suspend_ms = self
+            .observe
+            .pressure_suspend_ms
+            .unwrap_or(1000);
+        let observe_max_bundle_bytes = self
+            .observe
+            .max_bundle_bytes
+            .unwrap_or(10 * 1024 * 1024);
+
         ResolvedConfig {
             profile,
             dal,
@@ -591,6 +652,9 @@ profile = "minimal"
             session_timeout,
             session_on_limit,
             telemetry_enabled,
+            observe_sample_hz,
+            observe_pressure_suspend_ms,
+            observe_max_bundle_bytes,
         }
     }
 
@@ -604,6 +668,36 @@ profile = "minimal"
     #[must_use]
     pub fn guards_off_via_profile(resolved: &ResolvedConfig) -> bool {
         !resolved.blocklist_enabled || resolved.dal == "E"
+    }
+
+    /// Returns the effective observe sample rate, honoring CLI precedence.
+    ///
+    /// Precedence: CLI override > env(RUNTIMO_OBSERVE_SAMPLE_HZ) > file > default(50).
+    ///
+    /// # Parameters
+    /// * `cli_override` — value from CLI flag `--observe-sample-hz`, if provided.
+    #[must_use]
+    pub fn effective_observe_sample_hz(&self, cli_override: Option<u64>) -> u64 {
+        if let Some(v) = cli_override {
+            return v;
+        }
+        if let Ok(v) = std::env::var("RUNTIMO_OBSERVE_SAMPLE_HZ") {
+            if let Ok(n) = v.parse::<u64>() {
+                return n;
+            }
+        }
+        if let Some(v) = self.observe.sample_rate_hz {
+            return v;
+        }
+        50
+    }
+
+    /// Static helper: effective sample hz with CLI, env, file, profile, default.
+    ///
+    /// Convenience that loads config from disk then applies [`Self::effective_observe_sample_hz`].
+    #[must_use]
+    pub fn observe_sample_hz_with_cli(cli_override: Option<u64>) -> u64 {
+        Self::load().effective_observe_sample_hz(cli_override)
     }
 
     /// Loads config from disk, returning defaults if the file doesn't exist or is invalid.
@@ -1316,5 +1410,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("XDG_CONFIG_HOME");
         std::env::remove_var("RUNTIMO_DAL");
+    }
+
+    #[test]
+    fn resolved_malformed_env_falls_through_to_file() {
+        let _guard = CONFIG_TEST_MUTEX.lock().unwrap();
+        let tmp = std::env::temp_dir().join("runtimo_test_malformed_env");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("runtimo")).unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+        std::fs::write(
+            tmp.join("runtimo/config.toml"),
+            "[observe]\nsample_rate_hz = 77\n",
+        )
+        .unwrap();
+        std::env::set_var("RUNTIMO_OBSERVE_SAMPLE_HZ", "not_a_number");
+        let cfg = RuntimoConfig::load();
+        // resolved() must fall through malformed env to file value 77, not 50
+        let resolved = cfg.resolved();
+        assert_eq!(
+            resolved.observe_sample_hz, 77,
+            "malformed env must fall through to file value 77, got {}",
+            resolved.observe_sample_hz
+        );
+        // effective_observe_sample_hz must also fall through
+        assert_eq!(
+            cfg.effective_observe_sample_hz(None),
+            77,
+            "effective must also fall through malformed env to file"
+        );
+        // Verify with malformed env and no file → default 50
+        std::fs::write(tmp.join("runtimo/config.toml"), "").unwrap();
+        let cfg2 = RuntimoConfig::load();
+        assert_eq!(cfg2.resolved().observe_sample_hz, 50);
+        assert_eq!(cfg2.effective_observe_sample_hz(None), 50);
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::env::remove_var("RUNTIMO_OBSERVE_SAMPLE_HZ");
     }
 }

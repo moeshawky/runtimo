@@ -95,6 +95,8 @@ pub mod telemetry;
 pub mod validation;
 /// Write-ahead log for crash recovery.
 pub mod wal;
+/// Observe subsystem — sampling, bundling, budgeting, auditing.
+pub mod observe;
 
 pub use backup::BackupManager;
 pub use capabilities::{Delete, FileRead, FileWrite, GitExec, Kill, ShellExec, Undo};

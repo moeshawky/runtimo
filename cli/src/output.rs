@@ -263,6 +263,9 @@ mod tests {
             session_timeout: 3600,
             session_on_limit: "stop".to_string(),
             telemetry_enabled: true,
+            observe_sample_hz: 50,
+            observe_pressure_suspend_ms: 1000,
+            observe_max_bundle_bytes: 10 * 1024 * 1024,
         }
     }
 

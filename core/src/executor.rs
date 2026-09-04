@@ -362,6 +362,9 @@ pub fn execute_with_telemetry_and_session(
         oov_ratio: None,
         detection_flags: None,
         backup_path: None,
+        bundle_hash: None,
+        mono_ns: None,
+        wall_ns: None,
     })?;
 
     // Cognitive safety check — runs llmosafe's CognitivePipeline
@@ -499,6 +502,9 @@ pub fn execute_with_telemetry_and_session(
                     oov_ratio: None,
                     detection_flags: None,
                     backup_path: Some(std::path::PathBuf::from(bp)),
+                    bundle_hash: None,
+                    mono_ns: None,
+                    wall_ns: None,
                 })?;
             }
         }
@@ -545,6 +551,9 @@ pub fn execute_with_telemetry_and_session(
         oov_ratio: None,
         detection_flags: None,
         backup_path: None,
+        bundle_hash: None,
+        mono_ns: None,
+        wall_ns: None,
     })?;
 
     // Dev-only: log shell command executions separately for error absorption analysis.
@@ -605,6 +614,9 @@ pub fn execute_with_telemetry_and_session(
             oov_ratio: None,
             detection_flags: None,
             backup_path: None,
+            bundle_hash: None,
+            mono_ns: None,
+            wall_ns: None,
         }) {
             log::error!("WAL CommandExecuted append failed: {}", e);
         }
@@ -717,6 +729,9 @@ fn log_job_failed_with_snapshots(
         oov_ratio,
         detection_flags,
         backup_path: None,
+        bundle_hash: None,
+        mono_ns: None,
+        wall_ns: None,
     })
 }
 

@@ -25,6 +25,7 @@ llmosafe = { version = "0.7.7", default-features = false, features = ["std", "da
 libc = "0.2"
 toml = "0.8"
 unicode-normalization = "0.1"
+sha2 = "0.10"
 
 [dev-dependencies]
 anyhow = "1.0"

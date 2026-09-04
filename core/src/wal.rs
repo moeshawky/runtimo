@@ -159,6 +159,19 @@ pub struct WalEvent {
     /// lines written before this field existed still deserialize.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup_path: Option<std::path::PathBuf>,
+    /// Bundle hash for observe bundles — sha256(prev_hash ++ batch), hex-encoded.
+    ///
+    /// Populated only on observe bundle events. `None` for legacy events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_hash: Option<String>,
+    /// Monotonic clock timestamp in nanoseconds (observe dual-clock).
+    ///
+    /// Paired with `wall_ts_ns` to allow ordering under clock skew.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mono_ns: Option<u64>,
+    /// Wall-clock timestamp in nanoseconds since UNIX epoch (observe dual-clock).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_ns: Option<u64>,
 }
 
 /// Types of WAL events, corresponding to job lifecycle stages
@@ -190,6 +203,16 @@ pub enum WalEventType {
     /// backup is audited even if the `JobCompleted` append fails. The `output.data`
     /// carries `path` (original target) and `backup_path` (backup location).
     BackupCreated,
+    /// Observe session started — collector attached to target.
+    ObserveStarted,
+    /// Observe sample batch flushed (256 events or 100 ms window).
+    ObserveBatch,
+    /// Observe sample dropped due to bounded channel overflow (TRUNCATED marker).
+    ObserveTruncated,
+    /// Observe sampling suspended under resource pressure.
+    ObserveSuspended,
+    /// Observe session completed — bundle finalized with watermark fsync.
+    ObserveCompleted,
 }
 
 impl WalEventType {
@@ -211,6 +234,11 @@ impl WalEventType {
             Self::JobRolledBack => "job_rolled_back",
             Self::CommandExecuted => "command_executed",
             Self::BackupCreated => "backup_created",
+            Self::ObserveStarted => "observe_started",
+            Self::ObserveBatch => "observe_batch",
+            Self::ObserveTruncated => "observe_truncated",
+            Self::ObserveSuspended => "observe_suspended",
+            Self::ObserveCompleted => "observe_completed",
         }
     }
 }
