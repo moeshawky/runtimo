@@ -4,7 +4,19 @@
 
 [![Crates.io](https://img.shields.io/crates/v/runtimo-core.svg)](https://crates.io/crates/runtimo-core)
 [![Documentation](https://docs.rs/runtimo-core/badge.svg)](https://docs.rs/runtimo-core)
+[![CI](https://github.com/moeshawky/runtimo/actions/workflows/ci.yml/badge.svg)](https://github.com/moeshawky/runtimo/actions/workflows/ci.yml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.70-blue.svg)](rust-toolchain.toml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+- [x] Project name + one-line description
+- [x] Badges row (CI, version, license, MSRV)
+- [x] Installation instructions (`cargo add runtimo-core`)
+- [x] Quick start example (compilable)
+- [x] API docs link ([docs.rs](https://docs.rs/runtimo-core))
+- [x] [CHANGELOG](CHANGELOG.md)
+- [x] [License](LICENSE)
+- [x] [Contributing](CONTRIBUTING.md)
+- [x] MSRV badge (1.70.0)
 
 ## What Is Runtimo?
 
@@ -16,7 +28,9 @@ Runtimo is a Rust workspace providing a **capability execution engine**. Every c
 - **Backup/undo** — Files backed up before mutation, rollback by job ID
 - **Input validation** — Capabilities validate arguments including path traversal, symlink, and null byte protection
 
-**Version:** 0.8.0 | **Rust Edition:** 2021 | **Tests:** 401
+**Version:** 0.8.2 | **Rust Edition:** 2021 | **Tests:** 552
+
+See [CHANGELOG.md](CHANGELOG.md) for full release history.
 
 ## Quick Start
 
@@ -537,7 +551,7 @@ runtimo/
 │   ├── tests/
 │   │   ├── integration.rs  # 58 integration tests
 │   │   └── robust.rs       # 46 property-based tests (6 G-categories)
-│   └── examples/
+│   └── examples/            # ← moved from root to core/examples/
 ├── cli/                    # runtimo binary (+ runtimo-daemon)
 │   └── src/
 │       ├── main.rs         # CLI commands via clap
