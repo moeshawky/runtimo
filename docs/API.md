@@ -1,8 +1,8 @@
 # Runtimo Core API Reference
 
-**Version:** 0.8.0
+**Version:** 0.8.3
 **Updated:** 2026-08-09
-**Documentation:** [docs.rs/runtimo-core](https://docs.rs/runtimo-core/0.8.0)
+**Documentation:** [docs.rs/runtimo-core](https://docs.rs/runtimo-core/0.8.3)
 
 ## Quick Links
 
@@ -259,10 +259,27 @@ runtimo run -c Delete -a '{"path":"/models/llama-70b.safetensors","no_backup":tr
 
 > **Testing:** Blocklist tests are run inside Docker/Podman containers with `--rm`. Never test destructive payloads against the real filesystem. See the ShellExec Adversarial Testing Protocol in AGENTS.md.
 
+**Output** (`data` on success or error):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `cmd` | `string` | Echoed command |
+| `stdout` | `string` | Bounded stdout (10 MB) |
+| `stderr` | `string` | Bounded stderr (10 MB) |
+| `exit_code` | `i32` | `status.code().unwrap_or(-1)`; `-1` when signal-terminated |
+| `pid` | `u32` | Child PID |
+| `timeout_secs` | `u64` | Effective timeout |
+| `timed_out` | `bool` | `true` ONLY on timeout-kill path (elapsed > timeout and `SIGKILL` to process group). Signal kills (OOM `SIGKILL`, `SIGTERM`) leave `false`. Source: `core/src/capabilities/shell_exec.rs:81-105`, `1207-1263`, `1559-1585` |
+| `signal` | `Option<i32>` | Terminating signal number via `ExitStatus::signal()`; `Some(n)` for any signal, `None` for normal exit. Source: `core/src/capabilities/shell_exec.rs:1559` |
+| `truncated` | `bool` | `true` when stdout or stderr hit 10 MB cap |
+
+> `timed_out` replaces the prior `code().is_none()` inference (RC3 fix) — the only timeout sentinel.
+
 **Example:**
 ```bash
 runtimo run -c ShellExec -a '{"cmd":"echo hello && whoami"}'
-# → {"cmd":"echo hello && whoami","exit_code":0,"stdout":"hello\nuser\n",...}
+# → {"cmd":"echo hello && whoami","exit_code":0,"stdout":"hello\nuser\n","timed_out":false,"signal":null,...}
+# timeout case → {"exit_code":-1,"timed_out":true,"signal":9,"stderr":"","stdout":"...partial..."}
 ```
 
 **Blocked example:**
@@ -412,6 +429,10 @@ guard.check()?;  // Returns Err if resources exceeded
 - Pressure score: 0-100% (reject if > 80%)
 - Raw entropy: 0-1000 (RSS 50%, IO wait 25%, load 25%)
 
+### Config Guard Accessors (0.8.3 single-source)
+
+Guard checks delegate to `RuntimoConfig::resolved()` — single source of truth. Precedence for each flag (`blocklist_enabled`, `path_restriction_enabled`, `critical_files_enabled`, `path_sanitization_enabled`) is `top-level > [guards].* > profile != "ephemeral" > builtin true`. The `ephemeral` profile disables guards (`blocklist off`, DAL `E`). Env vars (`RUNTIMO_ENABLE_NETWORK`, etc.) are read via `RuntimoConfig::env_var()` which checks `[env]` table first, then process env. Source: `core/src/config.rs:591-624`, `942-1013`, `528-700`
+
 ## Write-Ahead Log
 
 ### WalWriter
@@ -548,6 +569,10 @@ pub struct ExecutionResult {
     pub wal_seq: u64,
 }
 ```
+
+### Err-path BackupCreated Audit (0.8.3)
+
+When a capability fails after creating a backup (FileWrite, Delete, GitExec), `execute_with_telemetry_and_session` emits a `WalEventType::BackupCreated` before `JobFailed` so orphan backups are auditable. The existence check scans `args` for `path` / `repo_path` / `dir` keys (covers `FileWrite` `path` and `GitExec` `repo_path`). WAL ordering invariant: `BackupCreated` precedes `JobFailed`. Source: `core/src/executor.rs:220-232`, `446-466`, `849`, `1599-1722`
 
 ## Job Management
 
@@ -723,6 +748,32 @@ runtimo session --list
 runtimo session --resume <session_id>
 ```
 
+### runtimo observe (daemon JSON-RPC)
+
+Observe collects process samples into a WAL-backed bundle (`data_dir/bundles/<run_id>.jsonl`).
+
+| RPC | Notes |
+|-----|-------|
+| `observe_start` | Spawns sibling collector; `burst:true` returns `-32601 observe_burst deferred` (P2B file-watch not yet implemented). Source: `daemon/src/engine.rs:133-134`, `747-758` |
+| `observe_burst` | Always `-32601 observe_burst deferred` |
+| `observe_status` / `observe_verify` | Status and offline verification |
+
+**Verify result** (`VerifyResult` from `core/src/observe/bundle.rs:400-423`, `542-559`):
+
+| Field | Description |
+|-------|-------------|
+| `watermark` | `Option<String>` — honest watermark from final `ObserveCompleted` `output.watermark` when present: `"Complete"` \| `"Truncated"` \| `"Incomplete"` (DAL-A `Halt` → `Incomplete`). `None` when no `ObserveCompleted` marker. Never derived from `truncated_gaps` |
+
+Writer overflow marker uses key `bundle_dropped` (not `dropped`) to distinguish writer overflow from sampler `TRUNCATED` frames: `{"bundle_dropped": <u64>}` on `WalEventType::ObserveTruncated`. Source: `core/src/observe/bundle.rs:276`, `285`, `502-510`
+
+### Daemon `working_dir` validation (0.8.3)
+
+`working_dir` is validated via `resolve_working_dir()` (single source, `require_exists:true`). Invalid paths return JSON-RPC `-32602 Invalid working_dir: …` and are never swallowed to `None` or `current_dir().unwrap_or("/")`. Covers `run`, `dispatch`, and observe. Source: `daemon/src/engine.rs:54-89`, `170-210`, `297-327`
+
+### Reconcile hint (0.8.3)
+
+On daemon restart, in-flight jobs are reconciled to `JobFailed` with the original `capability` preserved and `output: {"reconciled": true}` plus message `daemon terminated before job completion (reconciled on restart)`. Source: `daemon/src/engine.rs:1187-1249`, `2287-2314`
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -746,7 +797,7 @@ cargo test -- --nocapture
 
 ## Version
 
-0.7.1
+0.8.3
 
 ## License
 

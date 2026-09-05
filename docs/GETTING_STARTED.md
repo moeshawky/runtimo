@@ -1,6 +1,6 @@
 # Getting Started with Runtimo
 
-**Version:** 0.8.0
+**Version:** 0.8.3
 **Last Updated:** 2026-08-09
 
 This guide walks you through using Runtimo for the first time. By the end, you'll have executed capabilities with full telemetry, process tracking, and crash recovery.
@@ -317,6 +317,10 @@ Runtimo blocks dangerous operations by default:
 | **Credential files** | `.env`, `.env.*` via FileWrite | Use alternative filename |
 | **Path escape** | `..`, `~`, `$HOME`, null bytes | Use full paths within allowed dirs |
 | **Network tools** | `curl`, `wget`, `ssh`, `nc`, etc. | Set `RUNTIMO_ENABLE_NETWORK=1` |
+
+### Observe burst mode (0.8.3 contract)
+
+`observe --burst` / `observe_start` with `burst:true` is deferred — daemon returns JSON-RPC `-32601 observe_burst deferred: P2B file-watch burst not yet implemented (use out-of-process polling; see audit.rs)` and the dedicated `observe_burst` RPC also returns `-32601`. Do not document `burst` as working. Source: `daemon/src/engine.rs:133-134`, `148-154`, `747-758`
 
 ### Quoting Bypass Protection (new in 0.7.1)
 

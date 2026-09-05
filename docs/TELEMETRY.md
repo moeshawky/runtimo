@@ -78,4 +78,4 @@ cargo test -p runtimo-core --lib -- telemetry
 # 8 tests: capture, cache, back-compat, empty state, serialization, old WAL deser
 ```
 
-**Last Verified:** 2026-05-28 (8 telemetry tests pass, clippy clean)
+**Last Verified:** 2026-09-05 (21 telemetry tests pass, clippy clean)
