@@ -66,3 +66,18 @@ session-ses_*.md
 
 # CodeGraph index cache (generated, never committed)
 .codegraph/
+
+# Session transcripts (agentic artifacts)
+annotate.json
+beauty.json
+chatgpt-discusss.md
+
+# Per-crate bug reports (intermediate audit artifacts)
+.annotations/_bugs/cli/
+.annotations/_bugs/core/
+.annotations/_bugs/daemon/
+.annotations/_do_not/
+.annotations/cli/
+.annotations/core/
+.annotations/daemon/
+.annotations/root/

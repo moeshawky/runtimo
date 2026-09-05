@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **DAL divergence, prefix normalization, atomic save** (T1-T3) — unified `get_dal()` to delegate to `resolved().dal` (E for bare installs); stripped trailing `/` in path prefixes with root preservation; `save()` uses temp+fsync+rename with EISDIR failure test proving byte-identical recovery. (`core/src/config.rs`, `core/src/validation/path.rs`, `core/src/llmosafe.rs`)
+- **CPU unit normalization, lightweight monitor, RAM basis** (T1-T3) — `normalize_cpu_percent` divides by logical cores keeping threshold 90; `capture_lightweight` covers all HealthMonitor-read fields (no accelerator/network probes); `ram_available` (MemAvailable) replaces `MemFree` for percent and leak detection. (`core/src/monitor.rs`)
+- **Backup orphan and clone stderr** (T4-T5) — WAL `BackupCreated` event proven before `JobFailed` on Err path via layout-derived backup path; `op_clone` uses `wait_with_output`-style capture with `is_char_boundary`-safe truncation and redaction. (`core/src/executor.rs`, `core/src/capabilities/git_exec.rs`)
+
 ## [0.8.1] - 2026-08-28
 ### Fixed
 - **WAL backup audit (CBP B2 / RC1)** — executor now emits `WalEventType::BackupCreated` with `backup_path` between `JobStarted` and `JobCompleted` so mutating capabilities (FileWrite, Delete, GitExec) remain auditable and undo-able even when `JobCompleted` fails (prevents orphaned backup). Adds `backup_path: Option<PathBuf>` to `WalEvent` (serde default for backward compat) and new variant `WalEventType::BackupCreated`. (`core/src/wal.rs`, `core/src/executor.rs`)
