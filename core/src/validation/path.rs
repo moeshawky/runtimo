@@ -39,7 +39,7 @@
 //! # Configuration
 //!
 //! Allowed prefixes are merged from three sources (lowest to highest priority):
-//! 1. Built-in defaults (`/tmp`, `/var/tmp`, `/home`)
+//! 1. Built-in defaults (`/tmp`, `/var/tmp`)
 //! 2. `RUNTIMO_ALLOWED_PATHS` env var (colon-separated)
 //! 3. Config file `~/.config/runtimo/config.toml` (`allowed_paths` array)
 //!
@@ -87,14 +87,23 @@ impl Default for PathContext {
 ///
 /// Combines built-in defaults, `RUNTIMO_ALLOWED_PATHS` env var,
 /// config file prefixes, and any context-specific overrides.
+/// Trailing slashes on context prefixes are stripped except for
+/// the root `/` (so `/tmp/` ≡ `/tmp` and `/` is preserved).
 fn get_allowed_prefixes(ctx: &PathContext) -> Vec<String> {
     let mut prefixes = crate::config::RuntimoConfig::get_allowed_prefixes();
 
-    // Add context-specific prefixes
+    // Add context-specific prefixes — normalize trailing slash except root
     for p in &ctx.allowed_prefixes {
         let trimmed = p.trim().to_string();
-        if !prefixes.contains(&trimmed) {
-            prefixes.push(trimmed);
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut normalized = trimmed.trim_end_matches('/').to_string();
+        if normalized.is_empty() {
+            normalized = "/".to_string();
+        }
+        if !prefixes.contains(&normalized) {
+            prefixes.push(normalized);
         }
     }
 
@@ -249,8 +258,21 @@ fn truncate_path(s: &str) -> String {
 ///
 /// Requires either an exact match or the path starts with `prefix/`.
 /// Prevents bypass attacks like `/tmpfoo` matching `/tmp`.
+/// Defense-in-depth: `prefix` is normalized by stripping trailing
+/// slashes except for the root `/` (so `/tmp/` ≡ `/tmp` and `/`
+/// is preserved as `/`), preventing the double-slash `"/tmp//"`
+/// compound that would fail `starts_with` checks. The root prefix
+/// `/` matches any absolute path.
 fn path_in_prefix(path: &str, prefix: &str) -> bool {
-    path == prefix || path.starts_with(&format!("{}/", prefix))
+    let trimmed = prefix.trim();
+    let mut normalized = trimmed.trim_end_matches('/').to_string();
+    if normalized.is_empty() {
+        normalized = "/".to_string();
+    }
+    if normalized == "/" {
+        return path == "/" || path.starts_with('/');
+    }
+    path == normalized || path.starts_with(&format!("{}/", normalized))
 }
 
 #[cfg(test)]
@@ -448,5 +470,64 @@ mod tests {
         assert!(!path_in_prefix("/etc/shadow", "/tmp"));
         assert!(path_in_prefix("/home/user/file", "/home"));
         assert!(!path_in_prefix("/homeless/file", "/home"));
+        // Trailing-slash equivalence: "/tmp/" ≡ "/tmp" after normalization.
+        assert!(path_in_prefix("/tmp", "/tmp/"));
+        assert!(path_in_prefix("/tmp/foo", "/tmp/"));
+        assert!(!path_in_prefix("/tmpfoo", "/tmp/"));
+        // Root prefix "/" survives normalization and matches any absolute path.
+        assert!(path_in_prefix("/", "/"));
+        assert!(path_in_prefix("/etc/shadow", "/"));
+        assert!(path_in_prefix("/tmp/foo", "/"));
+    }
+
+    #[test]
+    fn ctx_prefix_trailing_slash_normalized() {
+        // A context prefix with a trailing slash behaves like the same
+        // prefix without one (producer normalization), and the prefix
+        // boundary still rejects sibling directories.
+        let ctx_slash = PathContext {
+            allowed_prefixes: vec!["/runtimo_ctx_x/".to_string()],
+            require_exists: false,
+            require_file: false,
+        };
+        let result = validate_path("/runtimo_ctx_x/file.txt", &ctx_slash);
+        assert!(
+            result.is_ok(),
+            "trailing-slash ctx prefix must allow its subtree: {result:?}"
+        );
+
+        let result = validate_path("/runtimo_ctx_xother/file.txt", &ctx_slash);
+        assert!(
+            result.is_err(),
+            "sibling dir must not match the prefix: {result:?}"
+        );
+
+        // Root prefix "/" via context allows any absolute path.
+        let ctx_root = PathContext {
+            allowed_prefixes: vec!["/".to_string()],
+            require_exists: false,
+            require_file: false,
+        };
+        assert!(validate_path("/runtimo_ctx_root_any/where.txt", &ctx_root).is_ok());
+    }
+
+    #[test]
+    fn env_var_trailing_slash_normalized() {
+        let _guard = PATH_ENV_MUTEX.lock().unwrap();
+        let ctx = PathContext {
+            require_exists: false,
+            require_file: false,
+            ..Default::default()
+        };
+        std::env::set_var("RUNTIMO_ALLOWED_PATHS", "/srv_ts_zz/");
+        assert!(
+            validate_path("/srv_ts_zz/config", &ctx).is_ok(),
+            "env prefix with trailing slash must allow its subtree"
+        );
+        std::env::remove_var("RUNTIMO_ALLOWED_PATHS");
+        assert!(
+            validate_path("/srv_ts_zz/config", &ctx).is_err(),
+            "prefix must be gone after cleanup"
+        );
     }
 }

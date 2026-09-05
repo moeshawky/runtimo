@@ -168,8 +168,9 @@ pub struct RuntimoConfig {
 
     /// Design Assurance Level (A-E) for the llmosafe cognitive pipeline.
     ///
-    /// When set, overrides the `RUNTIMO_DAL` env var. Case-insensitive —
-    /// `get_dal()` uppercases the resolved value. Controls how strictly
+    /// When set, used unless the `RUNTIMO_DAL` env var is set (the env var
+    /// takes precedence). Case-insensitive — `get_dal()` uppercases it and
+    /// controls how strictly
     /// the cognitive safety pipeline gates execution:
     /// - A: No override (strictest)
     /// - B: Halt → Escalate
@@ -762,40 +763,109 @@ profile = "minimal"
         }
     }
 
-    /// Saves config to disk, creating parent directories as needed.
+    /// Saves config to disk atomically, creating parent directories as needed.
+    ///
+    /// Uses a temp-file + `fsync` + `rename` pattern in the same directory
+    /// so a crash or disk-full mid-write never leaves a truncated
+    /// `config.toml`. On failure the original file is left byte-identical
+    /// (either untouched or replaced only after the temp is fully synced).
+    /// The parent directory is `fsync`ed after rename where possible to
+    /// persist the directory entry. Mirrors the atomic pattern in
+    /// `capabilities::file_write::atomic_write`.
     ///
     /// # Errors
     ///
-    /// Returns an error if parent directories cannot be created or if the config
-    /// file cannot be serialized/written to disk.
+    /// Returns an error if parent directories cannot be created, if the
+    /// config cannot be serialized, or if temp creation / write / fsync /
+    /// rename fails.
     pub fn save(&self) -> Result<(), String> {
         let path = Self::config_path();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let content = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(&path, content).map_err(|e| e.to_string())?;
+        // Temp file in the same directory so rename is atomic (same filesystem).
+        // Pattern: .{filename}.tmp — matches file_write::atomic_write.
+        let tmp_name = format!(
+            ".{}.tmp",
+            path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "config.toml".to_string())
+        );
+        let tmp_path = path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join(&tmp_name);
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&tmp_path).map_err(|e| e.to_string())?;
+            file.write_all(content.as_bytes())
+                .map_err(|e| e.to_string())?;
+            file.sync_all().map_err(|e| e.to_string())?;
+        }
+        std::fs::rename(&tmp_path, &path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            e.to_string()
+        })?;
+        // Best-effort directory fsync to persist the rename.
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
         Ok(())
     }
 
     /// Returns the resolved Design Assurance Level.
     ///
     /// Priority (highest to lowest):
-    /// 1. `RUNTIMO_DAL` env var
-    /// 2. Config file `dal` field
-    /// 3. Default: `A`
+    /// 1. `RUNTIMO_DAL` env var (case-insensitive, uppercased)
+    /// 2. Config file `dal` field (top-level `dal`)
+    /// 3. Config file `[guards].dal` field
+    /// 4. Profile default (`service` ⇒ `A`, otherwise `E`)
+    /// 5. Built-in default `E` (permissive, bare install)
     ///
-    /// The env var and config-file branches both uppercase the value, so
-    /// `dal = "b"` and `RUNTIMO_DAL=b` resolve identically to `B`.
+    /// Mirrors [`Self::resolved`] DAL precedence so the live gate
+    /// ([`crate::llmosafe::LlmoSafeGuard`]) and the reported
+    /// [`ResolvedConfig::dal`] agree for every state (empty, env,
+    /// file, profile). The env var and config-file branches both
+    /// uppercase the value, so `dal = "b"` and `RUNTIMO_DAL=b`
+    /// resolve identically to `B`. Unknown values are uppercased
+    /// and returned as-is; the DAL mapper in `llmosafe` falls back
+    /// to `A` for unknown strings.
+    ///
+    /// # Side effects
+    /// Reads `RUNTIMO_DAL` from the process environment and loads
+    /// the config file from disk via [`Self::load`].
     #[must_use]
     pub fn get_dal() -> String {
-        // Env var takes precedence
+        // Env var takes precedence (highest priority, mirrors resolved())
         if let Ok(env_dal) = std::env::var("RUNTIMO_DAL") {
             return env_dal.to_uppercase();
         }
-        // Config file
+        // Config file — mirror resolved() precedence: top-level dal > guards.dal > profile > builtin(E)
         let config = Self::load();
-        config.dal.unwrap_or_else(|| "A".to_string()).to_uppercase()
+        if let Some(d) = config.dal {
+            return d.to_uppercase();
+        }
+        if let Some(d) = config.guards.dal {
+            return d.to_uppercase();
+        }
+        // Profile determination mirrors resolved(): file profile > builtin minimal, lowercased and validated
+        let profile = config
+            .profile
+            .clone()
+            .unwrap_or_else(|| "minimal".to_string())
+            .to_lowercase();
+        let profile = match profile.as_str() {
+            "ephemeral" | "service" | "minimal" => profile,
+            _ => "minimal".to_string(),
+        };
+        if profile == "service" {
+            "A".to_string()
+        } else {
+            "E".to_string()
+        }
     }
 
     /// Resolves an environment variable, preferring the config `[env]` table
@@ -890,32 +960,44 @@ profile = "minimal"
     ///
     /// Empty strings are filtered out to prevent matching everything
     /// via `format!("{}/", "")` which produces `"/"` (N-014).
+    /// Trailing slashes are stripped except for the root prefix `/`,
+    /// so `/tmp/` and `/tmp` are equivalent and `/` is preserved
+    /// (never stripped to `""`). This avoids the double-slash
+    /// `"/tmp//"` compound that would fail `path_in_prefix`.
     #[must_use]
     pub fn get_allowed_prefixes() -> Vec<String> {
         let mut prefixes: Vec<String> = DEFAULT_PREFIXES.iter().map(|s| s.to_string()).collect();
 
-        // Env var (colon-separated)
+        // Env var (colon-separated) — normalize trailing slash except root
         if let Ok(env_paths) = std::env::var("RUNTIMO_ALLOWED_PATHS") {
             for p in env_paths.split(':').filter(|s| !s.is_empty()) {
                 let trimmed = p.trim().to_string();
                 if trimmed.is_empty() {
                     continue;
                 }
-                if !prefixes.contains(&trimmed) {
-                    prefixes.push(trimmed);
+                let mut normalized = trimmed.trim_end_matches('/').to_string();
+                if normalized.is_empty() {
+                    normalized = "/".to_string();
+                }
+                if !prefixes.contains(&normalized) {
+                    prefixes.push(normalized);
                 }
             }
         }
 
-        // Config file
+        // Config file — same normalization
         let config = Self::load();
         for p in &config.allowed_paths {
             let trimmed = p.trim().to_string();
             if trimmed.is_empty() {
                 continue;
             }
-            if !prefixes.contains(&trimmed) {
-                prefixes.push(trimmed);
+            let mut normalized = trimmed.trim_end_matches('/').to_string();
+            if normalized.is_empty() {
+                normalized = "/".to_string();
+            }
+            if !prefixes.contains(&normalized) {
+                prefixes.push(normalized);
             }
         }
 
@@ -1441,5 +1523,171 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("XDG_CONFIG_HOME");
         std::env::remove_var("RUNTIMO_OBSERVE_SAMPLE_HZ");
+    }
+    #[test]
+    fn get_dal_agrees_with_resolved_for_all_states() {
+        let _guard = CONFIG_TEST_MUTEX.lock().unwrap();
+        let tmp = std::env::temp_dir().join("runtimo_test_dal_agreement");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("runtimo")).unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+        let cfg_path = tmp.join("runtimo/config.toml");
+        std::env::remove_var("RUNTIMO_DAL");
+
+        // State 1: bare install (no config file, no env) — both accessors E.
+        std::fs::remove_file(&cfg_path).ok();
+        assert_eq!(
+            RuntimoConfig::get_dal(),
+            RuntimoConfig::load().resolved().dal,
+            "bare install must agree"
+        );
+        assert_eq!(
+            RuntimoConfig::get_dal(),
+            "E",
+            "bare install resolves to provisioned E"
+        );
+
+        // State 2: top-level `dal` in the config file.
+        std::fs::write(&cfg_path, "dal = \"C\"\n").unwrap();
+        assert_eq!(
+            RuntimoConfig::get_dal(),
+            RuntimoConfig::load().resolved().dal,
+            "file dal must agree"
+        );
+        assert_eq!(RuntimoConfig::get_dal(), "C");
+
+        // State 3: `[guards].dal` only (no top-level dal).
+        std::fs::write(&cfg_path, "[guards]\ndal = \"D\"\n").unwrap();
+        assert_eq!(
+            RuntimoConfig::get_dal(),
+            RuntimoConfig::load().resolved().dal,
+            "guards dal must agree"
+        );
+        assert_eq!(RuntimoConfig::get_dal(), "D");
+
+        // State 4: top-level dal beats [guards].dal.
+        std::fs::write(&cfg_path, "dal = \"B\"\n[guards]\ndal = \"D\"\n").unwrap();
+        assert_eq!(
+            RuntimoConfig::get_dal(),
+            RuntimoConfig::load().resolved().dal,
+            "top-level dal must beat guards"
+        );
+        assert_eq!(RuntimoConfig::get_dal(), "B");
+
+        // State 5: profile service without dal — both A.
+        std::fs::write(&cfg_path, "profile = \"service\"\n").unwrap();
+        assert_eq!(
+            RuntimoConfig::get_dal(),
+            RuntimoConfig::load().resolved().dal,
+            "service profile must agree"
+        );
+        assert_eq!(
+            RuntimoConfig::get_dal(),
+            "A",
+            "service profile defaults to A"
+        );
+
+        // State 6: profile ephemeral without dal — both E (provisioned).
+        std::fs::write(&cfg_path, "profile = \"ephemeral\"\n").unwrap();
+        assert_eq!(
+            RuntimoConfig::get_dal(),
+            RuntimoConfig::load().resolved().dal,
+            "ephemeral profile must agree"
+        );
+        assert_eq!(
+            RuntimoConfig::get_dal(),
+            "E",
+            "ephemeral profile defaults to E"
+        );
+
+        // State 7: env var beats file and profile; both accessors agree.
+        std::fs::write(&cfg_path, "dal = \"C\"\n[guards]\ndal = \"D\"\n").unwrap();
+        std::env::set_var("RUNTIMO_DAL", "b");
+        assert_eq!(
+            RuntimoConfig::get_dal(),
+            RuntimoConfig::load().resolved().dal,
+            "env var must agree"
+        );
+        assert_eq!(RuntimoConfig::get_dal(), "B", "env var beats file");
+        std::env::remove_var("RUNTIMO_DAL");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn get_allowed_prefixes_normalizes_config_file_entries() {
+        let _guard = CONFIG_TEST_MUTEX.lock().unwrap();
+        let tmp = std::env::temp_dir().join("runtimo_test_prefix_norm");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("runtimo")).unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+        let cfg_path = tmp.join("runtimo/config.toml");
+
+        // Trailing slashes are stripped; root "/" survives normalization.
+        std::fs::write(
+            &cfg_path,
+            "allowed_paths = [\"/runtimo_prefix_x/\", \"/runtimo_prefix_y\", \"/\"]\n",
+        )
+        .unwrap();
+
+        let prefixes = RuntimoConfig::get_allowed_prefixes();
+        assert!(
+            prefixes.contains(&"/runtimo_prefix_x".to_string()),
+            "trailing slash must be stripped: {prefixes:?}"
+        );
+        assert!(
+            !prefixes.contains(&"/runtimo_prefix_x/".to_string()),
+            "no slash-suffixed duplicate: {prefixes:?}"
+        );
+        assert!(
+            prefixes.contains(&"/runtimo_prefix_y".to_string()),
+            "plain entry preserved: {prefixes:?}"
+        );
+        assert!(
+            prefixes.contains(&"/".to_string()),
+            "root prefix must survive normalization: {prefixes:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn save_failure_leaves_original_byte_identical() {
+        let _guard = CONFIG_TEST_MUTEX.lock().unwrap();
+        let tmp = std::env::temp_dir().join("runtimo_test_save_atomic");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("runtimo")).unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+        let cfg_path = tmp.join("runtimo/config.toml");
+
+        // Establish a known original via a successful save.
+        let config = RuntimoConfig {
+            profile: Some("minimal".to_string()),
+            ..Default::default()
+        };
+        config.save().expect("initial save must succeed");
+        let original = std::fs::read(&cfg_path).unwrap();
+
+        // Force save() to fail at temp-file creation: .config.toml.tmp
+        // exists as a directory, so File::create hits EISDIR. The rename —
+        // the only operation that touches the original — can never run.
+        std::fs::create_dir_all(cfg_path.with_file_name(".config.toml.tmp")).unwrap();
+
+        let err = config
+            .save()
+            .expect_err("save must fail while .config.toml.tmp is a directory");
+        assert!(!err.is_empty());
+
+        // Original file is byte-identical after the failed save.
+        assert_eq!(
+            std::fs::read(&cfg_path).unwrap(),
+            original,
+            "original must be byte-identical after failed save"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("XDG_CONFIG_HOME");
     }
 }

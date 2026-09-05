@@ -135,6 +135,17 @@ const SECRET_PATTERNS: &[&str] = &[
     "keystore.p12",
 ];
 
+/// Extra line-content patterns redacted from git stderr by [`redact_stderr`].
+///
+/// Distinct from [`SECRET_PATTERNS`] (secret file names excluded from
+/// `git add -A`) — these match content inside stderr lines.
+const EXTRA_PATTERNS: &[&str] = &["password", "token", "secret", "key=", "auth="];
+
+/// Maximum length (bytes) of the redacted git-stderr tail carried in error
+/// strings. Longer output is cut at a character boundary and suffixed with
+/// `"... (truncated)"`.
+const MAX_STDERR_LEN: usize = 512;
+
 /// Maximum number of untracked files allowed for `git clean -fd`.
 const MAX_CLEAN_FILES: usize = 1000;
 
@@ -618,6 +629,8 @@ impl GitExec {
 
         let mut child = cmd
             .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| Error::ExecutionFailed(format!("git clone spawn failed: {}", e)))?;
 
@@ -649,10 +662,19 @@ impl GitExec {
         };
 
         if !status.success() {
-            return Err(Error::ExecutionFailed(
-                "git clone failed (see stderr)".into(),
-            ));
+            let output = child
+                .wait_with_output()
+                .map_err(|e| Error::ExecutionFailed(format!("git wait failed: {}", e)))?;
+            let stderr_raw = String::from_utf8_lossy(&output.stderr).to_string();
+            let stderr_text = redact_stderr(&stderr_raw);
+            let msg = if stderr_text.trim().is_empty() {
+                "unknown error".to_string()
+            } else {
+                stderr_text
+            };
+            return Err(Error::ExecutionFailed(format!("git clone failed: {msg}")));
         }
+        let _ = child.wait_with_output();
 
         let state = Self::capture_state(path, timeout_secs)?;
 
@@ -1102,6 +1124,77 @@ impl TypedCapability for GitExec {
     }
 }
 
+/// Redacts secret-bearing lines from git stderr before it reaches error
+/// strings (which surface in WAL `error` fields, CLI output, and daemon logs).
+///
+/// Two pattern passes run line-by-line: [`SECRET_PATTERNS`] (secret file
+/// names) plus [`EXTRA_PATTERNS`] (line-content markers). Any line
+/// containing a pattern is replaced wholesale with
+/// `"[REDACTED - secret pattern detected]"`; lines that already carry the
+/// redaction marker are never re-processed, so the marker itself (which
+/// contains "secret") is stable under repeated passes.
+///
+/// The result is truncated to [`MAX_STDERR_LEN`] bytes (character-boundary
+/// safe, then suffixed with `"... (truncated)"`) so a chatty clone failure
+/// cannot bloat the error string.
+///
+/// # Inputs
+/// - `s`: raw git stderr (UTF-8 after `String::from_utf8_lossy`)
+///
+/// # Returns
+/// - Redacted, truncated, always-valid-UTF-8 text. Never panics on
+///   multi-byte input (truncation backs off to a character boundary).
+///
+/// # Errors
+/// - None. This is a pure string transform.
+fn redact_stderr(s: &str) -> String {
+    let mut result = s.to_string();
+    for pattern in SECRET_PATTERNS {
+        if result.to_lowercase().contains(&pattern.to_lowercase()) {
+            result = result
+                .lines()
+                .map(|line| {
+                    if line.to_lowercase().contains(&pattern.to_lowercase()) {
+                        "[REDACTED - secret pattern detected]"
+                    } else {
+                        line
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+    }
+    for pattern in EXTRA_PATTERNS {
+        if result.to_lowercase().contains(pattern) {
+            result = result
+                .lines()
+                .map(|line| {
+                    if line.contains("[REDACTED") {
+                        line.to_string()
+                    } else if line.to_lowercase().contains(pattern) {
+                        "[REDACTED - secret pattern detected]".to_string()
+                    } else {
+                        line.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+    }
+    if result.len() > MAX_STDERR_LEN {
+        // Back off to a character boundary — git stderr can embed
+        // user-controlled paths/URLs with multi-byte UTF-8, and a raw
+        // byte slice would panic mid-character on the error path.
+        let mut end = MAX_STDERR_LEN;
+        while !result.is_char_boundary(end) {
+            end = end.saturating_sub(1);
+        }
+        format!("{}... (truncated)", &result[..end])
+    } else {
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1339,5 +1432,97 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn clone_failure_includes_stderr_message() {
+        let tmp = std::env::temp_dir().join("runtimo_git_stderr_test");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let cap = GitExec::new(test_backup_dir()).expect("Failed to create GitExec");
+        let ctx = Context {
+            dry_run: false,
+            job_id: "stderr-test".into(),
+            working_dir: std::env::temp_dir(),
+        };
+        let result = Capability::execute(
+            &cap,
+            &serde_json::json!({
+                "operation": "clone",
+                "url": "https://invalid.example.com/no-such-repo.git",
+                "path": tmp.join("target").to_str().unwrap()
+            }),
+            &ctx,
+        );
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("git clone failed"),
+            "Error should contain 'git clone failed': {err_msg}"
+        );
+        assert!(
+            !err_msg.contains("see stderr"),
+            "Should not contain old opaque 'see stderr' message: {err_msg}"
+        );
+        // Proves the capture is non-empty: git's fatal line embeds the URL,
+        // so a real stderr capture must carry the host. 'unknown error'
+        // (the empty-capture fallback) would fail this assertion.
+        assert!(
+            err_msg.contains("invalid.example.com"),
+            "Error should carry git's captured stderr (URL host), got: {err_msg}"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(test_backup_dir()).ok();
+    }
+
+    #[test]
+    fn redact_stderr_strips_secrets() {
+        let input = "remote: Password: s3cret123\nremote: OK\n";
+        let result = super::redact_stderr(input);
+        assert!(
+            !result.contains("s3cret123"),
+            "Secret should be redacted, got: {result}"
+        );
+        assert!(
+            result.contains("[REDACTED"),
+            "Should contain [REDACTED], got: {result}"
+        );
+        assert!(
+            result.contains("remote: OK"),
+            "Non-secret line should be preserved: {result}"
+        );
+    }
+
+    #[test]
+    fn redact_stderr_truncates_long_output() {
+        let long = "x".repeat(1000);
+        let result = super::redact_stderr(&long);
+        assert!(
+            result.len() < 600,
+            "Should truncate long output, got {} chars",
+            result.len()
+        );
+        assert!(result.contains("(truncated)"));
+    }
+
+    #[test]
+    fn redact_stderr_truncation_is_char_boundary_safe() {
+        // 511 ASCII bytes + one 2-byte char (U+00E9 'é'): the 512-byte
+        // cutoff lands INSIDE the multi-byte char. A raw byte slice
+        // panics here; git stderr reaches this path with user-controlled
+        // paths/URLs embedded in fatal lines.
+        let input = format!("{}é", "x".repeat(511));
+        assert_eq!(input.len(), 513);
+        let result = super::redact_stderr(&input);
+        assert!(
+            result.len() < 600,
+            "Should truncate at the boundary, got {} chars",
+            result.len()
+        );
+        assert!(result.contains("(truncated)"));
+        assert!(result.ends_with("... (truncated)"));
     }
 }

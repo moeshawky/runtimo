@@ -3,8 +3,15 @@
 //! Monitors system health by capturing periodic snapshots of hardware telemetry
 //! and process state. Alerts on threshold violations:
 //! - Zombie processes > 10
-//! - CPU usage > 90% for 5 consecutive minutes
+//! - CPU usage > 90% for 5 consecutive minutes (normalized by logical core count, ≤100%)
 //! - Memory monotonic increase (potential leak)
+//!
+//! The monitor loop uses [`Telemetry::capture_lightweight()`] to avoid the
+//! overhead of accelerator/network probing on every 60-second cycle.
+//!
+//! CPU percentage is normalized as `total_cpu / cpu_count` so that a 32-core
+//! host summing to 300% reports 9.4%, not a false 300% alert. Single-core
+//! hosts are unaffected (normalized == raw).
 //!
 //! # Example
 //!
@@ -38,9 +45,12 @@ const CHECK_INTERVAL_SECS: u64 = 60;
 pub struct HealthState {
     /// Unix timestamp of last check.
     pub timestamp: u64,
-    /// Total CPU usage percentage.
+    /// Total CPU usage percentage, normalized by logical core count (`total_cpu / cpu_count`, capped at 100%).
+    /// On single-core hosts this equals the raw sum; on multi-core hosts it prevents >100% false positives.
     pub cpu_percent: f32,
-    /// Total memory usage percentage.
+    /// Total memory usage percentage. Computed as
+    /// `(ram_total - ram_available) / ram_total * 100`, reflecting actual
+    /// memory pressure rather than free-but-cached memory.
     pub ram_percent: f32,
     /// Number of zombie processes.
     pub zombie_count: usize,
@@ -134,8 +144,8 @@ impl HealthMonitor {
     /// The monitor checks system health every 60 seconds and updates
     /// the shared health state. Alerts are generated for:
     /// - Zombie count > 10
-    /// - CPU > 90% for 5+ consecutive minutes
-    /// - Monotonic RAM increase
+    /// - CPU > 90% (normalized: `total_cpu / logical_cores`, so ≤100%) for 5+ consecutive minutes
+    /// - Monotonic RAM increase (computed from `ram_available`, not `ram_free`)
     ///
     /// # Returns
     ///
@@ -156,8 +166,8 @@ impl HealthMonitor {
 
         let handle = thread::spawn(move || {
             while !stop_flag_clone.load(Ordering::Relaxed) {
-                // Capture health snapshot
-                let telemetry = Telemetry::capture();
+                // Capture health snapshot — lightweight avoids accelerator/network shell-outs
+                let telemetry = Telemetry::capture_lightweight();
                 let processes = ProcessSnapshot::capture();
 
                 let mut current_state = state_clone.write().unwrap_or_else(|e| {
@@ -168,9 +178,12 @@ impl HealthMonitor {
 
                 // Update state
                 current_state.timestamp = telemetry.timestamp;
-                current_state.cpu_percent = processes.summary.total_cpu_percent;
+                current_state.cpu_percent = normalize_cpu_percent(
+                    processes.summary.total_cpu_percent,
+                    telemetry.system.cpu_count,
+                );
                 current_state.ram_percent =
-                    parse_ram_percent(&telemetry.system.ram_total, &telemetry.system.ram_free);
+                    parse_ram_percent(&telemetry.system.ram_total, &telemetry.system.ram_available);
                 current_state.zombie_count = processes.summary.zombie_count;
                 current_state.process_count = processes.summary.total_processes;
                 current_state
@@ -267,16 +280,39 @@ impl HealthMonitor {
     }
 }
 
-/// Helper to compute RAM usage percentage from total and free values.
+/// Normalizes total CPU percentage by logical core count.
 ///
-/// Accepts raw telemetry strings like "16Gi" (total) and "13Gi" (free).
-/// Returns used percentage: ((total - free) / total) * 100.
-fn parse_ram_percent(ram_total: &str, ram_free: &str) -> f32 {
+/// `total_cpu` is the sum of per-process `%cpu` values (which can exceed 100% on multi-core).
+/// Dividing by `cpu_count` yields a 0–100% utilization metric comparable to the 90% threshold.
+///
+/// # Inputs
+/// - `total_cpu`: summed `%cpu` across all processes (e.g. 320.0 on 4-core host)
+/// - `cpu_count`: logical cores from `/proc/cpuinfo` (0 means unknown)
+///
+/// # Outputs
+/// - Normalized percent: `total_cpu / cpu_count` when `cpu_count > 0`, otherwise `total_cpu`.
+///
+fn normalize_cpu_percent(total_cpu: f32, cpu_count: u32) -> f32 {
+    if cpu_count > 0 {
+        #[allow(clippy::cast_precision_loss)]
+        {
+            total_cpu / (cpu_count as f32)
+        }
+    } else {
+        total_cpu
+    }
+}
+
+/// Helper to compute RAM usage percentage from total and available values.
+///
+/// Accepts raw telemetry strings like "16Gi" (total) and "13Gi" (available).
+/// Returns used percentage: ((total - available) / total) * 100.
+fn parse_ram_percent(ram_total: &str, ram_available: &str) -> f32 {
     let total_val = parse_size_value(ram_total.trim()).unwrap_or(0.0);
-    let free_val = parse_size_value(ram_free.trim()).unwrap_or(0.0);
+    let available_val = parse_size_value(ram_available.trim()).unwrap_or(0.0);
 
     if total_val > 0.0 {
-        ((total_val - free_val) / total_val) * 100.0
+        ((total_val - available_val) / total_val) * 100.0
     } else {
         0.0
     }
@@ -426,5 +462,68 @@ mod tests {
         assert!((parse_size_value("13Gi").unwrap() - 13.0).abs() < 0.01);
         assert!((parse_size_value("512Mi").unwrap() - 0.5).abs() < 0.01);
         assert_eq!(parse_size_value("invalid"), None);
+    }
+
+    #[test]
+    fn test_normalize_cpu_percent_multicore() {
+        assert!((normalize_cpu_percent(320.0, 4) - 80.0).abs() < 0.01);
+        assert!((normalize_cpu_percent(2880.0, 32) - 90.0).abs() < 0.01);
+        assert!((normalize_cpu_percent(75.0, 1) - 75.0).abs() < 0.01);
+        assert!((normalize_cpu_percent(50.0, 0) - 50.0).abs() < 0.01);
+        assert!(normalize_cpu_percent(400.0, 8) <= 100.0);
+    }
+
+    #[test]
+    fn test_lightweight_capture_has_no_accelerator_or_network() {
+        use crate::telemetry::Telemetry;
+        let telemetry = Telemetry::capture_lightweight();
+        assert!(telemetry.hardware.accelerators.is_empty());
+        assert!(!telemetry.hardware.jax_available);
+        assert!(telemetry.hardware.jax_version.is_none());
+        assert!(telemetry.hardware.jax_device_count.is_none());
+        assert_eq!(telemetry.network.public_ip, "unknown");
+        assert!(!telemetry.network.tunnel_running);
+        assert!(telemetry.network.tunnel_pid.is_none());
+        assert!(telemetry.network.listening_ports.is_empty());
+    }
+
+    #[test]
+    fn test_ram_percent_uses_available_not_free() {
+        // /proc/meminfo fixture (telemetry.rs parses MemTotal/MemFree/MemAvailable):
+        //   MemTotal:     32Gi
+        //   MemFree:       8Gi   ← free-but-cached, the old (wrong) basis
+        //   MemAvailable:  22Gi  ← actual available, the basis the monitor must use
+        // The monitor consumes ram_available (monitor.rs state update), so the
+        // percent must reflect 22Gi, not 8Gi.
+        let mem_total = "32Gi";
+        let mem_free = "8Gi";
+        let mem_available = "22Gi";
+
+        let percent = parse_ram_percent(mem_total, mem_available);
+        assert!(
+            (percent - 31.25).abs() < 0.01,
+            "available-basis expected 31.25%, got {}",
+            percent
+        );
+
+        // The free-basis value the pre-fix code produced — must NOT be the result.
+        let free_basis = parse_ram_percent(mem_total, mem_free);
+        assert!(
+            (free_basis - 75.0).abs() < 0.01,
+            "free-basis sanity: got {}",
+            free_basis
+        );
+        assert!(
+            (percent - free_basis).abs() > 40.0,
+            "percent must reflect available, not free: available={} free={}",
+            percent,
+            free_basis
+        );
+    }
+
+    #[test]
+    fn test_ram_percent_zero_total() {
+        let result = parse_ram_percent("0Gi", "0Gi");
+        assert_eq!(result, 0.0);
     }
 }

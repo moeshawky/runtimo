@@ -218,10 +218,22 @@ fn fresh_process_after() -> ProcessSnapshot {
 ///
 /// For mutating capabilities that create a backup before writing (FileWrite,
 /// Delete, GitExec), this function emits a [`WalEventType::BackupCreated`] WAL
-/// event between `JobStarted` and `JobCompleted`, carrying the original `path`
-/// and `backup_path` from `output.data`. The event is written before the
-/// fallible `JobCompleted` append so the backup remains auditable (and `undo`-able)
-/// even if `JobCompleted` never lands, preventing an orphaned backup.
+/// event carrying the original `path` and `backup_path`, always BEFORE the
+/// terminal lifecycle append so the backup remains auditable (and `undo`-able)
+/// even when the terminal append never lands, preventing an orphaned backup.
+///
+/// - **Success path:** the event is emitted from the capability's reported
+///   `output.data` (`path` + `backup_path`) before the fallible
+///   `JobCompleted` append.
+/// - **Failure path (Err):** the capability's `Output` is unavailable, so the
+///   backup location is derived from the `BackupManager` layout —
+///   `backup_dir()/job_id/file_name` with collision suffixes `.1`–`.10`
+///   (see `BackupManager::create_backup`, which appends the first free
+///   suffix). An existence check gates the emit; the `BackupCreated` event
+///   is appended before `JobFailed` so `undo`'s WAL scan (which reads
+///   `output.data.{path, backup_path}` from any event of the job) covers
+///   failed jobs too. The audit append is best-effort (`let _`): a failure
+///   here must not mask the capability failure that `JobFailed` records.
 ///
 /// # Arguments
 ///
@@ -430,6 +442,63 @@ pub fn execute_with_telemetry_and_session(
         Err(e) => {
             let telemetry_after = fresh_telemetry_after(telemetry_on);
             let process_after = fresh_process_after();
+            // T4: backup orphan audit — if capability created a backup before failing,
+            // the file exists at backup_dir/job_id/file_name. Emit BackupCreated
+            // before JobFailed so WAL consumers and undo can locate it.
+            if let Some(orig_path) = args.get("path").and_then(|v| v.as_str()) {
+                if !orig_path.is_empty() {
+                    if let Some(file_name) = std::path::Path::new(orig_path).file_name() {
+                        let job_dir = crate::utils::backup_dir().join(&job_id_str);
+                        let mut candidate = job_dir.join(file_name);
+                        let found = if candidate.exists() {
+                            Some(candidate)
+                        } else {
+                            let mut found_inner = None;
+                            for i in 1..=10 {
+                                candidate =
+                                    job_dir.join(format!("{}.{}", file_name.to_string_lossy(), i));
+                                if candidate.exists() {
+                                    found_inner = Some(candidate);
+                                    break;
+                                }
+                            }
+                            found_inner
+                        };
+                        if let Some(bp) = found {
+                            let backup_seq = wal.seq();
+                            let _ = wal.append(WalEvent {
+                                seq: backup_seq,
+                                ts: telemetry_after.timestamp,
+                                event_type: WalEventType::BackupCreated,
+                                job_id: job_id_str.clone(),
+                                capability: Some(cap_name.clone()),
+                                output: Some(serde_json::json!({
+                                    "data": {
+                                        "path": orig_path,
+                                        "backup_path": bp.to_string_lossy().to_string()
+                                    }
+                                })),
+                                error: None,
+                                telemetry_before: None,
+                                telemetry_after: None,
+                                process_before: None,
+                                process_after: None,
+                                cmd: None,
+                                cmd_stdout: None,
+                                cmd_stderr: None,
+                                cmd_exit_code: None,
+                                cmd_corrected: None,
+                                oov_ratio: None,
+                                detection_flags: None,
+                                backup_path: Some(bp),
+                                bundle_hash: None,
+                                mono_ns: None,
+                                wall_ns: None,
+                            });
+                        }
+                    }
+                }
+            }
             let end_seq = wal.seq();
             let err_msg = format!("Execution failed: {}", e);
             log_job_failed_with_snapshots(
@@ -1364,5 +1433,105 @@ mod tests {
         let spawned = identify_spawned_pids(&before, &after);
         assert_eq!(spawned.len(), 1, "Should detect exactly 1 spawned PID");
         assert_eq!(spawned[0], 99, "Spawned PID should be 99");
+    }
+
+    /// Capability that creates a backup then fails — simulates FileWrite post-backup failure.
+    struct FailAfterBackupCap;
+    impl Capability for FailAfterBackupCap {
+        fn name(&self) -> &'static str {
+            "FailAfterBackup"
+        }
+        fn description(&self) -> &'static str {
+            "creates backup then fails"
+        }
+        fn schema(&self) -> Value {
+            json!({"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]})
+        }
+        fn validate(&self, _args: &Value) -> crate::Result<()> {
+            Ok(())
+        }
+        fn execute(&self, args: &Value, ctx: &Context) -> crate::Result<Output> {
+            let path_str = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let path = std::path::Path::new(path_str);
+            if path.exists() {
+                let backup_dir = crate::utils::backup_dir();
+                let mgr = crate::backup::BackupManager::new(backup_dir)
+                    .map_err(|e| crate::Error::BackupError(format!("backup mgr: {}", e)))?;
+                let _ = mgr.create_backup(path, &ctx.job_id);
+            }
+            Err(crate::Error::ExecutionFailed(
+                "simulated failure after backup".into(),
+            ))
+        }
+    }
+
+    #[test]
+    fn test_backup_orphan_on_err_path_is_audited() {
+        let dir = unique_test_dir();
+        std::fs::create_dir_all(&dir).ok();
+        let target = make_file(&dir, "orphan.txt", "original content");
+        let wp = wal_path(&dir);
+
+        let cap = FailAfterBackupCap;
+        let result = execute_with_telemetry_and_session(
+            &cap,
+            &json!({"path": target.to_str().unwrap()}),
+            false,
+            &wp,
+            None,
+            None,
+            30,
+        )
+        .unwrap();
+        assert!(!result.success, "should be failure");
+        let reader = crate::WalReader::load(&wp).unwrap();
+        let events = reader.events();
+        let has_backup = events.iter().any(|e| {
+            matches!(e.event_type, crate::WalEventType::BackupCreated)
+                && e.job_id == result.job_id
+                && e.backup_path.is_some()
+        });
+        assert!(
+            has_backup,
+            "WAL must contain BackupCreated for failed job {} — orphan backup not audited",
+            result.job_id
+        );
+        // WAL ordering invariant: BackupCreated must precede JobFailed so
+        // consumers that stop reading at the terminal event can still
+        // locate the backup.
+        let backup_idx = events.iter().position(|e| {
+            matches!(e.event_type, crate::WalEventType::BackupCreated) && e.job_id == result.job_id
+        });
+        let failed_idx = events.iter().position(|e| {
+            matches!(e.event_type, crate::WalEventType::JobFailed) && e.job_id == result.job_id
+        });
+        assert!(
+            backup_idx.is_some(),
+            "BackupCreated event missing for job {}",
+            result.job_id
+        );
+        assert!(
+            failed_idx.is_some(),
+            "JobFailed event missing for job {}",
+            result.job_id
+        );
+        assert!(
+            backup_idx < failed_idx,
+            "BackupCreated (idx {:?}) must precede JobFailed (idx {:?})",
+            backup_idx,
+            failed_idx
+        );
+        let backup_event = events
+            .iter()
+            .find(|e| {
+                matches!(e.event_type, crate::WalEventType::BackupCreated)
+                    && e.job_id == result.job_id
+            })
+            .unwrap();
+        let bp = backup_event.backup_path.as_ref().unwrap();
+        assert!(bp.exists(), "backup file should exist at {:?}", bp);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(crate::utils::backup_dir().join(&result.job_id));
     }
 }

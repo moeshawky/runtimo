@@ -35,11 +35,15 @@ use std::time::{Duration, Instant};
 
 /// Parses a DAL string into a `DesignAssuranceLevel`.
 ///
-/// Reads `RuntimoConfig::get_dal()`, which uppercases the value from either
-/// source (env var `RUNTIMO_DAL` or config file `dal`), so `dal = "b"` and
-/// `RUNTIMO_DAL=b` both resolve to `"B"`. Exact-matches `"B"` through `"E"`
-/// to their level; any unknown or absent value resolves to the strictest
-/// `DesignAssuranceLevel::A`.
+/// Reads `RuntimoConfig::get_dal()`, which resolves with the same
+/// precedence as `RuntimoConfig::resolved()`: env var `RUNTIMO_DAL` >
+/// top-level `dal` > `[guards].dal` > profile default (`service` ⇒ `A`,
+/// otherwise `E`) > built-in `E` for a bare install. Env and config
+/// values are uppercased, so `dal = "b"` and `RUNTIMO_DAL=b` resolve to
+/// `"B"`. The mapper exact-matches `"B"` through `"E"` to their level;
+/// only unknown strings (e.g. `"Z"`) fall back to the strictest
+/// `DesignAssuranceLevel::A` — a bare install resolves to `"E"`
+/// (permissive), not `"A"`.
 fn dal_from_config() -> DesignAssuranceLevel {
     match RuntimoConfig::get_dal().as_str() {
         "B" => DesignAssuranceLevel::B,
@@ -237,8 +241,9 @@ fn apply_dal_to_decision(dal: DesignAssuranceLevel, decision: SafetyDecision) ->
 impl LlmoSafeGuard {
     /// Creates a guard with the default memory ceiling (80% of system memory).
     ///
-    /// DAL is resolved via `RuntimoConfig::get_dal()` which checks:
-    /// env var `RUNTIMO_DAL` → config file `dal` field → default `A`.
+    /// DAL is resolved via `RuntimoConfig::get_dal()`: env var
+    /// `RUNTIMO_DAL` → config `dal` → `[guards].dal` → profile (`service` ⇒ `A`,
+    /// else `E`) → built-in `E` for a bare install.
     #[must_use]
     pub fn new() -> Self {
         let guard = ResourceGuard::auto(0.8);
@@ -250,8 +255,9 @@ impl LlmoSafeGuard {
 
     /// Creates a guard with an explicit memory ceiling in bytes.
     ///
-    /// DAL is resolved via `RuntimoConfig::get_dal()` which checks:
-    /// env var `RUNTIMO_DAL` → config file `dal` field → default `A`.
+    /// DAL is resolved via `RuntimoConfig::get_dal()`: env var
+    /// `RUNTIMO_DAL` → config `dal` → `[guards].dal` → profile (`service` ⇒ `A`,
+    /// else `E`) → built-in `E` for a bare install.
     #[must_use]
     pub fn with_memory_ceiling_bytes(memory_ceiling_bytes: usize) -> Self {
         Self {
@@ -615,8 +621,11 @@ mod tests {
 
     #[test]
     fn test_cognitive_pipeline_integration() {
-        // Default DAL A: benign input passes the sifter (no bias, low entropy)
-        let guard_strict = LlmoSafeGuard::new();
+        // DAL pinned to A (strictest): bare installs now resolve to E via
+        // the unified get_dal()/resolved() default, so an explicit A is
+        // required to exercise the strict gating path. Benign input still
+        // proceeds; suspicious input must not.
+        let guard_strict = LlmoSafeGuard::new().with_dal(DesignAssuranceLevel::A);
         let res_benign = guard_strict.check_cognitive_pipeline("Hello world", "Hello world");
         assert!(res_benign.is_ok());
         let result_benign = res_benign.unwrap();

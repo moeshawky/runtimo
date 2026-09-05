@@ -63,3 +63,6 @@ publishing.md
 .cam-workpaper.yaml
 session-ses_*.md
 .ix/
+
+# CodeGraph index cache (generated, never committed)
+.codegraph/
