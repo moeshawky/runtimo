@@ -2,7 +2,7 @@
 //!
 //! The observe pipeline collects low-overhead samples from a target process
 //! without modifying it (sibling supervision only). All data is WAL-backed
-//! via [`BundleWriter`] with hash-chained batches and checkpointing.
+//! via [`crate::observe::bundle::BundleWriter`] with hash-chained batches and checkpointing.
 //!
 //! # Modules
 //! * `bundle` — WAL-backed, hash-chained bundle writer with batched fsync

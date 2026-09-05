@@ -84,6 +84,12 @@ fn default_limit() -> usize {
 }
 
 /// Parameters for `observe_start`.
+///
+/// `burst` is a deferred P2B feature (file-watch burst). When `Some(true)` the
+/// handler must not silently poll — it must gate to an explicit deferred error
+/// (`-32601 observe_burst deferred`) or surface `burst_deferred:true` in the
+/// success response so the contract is not dead. See `daemon/src/engine.rs:110`
+/// `observe_burst` pattern and `cli/src/main.rs` burst forwarding.
 #[derive(Debug, Deserialize)]
 pub struct ObserveStartParams {
     /// Target pid to sample (if None, `cmd` must be set — CLI spawns sibling).
@@ -102,6 +108,10 @@ pub struct ObserveStartParams {
     #[serde(default)]
     pub dal: Option<String>,
     /// Whether burst file-watch is enabled (P2B — deferred if non-trivial).
+    ///
+    /// When `Some(true)`, the server must return `-32601 observe_burst deferred`
+    /// (mirror `engine.rs:110`) or include `burst_deferred:true` in the response;
+    /// the CLI must also print the deferred note to stdout, not only daemon stderr.
     #[serde(default)]
     pub burst: Option<bool>,
     /// Explicit run id (default: generated).

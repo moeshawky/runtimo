@@ -4,10 +4,10 @@
 //! stop `>1 ms`, no `LD_PRELOAD`, no in-process hook. Each tick is
 //! gated through [`LlmoSafeGuard::execute`] (`llmosafe.rs:331-337`) so
 //! pressure `>80 %` suspends via [`ObserveBudget::should_suspend`].
-//! Rate is taken from [`ObserveConfig::sample_rate_hz`] (`config.rs`)
+//! Rate is taken from [`crate::config::ObserveConfig::sample_rate_hz`] (`config.rs`)
 //! default `50 Hz` (`Q3 P1A`). Output is via a bounded `512`-cap
 //! channel that drops newest on overflow and emits a `TRUNCATED` marker
-//! on drain — same discipline as [`AuditHook`] (`audit.rs`), never
+//! on drain — same discipline as [`crate::observe::audit::AuditHook`] (`audit.rs`), never
 //! silent zeros. Fallback (permission `EPERM`, unknown runtime) emits
 //! `TRUNCATED`/`SAMPLED` markers with an error note.
 //!
@@ -61,6 +61,10 @@ impl SampleEvent {
     /// Redacts any frame containing `auth_token`/`bearer`/`api_key`
     /// (case-insensitive) to `REDACTED` before serialization — same
     /// `G-SEC` discipline as [`crate::observe::audit::AuditEvent::to_wal_event`].
+    /// Sampler `ObserveTruncated` events carry `frames`/`truncated`/`error` and
+    /// are part of the hash chain; they must NOT be confused with writer
+    /// overflow markers which use `bundle_dropped` sentinel (bundle.rs:276-298)
+    /// and are excluded from hash recompute (bundle.rs:488-498).
     #[must_use]
     pub fn to_wal_event(&self) -> WalEvent {
         let et = if self.truncated {

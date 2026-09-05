@@ -65,8 +65,14 @@ impl BackgroundJobRegistry {
     }
 
     /// Releases a concurrency slot after a background job completes.
+    ///
+    /// Uses `checked_sub` to avoid wrapping `0 → MAX` on a double-release or
+    /// release-without-reserve, which would permanently block `try_reserve`.
+    /// A release when `running == 0` is a no-op (idempotent).
     pub fn release(&self) {
-        self.running.fetch_sub(1, Ordering::SeqCst);
+        let _ = self
+            .running
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
     }
 
     /// Inserts a new background job into the registry.

@@ -73,11 +73,38 @@ use serde_json::Value;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
+use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, Command, ExitStatus};
 use std::thread;
 use std::time::{Duration, Instant};
 
-type WaitResult = Result<(ExitStatus, Vec<u8>, Vec<u8>, Vec<u32>)>;
+/// Outcome of [`wait_with_timeout`] — carries the explicit `timed_out` sentinel
+/// and the raw `ExitStatus` so the caller can derive `signal`.
+///
+/// `timed_out` is `true` ONLY on the timeout-kill path (elapsed > timeout
+/// and `SIGKILL` issued to the child's process group). Signal terminations
+/// (OOM `SIGKILL`, `SIGTERM`, etc.) leave `timed_out == false` and expose
+/// the terminating signal via `status.signal()`.
+///
+/// This disambiguates `exit_status.code().is_none()` (true for ANY signal)
+/// from an actual timeout, fixing the false-positive/false-negative sentinel
+/// bug (RC3).
+#[derive(Debug)]
+struct WaitOutcome {
+    /// Child exit status (may be signal-terminated).
+    status: ExitStatus,
+    /// Captured stdout (bounded to `MAX_OUTPUT_BYTES`).
+    stdout: Vec<u8>,
+    /// Captured stderr (bounded to `MAX_OUTPUT_BYTES`).
+    stderr: Vec<u8>,
+    /// Descendant PIDs seen just before return (for audit).
+    #[allow(dead_code)] // audit trail — retained for future WAL `spawned_pids` parity
+    descendants: Vec<u32>,
+    /// `true` iff the timeout-kill path fired (lines 1177-1192).
+    timed_out: bool,
+}
+
+type WaitResult = Result<WaitOutcome>;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024;
@@ -1153,6 +1180,29 @@ fn check_command_paths(cmd: &str) -> Option<String> {
     None
 }
 
+/// Waits for `child` with a hard timeout, collecting output and descendant PIDs.
+///
+/// # Parameters
+/// - `child`: mutable handle to the spawned `sh -c` process (stdout/stderr already `piped`).
+/// - `pgid`: process-group ID to `SIGKILL` on timeout (child's PID, used as `kill(-pgid, SIGKILL)`).
+/// - `timeout_secs`: wall-clock budget; when exceeded the process group is killed.
+///
+/// # Returns
+/// - `Ok(WaitOutcome)`: child exited (normal, signal, or timeout-killed). `timed_out` is `true`
+///   **only** when this function's timeout-kill path (elapsed > timeout) fired; signal
+///   terminations (OOM `SIGKILL`, `SIGTERM`, etc.) return `timed_out == false` with
+///   `status.signal() == Some(signum)`. This bool threads the timeout sentinel explicitly
+///   instead of inferring from `code().is_none()`, fixing the false-positive.
+/// - `Err(Error::ExecutionFailed)`: `try_wait` I/O error or `wait` failure (not a timeout).
+///
+/// # Side effects
+/// - Spawns two threads to drain stdout/stderr (bounded to `MAX_OUTPUT_BYTES`).
+/// - On timeout, sends `SIGKILL` to `-pgid` (kills the whole process group) and reaps
+///   the child, joining the drain threads so no pipe is left open.
+///
+/// # Invariants
+/// - `timed_out == true` implies the `SIGKILL` was issued by this function.
+/// - `timed_out == false` implies either normal exit or external signal kill.
 #[allow(clippy::arithmetic_side_effects)] // -(pgid) negation is safe for valid PIDs
 fn wait_with_timeout(child: &mut Child, pgid: u32, timeout_secs: u64) -> WaitResult {
     let start = Instant::now();
@@ -1182,14 +1232,35 @@ fn wait_with_timeout(child: &mut Child, pgid: u32, timeout_secs: u64) -> WaitRes
                 let _ = libc::kill(-(pgid as libc::pid_t), libc::SIGKILL);
             }
             let killed_descendants = get_all_descendants(child_pid);
-            let _ = child.wait();
-            let _ = stdout_thread.map(|h| h.join().unwrap_or_default());
-            let _ = stderr_thread.map(|h| h.join().unwrap_or_default());
-            return Err(Error::ExecutionFailed(format!(
-                "command timed out after {}s (killed {} descendants)",
-                timeout_secs,
-                killed_descendants.len()
-            )));
+            // Capture the child's exit status and output even on timeout so the
+            // caller can report `timed_out:true` with `signal:Some(9)` and still
+            // see partial stdout/stderr. Prior code discarded both (false negative).
+            let status = match child.wait() {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = stdout_thread.map(|h| h.join().unwrap_or_default());
+                    let _ = stderr_thread.map(|h| h.join().unwrap_or_default());
+                    return Err(Error::ExecutionFailed(format!(
+                        "command timed out after {}s (killed {} descendants) — wait failed: {}",
+                        timeout_secs,
+                        killed_descendants.len(),
+                        e
+                    )));
+                }
+            };
+            let stdout_data = stdout_thread
+                .map(|h| h.join().unwrap_or_default())
+                .unwrap_or_default();
+            let stderr_data = stderr_thread
+                .map(|h| h.join().unwrap_or_default())
+                .unwrap_or_default();
+            return Ok(WaitOutcome {
+                status,
+                stdout: stdout_data,
+                stderr: stderr_data,
+                descendants: killed_descendants,
+                timed_out: true,
+            });
         }
         last_descendants = get_all_descendants(child_pid);
         match child.try_wait() {
@@ -1200,7 +1271,13 @@ fn wait_with_timeout(child: &mut Child, pgid: u32, timeout_secs: u64) -> WaitRes
                 let stderr_data = stderr_thread
                     .map(|h| h.join().unwrap_or_default())
                     .unwrap_or_default();
-                return Ok((status, stdout_data, stderr_data, last_descendants));
+                return Ok(WaitOutcome {
+                    status,
+                    stdout: stdout_data,
+                    stderr: stderr_data,
+                    descendants: last_descendants,
+                    timed_out: false,
+                });
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(50)),
             Err(e) => return Err(Error::ExecutionFailed(format!("error waiting: {}", e))),
@@ -1447,24 +1524,67 @@ impl TypedCapability for ShellExec {
                 let _ = stdin_pipe.write_all(stdin_content.as_bytes());
             }
         }
-        let (exit_status, stdout, stderr, _descendants) =
-            wait_with_timeout(&mut child, pgid, timeout)
-                .map_err(|e| CapabilityError::Internal(e.to_string()))?;
-        let stdout_str = String::from_utf8_lossy(&stdout).to_string();
-        let stderr_str = String::from_utf8_lossy(&stderr).to_string();
-        let success = exit_status.success();
+        // `WaitOutcome.timed_out` is the explicit sentinel — true ONLY on the
+        // timeout-kill path. `signal` is `Some(signum)` for any signal termination
+        // (OOM `SIGKILL`, `SIGTERM`, timeout `SIGKILL`, etc.), `None` for normal exit.
+        // This replaces the buggy `code().is_none()` sentinel (RC3).
+        let outcome = match wait_with_timeout(&mut child, pgid, timeout) {
+            Ok(o) => o,
+            Err(e) => {
+                let msg = e.to_string();
+                // Timeout-kill Err path must still carry `timed_out:true` + `signal`
+                // in data (AP-4/AP-3 coordination). If the error string indicates a
+                // timeout, synthesize an error Output with structured data rather
+                // than a bare `CapabilityError::Internal` (false negative fix).
+                if msg.contains("timed out") {
+                    let mut out = Output::error(msg.clone(), msg);
+                    out.data = Some(serde_json::json!({
+                        "cmd": &args.cmd,
+                        "stdout": "",
+                        "stderr": "",
+                        "exit_code": -1,
+                        "pid": child_pid,
+                        "timeout_secs": timeout,
+                        "timed_out": true,
+                        "signal": 9,
+                        "truncated": false
+                    }));
+                    return Ok(out);
+                }
+                return Err(CapabilityError::Internal(msg));
+            }
+        };
+        let stdout_str = String::from_utf8_lossy(&outcome.stdout).to_string();
+        let stderr_str = String::from_utf8_lossy(&outcome.stderr).to_string();
+        let signal: Option<i32> = outcome.status.signal();
+        let success = !outcome.timed_out && outcome.status.success();
 
-        let mut out = if success {
+        let mut out = if outcome.timed_out {
+            Output::error(
+                format!("command timed out after {}s", timeout),
+                format!("command timed out after {}s", timeout),
+            )
+        } else if success {
             Output::ok("completed".into())
         } else {
-            Output::error(
-                format!("exit code {}", exit_status.code().unwrap_or(-1)),
-                format!("exit code {}", exit_status.code().unwrap_or(-1)),
-            )
+            let msg = if let Some(sig) = signal {
+                format!("terminated by signal {}", sig)
+            } else {
+                format!("exit code {}", outcome.status.code().unwrap_or(-1))
+            };
+            Output::error(msg.clone(), msg)
         };
-        out.data = Some(
-            serde_json::json!({ "cmd": &args.cmd, "stdout": stdout_str, "stderr": stderr_str, "exit_code": exit_status.code().unwrap_or(-1), "pid": child_pid, "timeout_secs": timeout, "timed_out": exit_status.code().is_none(), "truncated": stdout.len() >= MAX_OUTPUT_BYTES || stderr.len() >= MAX_OUTPUT_BYTES }),
-        );
+        out.data = Some(serde_json::json!({
+            "cmd": &args.cmd,
+            "stdout": stdout_str,
+            "stderr": stderr_str,
+            "exit_code": outcome.status.code().unwrap_or(-1),
+            "pid": child_pid,
+            "timeout_secs": timeout,
+            "timed_out": outcome.timed_out,
+            "signal": signal,
+            "truncated": outcome.stdout.len() >= MAX_OUTPUT_BYTES || outcome.stderr.len() >= MAX_OUTPUT_BYTES
+        }));
         Ok(out)
     }
 }
@@ -1836,16 +1956,43 @@ mod tests {
     #[test]
     fn enforces_timeout() {
         let s = Instant::now();
-        assert!(Capability::execute(
+        let r = Capability::execute(
             &ShellExec,
             &serde_json::json!({"cmd": "sleep 5", "timeout_secs": 1}),
             &Context {
                 dry_run: false,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
+            },
+        );
+        // RC3 fix: timeout-kill returns Ok(Output) with status error + timed_out:true
+        // (was Err with no timed_out field — false negative). Accept either shape
+        // during transition, but verify timed_out sentinel when present.
+        match r {
+            Ok(out) => {
+                assert_eq!(out.status, "error", "timeout should be error status");
+                let data = out.data.expect("timeout output must have data");
+                assert_eq!(
+                    data["timed_out"], true,
+                    "timeout kill must have timed_out:true, got {:?}",
+                    data
+                );
+                assert!(
+                    data["signal"].is_number(),
+                    "timeout kill must have signal Some, got {:?}",
+                    data["signal"]
+                );
             }
-        )
-        .is_err());
+            Err(e) => {
+                // Legacy Err path — still considered timeout if message matches
+                let msg = e.to_string();
+                assert!(
+                    msg.to_lowercase().contains("timed out") || msg.contains("timeout"),
+                    "expected timeout error, got: {}",
+                    msg
+                );
+            }
+        }
         assert!(s.elapsed().as_secs() < 3);
     }
 
@@ -3009,5 +3156,105 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    // ── RC3: timed_out sentinel + signal tests ─────────────────────────
+
+    /// Simulates OOM-style signal kill via direct `wait_with_timeout` with an
+    /// external `SIGKILL` (not via `kill` command which is blocklisted).
+    /// Must be `timed_out:false` and `signal:Some`, not a false positive.
+    #[test]
+    fn signal_kill_is_not_timed_out() {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        // Spawn a sleep that we will SIGKILL externally after 200ms.
+        // Use direct `wait_with_timeout` to bypass ShellExec blocklist.
+        let mut child = Command::new("sleep")
+            .arg("10")
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let pgid = pid;
+        // Killer thread: SIGKILL the child after 200ms (simulates OOM).
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            // SAFETY: pid is a valid child PID from child.id(); SIGKILL is well-defined;
+            // single-PID kill does not target a process group.
+            #[allow(clippy::cast_possible_wrap)]
+            unsafe {
+                let _ = libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+        });
+        let outcome = wait_with_timeout(&mut child, pgid, 30).expect("wait should succeed");
+        assert!(
+            !outcome.timed_out,
+            "signal kill must have timed_out:false (OOM at 2s with timeout 30 is NOT a timeout)"
+        );
+        let sig = outcome.status.signal();
+        assert!(
+            sig.is_some(),
+            "signal kill must have signal:Some, got {:?} status {:?}",
+            sig,
+            outcome.status
+        );
+        assert_eq!(sig.unwrap(), 9, "kill -9 should yield signal 9");
+    }
+
+    /// Timeout-kill path (elapsed > timeout, `SIGKILL` to pgid) must be
+    /// `timed_out:true` with `signal:Some` and captured in `data` even
+    /// though the waiter timed out. Covers the false-negative Err path.
+    #[test]
+    fn timeout_kill_is_timed_out_true() {
+        let r = Capability::execute(
+            &ShellExec,
+            &serde_json::json!({"cmd": "sleep 5", "timeout_secs": 1}),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::temp_dir(),
+            },
+        )
+        .expect("timeout kill should return Ok(Output) with error status, not Err");
+        assert_eq!(r.status, "error", "timeout should be error status");
+        let data = r.data.expect("timeout output must have data");
+        assert_eq!(
+            data["timed_out"], true,
+            "timeout kill must have timed_out:true, got {:?}",
+            data
+        );
+        // Timeout uses SIGKILL (9) to the pgid — signal must be present.
+        assert!(
+            data["signal"].is_number(),
+            "timeout kill must have signal:Some(9), got {:?}",
+            data["signal"]
+        );
+        assert_eq!(data["timeout_secs"], 1);
+    }
+
+    /// Normal exit must be `timed_out:false` and `signal:None` (null in JSON).
+    #[test]
+    fn normal_exit_is_not_timed_out_no_signal() {
+        let r = Capability::execute(
+            &ShellExec,
+            &serde_json::json!({"cmd": "true", "timeout_secs": 5}),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::temp_dir(),
+            },
+        )
+        .unwrap();
+        assert_eq!(r.status, "ok");
+        let data = r.data.unwrap();
+        assert_eq!(data["timed_out"], false);
+        assert!(
+            data["signal"].is_null(),
+            "normal exit signal should be null, got {:?}",
+            data["signal"]
+        );
     }
 }

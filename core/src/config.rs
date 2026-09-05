@@ -126,7 +126,7 @@ pub struct ObserveConfig {
 /// Precedence (highest to lowest): CLI > env > file > profile > builtin.
 /// Provisionals for Gate 1: bare DAL = E, no transient --profile flag, ephemeral WAL = batch.
 #[derive(Debug, Clone)]
-#[allow(clippy::exhaustive_structs)]
+#[allow(clippy::exhaustive_structs, clippy::struct_excessive_bools)]
 pub struct ResolvedConfig {
     /// Effective profile name.
     pub profile: String,
@@ -142,6 +142,12 @@ pub struct ResolvedConfig {
     pub output_renderer: String,
     /// Whether blocklist is enabled.
     pub blocklist_enabled: bool,
+    /// Whether critical-files denylist is enabled.
+    pub critical_files_enabled: bool,
+    /// Whether allowed-prefix path whitelist is enabled.
+    pub path_restriction_enabled: bool,
+    /// Whether ShellExec PATH sanitization is enabled.
+    pub path_sanitization_enabled: bool,
     /// Effective max sessions.
     pub session_max: u32,
     /// Effective session timeout.
@@ -591,6 +597,33 @@ profile = "minimal"
             profile != "ephemeral"
         };
 
+        // Critical-files denylist: top-level > guards > profile > builtin(true)
+        let critical_files_enabled = if let Some(b) = self.critical_files_enabled {
+            b
+        } else if let Some(b) = self.guards.critical_files_enabled {
+            b
+        } else {
+            profile != "ephemeral"
+        };
+
+        // Path whitelist: top-level > guards > profile > builtin(true)
+        let path_restriction_enabled = if let Some(b) = self.path_restriction_enabled {
+            b
+        } else if let Some(b) = self.guards.path_restriction_enabled {
+            b
+        } else {
+            profile != "ephemeral"
+        };
+
+        // PATH sanitization: top-level > guards > profile > builtin(true)
+        let path_sanitization_enabled = if let Some(b) = self.path_sanitization_enabled {
+            b
+        } else if let Some(b) = self.guards.path_sanitization_enabled {
+            b
+        } else {
+            profile != "ephemeral"
+        };
+
         // Session: file session > profile > builtin
         let session_max = if let Some(m) = self.session.max_sessions {
             m
@@ -643,6 +676,9 @@ profile = "minimal"
             output_format,
             output_renderer,
             blocklist_enabled,
+            critical_files_enabled,
+            path_restriction_enabled,
+            path_sanitization_enabled,
             session_max,
             session_timeout,
             session_on_limit,
@@ -903,38 +939,78 @@ profile = "minimal"
 
     /// Whether the ShellExec dangerous-command blocklist is enabled.
     ///
-    /// Defaults to enabled when unconfigured. `blocklist_enabled = false` in
-    /// config.toml makes ShellExec behave like plain `sh -c`.
+    /// Single source of truth: delegates to `Self::load().resolved().blocklist_enabled`
+    /// with precedence `blocklist_enabled` (top-level) > `[guards].blocklist_enabled` >
+    /// `profile != "ephemeral"` > builtin `true`. The `ephemeral` profile disables
+    /// the blocklist by default (resolves to `false`); `minimal` and `service`
+    /// resolve to `true` when unconfigured.
+    ///
+    /// # Side effects
+    /// Reads the config file from disk via [`Self::load`] (stderr warning on parse
+    /// failure, falls back to defaults).
+    ///
+    /// # Returns
+    /// `true` when the blocklist is active; `false` when disabled via config or
+    /// ephemeral profile.
     #[must_use]
     pub fn blocklist_enabled() -> bool {
-        Self::load().blocklist_enabled.unwrap_or(true)
+        Self::load().resolved().blocklist_enabled
     }
 
     /// Whether the FileWrite/Delete critical-files denylist is enabled.
     ///
-    /// Defaults to enabled when unconfigured.
+    /// Single source of truth: delegates to `Self::load().resolved().critical_files_enabled`
+    /// with precedence `critical_files_enabled` (top-level) > `[guards].critical_files_enabled` >
+    /// `profile != "ephemeral"` > builtin `true`. The `ephemeral` profile disables
+    /// the denylist by default (resolves to `false`); `minimal` and `service`
+    /// resolve to `true` when unconfigured.
+    ///
+    /// # Side effects
+    /// Reads the config file from disk via [`Self::load`].
+    ///
+    /// # Returns
+    /// `true` when the critical-files denylist is active; `false` when disabled.
     #[must_use]
     pub fn critical_files_enabled() -> bool {
-        Self::load().critical_files_enabled.unwrap_or(true)
+        Self::load().resolved().critical_files_enabled
     }
 
     /// Whether the allowed-prefix path whitelist is enabled.
     ///
-    /// Defaults to enabled when unconfigured. `path_restriction_enabled =
-    /// false` removes the "only /tmp, /var/tmp and configured
-    /// prefixes" constraint for FileRead/FileWrite/Delete.
+    /// Single source of truth: delegates to `Self::load().resolved().path_restriction_enabled`
+    /// with precedence `path_restriction_enabled` (top-level) > `[guards].path_restriction_enabled` >
+    /// `profile != "ephemeral"` > builtin `true`. The `ephemeral` profile disables
+    /// the whitelist by default (resolves to `false`); `minimal` and `service`
+    /// resolve to `true` when unconfigured. When `false`, `validate_path()` skips
+    /// the allowed-prefix check.
+    ///
+    /// # Side effects
+    /// Reads the config file from disk via [`Self::load`].
+    ///
+    /// # Returns
+    /// `true` when path restriction is active; `false` when disabled.
     #[must_use]
     pub fn path_restriction_enabled() -> bool {
-        Self::load().path_restriction_enabled.unwrap_or(true)
+        Self::load().resolved().path_restriction_enabled
     }
 
     /// Whether ShellExec children get a forced `PATH` (default: enabled).
     ///
-    /// When `false`, children inherit the caller's `PATH`, resolving custom
-    /// binaries outside `/usr/local/bin:/usr/bin:/bin`.
+    /// Single source of truth: delegates to `Self::load().resolved().path_sanitization_enabled`
+    /// with precedence `path_sanitization_enabled` (top-level) > `[guards].path_sanitization_enabled` >
+    /// `profile != "ephemeral"` > builtin `true`. The `ephemeral` profile disables
+    /// sanitization by default (resolves to `false`); `minimal` and `service`
+    /// resolve to `true` when unconfigured. When `false`, children inherit the
+    /// caller's `PATH`, resolving custom binaries outside `/usr/local/bin:/usr/bin:/bin`.
+    ///
+    /// # Side effects
+    /// Reads the config file from disk via [`Self::load`].
+    ///
+    /// # Returns
+    /// `true` when PATH sanitization is active; `false` when disabled.
     #[must_use]
     pub fn path_sanitization_enabled() -> bool {
-        Self::load().path_sanitization_enabled.unwrap_or(true)
+        Self::load().resolved().path_sanitization_enabled
     }
 
     /// Returns the default timeout for a capability, or the fallback.
@@ -1685,6 +1761,170 @@ mod tests {
             std::fs::read(&cfg_path).unwrap(),
             original,
             "original must be byte-identical after failed save"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn guard_accessors_agree_with_resolved_when_guards_table_false() {
+        let _guard = CONFIG_TEST_MUTEX.lock().unwrap();
+        let tmp = std::env::temp_dir().join("runtimo_test_guards_table_false");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("runtimo")).unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+        let cfg_path = tmp.join("runtimo/config.toml");
+
+        // Witness: [guards] false must disable via resolved and accessor.
+        std::fs::write(
+            &cfg_path,
+            "[guards]\nblocklist_enabled = false\ncritical_files_enabled = false\npath_restriction_enabled = false\npath_sanitization_enabled = false\n",
+        )
+        .unwrap();
+
+        let resolved = RuntimoConfig::load().resolved();
+        assert!(
+            !resolved.blocklist_enabled,
+            "guards blocklist false → resolved false"
+        );
+        assert!(
+            !resolved.critical_files_enabled,
+            "guards critical_files false → resolved false"
+        );
+        assert!(
+            !resolved.path_restriction_enabled,
+            "guards path_restriction false → resolved false"
+        );
+        assert!(
+            !resolved.path_sanitization_enabled,
+            "guards path_sanitization false → resolved false"
+        );
+
+        // Single source: accessors must agree with resolved.
+        assert_eq!(
+            RuntimoConfig::blocklist_enabled(),
+            resolved.blocklist_enabled,
+            "blocklist accessor must agree with resolved (guards false)"
+        );
+        assert_eq!(
+            RuntimoConfig::critical_files_enabled(),
+            resolved.critical_files_enabled,
+            "critical_files accessor must agree with resolved (guards false)"
+        );
+        assert_eq!(
+            RuntimoConfig::path_restriction_enabled(),
+            resolved.path_restriction_enabled,
+            "path_restriction accessor must agree with resolved (guards false)"
+        );
+        assert_eq!(
+            RuntimoConfig::path_sanitization_enabled(),
+            resolved.path_sanitization_enabled,
+            "path_sanitization accessor must agree with resolved (guards false)"
+        );
+
+        assert!(!RuntimoConfig::blocklist_enabled());
+        assert!(!RuntimoConfig::critical_files_enabled());
+        assert!(!RuntimoConfig::path_restriction_enabled());
+        assert!(!RuntimoConfig::path_sanitization_enabled());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn guard_accessors_agree_with_resolved_when_ephemeral_profile() {
+        let _guard = CONFIG_TEST_MUTEX.lock().unwrap();
+        let tmp = std::env::temp_dir().join("runtimo_test_ephemeral_agreement");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("runtimo")).unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+        let cfg_path = tmp.join("runtimo/config.toml");
+
+        // Witness: profile=ephemeral must disable all guards via resolved and accessor.
+        std::fs::write(&cfg_path, "profile = \"ephemeral\"\n").unwrap();
+
+        let resolved = RuntimoConfig::load().resolved();
+        assert_eq!(resolved.profile, "ephemeral");
+        assert!(!resolved.blocklist_enabled, "ephemeral → blocklist false");
+        assert!(
+            !resolved.critical_files_enabled,
+            "ephemeral → critical_files false"
+        );
+        assert!(
+            !resolved.path_restriction_enabled,
+            "ephemeral → path_restriction false"
+        );
+        assert!(
+            !resolved.path_sanitization_enabled,
+            "ephemeral → path_sanitization false"
+        );
+
+        assert_eq!(
+            RuntimoConfig::blocklist_enabled(),
+            resolved.blocklist_enabled,
+            "blocklist accessor must agree with resolved (ephemeral)"
+        );
+        assert_eq!(
+            RuntimoConfig::critical_files_enabled(),
+            resolved.critical_files_enabled,
+            "critical_files accessor must agree with resolved (ephemeral)"
+        );
+        assert_eq!(
+            RuntimoConfig::path_restriction_enabled(),
+            resolved.path_restriction_enabled,
+            "path_restriction accessor must agree with resolved (ephemeral)"
+        );
+        assert_eq!(
+            RuntimoConfig::path_sanitization_enabled(),
+            resolved.path_sanitization_enabled,
+            "path_sanitization accessor must agree with resolved (ephemeral)"
+        );
+
+        // Ephemeral must be OFF.
+        assert!(!RuntimoConfig::blocklist_enabled());
+        assert!(!RuntimoConfig::critical_files_enabled());
+        assert!(!RuntimoConfig::path_restriction_enabled());
+        assert!(!RuntimoConfig::path_sanitization_enabled());
+
+        // Top-level explicit true must beat ephemeral (precedence check).
+        std::fs::write(
+            &cfg_path,
+            "profile = \"ephemeral\"\nblocklist_enabled = true\ncritical_files_enabled = true\npath_restriction_enabled = true\npath_sanitization_enabled = true\n",
+        )
+        .unwrap();
+        let resolved2 = RuntimoConfig::load().resolved();
+        assert!(
+            resolved2.blocklist_enabled,
+            "top-level true must beat ephemeral"
+        );
+        assert!(
+            resolved2.critical_files_enabled,
+            "top-level true must beat ephemeral"
+        );
+        assert!(
+            resolved2.path_restriction_enabled,
+            "top-level true must beat ephemeral"
+        );
+        assert!(
+            resolved2.path_sanitization_enabled,
+            "top-level true must beat ephemeral"
+        );
+        assert_eq!(
+            RuntimoConfig::blocklist_enabled(),
+            resolved2.blocklist_enabled
+        );
+        assert_eq!(
+            RuntimoConfig::critical_files_enabled(),
+            resolved2.critical_files_enabled
+        );
+        assert_eq!(
+            RuntimoConfig::path_restriction_enabled(),
+            resolved2.path_restriction_enabled
+        );
+        assert_eq!(
+            RuntimoConfig::path_sanitization_enabled(),
+            resolved2.path_sanitization_enabled
         );
 
         let _ = std::fs::remove_dir_all(&tmp);

@@ -273,6 +273,7 @@ impl BundleWriter {
             ev.bundle_hash = Some(hash.clone());
         }
         // If drops occurred, inject a TRUNCATED marker event at end of batch.
+        // Uses `bundle_dropped` sentinel to distinguish writer overflow from sampler TRUNCATED frames (which carry `frames`/`truncated`).
         if self.dropped > 0 {
             let truncated = WalEvent {
                 seq: self.next_seq,
@@ -281,7 +282,7 @@ impl BundleWriter {
                     .map_or(0, |d| d.as_secs()),
                 event_type: WalEventType::ObserveTruncated,
                 job_id: "bundle".to_string(),
-                output: Some(serde_json::json!({"dropped": self.dropped})),
+                output: Some(serde_json::json!({"bundle_dropped": self.dropped})),
                 bundle_hash: Some(hash.clone()),
                 mono_ns: Some(self.base.elapsed().as_nanos() as u64),
                 wall_ns: Some(
@@ -397,6 +398,12 @@ impl Drop for BundleWriter {
 }
 
 /// Result of offline bundle verification.
+///
+/// Includes the honest bundle watermark parsed from the final
+/// `ObserveCompleted` event (`output.watermark`) when present.
+/// This preserves supervisor provenance: DAL-A `Halt` → `Incomplete`
+/// even when `truncated_gaps == 0`, fixing the previous derivation
+/// `truncated_gaps > 0 ? TRUNCATED : Complete`.
 #[derive(Debug, Clone)]
 #[allow(clippy::exhaustive_structs)]
 pub struct VerifyResult {
@@ -408,6 +415,11 @@ pub struct VerifyResult {
     pub hash_ok: bool,
     /// First error, if any.
     pub error: Option<String>,
+    /// Honest watermark from final `ObserveCompleted` event, if present.
+    ///
+    /// Parsed from `output.watermark` (`"Complete"` | `"Truncated"` | `"Incomplete"`).
+    /// `None` when the bundle has no `ObserveCompleted` marker (truncated/incomplete write).
+    pub watermark: Option<String>,
 }
 
 /// Offline verification of a bundle file.
@@ -415,9 +427,12 @@ pub struct VerifyResult {
 /// Checks:
 /// * seq is strictly increasing by 1; gaps are counted as `TRUNCATED`.
 /// * hash chain recomputes: `sha256(prev_hash ++ batch_line)` matches `bundle_hash`.
+/// * watermark is parsed from the final `ObserveCompleted` event's `output.watermark`
+///   (`Complete` | `Truncated` | `Incomplete`), preserving DAL-A provenance.
 ///
 /// `TRUNCATED` events are expected to have `ObserveTruncated` type; gaps without
-/// a marker are reported as truncated gaps.
+/// a marker are reported as truncated gaps. The honest watermark is never derived
+/// from `truncated_gaps`; it is read from the supervisor's `ObserveCompleted` marker.
 ///
 /// # Errors
 /// Returns `VerifyResult` with `error` if file cannot be read.
@@ -431,6 +446,7 @@ pub fn verify_bundle(path: &Path) -> VerifyResult {
                 truncated_gaps: 0,
                 hash_ok: false,
                 error: Some(format!("read failed: {e}")),
+                watermark: None,
             }
         }
     };
@@ -446,6 +462,7 @@ pub fn verify_bundle(path: &Path) -> VerifyResult {
             truncated_gaps: 0,
             hash_ok: true,
             error: None,
+            watermark: None,
         };
     }
     // Seq-gap detection → TRUNCATED count.
@@ -482,15 +499,15 @@ pub fn verify_bundle(path: &Path) -> VerifyResult {
             continue;
         }
         // Detect whether last event in batch is a writer-injected drop TRUNCATED marker.
-        // That marker is appended AFTER hash computation (output contains "dropped"), so it
+        // That marker is appended AFTER hash computation (output contains "bundle_dropped"), so it
         // must be excluded from hash recompute. Sampler TRUNCATED samples (frames) are part
-        // of the batch and must NOT be excluded — only drop markers have "dropped".
+        // of the batch and must NOT be excluded — only drop markers have "bundle_dropped".
         let has_trailing_drop = batch_end > idx + 1
             && events[batch_end - 1].event_type == WalEventType::ObserveTruncated
             && events[batch_end - 1]
                 .output
                 .as_ref()
-                .is_some_and(|v| v.get("dropped").is_some());
+                .is_some_and(|v| v.get("bundle_dropped").is_some());
         let hash_end = if has_trailing_drop {
             batch_end - 1
         } else {
@@ -522,11 +539,24 @@ pub fn verify_bundle(path: &Path) -> VerifyResult {
         idx = batch_end;
     }
 
+    // Honest watermark: parse from final ObserveCompleted event's output.watermark.
+    // Supervisor finalize() writes `output: {"watermark": "Complete"|"Truncated"|"Incomplete"}`.
+    // Never derive from truncated_gaps — that conflates DAL-A Halt (Incomplete) with gaps.
+    let watermark = events
+        .iter()
+        .rev()
+        .find(|e| e.event_type == WalEventType::ObserveCompleted)
+        .and_then(|e| e.output.as_ref())
+        .and_then(|v| v.get("watermark"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     VerifyResult {
         total: events.len(),
         truncated_gaps,
         hash_ok,
         error: None,
+        watermark,
     }
 }
 
@@ -612,10 +642,10 @@ mod tests {
             WalEventType::ObserveTruncated
         );
         assert_eq!(
-            events.last().unwrap().output.as_ref().unwrap()["dropped"],
+            events.last().unwrap().output.as_ref().unwrap()["bundle_dropped"],
             2
         );
-        // Verify detects gap/truncated
+        // Verify detects gap/truncated — watermark may be None or set by finalize
         let v = verify_bundle(&path);
         assert!(v.hash_ok);
         let _ = std::fs::remove_file(&path);

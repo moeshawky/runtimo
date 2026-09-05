@@ -167,6 +167,10 @@ impl ResourceHistory {
     }
 }
 
+/// Global fallback history (legacy — retained for compatibility, no longer used
+/// for sampling; per-guard history is authoritative). Kept to avoid breaking
+/// external linkage, but `LlmoSafeGuard::check` now uses per-instance history.
+#[allow(dead_code)]
 static RESOURCE_HISTORY: Mutex<Option<ResourceHistory>> = Mutex::new(None);
 
 /// Returns the path for persisting resource history state.
@@ -195,6 +199,15 @@ fn resource_history_path() -> Option<PathBuf> {
 pub struct LlmoSafeGuard {
     guard: ResourceGuard,
     policy: EscalationPolicy,
+    /// Per-instance resource history for cooldown enforcement.
+    ///
+    /// Previously shared via `RESOURCE_HISTORY` static, which caused cross-guard
+    /// interference (one guard's cooldown suppressed sampling for all guards).
+    /// Now scoped per-guard so each guard's 1 s cooldown and 30 s rolling window
+    /// are independent. The 1 s cooldown returns `Ok` using the cached rolling
+    /// average without fresh sampling — callers see `Ok` but no new pressure
+    /// measurement is taken during cooldown (distinct Cached behavior).
+    history: Mutex<ResourceHistory>,
 }
 
 /// Applies the Design Assurance Level (DAL) policy to a safety decision.
@@ -250,6 +263,7 @@ impl LlmoSafeGuard {
         Self {
             guard,
             policy: EscalationPolicy::default().with_dal(dal_from_config()),
+            history: Mutex::new(ResourceHistory::new(30, 1, resource_history_path())),
         }
     }
 
@@ -263,10 +277,19 @@ impl LlmoSafeGuard {
         Self {
             guard: ResourceGuard::new(memory_ceiling_bytes),
             policy: EscalationPolicy::default().with_dal(dal_from_config()),
+            history: Mutex::new(ResourceHistory::new(30, 1, resource_history_path())),
         }
     }
 
     /// Checks current resource usage via llmosafe's real `/proc/stat` reading.
+    ///
+    /// Uses a **per-guard** rolling history (30 s window, 1 s cooldown) so each
+    /// `LlmoSafeGuard` instance's cooldown is independent. The 1 s cooldown
+    /// is a *Cached* path: it returns `Ok(())` without fresh sampling, using the
+    /// cached rolling average. If the cached average exceeds 80 % the cooldown
+    /// still returns an error. This documents the distinct `Cached` variant
+    /// behavior — callers see `Ok` but no new measurement is taken during the
+    /// cooldown window.
     ///
     /// FINDING #16: Uses rolling average over recent measurements instead of
     /// instantaneous values, and enforces a cooldown period to prevent
@@ -274,31 +297,27 @@ impl LlmoSafeGuard {
     ///
     /// # Returns
     ///
-    /// `Ok(())` if resources are within limits.
+    /// `Ok(())` if resources are within limits (or within cooldown with a
+    /// cached average ≤ 80 %).
     ///
     /// # Errors
     ///
-    /// Returns an error string if resource pressure exceeds 80% or the
-    /// underlying `ResourceGuard::check()` fails.
+    /// Returns an error string if resource pressure exceeds 80 % (instantaneous
+    /// or rolling average) or the underlying `ResourceGuard::check()` fails.
+    /// During cooldown, the error is based on the cached rolling average.
     ///
     /// # Panics
-    /// Panics if the global resource history mutex is poisoned.
+    /// Panics if the per-guard history mutex is poisoned.
     pub fn check(&self) -> Result<(), String> {
-        let mut history = RESOURCE_HISTORY.lock().unwrap_or_else(|e| e.into_inner());
-        if history.is_none() {
-            *history = Some(ResourceHistory::new(30, 1, resource_history_path()));
-        }
-        #[allow(clippy::expect_used)]
-        let hist = history
-            .as_mut()
-            .expect("history always Some after initialization above");
+        let mut hist = self.history.lock().unwrap_or_else(|e| e.into_inner());
 
-        // FINDING #16: Enforce cooldown between checks
+        // FINDING #16 + T9b: Enforce per-guard cooldown between checks.
+        // This is a Cached path — no fresh sampling, Ok uses cached average.
         if hist.is_in_cooldown() {
             if let Some(avg) = hist.rolling_average() {
                 if avg > 80.0 {
                     return Err(format!(
-                        "Resource pressure averaging {:.1}% over last 30s (cooldown active)",
+                        "Resource pressure averaging {:.1}% over last 30s (cooldown active, cached)",
                         avg
                     ));
                 }

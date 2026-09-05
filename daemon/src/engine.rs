@@ -51,6 +51,44 @@ struct DaemonState {
     bg_jobs: BackgroundJobRegistry,
 }
 
+/// Resolves and validates an optional working directory string.
+///
+/// When `working_dir` is `None` or empty, returns `Ok(None)` (no override).
+/// When `Some(path)` is provided, validates via [`runtimo_core::validation::path::validate_path`]
+/// with `require_exists: true` and `require_file: false`. On validation failure,
+/// returns `Err(JsonRpcError)` with code `-32602` and a descriptive message —
+/// never swallows the error to `None` (the previous `eprintln!+None` gap).
+///
+/// This is the single source of truth for working-directory validation,
+/// used by both `handle_run` and `handle_dispatch` to eliminate the dual-decision
+/// split (T2). It does not fall back to `current_dir().unwrap_or("/")` — callers
+/// pass `None` through to the executor, which uses its own default only when no
+/// override is requested.
+///
+/// # Errors
+/// Returns `JsonRpcError` with code `-32602` when the path fails validation.
+fn resolve_working_dir(
+    working_dir: &Option<String>,
+) -> std::result::Result<Option<PathBuf>, JsonRpcError> {
+    match working_dir {
+        Some(wd) if !wd.is_empty() => {
+            let ctx = runtimo_core::validation::path::PathContext {
+                require_exists: true,
+                require_file: false,
+                ..Default::default()
+            };
+            match runtimo_core::validation::path::validate_path(wd, &ctx) {
+                Ok(validated) => Ok(Some(validated)),
+                Err(e) => Err(JsonRpcError {
+                    code: -32602,
+                    message: format!("Invalid working_dir: {e}"),
+                }),
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
 impl DaemonState {
     fn new(wal_path: &Path) -> std::result::Result<Self, Box<dyn std::error::Error>> {
         let mut registry = CapabilityRegistry::new();
@@ -129,7 +167,9 @@ async fn handle_request(state: &Arc<DaemonState>, req: JsonRpcRequest) -> JsonRp
 /// Handles the `run` RPC method — synchronous capability execution with full telemetry.
 ///
 /// Acquires the WAL mutex, executes the capability, and returns the result.
-/// Times out at `timeout_secs` (default 30s).
+/// Times out at `timeout_secs` (default 30s). Validates `working_dir` via
+/// [`resolve_working_dir`] — invalid paths return `-32602` without execution
+/// (unified validation, T2).
 ///
 /// # Outputs
 ///
@@ -166,6 +206,18 @@ async fn handle_run(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonR
         };
     };
 
+    // Unified working_dir validation (T2): reject invalid working_dir with -32602.
+    let resolved_wd = match resolve_working_dir(&run_params.working_dir) {
+        Ok(wd) => wd,
+        Err(e) => {
+            return JsonRpcResponse {
+                result: None,
+                error: Some(e),
+                id,
+            };
+        }
+    };
+
     // Concurrency Note: This mutex serializes ALL capability execution, not just WAL writes.
     // Concurrent dispatch calls queue behind this lock — if Client A runs a 30-second capability,
     // Client B cannot execute ANY capability for 30 seconds.
@@ -183,7 +235,7 @@ async fn handle_run(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonR
         run_params.dry_run,
         &state.wal_path,
         None,
-        run_params.working_dir.clone().map(PathBuf::from),
+        resolved_wd,
         run_params
             .timeout_secs
             .unwrap_or_else(|| RuntimoConfig::get_capability_timeout(&run_params.capability, 30)),
@@ -242,6 +294,9 @@ async fn handle_run(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonR
 /// Returns immediately with a job ID. The job runs on a blocking task via
 /// `tokio::task::spawn_blocking` with the same safety checks, WAL logging,
 /// and telemetry as `handle_run`. Rejects when `MAX_CONCURRENT_JOBS` (16) is reached.
+/// Validates `working_dir` via [`resolve_working_dir`] — invalid paths return
+/// `-32602` without dispatching (`dispatched:true` never returned on bad dir, T2).
+/// Dangerous `ShellExec` commands are rejected via `is_dangerous_command` before dispatch.
 ///
 /// On completion, the job's `result` field is set to the capability's error
 /// message (extracted from `Output.error`) if the execution failed, or `None`
@@ -304,22 +359,16 @@ async fn handle_dispatch(state: &Arc<DaemonState>, params: Value, id: Value) -> 
     let cap_name = run_params.capability.clone();
     let dry = run_params.dry_run;
     let args = run_params.args;
-    let working_dir = match run_params.working_dir {
-        Some(ref wd) if !wd.is_empty() => {
-            let ctx = runtimo_core::validation::path::PathContext {
-                require_exists: true,
-                require_file: false,
-                ..Default::default()
+    // Unified working_dir validation (T2): reject invalid working_dir with -32602, never swallow to None.
+    let working_dir = match resolve_working_dir(&run_params.working_dir) {
+        Ok(wd) => wd.map(|p| p.to_string_lossy().to_string()),
+        Err(e) => {
+            return JsonRpcResponse {
+                result: None,
+                error: Some(e),
+                id,
             };
-            match runtimo_core::validation::path::validate_path(wd, &ctx) {
-                Ok(_validated) => Some(wd.clone()),
-                Err(e) => {
-                    eprintln!("[runtimo] Working directory validation failed: {}", e);
-                    None
-                }
-            }
         }
-        _ => None,
     };
     let timeout_secs = run_params
         .timeout_secs
@@ -665,7 +714,9 @@ async fn handle_jobs(state: &Arc<DaemonState>, params: Value, id: Value) -> Json
 /// via `validation::path` (default `data_dir/bundles/<run_id>.jsonl`),
 /// reserves a `BackgroundJob` slot, inserts `running`, and `spawn_blocking`
 /// the `ObserveSupervisor` loop. The target (`pid` or `cmd` sibling) is never
-/// signalled on collector failure — watermark only.
+/// signalled on collector failure — watermark only. When `cmd` is supplied,
+/// it is gated through `is_dangerous_command` (same blocklist as `ShellExec`
+/// dispatch) and rejected with `-32602` (T3).
 #[allow(clippy::unused_async)]
 async fn handle_observe_start(
     state: &Arc<DaemonState>,
@@ -693,9 +744,17 @@ async fn handle_observe_start(
     let hz = p
         .sample_rate_hz
         .unwrap_or_else(|| runtimo_core::RuntimoConfig::load().effective_observe_sample_hz(None));
-    // P2B burst (file-watch) is deferred — acknowledge but do not implement under 80-line budget.
+    // P2B burst (file-watch) is deferred — gate to explicit -32601 so the contract
+    // is not dead. Mirrors the `observe_burst` handler at line 110.
     if p.burst.unwrap_or(false) {
-        eprintln!("[runtimo] note: observe burst (P2B bundle-path watch) deferred — using polling");
+        return JsonRpcResponse {
+            result: None,
+            error: Some(JsonRpcError {
+                code: -32601,
+                message: "observe_burst deferred: P2B file-watch burst not yet implemented (use out-of-process polling; see audit.rs)".into(),
+            }),
+            id,
+        };
     }
 
     let out_path = if let Some(out) = p.out {
@@ -726,6 +785,20 @@ async fn handle_observe_start(
     } else {
         runtimo_core::observe::bundle_path(&run_id)
     };
+
+    // Gate observe sibling cmd through same dangerous-command filter as ShellExec dispatch (T3).
+    if let Some(ref cmd) = p.cmd {
+        if let Some(reason) = is_dangerous_command(cmd) {
+            return JsonRpcResponse {
+                result: None,
+                error: Some(JsonRpcError {
+                    code: -32602,
+                    message: format!("dangerous command blocked: {reason}"),
+                }),
+                id,
+            };
+        }
+    }
 
     // Resolve target pid: explicit pid or spawn cmd as sibling.
     let target_pid: Option<u32> = if let Some(pid) = p.pid {
@@ -967,6 +1040,24 @@ async fn handle_observe_verify(
         };
     }
     let v = runtimo_core::observe::verify_bundle(&path);
+    // Watermark: prefer VerifyResult.watermark (AP-4), fallback to parsing final ObserveCompleted output.watermark.
+    let watermark: Option<String> = v.watermark.clone().or_else(|| {
+        std::fs::read_to_string(&path).ok().and_then(|content| {
+            let mut last_wm: Option<String> = None;
+            for line in content.lines().filter(|l| !l.trim().is_empty()) {
+                if let Ok(ev) = serde_json::from_str::<runtimo_core::WalEvent>(line) {
+                    if matches!(ev.event_type, runtimo_core::WalEventType::ObserveCompleted) {
+                        if let Some(out) = ev.output.as_ref() {
+                            if let Some(wm) = out.get("watermark").and_then(|w| w.as_str()) {
+                                last_wm = Some(wm.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            last_wm
+        })
+    });
     JsonRpcResponse {
         result: Some(serde_json::json!({
             "path": p.path,
@@ -974,6 +1065,7 @@ async fn handle_observe_verify(
             "truncated_gaps": v.truncated_gaps,
             "hash_ok": v.hash_ok,
             "error": v.error,
+            "watermark": watermark,
         })),
         error: None,
         id,
@@ -1104,13 +1196,16 @@ fn reconcile_orphaned_jobs(wal_path: &std::path::Path) {
 
     let events = reader.events();
 
-    // Collect job_ids that have a JobStarted event
-    let mut started: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    // Collect job_ids that have a JobStarted event, preserving capability for provenance (T5).
+    let mut started: std::collections::HashMap<String, (u64, Option<String>)> =
+        std::collections::HashMap::new();
     let mut finished: std::collections::HashSet<&String> = std::collections::HashSet::new();
 
     for e in events {
         if matches!(e.event_type, WalEventType::JobStarted) {
-            started.entry(e.job_id.clone()).or_insert(e.ts);
+            started
+                .entry(e.job_id.clone())
+                .or_insert((e.ts, e.capability.clone()));
         }
         if matches!(
             e.event_type,
@@ -1142,13 +1237,14 @@ fn reconcile_orphaned_jobs(wal_path: &std::path::Path) {
 
     if let Ok(mut wal) = WalWriter::create(wal_path) {
         for jid in &orphaned {
+            let capability = started.get(jid).and_then(|(_, c)| c.clone());
             let _ = wal.append(WalEvent {
                 seq: wal.seq(),
                 ts: now,
                 event_type: WalEventType::JobFailed,
                 job_id: jid.clone(),
-                capability: None,
-                output: None,
+                capability,
+                output: Some(serde_json::json!({"reconciled": true})),
                 error: Some(
                     "daemon terminated before job completion (reconciled on restart)".into(),
                 ),
@@ -2118,5 +2214,158 @@ mod tests {
             socket: std::path::PathBuf::from("/tmp/test.sock"),
         };
         assert_eq!(args.socket, std::path::PathBuf::from("/tmp/test.sock"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_dispatch_invalid_working_dir_returns_32602() {
+        let dir = unique_test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = {
+            let _guard = ENV_MUTEX.lock().unwrap();
+            std::env::set_var("XDG_DATA_HOME", dir.to_str().unwrap());
+            let wp = dir.join("wal.jsonl");
+            Arc::new(DaemonState::new(&wp).unwrap())
+        };
+        // working_dir that does not exist and is absolute — should be rejected with -32602, not dispatched:true
+        let params = serde_json::json!({"capability": "FileRead", "args": {"path": "/tmp/test.txt"}, "working_dir": "/nonexistent_xyz_invalid_12345"});
+        let response = handle_dispatch(&state, params, serde_json::Value::from(1)).await;
+        assert!(
+            response.error.is_some(),
+            "invalid working_dir should return error, not dispatched"
+        );
+        assert_eq!(response.error.unwrap().code, -32602);
+        assert!(
+            response.result.is_none(),
+            "should not have dispatched result"
+        );
+        std::env::remove_var("XDG_DATA_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_handle_run_invalid_working_dir_returns_32602() {
+        let dir = unique_test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = {
+            let _guard = ENV_MUTEX.lock().unwrap();
+            std::env::set_var("XDG_DATA_HOME", dir.to_str().unwrap());
+            let wp = dir.join("wal.jsonl");
+            Arc::new(DaemonState::new(&wp).unwrap())
+        };
+        let params = serde_json::json!({"capability": "FileRead", "args": {"path": "/tmp/test.txt"}, "working_dir": "/nonexistent_xyz_invalid_12345"});
+        let response = handle_run(&state, params, serde_json::Value::from(1)).await;
+        assert!(response.error.is_some());
+        assert_eq!(response.error.unwrap().code, -32602);
+        std::env::remove_var("XDG_DATA_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_handle_observe_start_dangerous_cmd_rejected() {
+        let dir = unique_test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = {
+            let _guard = ENV_MUTEX.lock().unwrap();
+            std::env::set_var("XDG_DATA_HOME", dir.to_str().unwrap());
+            let wp = dir.join("wal.jsonl");
+            Arc::new(DaemonState::new(&wp).unwrap())
+        };
+        // Use a known dangerous command — mkfs is blocked by is_dangerous_command
+        let params = serde_json::json!({"cmd": "mkfs /dev/sda1"});
+        let response = handle_observe_start(&state, params, serde_json::Value::from(1)).await;
+        assert!(
+            response.error.is_some(),
+            "dangerous observe cmd should be rejected"
+        );
+        assert_eq!(response.error.unwrap().code, -32602);
+        assert!(response.result.is_none());
+        std::env::remove_var("XDG_DATA_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_reconcile_preserves_capability_and_reconciled_hint() {
+        let dir = unique_test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let wal_path = dir.join("wal.jsonl");
+        make_wal(
+            &wal_path,
+            &[make_started_event(0, 1000, "job-preserve", "FileRead")],
+        );
+        reconcile_orphaned_jobs(&wal_path);
+        let reader = WalReader::load(&wal_path).unwrap();
+        let failed = reader
+            .events()
+            .iter()
+            .find(|e| e.job_id == "job-preserve" && matches!(e.event_type, WalEventType::JobFailed))
+            .expect("should have JobFailed");
+        assert_eq!(
+            failed.capability.as_deref(),
+            Some("FileRead"),
+            "capability should be preserved from JobStarted"
+        );
+        assert!(
+            failed
+                .output
+                .as_ref()
+                .and_then(|v| v.get("reconciled"))
+                .and_then(|v| v.as_bool())
+                == Some(true),
+            "output should contain reconciled:true hint, got {:?}",
+            failed.output
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_handle_observe_verify_returns_watermark() {
+        // Create a bundle with an ObserveCompleted event containing watermark
+        let dir = unique_test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("RUNTIMO_ALLOWED_PATHS", dir.to_str().unwrap());
+        let bundle_path = dir.join("test_wm.jsonl");
+        // Manually write bundle with ObserveCompleted watermark
+        let ev0 = WalEvent {
+            seq: 0,
+            ts: 1,
+            event_type: WalEventType::ObserveBatch,
+            job_id: "wm-job".into(),
+            bundle_hash: Some("0".repeat(64)),
+            ..Default::default()
+        };
+        let ev1 = WalEvent {
+            seq: 1,
+            ts: 2,
+            event_type: WalEventType::ObserveCompleted,
+            job_id: "wm-job".into(),
+            output: Some(serde_json::json!({"watermark": "Complete", "dal": "A"})),
+            bundle_hash: Some("0".repeat(64)),
+            ..Default::default()
+        };
+        let mut s = String::new();
+        s.push_str(&serde_json::to_string(&ev0).unwrap());
+        s.push('\n');
+        s.push_str(&serde_json::to_string(&ev1).unwrap());
+        s.push('\n');
+        std::fs::write(&bundle_path, s).unwrap();
+
+        let state = {
+            let _guard = ENV_MUTEX.lock().unwrap();
+            std::env::set_var("XDG_DATA_HOME", dir.to_str().unwrap());
+            let wp = dir.join("wal.jsonl");
+            Arc::new(DaemonState::new(&wp).unwrap())
+        };
+        let params = serde_json::json!({"path": bundle_path.to_str().unwrap()});
+        let resp = handle_observe_verify(&state, params, serde_json::Value::from(1)).await;
+        assert!(resp.error.is_none(), "verify should succeed");
+        let result = resp.result.unwrap();
+        assert_eq!(
+            result["watermark"], "Complete",
+            "watermark should be Complete from ObserveCompleted"
+        );
+        assert_eq!(result["total"], 2);
+        std::env::remove_var("RUNTIMO_ALLOWED_PATHS");
+        std::env::remove_var("XDG_DATA_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

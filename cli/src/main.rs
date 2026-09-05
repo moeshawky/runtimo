@@ -2632,6 +2632,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                     std::process::exit(1);
                 }
                 let res = runtimo_core::observe::verify_bundle(&vpath);
+                // T6cli: consume honest watermark from VerifyResult.watermark (AP-5 field),
+                // never derive from truncated_gaps. Fallback only when no ObserveCompleted marker.
+                let watermark_display = res.watermark.clone().unwrap_or_else(|| {
+                    if res.truncated_gaps > 0 {
+                        "TRUNCATED".to_string()
+                    } else {
+                        "Complete".to_string()
+                    }
+                });
                 if mode.is_json() {
                     println!(
                         "{}",
@@ -2641,27 +2650,25 @@ fn main() -> Result<(), Box<dyn Error>> {
                             "truncated_gaps": res.truncated_gaps,
                             "hash_ok": res.hash_ok,
                             "error": res.error,
+                            "watermark": res.watermark,
                         }))
                         .unwrap()
                     );
                 } else {
                     println!(
-                        "verify {}: total={} truncated_gaps={} hash_ok={} error={:?}",
+                        "verify {}: total={} truncated_gaps={} hash_ok={} error={:?} watermark={:?}",
                         vpath.display(),
                         res.total,
                         res.truncated_gaps,
                         res.hash_ok,
-                        res.error
+                        res.error,
+                        res.watermark
                     );
                     println!(
                         "trailer: bundle {} — hash chain {} — watermark {}",
                         vpath.display(),
                         if res.hash_ok { "ok" } else { "FAIL" },
-                        if res.truncated_gaps > 0 {
-                            "TRUNCATED"
-                        } else {
-                            "Complete"
-                        }
+                        watermark_display
                     );
                 }
                 #[allow(clippy::bool_to_int_with_if)]
@@ -2673,8 +2680,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                     });
                 }
             }
+            // T10: burst is a dead contract — surface explicitly to stdout (not just daemon stderr)
+            // and gate via RPC deferred error. The daemon's handle_observe_start returns
+            // -32601 observe_burst deferred when burst=true (mirror engine.rs:110 pattern);
+            // the CLI mirrors that by printing the same note to stdout with burst_deferred:true
+            // and by forwarding burst in the RPC params.
             if burst {
                 eprintln!("note: --burst file-watch burst (P2B bundle-path watch) deferred — not yet trivial; using polling");
+                println!("note: --burst file-watch burst (P2B bundle-path watch) deferred — not yet trivial; using polling (burst_deferred:true)");
             }
             // Resolve out path (validated, data_dir default)
             let run_id = runtimo_core::utils::generate_id();
@@ -2711,6 +2724,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     "sample_rate_hz": hz,
                     "dal": dal_str,
                     "out": bundle_path.display().to_string(),
+                    "burst": burst,
                 });
                 if let Some(p) = pid {
                     params["pid"] = serde_json::json!(p);

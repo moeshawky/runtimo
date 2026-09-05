@@ -444,57 +444,56 @@ pub fn execute_with_telemetry_and_session(
             let process_after = fresh_process_after();
             // T4: backup orphan audit — if capability created a backup before failing,
             // the file exists at backup_dir/job_id/file_name. Emit BackupCreated
-            // before JobFailed so WAL consumers and undo can locate it.
-            if let Some(orig_path) = args.get("path").and_then(|v| v.as_str()) {
-                if !orig_path.is_empty() {
-                    if let Some(file_name) = std::path::Path::new(orig_path).file_name() {
-                        let job_dir = crate::utils::backup_dir().join(&job_id_str);
-                        let mut candidate = job_dir.join(file_name);
-                        let found = if candidate.exists() {
-                            Some(candidate)
-                        } else {
-                            let mut found_inner = None;
-                            for i in 1..=10 {
-                                candidate =
-                                    job_dir.join(format!("{}.{}", file_name.to_string_lossy(), i));
-                                if candidate.exists() {
-                                    found_inner = Some(candidate);
-                                    break;
+            // before JobFailed so WAL consumers and undo can locate it. Scans
+            // known path keys (path, repo_path, dir) to cover FileWrite and
+            // GitExec alike; uses existence check with collision suffixes
+            // `.1`–`.10` mirroring `BackupManager::create_backup`.
+            for key in ["path", "repo_path", "dir"] {
+                if let Some(orig_path) = args.get(key).and_then(|v| v.as_str()) {
+                    if orig_path.is_empty() {
+                        continue;
+                    }
+                    let Some(file_name) = std::path::Path::new(orig_path).file_name() else {
+                        continue;
+                    };
+                    let job_dir = crate::utils::backup_dir().join(&job_id_str);
+                    let found = find_backup_candidate(&job_dir, file_name);
+                    if let Some(bp) = found {
+                        let backup_seq = wal.seq();
+                        if let Err(e) = wal.append(WalEvent {
+                            seq: backup_seq,
+                            ts: telemetry_after.timestamp,
+                            event_type: WalEventType::BackupCreated,
+                            job_id: job_id_str.clone(),
+                            capability: Some(cap_name.clone()),
+                            output: Some(serde_json::json!({
+                                "data": {
+                                    "path": orig_path,
+                                    "backup_path": bp.to_string_lossy().to_string()
                                 }
-                            }
-                            found_inner
-                        };
-                        if let Some(bp) = found {
-                            let backup_seq = wal.seq();
-                            let _ = wal.append(WalEvent {
-                                seq: backup_seq,
-                                ts: telemetry_after.timestamp,
-                                event_type: WalEventType::BackupCreated,
-                                job_id: job_id_str.clone(),
-                                capability: Some(cap_name.clone()),
-                                output: Some(serde_json::json!({
-                                    "data": {
-                                        "path": orig_path,
-                                        "backup_path": bp.to_string_lossy().to_string()
-                                    }
-                                })),
-                                error: None,
-                                telemetry_before: None,
-                                telemetry_after: None,
-                                process_before: None,
-                                process_after: None,
-                                cmd: None,
-                                cmd_stdout: None,
-                                cmd_stderr: None,
-                                cmd_exit_code: None,
-                                cmd_corrected: None,
-                                oov_ratio: None,
-                                detection_flags: None,
-                                backup_path: Some(bp),
-                                bundle_hash: None,
-                                mono_ns: None,
-                                wall_ns: None,
-                            });
+                            })),
+                            error: None,
+                            telemetry_before: None,
+                            telemetry_after: None,
+                            process_before: None,
+                            process_after: None,
+                            cmd: None,
+                            cmd_stdout: None,
+                            cmd_stderr: None,
+                            cmd_exit_code: None,
+                            cmd_corrected: None,
+                            oov_ratio: None,
+                            detection_flags: None,
+                            backup_path: Some(bp),
+                            bundle_hash: None,
+                            mono_ns: None,
+                            wall_ns: None,
+                        }) {
+                            log::error!(
+                                "WAL BackupCreated append failed for job {}: {}",
+                                job_id_str,
+                                e
+                            );
                         }
                     }
                 }
@@ -842,6 +841,31 @@ fn inject_timeout(args: &Value, timeout_secs: u64) -> Value {
     value
 }
 
+/// Locates an existing backup file for `file_name` under `job_dir`.
+///
+/// Mirrors the collision-suffix layout of [`crate::backup::BackupManager::create_backup`]:
+/// `job_dir/file_name`, then `job_dir/file_name.1` … `job_dir/file_name.10`.
+/// Returns the first path that exists on disk, or `None` if none is found.
+/// Used by the Err-path `BackupCreated` audit to avoid scanning only the
+/// unsuffixed candidate.
+///
+/// # Parameters
+/// - `job_dir`: `backup_dir()/job_id`
+/// - `file_name`: file name component of the original path
+fn find_backup_candidate(job_dir: &Path, file_name: &std::ffi::OsStr) -> Option<PathBuf> {
+    let mut candidate = job_dir.join(file_name);
+    if candidate.exists() {
+        return Some(candidate);
+    }
+    for i in 1..=10 {
+        candidate = job_dir.join(format!("{}.{}", file_name.to_string_lossy(), i));
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 /// Execute a capability inline and check if it exceeded the timeout.
 ///
 /// Runs the capability and measures elapsed time. For subprocess-based
@@ -849,7 +873,25 @@ fn inject_timeout(args: &Value, timeout_secs: u64) -> Value {
 /// by the capability. For pure-Rust capabilities, the timeout is checked
 /// **after** execution completes — the capability cannot be forcibly
 /// interrupted without subprocess isolation. If the timeout was exceeded,
-/// a warning is logged but the result is still returned.
+/// the original [`Output`] is preserved and enriched with `timed_out: true`
+/// in `data` instead of converting the success into an `Err` (which would
+/// discard the output). A warning is logged via `log::warn!` for
+/// observability, but the caller still receives the successful output
+/// with the sentinel flag so downstream consumers can distinguish
+/// slow-success from fast-success without losing data. Failures (`Err`)
+/// are propagated unchanged.
+///
+/// # Parameters
+/// - `capability`: capability to execute
+/// - `args`: JSON arguments (already timeout-injected)
+/// - `ctx`: execution context
+/// - `timeout_secs`: advisory timeout in seconds
+///
+/// # Returns
+/// - `Ok(Output)` with `data.timed_out == true` when the capability
+///   succeeded but exceeded `timeout_secs`
+/// - `Ok(Output)` unchanged when execution was within budget
+/// - `Err` when the capability itself failed (even if it also timed out)
 fn execute_with_timeout_check(
     capability: &dyn Capability,
     args: &Value,
@@ -871,11 +913,21 @@ fn execute_with_timeout_check(
             elapsed.as_secs_f64(),
             timeout_secs
         );
-        return Err(Error::ExecutionFailed(format!(
-            "capability exceeded timeout: {:.1}s > {}s",
-            elapsed.as_secs_f64(),
-            timeout_secs
-        )));
+        let mut out = output?;
+        match &mut out.data {
+            Some(Value::Object(map)) => {
+                map.insert("timed_out".to_string(), Value::Bool(true));
+            }
+            Some(other) => {
+                // Non-object data: wrap original value and add flag.
+                let original = std::mem::replace(other, Value::Null);
+                *other = serde_json::json!({"value": original, "timed_out": true});
+            }
+            None => {
+                out.data = Some(serde_json::json!({"timed_out": true}));
+            }
+        }
+        return Ok(out);
     }
 
     output
@@ -1103,25 +1155,82 @@ mod tests {
 
     #[test]
     fn test_execute_with_timeout_returns_error() {
-        // Use timeout=0 (or very small) to trigger timeout on any non-trivial execution
+        // T7exec: slow success must preserve Output with timed_out:true instead of Err.
         let result = execute_with_timeout_check(
             &SlowCap,
             &json!({}),
             &Context::new(false, "timeout-test".into()),
             0, // zero timeout — any execution exceeds it
         );
-        // SlowCap takes 200ms, with timeout=0 it should error
         assert!(
-            result.is_err(),
-            "Should return timeout error, got: {:?}",
+            result.is_ok(),
+            "Slow success should be preserved as Ok with timed_out flag, got: {:?}",
             result
         );
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("timeout"),
-            "Error should mention timeout: {}",
-            err
+        let out = result.unwrap();
+        assert_eq!(out.status, "ok");
+        let data = out
+            .data
+            .expect("slow-success should have data with timed_out");
+        assert_eq!(
+            data.get("timed_out"),
+            Some(&Value::Bool(true)),
+            "timed_out flag must be true for slow success, got: {:?}",
+            data
         );
+    }
+
+    #[test]
+    fn test_execute_with_timeout_preserves_output_with_timed_out_flag() {
+        // Explicit slow-success sentinel test: Output data is preserved and enriched.
+        let result = execute_with_timeout_check(
+            &SlowCap,
+            &json!({"extra": "keep"}),
+            &Context::new(false, "timeout-preserve".into()),
+            0,
+        )
+        .unwrap();
+        assert_eq!(result.status, "ok");
+        let data = result.data.unwrap();
+        assert_eq!(data.get("timed_out"), Some(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_execute_with_timeout_fast_path_no_flag() {
+        // Fast path must not inject timed_out.
+        struct FastCap;
+        impl Capability for FastCap {
+            fn name(&self) -> &'static str {
+                "Fast"
+            }
+            fn description(&self) -> &'static str {
+                "fast capability"
+            }
+            fn schema(&self) -> Value {
+                json!({"type": "object"})
+            }
+            fn validate(&self, _args: &Value) -> crate::Result<()> {
+                Ok(())
+            }
+            fn execute(&self, _args: &Value, _ctx: &Context) -> crate::Result<Output> {
+                Ok(Output::ok("fast completed".into()))
+            }
+        }
+        let result = execute_with_timeout_check(
+            &FastCap,
+            &json!({}),
+            &Context::new(false, "fast-test".into()),
+            30,
+        )
+        .unwrap();
+        assert_eq!(result.status, "ok");
+        if let Some(data) = result.data {
+            assert!(
+                data.get("timed_out").is_none(),
+                "fast path must not have timed_out flag, got: {:?}",
+                data
+            );
+        }
     }
 
     #[test]
@@ -1533,5 +1642,110 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(crate::utils::backup_dir().join(&result.job_id));
+    }
+
+    /// Capability that backs up via `repo_path` key then fails — simulates GitExec.
+    struct FailAfterBackupRepoCap;
+    impl Capability for FailAfterBackupRepoCap {
+        fn name(&self) -> &'static str {
+            "FailAfterBackupRepo"
+        }
+        fn description(&self) -> &'static str {
+            "creates backup via repo_path then fails"
+        }
+        fn schema(&self) -> Value {
+            json!({"type": "object", "properties": {"repo_path": {"type": "string"}}, "required": ["repo_path"]})
+        }
+        fn validate(&self, _args: &Value) -> crate::Result<()> {
+            Ok(())
+        }
+        fn execute(&self, args: &Value, ctx: &Context) -> crate::Result<Output> {
+            let path_str = args.get("repo_path").and_then(|v| v.as_str()).unwrap_or("");
+            let path = std::path::Path::new(path_str);
+            if path.exists() {
+                let backup_dir = crate::utils::backup_dir();
+                let mgr = crate::backup::BackupManager::new(backup_dir)
+                    .map_err(|e| crate::Error::BackupError(format!("backup mgr: {}", e)))?;
+                let _ = mgr.create_backup(path, &ctx.job_id);
+            }
+            Err(crate::Error::ExecutionFailed(
+                "simulated repo_path failure after backup".into(),
+            ))
+        }
+    }
+
+    #[test]
+    fn test_backup_orphan_via_repo_path_is_audited() {
+        // T4 widening: GitExec uses `path`/`repo_path` — Err audit must scan both.
+        let dir = unique_test_dir();
+        std::fs::create_dir_all(&dir).ok();
+        let target = make_file(&dir, "repo_orphan.txt", "repo content");
+        let wp = wal_path(&dir);
+
+        let cap = FailAfterBackupRepoCap;
+        let result = execute_with_telemetry_and_session(
+            &cap,
+            &json!({"repo_path": target.to_str().unwrap()}),
+            false,
+            &wp,
+            None,
+            None,
+            30,
+        )
+        .unwrap();
+        assert!(!result.success, "should be failure");
+        let reader = crate::WalReader::load(&wp).unwrap();
+        let events = reader.events();
+        let has_backup = events.iter().any(|e| {
+            matches!(e.event_type, crate::WalEventType::BackupCreated)
+                && e.job_id == result.job_id
+                && e.backup_path.is_some()
+        });
+        assert!(
+            has_backup,
+            "WAL must contain BackupCreated for repo_path failed job {}",
+            result.job_id
+        );
+        let backup_idx = events.iter().position(|e| {
+            matches!(e.event_type, crate::WalEventType::BackupCreated) && e.job_id == result.job_id
+        });
+        let failed_idx = events.iter().position(|e| {
+            matches!(e.event_type, crate::WalEventType::JobFailed) && e.job_id == result.job_id
+        });
+        assert!(
+            backup_idx < failed_idx,
+            "BackupCreated must precede JobFailed for repo_path"
+        );
+        let bp = events
+            .iter()
+            .find(|e| {
+                matches!(e.event_type, crate::WalEventType::BackupCreated)
+                    && e.job_id == result.job_id
+            })
+            .unwrap()
+            .backup_path
+            .as_ref()
+            .unwrap();
+        assert!(bp.exists(), "backup file should exist at {:?}", bp);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(crate::utils::backup_dir().join(&result.job_id));
+    }
+
+    #[test]
+    fn test_find_backup_candidate_with_suffix() {
+        // Suffix scan: .1 must be found when unsuffixed candidate missing.
+        let dir = unique_test_dir();
+        std::fs::create_dir_all(&dir).ok();
+        let job_dir = dir.join("job_suffix");
+        std::fs::create_dir_all(&job_dir).ok();
+        let orig = dir.join("suffix_test.txt");
+        std::fs::write(&orig, "orig").unwrap();
+        let suffixed = job_dir.join("suffix_test.txt.1");
+        std::fs::write(&suffixed, "backup1").unwrap();
+        let found = find_backup_candidate(&job_dir, std::ffi::OsStr::new("suffix_test.txt"));
+        assert!(found.is_some());
+        assert_eq!(found.unwrap(), suffixed);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
