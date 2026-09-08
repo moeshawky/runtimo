@@ -8,10 +8,11 @@
 # REQUIRED: The crate must already exist on crates.io (first publish is manual)
 #
 # RUNTIMO DIVERGENCE (one tool, one repo — AGENTS.md): cli, core, and daemon
-# are a single program at a single workspace version. They publish together,
-# in dependency order, from the CRATES list below. PROJECT stays for the
-# environment URL; PUBLISH_FLAGS is retired on this copy (ordered multi-crate
-# publish replaces the single `-p` flag).
+# are a single program at a single workspace version. They publish together
+# in dependency order. Each downstream crate verifies against the live index,
+# so dry-run AND publish interleave per crate: a downstream dry-run cannot
+# pass until its upstream version is actually on crates.io. Do NOT regroup
+# into dry-run-all / publish-all — run 34267676335 proved that fails.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 name: Publish to crates.io
@@ -23,7 +24,6 @@ on:
 
 env:
   PROJECT: runtimo                          # ← CHANGE: ix | sniper | llmosafe | runtimo
-  CRATES: "runtimo-core runtimo-daemon runtimo-cli"   # dependency order, space-separated
 
 jobs:
   # ── Gate: verify token exists ────────────────────────────────────────────
@@ -43,8 +43,8 @@ jobs:
             echo "❌ Set CRATES_IO in repo Settings > Secrets > Actions"
           fi
 
-  # ── Dry-run: verify every crate can be published ────────────────────────
-  dry-run:
+  # ── Crate 1/3: runtimo-core (no workspace deps) ──────────────────────────
+  publish-core:
     needs: check-token
     if: needs.check-token.outputs.has-token == 'true'
     runs-on: ubuntu-latest
@@ -52,16 +52,45 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: cargo publish --dry-run (all crates, dependency order)
-        run: |
-          for crate in ${{ env.CRATES }}; do
-            echo "── dry-run $crate ──"
-            cargo publish -p "$crate" --dry-run --locked
-          done
+      - name: Dry-run runtimo-core
+        run: cargo publish -p runtimo-core --dry-run --locked
 
-  # ── Publish (dependency order; skips versions already on the index) ─────
-  publish:
-    needs: dry-run
+      - name: Publish runtimo-core (skip if version on index)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO }}
+        run: |
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
+          if cargo search runtimo-core --limit 1 2>/dev/null | grep -q "^runtimo-core = \"$VERSION\""; then
+            echo "── runtimo-core $VERSION already on crates.io, skipping ──"
+          else
+            cargo publish -p runtimo-core --locked
+          fi
+
+  # ── Crate 2/3: runtimo-daemon (needs runtimo-core live) ──────────────────
+  publish-daemon:
+    needs: publish-core
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Dry-run runtimo-daemon
+        run: cargo publish -p runtimo-daemon --dry-run --locked
+
+      - name: Publish runtimo-daemon (skip if version on index)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO }}
+        run: |
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
+          if cargo search runtimo-daemon --limit 1 2>/dev/null | grep -q "^runtimo-daemon = \"$VERSION\""; then
+            echo "── runtimo-daemon $VERSION already on crates.io, skipping ──"
+          else
+            cargo publish -p runtimo-daemon --locked
+          fi
+
+  # ── Crate 3/3: runtimo-cli (needs daemon + core live) ────────────────────
+  publish-cli:
+    needs: publish-daemon
     runs-on: ubuntu-latest
     environment:
       name: cratesio
@@ -70,17 +99,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Publish to crates.io (runtimo-core → runtimo-daemon → runtimo-cli)
+      - name: Dry-run runtimo-cli
+        run: cargo publish -p runtimo-cli --dry-run --locked
+
+      - name: Publish runtimo-cli (skip if version on index)
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO }}
         run: |
           VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
-          echo "Workspace version: $VERSION"
-          for crate in ${{ env.CRATES }}; do
-            if cargo search "$crate" --limit 1 2>/dev/null | grep -q "^$crate = \"$VERSION\""; then
-              echo "── $crate $VERSION already on crates.io, skipping ──"
-            else
-              echo "── publishing $crate $VERSION ──"
-              cargo publish -p "$crate" --locked
-            fi
-          done
+          if cargo search runtimo-cli --limit 1 2>/dev/null | grep -q "^runtimo-cli = \"$VERSION\""; then
+            echo "── runtimo-cli $VERSION already on crates.io, skipping ──"
+          else
+            cargo publish -p runtimo-cli --locked
+          fi
