@@ -365,8 +365,8 @@ Exit codes:
 | Invocation | 0 | 1 |
 |------------|---|---|
 | `--self-test` | all 4 checks `ok` (`core/src/observe/self_test.rs:52-76`) | at least one `FAIL` |
-| `--verify <path>` | `hash_ok == true && error == None` (`cli/src/main.rs:630-632`) | hash mismatch or read error; also prints `truncated_gaps` |
-| `--pid`/`--cmd` normal | bundle finalized + `verify.total`/`hash_ok` printed (`cli/src/main.rs:2719-2733`) | invalid path, spawn failure, or finalize failure |
+| `--verify <path>` | `admissible` (`cli/src/main.rs:2742`) | hash mismatch or read error; also prints `truncated_gaps` |
+| `--pid`/`--cmd` normal | bundle finalized + `verify.total`/`hash_ok` printed (`cli/src/main.rs:2717-2742`) | invalid path, spawn failure, or finalize failure |
 
 #### --help (verbatim, `runtimo observe --help`, 2026-09-04, exit 0)
 
@@ -455,7 +455,7 @@ Retention: daemon hourly task runs `WalWriter::cleanup(..., 86400*7)` and `Backu
 | 1 | `fixture A exactness` | `AuditHook` 10 imports + 2 spawns + 1 raise + 1 dynamic = 14 events exact, `Complete` (no drops, no `TRUNCATED`) | `core/src/observe/self_test.rs:84-115`, `core/src/observe/audit.rs:268-307` |
 | 2 | `fixture B sampling bounds` | `OutOfProcessSampler` at 50 Hz, 10 ticks: observed rate within bounds or ≥5 samples, coverage via frames or fallback marker (never silent zeros) | `core/src/observe/self_test.rs:126-176` |
 | 3 | `DAL-A gate` | `inject_drop_next` + `PressureSpike` → watermark `INCOMPLETE`, never `COMPLETE` on DAL A; target never signalled | `core/src/observe/self_test.rs:181-221`, `core/src/observe/supervisor.rs:440-463` |
-| 4 | `tamper detection` | corrupt one byte → `verify_bundle` reports `!hash_ok || error.is_some() || truncated_gaps>0 || total!=3` | `core/src/observe/self_test.rs:225-292` |
+| 4 | `tamper detection` | corrupt one byte → `verify_bundle` reports `!v.hash_ok || v.error.is_some() || v.truncated_gaps > 0 || v.total != 3` | `core/src/observe/self_test.rs:225-292` |
 
 #### Live transcript (verbatim, `runtimo observe --self-test`, exit 0, 2026-09-04)
 

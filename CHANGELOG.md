@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Oracle layer + predicate unify** — New `core/src/oracle/` module (`spec.rs`, `eval.rs`, `benchmark.rs`) providing `PropertySpec`, `Predicate`, `Op`, `Verdict`, `PropertyVerdict`, `evaluate`, `parse_spec`. Property evaluation uses AND semantics over WAL events with typed predicates and field-path resolution; `bundle_hash` is never read. `cli/src/main.rs` and `daemon/src/engine.rs` consume oracle verdicts for property-gated observe flows. (`core/src/oracle/`, `cli/src/main.rs`, `daemon/src/engine.rs`)
 - **`--verify` exit keys off `admissible`** — CLI `--verify` now exits 0 iff `admissible` (conjunction of `structurally_parseable`, `integrity_valid`, `lifecycle_valid`, `completeness_known`, and no error). `hash_ok` is retained as a deprecated alias equal to `structurally_parseable && integrity_valid`. (`cli/src/main.rs`, `core/src/observe/bundle.rs`)
 - **Daemon `observe_verify` gains predicate fields** — `handle_observe_verify` now switches from `verify_bundle` to `verify_report`, returning the full 5-predicate set (`structurally_parseable`, `integrity_valid`, `lifecycle_valid`, `completeness_known`, `admissible`) plus `total`/`truncated_gaps`/`watermark`/`error`, with `hash_ok` retained as a deprecated alias. (`daemon/src/engine.rs`, `core/src/observe/bundle.rs`)
 
