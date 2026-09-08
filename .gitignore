@@ -81,3 +81,7 @@ chatgpt-discusss.md
 .annotations/core/
 .annotations/daemon/
 .annotations/root/
+
+# Local scanner configs (agentic dev artifacts, not for public tree)
+.moeinclude
+.codegraphinclude
