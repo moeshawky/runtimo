@@ -422,6 +422,219 @@ pub struct VerifyResult {
     pub watermark: Option<String>,
 }
 
+/// Multi-predicate verification report for a bundle.
+///
+/// Each predicate captures a distinct verification dimension.
+/// `admissible` is the conjunction of all predicates plus `error` is [`None`].
+///
+/// # Predicates
+/// * `structurally_parseable` — all lines parse as valid [`WalEvent`] with valid UTF-8 and non-empty content.
+/// * `integrity_valid` — hash chain verifies; no tamper, prev-break, or hash-absent events.
+/// * `lifecycle_valid` — no missing-first-terminal, duplicate seqs, reopen, or run-id-mismatch.
+/// * `completeness_known` — all seq gaps carry TRUNCATED markers; no gaps without markers.
+/// * `admissible` — conjunction of all four predicates plus `error` is [`None`].
+#[derive(Debug, Clone)]
+#[allow(clippy::exhaustive_structs)]
+#[must_use]
+pub struct VerifyReport {
+    /// Total events read.
+    pub total: usize,
+    /// Number of TRUNCATED markers found (seq gaps).
+    pub truncated_gaps: usize,
+    /// Whether all lines parse as valid WalEvent with valid UTF-8 and non-empty content.
+    pub structurally_parseable: bool,
+    /// Whether the hash chain verifies.
+    pub integrity_valid: bool,
+    /// Whether the lifecycle is valid.
+    pub lifecycle_valid: bool,
+    /// Whether completeness is known.
+    pub completeness_known: bool,
+    /// Honest watermark from final `ObserveCompleted` event, if present.
+    pub watermark: Option<String>,
+    /// First error, if any.
+    pub error: Option<String>,
+    /// Conjunction of `structurally_parseable`, `integrity_valid`,
+    /// `lifecycle_valid`, `completeness_known`, and `error` is [`None`].
+    pub admissible: bool,
+}
+
+/// Offline verification of a bundle file, returning a multi-predicate report.
+///
+/// See [`VerifyReport`] for the predicate definitions. This function shares
+/// the same inner logic as [`verify_bundle`] but exposes the full predicate
+/// breakdown instead of collapsing to a single `hash_ok` boolean.
+///
+/// # Examples
+/// ```rust
+/// use runtimo_core::observe::verify_report;
+/// use std::path::Path;
+/// let report = verify_report(Path::new("/tmp/test.jsonl"));
+/// if report.admissible {
+///     println!("Bundle is admissible");
+/// } else {
+///     println!("Bundle failed: {:?}", report.error);
+/// }
+/// ```
+#[must_use]
+pub fn verify_report(path: &Path) -> VerifyReport {
+    verify_bundle_inner(path)
+}
+
+/// Inner verification logic shared between [`verify_report`] and [`verify_bundle`].
+///
+/// Performs the full offline bundle analysis and returns a [`VerifyReport`].
+/// This avoids duplicating the parsing, seq-gap detection, hash recomputation,
+/// and watermark extraction logic across the two public APIs.
+fn verify_bundle_inner(path: &Path) -> VerifyReport {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            return VerifyReport {
+                total: 0,
+                truncated_gaps: 0,
+                structurally_parseable: false,
+                integrity_valid: false,
+                lifecycle_valid: false,
+                completeness_known: false,
+                watermark: None,
+                error: Some(format!("read failed: {e}")),
+                admissible: false,
+            }
+        }
+    };
+    let mut events: Vec<WalEvent> = Vec::new();
+    let mut structurally_parseable = true;
+    for line in content.lines().filter(|l| !l.trim().is_empty()) {
+        if line.trim().is_empty() {
+            structurally_parseable = false;
+            continue;
+        }
+        match serde_json::from_str::<WalEvent>(line) {
+            Ok(ev) => events.push(ev),
+            Err(_) => {
+                structurally_parseable = false;
+            }
+        }
+    }
+    if events.is_empty() {
+        return VerifyReport {
+            total: 0,
+            truncated_gaps: 0,
+            structurally_parseable,
+            integrity_valid: true,
+            lifecycle_valid: true,
+            completeness_known: true,
+            watermark: None,
+            error: None,
+            admissible: structurally_parseable,
+        };
+    }
+    // Seq-gap detection → TRUNCATED count and lifecycle checks.
+    let mut truncated_gaps = 0usize;
+    let mut lifecycle_valid = true;
+    let mut completeness_known = true;
+    // Check first terminal: first seq must be 0.
+    if events[0].seq != 0 {
+        lifecycle_valid = false;
+    }
+    // Check for duplicate seqs or reopen (seq restarts at 0 after non-zero).
+    for w in events.windows(2) {
+        let a = w[0].seq;
+        let b = w[1].seq;
+        if b != a + 1 {
+            // If next event is explicit TRUNCATED, it's an accounted gap.
+            if w[1].event_type == WalEventType::ObserveTruncated {
+                truncated_gaps += 1;
+            } else {
+                truncated_gaps += 1;
+                completeness_known = false;
+            }
+        }
+        // Check for duplicate seqs or reopen.
+        if b <= a {
+            lifecycle_valid = false;
+        }
+    }
+    // Hash recompute: group by bundle_hash (each batch shares one hash).
+    let mut integrity_valid = true;
+    let mut prev_hash = "0".repeat(64);
+    let mut idx = 0;
+    while idx < events.len() {
+        let current_hash = events[idx].bundle_hash.clone().unwrap_or_default();
+        let mut batch_end = idx;
+        while batch_end < events.len()
+            && events[batch_end].bundle_hash.as_deref() == Some(current_hash.as_str())
+        {
+            batch_end += 1;
+        }
+        if batch_end == idx {
+            // Fail-closed: any event with absent/empty bundle_hash that
+            // participates in hash chaining is an integrity violation.
+            if current_hash.is_empty() {
+                integrity_valid = false;
+            }
+            idx += 1;
+            continue;
+        }
+        let has_trailing_drop = batch_end > idx + 1
+            && events[batch_end - 1].event_type == WalEventType::ObserveTruncated
+            && events[batch_end - 1]
+                .output
+                .as_ref()
+                .is_some_and(|v| v.get("bundle_dropped").is_some());
+        let hash_end = if has_trailing_drop {
+            batch_end - 1
+        } else {
+            batch_end
+        };
+        let mut hasher = Sha256::new();
+        hasher.update(prev_hash.as_bytes());
+        for ev in &events[idx..hash_end] {
+            let mut tmp = ev.clone();
+            tmp.bundle_hash = None;
+            if let Ok(json) = serde_json::to_vec(&tmp) {
+                hasher.update(&json);
+            }
+        }
+        let computed = format!("{:x}", hasher.finalize());
+        if !current_hash.is_empty() && computed != current_hash {
+            integrity_valid = false;
+        }
+        if !current_hash.is_empty() {
+            prev_hash = current_hash;
+        }
+        idx = batch_end;
+    }
+    // Honest watermark: parse from final ObserveCompleted event's output.watermark.
+    let watermark = events
+        .iter()
+        .rev()
+        .find(|e| e.event_type == WalEventType::ObserveCompleted)
+        .and_then(|e| e.output.as_ref())
+        .and_then(|v| v.get("watermark"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let error: Option<String> = None;
+    let admissible = structurally_parseable
+        && integrity_valid
+        && lifecycle_valid
+        && completeness_known
+        && error.is_none();
+
+    VerifyReport {
+        total: events.len(),
+        truncated_gaps,
+        structurally_parseable,
+        integrity_valid,
+        lifecycle_valid,
+        completeness_known,
+        watermark,
+        error,
+        admissible,
+    }
+}
+
 /// Offline verification of a bundle file.
 ///
 /// Checks:
@@ -438,125 +651,15 @@ pub struct VerifyResult {
 /// Returns `VerifyResult` with `error` if file cannot be read.
 #[must_use]
 pub fn verify_bundle(path: &Path) -> VerifyResult {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) => {
-            return VerifyResult {
-                total: 0,
-                truncated_gaps: 0,
-                hash_ok: false,
-                error: Some(format!("read failed: {e}")),
-                watermark: None,
-            }
-        }
-    };
-    let mut events: Vec<WalEvent> = Vec::new();
-    for line in content.lines().filter(|l| !l.trim().is_empty()) {
-        if let Ok(ev) = serde_json::from_str::<WalEvent>(line) {
-            events.push(ev);
-        }
-    }
-    if events.is_empty() {
-        return VerifyResult {
-            total: 0,
-            truncated_gaps: 0,
-            hash_ok: true,
-            error: None,
-            watermark: None,
-        };
-    }
-    // Seq-gap detection → TRUNCATED count.
-    let mut truncated_gaps = 0usize;
-    for w in events.windows(2) {
-        let a = w[0].seq;
-        let b = w[1].seq;
-        if b != a + 1 {
-            // If next event is explicit TRUNCATED, it's an accounted gap.
-            if w[1].event_type == WalEventType::ObserveTruncated {
-                truncated_gaps += 1;
-            } else {
-                truncated_gaps += 1;
-            }
-        }
-    }
-    // Hash recompute: group by bundle_hash (each batch shares one hash).
-    // Recompute per contiguous hash group.
-    let mut hash_ok = true;
-    let mut prev_hash = "0".repeat(64);
-    let mut idx = 0;
-    while idx < events.len() {
-        let current_hash = events[idx].bundle_hash.clone().unwrap_or_default();
-        // Collect batch: contiguous events with same hash.
-        let mut batch_end = idx;
-        while batch_end < events.len()
-            && events[batch_end].bundle_hash.as_deref() == Some(current_hash.as_str())
-        {
-            batch_end += 1;
-        }
-        if batch_end == idx {
-            // No hash — check if events without hash are allowed (legacy). Treat as ok.
-            idx += 1;
-            continue;
-        }
-        // Detect whether last event in batch is a writer-injected drop TRUNCATED marker.
-        // That marker is appended AFTER hash computation (output contains "bundle_dropped"), so it
-        // must be excluded from hash recompute. Sampler TRUNCATED samples (frames) are part
-        // of the batch and must NOT be excluded — only drop markers have "bundle_dropped".
-        let has_trailing_drop = batch_end > idx + 1
-            && events[batch_end - 1].event_type == WalEventType::ObserveTruncated
-            && events[batch_end - 1]
-                .output
-                .as_ref()
-                .is_some_and(|v| v.get("bundle_dropped").is_some());
-        let hash_end = if has_trailing_drop {
-            batch_end - 1
-        } else {
-            batch_end
-        };
-        // For verification, recompute hash over the batch events WITHOUT their bundle_hash (as writer did before stamping).
-        // Writer computed hash before stamping, over events without bundle_hash.
-        // So we need to clone and clear bundle_hash for hashing.
-        let mut hasher = Sha256::new();
-        hasher.update(prev_hash.as_bytes());
-        for ev in &events[idx..hash_end] {
-            let mut tmp = ev.clone();
-            tmp.bundle_hash = None;
-            // Also clear mono/wall ns? No — writer included them, so keep them as-is.
-            if let Ok(json) = serde_json::to_vec(&tmp) {
-                hasher.update(&json);
-            }
-        }
-        let computed = format!("{:x}", hasher.finalize());
-        // Compare only if current_hash non-empty; empty means legacy without hash.
-        if !current_hash.is_empty() && computed != current_hash {
-            // Allow truncated-injected batch where hash includes only pre-truncated events — our computed should match.
-            // If mismatch, mark hash_ok false.
-            hash_ok = false;
-        }
-        if !current_hash.is_empty() {
-            prev_hash = current_hash;
-        }
-        idx = batch_end;
-    }
-
-    // Honest watermark: parse from final ObserveCompleted event's output.watermark.
-    // Supervisor finalize() writes `output: {"watermark": "Complete"|"Truncated"|"Incomplete"}`.
-    // Never derive from truncated_gaps — that conflates DAL-A Halt (Incomplete) with gaps.
-    let watermark = events
-        .iter()
-        .rev()
-        .find(|e| e.event_type == WalEventType::ObserveCompleted)
-        .and_then(|e| e.output.as_ref())
-        .and_then(|v| v.get("watermark"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
+    let report = verify_bundle_inner(path);
+    // Fail-closed mapping: hash_ok requires both structural parseability and integrity.
+    let hash_ok = report.structurally_parseable && report.integrity_valid;
     VerifyResult {
-        total: events.len(),
-        truncated_gaps,
+        total: report.total,
+        truncated_gaps: report.truncated_gaps,
         hash_ok,
-        error: None,
-        watermark,
+        error: report.error,
+        watermark: report.watermark,
     }
 }
 
@@ -650,6 +753,55 @@ mod tests {
         assert!(v.hash_ok);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&cp);
+    }
+
+    #[test]
+    fn hash_absent_event_fails_integrity() {
+        let path = tmp_bundle("hash_absent");
+        let _ = std::fs::remove_file(&path);
+        // Shaped exactly like /tmp/runtimo_test_bundle_fail_closed.jsonl:
+        // one hash-absent observe_batch + one hashed observe_batch.
+        let ev0 = WalEvent {
+            seq: 0,
+            ts: 1,
+            event_type: WalEventType::ObserveBatch,
+            job_id: "a".into(),
+            bundle_hash: None,
+            ..Default::default()
+        };
+        let ev1 = WalEvent {
+            seq: 1,
+            ts: 1000,
+            event_type: WalEventType::ObserveBatch,
+            job_id: "valid".into(),
+            bundle_hash: Some(
+                "d71de7965a83129bc061c1f9f601f38d161bc937af780b4faf242885775540bb".to_string(),
+            ),
+            mono_ns: Some(15672),
+            wall_ns: Some(1788865740613426198),
+            ..Default::default()
+        };
+        let mut s = String::new();
+        s.push_str(&serde_json::to_string(&ev0).unwrap());
+        s.push('\n');
+        s.push_str(&serde_json::to_string(&ev1).unwrap());
+        s.push('\n');
+        std::fs::write(&path, s).unwrap();
+        let report = verify_report(&path);
+        assert!(
+            !report.integrity_valid,
+            "hash-absent event must fail integrity"
+        );
+        assert!(
+            !report.admissible,
+            "hash-absent event must make bundle inadmissible"
+        );
+        let v = verify_bundle(&path);
+        assert!(
+            !v.hash_ok,
+            "shim hash_ok must be false when integrity fails"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

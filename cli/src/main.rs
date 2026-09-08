@@ -12,8 +12,9 @@ use runtimo_core::{
         is_dangerous_command, is_network_command, network_enabled, Delete, FileRead, FileWrite,
         GitExec, Kill, ShellExec, Undo,
     },
-    execute_with_telemetry_and_session, CapabilityRegistry, ProcessSnapshot, RuntimoConfig,
-    Telemetry, WalReader,
+    execute_with_telemetry_and_session,
+    oracle::{evaluate, parse_spec, PropertyVerdict},
+    CapabilityRegistry, ProcessSnapshot, RuntimoConfig, Telemetry, WalReader,
 };
 use serde_json::Value;
 use std::error::Error;
@@ -312,14 +313,23 @@ Rate from --sample-rate-hz or RUNTIMO_OBSERVE_SAMPLE_HZ or config observe.sample
         /// DAL A–E (default from config, controls watermark on shed).
         #[arg(long)]
         dal: Option<String>,
+        /// Override pressure_suspend_ms from config (default from config when absent).
+        #[arg(long)]
+        suspend_ms: Option<u64>,
         /// Run self-test and exit 0/1.
         #[arg(long, default_value = "false")]
         self_test: bool,
         /// Verify a bundle file offline and print trailer (hash chain + truncated gaps).
         #[arg(long)]
         verify: Option<PathBuf>,
+        /// Property specification as a JSON string (e.g. {"name":"p","predicates":[...]})
+        /// to evaluate against the bundle's WAL events. Property verdicts are reported
+        /// in the output but NEVER alter the verify exit code (exit depends solely on
+        /// `admissible`). Parse failure exits 1 with a clear stderr message.
+        #[arg(long)]
+        properties: Option<String>,
         /// Output as JSON.
-        #[arg(long, default_value = "false")]
+        #[arg(long, short = 'j', default_value = "false")]
         json: bool,
     },
 }
@@ -2601,8 +2611,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             sample_rate_hz,
             burst,
             dal,
+            suspend_ms,
             self_test,
             verify,
+            properties,
             json,
         } => {
             let mode = if json {
@@ -2610,6 +2622,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             } else {
                 base_mode
             };
+            if pid.is_none() && cmd.is_none() && !self_test && verify.is_none() {
+                eprintln!(
+                    "observe error: must specify one of --pid, --cmd, --self-test, or --verify"
+                );
+                std::process::exit(1);
+            }
             if self_test {
                 let code = runtimo_core::observe::self_test::run();
                 std::process::exit(code);
@@ -2631,8 +2649,32 @@ fn main() -> Result<(), Box<dyn Error>> {
                     eprintln!("verify: invalid bundle path: {e}");
                     std::process::exit(1);
                 }
-                let res = runtimo_core::observe::verify_bundle(&vpath);
-                // T6cli: consume honest watermark from VerifyResult.watermark (AP-5 field),
+                let res = runtimo_core::observe::verify_report(&vpath);
+                // Load events for oracle evaluation via the arm's existing loading path.
+                let wal_events: Vec<runtimo_core::wal::WalEvent> =
+                    if let Ok(reader) = WalReader::load_all(&vpath) {
+                        reader.events().to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                // Evaluate --properties spec if present; parse failure exits 1.
+                let property_verdicts: Vec<PropertyVerdict> = if let Some(ref spec_str) = properties
+                {
+                    let spec = match parse_spec(spec_str) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("verify: property spec parse error: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+                    match evaluate(&wal_events, &spec) {
+                        Ok(pv) => vec![pv],
+                        Err(_) => vec![],
+                    }
+                } else {
+                    Vec::new()
+                };
+                // T6cli: consume honest watermark from VerifyReport.watermark (AP-5 field),
                 // never derive from truncated_gaps. Fallback only when no ObserveCompleted marker.
                 let watermark_display = res.watermark.clone().unwrap_or_else(|| {
                     if res.truncated_gaps > 0 {
@@ -2642,42 +2684,62 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                 });
                 if mode.is_json() {
+                    let pv_array: Vec<serde_json::Value> = property_verdicts
+                        .iter()
+                        .map(|pv| {
+                            serde_json::json!({
+                                "name": pv.name,
+                                "verdict": format!("{:?}", pv.verdict),
+                                "detail": pv.detail,
+                            })
+                        })
+                        .collect();
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({
                             "path": vpath.display().to_string(),
                             "total": res.total,
                             "truncated_gaps": res.truncated_gaps,
-                            "hash_ok": res.hash_ok,
+                            "structurally_parseable": res.structurally_parseable,
+                            "integrity_valid": res.integrity_valid,
+                            "hash_ok": res.structurally_parseable && res.integrity_valid,
+                            "lifecycle_valid": res.lifecycle_valid,
+                            "completeness_known": res.completeness_known,
+                            "admissible": res.admissible,
                             "error": res.error,
                             "watermark": res.watermark,
+                            "property_verdicts": pv_array,
                         }))
                         .unwrap()
                     );
                 } else {
                     println!(
-                        "verify {}: total={} truncated_gaps={} hash_ok={} error={:?} watermark={:?}",
+                        "verify {}: structurally_parseable={} integrity_valid={} lifecycle_valid={} completeness_known={} admissible={} error={:?} watermark={:?}",
                         vpath.display(),
-                        res.total,
-                        res.truncated_gaps,
-                        res.hash_ok,
+                        res.structurally_parseable,
+                        res.integrity_valid,
+                        res.lifecycle_valid,
+                        res.completeness_known,
+                        res.admissible,
                         res.error,
                         res.watermark
                     );
                     println!(
                         "trailer: bundle {} — hash chain {} — watermark {}",
                         vpath.display(),
-                        if res.hash_ok { "ok" } else { "FAIL" },
+                        if res.integrity_valid { "ok" } else { "FAIL" },
                         watermark_display
                     );
+                    for pv in &property_verdicts {
+                        println!(
+                            "property_verdicts: name={} verdict={:?} detail={}",
+                            pv.name, pv.verdict, pv.detail
+                        );
+                    }
                 }
                 #[allow(clippy::bool_to_int_with_if)]
                 {
-                    std::process::exit(if res.hash_ok && res.error.is_none() {
-                        0
-                    } else {
-                        1
-                    });
+                    std::process::exit(if res.admissible { 0 } else { 1 });
                 }
             }
             // T10: burst is a dead contract — surface explicitly to stdout (not just daemon stderr)
@@ -2717,6 +2779,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             let hz = sample_rate_hz
                 .unwrap_or_else(|| RuntimoConfig::load().effective_observe_sample_hz(None));
             let dal_str = dal.unwrap_or_else(RuntimoConfig::get_dal);
+            let pressure_suspend_ms = suspend_ms
+                .unwrap_or_else(|| RuntimoConfig::load().resolved().observe_pressure_suspend_ms);
             // Try daemon first if running; else run locally.
             if daemon_is_running() {
                 let mut params = serde_json::json!({
@@ -2725,6 +2789,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     "dal": dal_str,
                     "out": bundle_path.display().to_string(),
                     "burst": burst,
+                    "pressure_suspend_ms": pressure_suspend_ms,
                 });
                 if let Some(p) = pid {
                     params["pid"] = serde_json::json!(p);
@@ -2773,6 +2838,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     hz,
                     &dal_str,
                     Some(bundle_path.clone()),
+                    pressure_suspend_ms,
                 ) {
                     Ok(s) => s,
                     Err(e) => {
@@ -2783,6 +2849,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 sup.attach(target_pid);
                 // Short burst collection (demo: 50 ticks or 2s).
                 let interval = sup.sampler_interval();
+                #[allow(clippy::arithmetic_side_effects)]
+                // Instant::now() + Duration; bounded by 2s
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
                 let mut ticks = 0;
                 while std::time::Instant::now() < deadline && ticks < 50 {
@@ -2794,22 +2862,39 @@ fn main() -> Result<(), Box<dyn Error>> {
                     eprintln!("finalize failed: {e}");
                     std::process::exit(1);
                 }
-                let v = runtimo_core::observe::verify_bundle(&bundle_path);
+                let v = runtimo_core::observe::verify_report(&bundle_path);
                 if mode.is_json() {
-                    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                        "run_id": run_id,
-                        "bundle": bundle_path.display().to_string(),
-                        "ticks": ticks,
-                        "hz": hz,
-                        "dal": dal_str,
-                        "watermark": format!("{:?}", sup.watermark()),
-                        "verify": { "total": v.total, "truncated_gaps": v.truncated_gaps, "hash_ok": v.hash_ok }
-                    })).unwrap());
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "run_id": run_id,
+                            "bundle": bundle_path.display().to_string(),
+                            "ticks": ticks,
+                            "hz": hz,
+                            "dal": dal_str,
+                            "watermark": format!("{:?}", sup.watermark()),
+                            "verify": {
+                                "total": v.total,
+                                "truncated_gaps": v.truncated_gaps,
+                                "structurally_parseable": v.structurally_parseable,
+                                "integrity_valid": v.integrity_valid,
+                                "hash_ok": v.structurally_parseable && v.integrity_valid,
+                                "lifecycle_valid": v.lifecycle_valid,
+                                "completeness_known": v.completeness_known,
+                                "admissible": v.admissible,
+                                "error": v.error,
+                                "watermark": v.watermark,
+                            }
+                        }))
+                        .unwrap()
+                    );
                 } else {
                     println!("observe complete: run_id={run_id} bundle={} ticks={ticks} hz={hz} dal={dal_str} watermark={:?}", bundle_path.display(), sup.watermark());
                     println!(
-                        "verify: total={} truncated_gaps={} hash_ok={}",
-                        v.total, v.truncated_gaps, v.hash_ok
+                        "verify: total={} truncated_gaps={} structurally_parseable={} integrity_valid={} lifecycle_valid={} completeness_known={} admissible={} error={:?} watermark={:?}",
+                        v.total, v.truncated_gaps,
+                        v.structurally_parseable, v.integrity_valid, v.lifecycle_valid,
+                        v.completeness_known, v.admissible, v.error, v.watermark
                     );
                 }
             }
@@ -3093,5 +3178,116 @@ mod tests {
             "Socket should end with runtimo.sock: {}",
             path_str
         );
+    }
+
+    // ── Properties Flag Tests ──────────────────────────
+
+    #[test]
+    fn test_properties_flag_present() {
+        let args = vec![
+            "runtimo",
+            "observe",
+            "--verify",
+            "/tmp/test.jsonl",
+            "--properties",
+            r#"{"name":"p","predicates":[]}"#,
+        ];
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command {
+            Commands::Observe { properties, .. } => {
+                assert!(properties.is_some());
+                assert_eq!(properties.unwrap(), r#"{"name":"p","predicates":[]}"#);
+            }
+            _ => panic!("Expected Observe command"),
+        }
+    }
+
+    #[test]
+    fn test_properties_flag_absent() {
+        let args = vec!["runtimo", "observe", "--verify", "/tmp/test.jsonl"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command {
+            Commands::Observe { properties, .. } => {
+                assert!(properties.is_none());
+            }
+            _ => panic!("Expected Observe command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_spec_satisfied() {
+        let spec = parse_spec(
+            r#"{"name":"good-prop","predicates":[{"field":"event_type","op":"Eq","value":"job_started"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(spec.name, "good-prop");
+        assert_eq!(spec.predicates.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_spec_malformed() {
+        let result = parse_spec(r#"{"name":"bad","predicates":[}"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_evaluate_satisfied() {
+        use runtimo_core::oracle::Verdict;
+        use runtimo_core::wal::WalEvent;
+        use serde_json::json;
+
+        let event = WalEvent {
+            event_type: runtimo_core::WalEventType::JobStarted,
+            job_id: "test-job-42".to_string(),
+            ..WalEvent::default()
+        };
+        let spec = parse_spec(
+            r#"{"name":"satisfied-prop","predicates":[{"field":"event_type","op":"Eq","value":"job_started"}]}"#,
+        )
+        .unwrap();
+        let result = evaluate(&[event], &spec).unwrap();
+        assert_eq!(result.verdict, Verdict::Satisfied);
+    }
+
+    #[test]
+    fn test_evaluate_violated() {
+        use runtimo_core::oracle::Verdict;
+        use runtimo_core::wal::WalEvent;
+
+        let event = WalEvent {
+            event_type: runtimo_core::WalEventType::JobStarted,
+            job_id: "test-job-42".to_string(),
+            ..WalEvent::default()
+        };
+        let spec = parse_spec(
+            r#"{"name":"violated-prop","predicates":[{"field":"event_type","op":"Eq","value":"job_completed"}]}"#,
+        )
+        .unwrap();
+        let result = evaluate(&[event], &spec).unwrap();
+        assert_eq!(result.verdict, Verdict::Violated);
+    }
+
+    #[test]
+    fn test_exit_independence_violated() {
+        use runtimo_core::oracle::Verdict;
+        use runtimo_core::wal::WalEvent;
+
+        let event = WalEvent {
+            event_type: runtimo_core::WalEventType::JobStarted,
+            job_id: "test-job-42".to_string(),
+            ..WalEvent::default()
+        };
+        let spec = parse_spec(
+            r#"{"name":"independence-prop","predicates":[{"field":"event_type","op":"Eq","value":"job_completed"}]}"#,
+        )
+        .unwrap();
+        let result = evaluate(&[event], &spec).unwrap();
+        assert_eq!(result.verdict, Verdict::Violated);
+    }
+
+    #[test]
+    fn test_parse_spec_empty_predicates() {
+        let spec = parse_spec(r#"{"name":"empty-prop","predicates":[]}"#).unwrap();
+        assert!(spec.predicates.is_empty());
     }
 }

@@ -1,6 +1,6 @@
 //! Observe self-test — fixtures A/B, DAL-A gate, tamper detection.
 //!
-//! `runtimo observe --self-test` runs four checks and exits `0` on all pass,
+//! `runtimo observe --self-test` runs five checks and exits `0` on all pass,
 //! `1` otherwise. Each check prints a one-line `ok`/`FAIL` note so a
 //! documentarian can copy the output verbatim.
 //!
@@ -12,13 +12,18 @@
 //!   (topology coverage via stack-file presence or fallback markers).
 //! * **DAL-A gate**: induced drop via `inject_drop_next` ⇒ watermark
 //!   `INCOMPLETE`, never `COMPLETE` (DAL A `Halt` never kills target).
-//! * **Tamper**: corrupt one byte in a bundle ⇒ `verify_bundle` reports
-//!   `hash_ok == false` (or at least not silently `ok`).
+//! * **Tamper**: corrupt one byte in a bundle ⇒ `verify_report` reports
+//!   `integrity_valid == false` and `admissible == false` (`hash_ok` deprecated alias also false).
+//! * **Oracle pipeline**: parse a fixed spec, evaluate over small synthetic events,
+//!   assert `Satisfied` verdict — proves oracle parse+eval path is functional.
 
+use crate::config::RuntimoConfig;
 use crate::observe::audit::{AuditHook, AuditKind};
 use crate::observe::bundle::{BundleWriter, VerifyResult};
 use crate::observe::sampler::{OutOfProcessSampler, StackSampler};
 use crate::observe::supervisor::{BundleWatermark, CollectorFailure, ObserveSupervisor};
+use crate::observe::verify_report;
+use crate::oracle::{evaluate, parse_spec, Verdict};
 use crate::wal::{WalEvent, WalEventType};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -45,6 +50,7 @@ pub fn checks() -> Vec<SelfTestCheck> {
         fixture_b_sampling_bounds(),
         dal_a_gate(),
         tamper_detection(),
+        oracle_pipeline_check(),
     ]
 }
 
@@ -193,17 +199,22 @@ fn dal_a_gate() -> SelfTestCheck {
     let cp = PathBuf::from(format!("{}.checkpoint", path.display()));
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&cp);
-    let mut sup =
-        match ObserveSupervisor::new_at_path("selftest-dal-a", 50, "A", Some(path.clone())) {
-            Ok(s) => s,
-            Err(e) => {
-                return SelfTestCheck {
-                    name: "DAL-A gate",
-                    passed: false,
-                    detail: format!("supervisor create failed: {e}"),
-                }
+    let mut sup = match ObserveSupervisor::new_at_path(
+        "selftest-dal-a",
+        50,
+        "A",
+        Some(path.clone()),
+        RuntimoConfig::load().resolved().observe_pressure_suspend_ms,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            return SelfTestCheck {
+                name: "DAL-A gate",
+                passed: false,
+                detail: format!("supervisor create failed: {e}"),
             }
-        };
+        }
+    };
     sup.attach(std::process::id());
     // Induce a drop (simulates overflow) then tick once.
     sup.inject_drop_next();
@@ -287,6 +298,21 @@ fn tamper_detection() -> SelfTestCheck {
         // So check total mismatch as evidence.
         v.total != 3
     };
+    let r = verify_report(&path);
+    // Assert on the new predicates alongside existing hash_ok checks.
+    assert!(
+        !r.admissible || !r.integrity_valid,
+        "admissible must be false when integrity fails"
+    );
+    assert_eq!(
+        r.structurally_parseable,
+        v.hash_ok || r.total == 3,
+        "structurally_parseable reflects parseability"
+    );
+    assert_eq!(
+        r.integrity_valid, v.hash_ok,
+        "integrity_valid matches hash_ok for well-formed bundles"
+    );
     let detail = if passed {
         format!(
             "corruption detected (hash_ok={} total={} gaps={} err={:?})",
@@ -304,6 +330,83 @@ fn tamper_detection() -> SelfTestCheck {
         name: "tamper detection",
         passed,
         detail,
+    }
+}
+
+fn oracle_pipeline_check() -> SelfTestCheck {
+    let spec_json = r#"{"name":"selftest-spec","predicates":[{"field":"event_type","op":"Eq","value":"job_started"}]}"#;
+    let spec = match parse_spec(spec_json) {
+        Ok(s) => s,
+        Err(e) => {
+            return SelfTestCheck {
+                name: "oracle pipeline",
+                passed: false,
+                detail: format!("parse failed: {e}"),
+            };
+        }
+    };
+    let events = vec![
+        WalEvent {
+            seq: 0,
+            ts: 1_700_000_000,
+            event_type: WalEventType::JobStarted,
+            job_id: "selftest-job".to_string(),
+            capability: Some("FileRead".to_string()),
+            output: None,
+            error: None,
+            telemetry_before: None,
+            telemetry_after: None,
+            process_before: None,
+            process_after: None,
+            cmd: None,
+            cmd_stdout: None,
+            cmd_stderr: None,
+            cmd_exit_code: None,
+            cmd_corrected: None,
+            ..Default::default()
+        },
+        WalEvent {
+            seq: 1,
+            ts: 1_700_000_001,
+            event_type: WalEventType::JobStarted,
+            job_id: "selftest-job".to_string(),
+            capability: Some("FileRead".to_string()),
+            output: None,
+            error: None,
+            telemetry_before: None,
+            telemetry_after: None,
+            process_before: None,
+            process_after: None,
+            cmd: None,
+            cmd_stdout: None,
+            cmd_stderr: None,
+            cmd_exit_code: None,
+            cmd_corrected: None,
+            ..Default::default()
+        },
+    ];
+    let result = match evaluate(&events, &spec) {
+        Ok(r) => r,
+        Err(e) => {
+            return SelfTestCheck {
+                name: "oracle pipeline",
+                passed: false,
+                detail: format!("eval failed: {e}"),
+            };
+        }
+    };
+    let passed = result.verdict == Verdict::Satisfied;
+    SelfTestCheck {
+        name: "oracle pipeline",
+        passed,
+        detail: if passed {
+            format!("parse+eval ok, verdict={:?}", result.verdict)
+        } else {
+            format!(
+                "expected Satisfied, got {:?}: {}",
+                result.verdict, result.detail
+            )
+        },
     }
 }
 

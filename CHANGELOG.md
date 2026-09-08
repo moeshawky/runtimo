@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **`--verify` exit keys off `admissible`** — CLI `--verify` now exits 0 iff `admissible` (conjunction of `structurally_parseable`, `integrity_valid`, `lifecycle_valid`, `completeness_known`, and no error). `hash_ok` is retained as a deprecated alias equal to `structurally_parseable && integrity_valid`. (`cli/src/main.rs`, `core/src/observe/bundle.rs`)
+- **Daemon `observe_verify` gains predicate fields** — `handle_observe_verify` now switches from `verify_bundle` to `verify_report`, returning the full 5-predicate set (`structurally_parseable`, `integrity_valid`, `lifecycle_valid`, `completeness_known`, `admissible`) plus `total`/`truncated_gaps`/`watermark`/`error`, with `hash_ok` retained as a deprecated alias. (`daemon/src/engine.rs`, `core/src/observe/bundle.rs`)
+
+### Removed
+- **`max_bundle_bytes` vaporware** — Removed `max_bundle_bytes` from `ObserveConfig`, `observe_max_bundle_bytes` from `ResolvedConfig`, and the corresponding resolution logic in `RuntimoConfig::resolved()`. The field was never wired to any actual bundle rotation logic. (`core/src/config.rs`, `cli/src/output.rs`)
+
 ## [0.8.3] - 2026-09-05
 
 ### Fixed

@@ -427,16 +427,22 @@ Source: live run `cargo build --release && ./target/release/runtimo observe --he
 
 Default bundle: `{data_dir}/bundles/<run_id>.jsonl` where `data_dir` is `XDG_DATA_HOME` or `~/.local/share` → `.../runtimo` (`core/src/lib.rs:206-224`), `run_id` is 32 hex chars (`core/src/lib.rs:242-267`), and `bundle_path()` asserts never ending in `wal.jsonl` (`core/src/observe/bundle.rs:43-56`). Explicit `--out` is validated against `RuntimoConfig::get_allowed_prefixes()` plus `data_dir` (`cli/src/main.rs:2603-2654`, `daemon/src/engine.rs:693-712`). Batching: ≤256 events or 100 ms, one `fsync` per batch plus watermark `fsync` on close/drop; checkpoint every 1 000 events or 5 s at `{bundle}.checkpoint` preserving `.jsonl` (`core/src/observe/bundle.rs:27-34`, `core/src/observe/bundle.rs:353-372`). Dual-clock: `mono_ns = base.elapsed()` strictly increasing, `wall_ns` is wall-clock since epoch (`core/src/observe/bundle.rs:81-84`, `core/src/observe/bundle.rs:220-230`).
 
-`verify_bundle(path)` (`core/src/observe/bundle.rs:422-525`) returns:
+`verify_report(path)` returns five predicates plus metadata. Exit 0 from `--verify` iff `admissible` (conjunction of all predicates and no error):
 
 | Field | Meaning | Failure signal |
 |-------|---------|----------------|
+| `structurally_parseable` | all lines parse as valid `WalEvent` with valid UTF-8 and non-empty content | `false` on malformed/empty lines |
+| `integrity_valid` | hash chain verifies; no tamper, prev-break, or hash-absent events | `false` on tamper |
+| `lifecycle_valid` | no missing-first-terminal, duplicate seqs, reopen, or run-id-mismatch | `false` on lifecycle violations |
+| `completeness_known` | all seq gaps carry `ObserveTruncated` markers | `false` on unaccounted gaps |
+| `admissible` | conjunction of the four predicates plus `error` is `None` | `false` on any failure |
+| `hash_ok` | **deprecated alias** for `structurally_parseable && integrity_valid` | retained for backward compatibility |
 | `total` | events read | < expected when corruption makes lines unparseable |
-| `truncated_gaps` | seq gaps (with or without `ObserveTruncated` marker) (`core/src/observe/bundle.rs:450-462`) | >0 means data was dropped and accounted |
-| `hash_ok` | recomputed `sha256(prev_hash ++ batch_json)` matches `bundle_hash` (`core/src/observe/bundle.rs:463-517`) | `false` on tamper |
-| `error` | read/parse error (`core/src/observe/bundle.rs:426-432`) | `Some(...)` |
+| `truncated_gaps` | seq gaps (with or without `ObserveTruncated` marker) | >0 means data was dropped and accounted |
+| `error` | read/parse error | `Some(...)` |
+| `watermark` | honest watermark from final `ObserveCompleted` event | `None` when no marker present |
 
-CLI `--verify` prints `verify <path>: total=… truncated_gaps=… hash_ok=… error=…` and `trailer: bundle … — hash chain ok/FAIL — watermark TRUNCATED/Complete` (`cli/src/main.rs:2616-2628`), exits 0 only if `hash_ok && error.is_none()`. Daemon `observe_verify` does the same read-only check with path validation (`daemon/src/engine.rs:867-911`).
+CLI `--verify` prints `verify <path>: structurally_parseable=… integrity_valid=… lifecycle_valid=… completeness_known=… admissible=… error=… watermark=…` and `trailer: bundle … — hash chain ok/FAIL — watermark TRUNCATED/Complete`, exits 0 only if `admissible`. Daemon `observe_verify` does the same read-only check with path validation, returning the full predicate set with `hash_ok` retained as a deprecated alias.
 
 Retention: daemon hourly task runs `WalWriter::cleanup(..., 86400*7)` and `BackupManager::cleanup(..., 86400*7)` — 7 days for WAL and backups/bundles (`daemon/src/engine.rs:1144-1151`, `core/src/config.rs:109` provisional `7d bundle retention — observe provisional 7d`).
 

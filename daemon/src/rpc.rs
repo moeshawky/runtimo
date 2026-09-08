@@ -117,6 +117,9 @@ pub struct ObserveStartParams {
     /// Explicit run id (default: generated).
     #[serde(default)]
     pub run_id: Option<String>,
+    /// Pressure suspend window in milliseconds (default 1000, via `ObserveConfig`).
+    #[serde(default)]
+    pub pressure_suspend_ms: Option<u64>,
 }
 
 /// Parameters for `observe_status`.
@@ -139,6 +142,19 @@ fn default_observe_limit() -> usize {
 pub struct ObserveVerifyParams {
     /// Bundle path to verify (validated; must be inside allowed prefixes or data_dir).
     pub path: String,
+}
+
+/// Parameters for `observe_evaluate`.
+///
+/// Contains the bundle path to evaluate and a property specification
+/// string. The path is validated against allowed prefixes and data_dir.
+/// The properties string is parsed via [`runtimo_core::oracle::parse_spec`].
+#[derive(Debug, Deserialize)]
+pub struct ObserveEvaluateParams {
+    /// Bundle path to evaluate (validated; must be inside allowed prefixes or data_dir).
+    pub path: String,
+    /// Property specification string (JSON with `name` and `predicates`).
+    pub properties: String,
 }
 
 #[cfg(test)]

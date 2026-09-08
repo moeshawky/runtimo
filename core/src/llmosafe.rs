@@ -23,12 +23,12 @@ use crate::config::RuntimoConfig;
 use llmosafe::llmosafe_pipeline::STAGE_SIFT;
 use llmosafe::{
     sift_text, CognitivePipeline, EscalationPolicy, EscalationReason, MemoryStats, PidState,
-    PipelineResult, PressureLevel, ResourceGuard, SafetyContext, SafetyDecision, StabilityResult,
-    Synapse,
+    PipelineResult, PressureLevel, ResourceGuard, SafetyContext, StabilityResult, Synapse,
 };
 use std::fs;
 
 pub use llmosafe::DesignAssuranceLevel;
+pub use llmosafe::SafetyDecision;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -224,7 +224,10 @@ pub struct LlmoSafeGuard {
 ///
 /// This is called after the cognitive pipeline produces a decision, applying
 /// the runtime's configured risk tolerance before the decision gates execution.
-fn apply_dal_to_decision(dal: DesignAssuranceLevel, decision: SafetyDecision) -> SafetyDecision {
+pub(crate) fn apply_dal_to_decision(
+    dal: DesignAssuranceLevel,
+    decision: SafetyDecision,
+) -> SafetyDecision {
     match dal {
         DesignAssuranceLevel::A => decision,
         DesignAssuranceLevel::B => match decision {

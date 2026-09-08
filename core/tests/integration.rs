@@ -1724,7 +1724,7 @@ fn observe_self_test_run_exits_zero() {
 
 #[test]
 fn observe_bundle_verify_roundtrip_integration() {
-    use runtimo_core::observe::{verify_bundle, BundleWriter};
+    use runtimo_core::observe::{verify_bundle, verify_report, BundleWriter};
     use runtimo_core::wal::{WalEvent, WalEventType};
     let dir = setup();
     let path = dir.join("observe_verify.jsonl");
@@ -1742,5 +1742,14 @@ fn observe_bundle_verify_roundtrip_integration() {
     let v = verify_bundle(&path);
     assert!(v.hash_ok, "bundle hash must verify after finalize");
     assert_eq!(v.total, 5);
+    let r = verify_report(&path);
+    assert!(r.admissible, "bundle must be admissible after finalize");
+    assert!(
+        r.structurally_parseable,
+        "bundle must be structurally parseable"
+    );
+    assert!(r.integrity_valid, "bundle must have valid integrity");
+    assert!(r.lifecycle_valid, "bundle must have valid lifecycle");
+    assert!(r.completeness_known, "bundle must have known completeness");
     cleanup(&dir);
 }

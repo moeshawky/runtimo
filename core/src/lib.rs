@@ -87,6 +87,8 @@ pub mod llmosafe;
 pub mod monitor;
 /// Observe subsystem — sampling, bundling, budgeting, auditing.
 pub mod observe;
+/// Oracle — property specification and evaluation.
+pub mod oracle;
 /// Process snapshot, zombie detection, and top-N queries.
 pub mod processes;
 /// Session tracking for reliable SSH.
@@ -97,6 +99,8 @@ pub mod telemetry;
 pub mod validation;
 /// Write-ahead log for crash recovery.
 pub mod wal;
+
+pub use oracle::{evaluate, Op, OracleError, Predicate, PropertySpec, PropertyVerdict, Verdict};
 
 pub use backup::BackupManager;
 pub use capabilities::{Delete, FileRead, FileWrite, GitExec, Kill, ShellExec, Undo};
