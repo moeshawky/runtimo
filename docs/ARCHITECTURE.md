@@ -1,7 +1,7 @@
 # Runtimo Architecture
 
-**Version:** 0.8.3
-**Last Updated:** 2026-08-09
+**Version:** 0.9.0
+**Last Updated:** 2026-09-08
 
 ---
 
@@ -11,16 +11,16 @@ Every capability execution follows a 10-step pipeline:
 
 ```rust
 // core/src/executor.rs — execute_with_telemetry_and_session()
-// daemon single-source working_dir: daemon/src/engine.rs:70-89 resolve_working_dir()
+// daemon single-source working_dir: daemon/src/engine.rs resolve_working_dir()
 
 1. Telemetry::capture()               // hardware + service discovery
 2. ProcessSnapshot::capture()         // process list with PPIDs
 3. LlmoSafeGuard::check()             // /proc/stat, /proc/self/status, 80% ceiling
 4. args size check                    // reject > 1 MB
 5. zombie check                       // reject if > 10 zombies
-6. WalWriter::append(JobStarted)      // fsync'd JSONL (one fsync per batch + watermark on bundle finalize; see core/src/observe/bundle.rs:308-388)
+6. WalWriter::append(JobStarted)      // fsync'd JSONL (one fsync per batch + watermark on bundle finalize; see core/src/observe/bundle.rs)
 7. capability.validate()              // schema + path + semantic checks
-8. capability.execute()               // runs the capability; Err-path still emits BackupCreated before JobFailed covering path/repo_path/dir (core/src/executor.rs:446-466)
+8. capability.execute()               // runs the capability; Err-path still emits BackupCreated before JobFailed covering path/repo_path/dir (core/src/executor.rs)
 9. Telemetry::capture()               // after snapshot
 10. ProcessSnapshot::capture()        // after snapshot
 11. WalWriter::append(JobCompleted)   // fsync'd, with output + telemetry; watermark fsync guarantees durability on bundle close
@@ -57,7 +57,7 @@ Capability (core/src/capability.rs)
   ├── Process Snapshot (core/src/processes.rs)
   │     ps aux parsing, PPID tracking, zombie detection
    ├── Config (core/src/config.rs)
-  │     TOML at ~/.config/runtimo/config.toml, env var override; guards resolved via single-source RuntimoConfig::resolved() (top-level > [guards].* > profile != ephemeral) — core/src/config.rs:528-700, 942-1013
+  │     TOML at ~/.config/runtimo/config.toml, env var override; guards resolved via single-source RuntimoConfig::resolved() (top-level > [guards].* > profile != ephemeral) — core/src/config.rs
    ├── Observe Bundle (core/src/observe/bundle.rs)
   │     WAL-backed BundleWriter: 256 events or 100 ms batch, sha256(prev_hash ++ batch_json) hash chain, one fsync per batch + watermark fsync on finalize/drop; overflow injects ObserveTruncated with bundle_dropped sentinel; verify returns watermark Complete/Truncated/Incomplete from ObserveCompleted output.watermark
   ├── Session Manager (core/src/session.rs)
@@ -108,9 +108,9 @@ ShellExec.execute()
   │     .stdin(pipe) .stdout(piped) .stderr(piped)
   ├─ setpgid() → process group isolation
   ├─ wait_with_timeout(child, pgid, timeout)
-  │     ├─ read stdout/stderr (bounded to 10 MB each)
-  │     ├─ on timeout: kill(-pgid, SIGKILL) → wait; returns WaitOutcome { timed_out:true, signal:Some(9) } with partial output (core/src/capabilities/shell_exec.rs:1207-1263)
-  │     └─ on child exit: check descendants via /proc/{pid}/children; signal paths return timed_out:false, signal:Some(n) (core/src/capabilities/shell_exec.rs:1559-1585)
+│     ├─ read stdout/stderr (bounded to 10 MB each)
+│     ├─ on timeout: kill(-pgid, SIGKILL) → wait; returns WaitOutcome { timed_out:true, signal:Some(9) } with partial output (core/src/capabilities/shell_exec.rs)
+│     └─ on child exit: check descendants via /proc/{pid}/children; signal paths return timed_out:false, signal:Some(n) (core/src/capabilities/shell_exec.rs)
   ├─ Output data: { timed_out: bool (true ONLY on timeout-kill), signal: Option<i32>, exit_code, stdout, stderr, pid, timeout_secs, truncated }
   ├─ Telemetry capture (before + after)
   └─ [debug] WalWriter::append(CommandExecuted) with cmd, stdout, stderr, exit_code
@@ -118,14 +118,14 @@ ShellExec.execute()
 ## Daemon Working-Dir (single-source) + Observe Burst / Reconcile
 
 ```
-daemon/src/engine.rs:70-89 resolve_working_dir()  →  -32602 on invalid, never eprintln!+None (dual-decision→single-source fix, T2)
+daemon/src/engine.rs resolve_working_dir()  →  -32602 on invalid, never eprintln!+None (dual-decision→single-source fix, T2)
   ├─ handle_run / handle_dispatch / handle_observe_start all delegate to resolve_working_dir (no fallback to current_dir().unwrap_or("/"))
   └─ invalid working_dir never swallows to None
 
-observe_start with burst:true → -32601 observe_burst deferred (daemon/src/engine.rs:133-154, 747-758)
+observe_start with burst:true → -32601 observe_burst deferred (daemon/src/engine.rs, daemon/src/rpc.rs)
 observe_burst RPC → always -32601 deferred
 
-reconcile (daemon restart): JobFailed preserves original capability + output {"reconciled": true} (daemon/src/engine.rs:1247-1249)
+reconcile (daemon restart): JobFailed preserves original capability + output {"reconciled": true} (daemon/src/engine.rs)
 ```
 ```
 

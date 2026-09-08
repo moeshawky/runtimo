@@ -36,9 +36,21 @@ pub struct JsonRpcResponse {
 }
 
 /// JSON-RPC error response body.
+///
+/// Error code `-32601` has two distinct meanings in this system:
+/// * **Method-not-found** (standard JSON-RPC): returned by `handle_request`
+///   fallback when `req.method` does not match any known handler.
+///   Message format: `"Method not found: {method}"`.
+/// * **Deferred feature** (P2B extension): returned by `observe_burst` and
+///   `handle_observe_start` when `burst=true`, indicating the feature is
+///   not yet implemented and the caller should use out-of-process polling.
+///   Message format: `"observe_burst deferred: ..."`.
+///
+/// Callers must distinguish these by checking the message prefix, not just
+/// the code, since both use `-32601`.
 #[derive(Debug, Serialize)]
 pub struct JsonRpcError {
-    /// Error code (JSON-RPC standard: -32700 parse error, -32601 method not found, etc.).
+    /// Error code (JSON-RPC standard: -32700 parse error, -32601 method not found / deferred, etc.).
     pub code: i32,
     /// Human-readable error description.
     pub message: String,

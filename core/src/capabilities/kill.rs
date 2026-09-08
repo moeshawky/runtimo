@@ -524,7 +524,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.status, "error");
-        assert!(result.data.as_ref().unwrap()["killed"].as_bool() == Some(false));
+        assert_eq!(
+            result.data.as_ref().unwrap()["killed"].as_bool(),
+            Some(false)
+        );
     }
 
     #[test]
@@ -545,8 +548,14 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.status, "ok");
-        assert!(result.data.as_ref().unwrap()["dry_run"].as_bool() == Some(true));
-        assert!(result.data.as_ref().unwrap()["killed"].as_bool() == Some(false));
+        assert_eq!(
+            result.data.as_ref().unwrap()["dry_run"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            result.data.as_ref().unwrap()["killed"].as_bool(),
+            Some(false)
+        );
     }
 
     #[test]
@@ -779,7 +788,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.status, "ok");
-        assert!(result.data.as_ref().unwrap()["dry_run"].as_bool() == Some(true));
+        assert_eq!(
+            result.data.as_ref().unwrap()["dry_run"].as_bool(),
+            Some(true)
+        );
         assert!(
             result.data.as_ref().unwrap().get("command").is_none(),
             "dry-run must not expose command"

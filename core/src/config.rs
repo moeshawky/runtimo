@@ -100,9 +100,7 @@ pub struct TelemetryConfig {
 /// # Fields
 /// * `sample_rate_hz` — samples per second for the sampler (default 50)
 /// * `pressure_suspend_ms` — how long to suspend sampling under high pressure (default 1000 ms)
-/// * `max_bundle_bytes` — maximum bundle file size before rotation (default 10 MiB)
-///
-/// # Nexus survey
+/// * `pressure_suspend_ms` — how long to suspend sampling under high pressure (default 1000 ms)
 /// * Q3 default sample Hz: nexus `config.rs` and docs contain no sampling rate;
 ///   provisional 50 Hz adopted (`ASSUMPTION: 50 Hz default — nexus silent, provisional`).
 /// * Q4 bundle retention: nexus uses 90 days for store (`nexus-reference.md:193 NEXUS_STORE_RETENTION_DAYS=90`);
@@ -116,9 +114,6 @@ pub struct ObserveConfig {
     /// Suspension window under pressure in milliseconds.
     #[serde(default)]
     pub pressure_suspend_ms: Option<u64>,
-    /// Maximum bundle file size in bytes.
-    #[serde(default)]
-    pub max_bundle_bytes: Option<u64>,
 }
 
 /// Resolved effective configuration after merging precedence.
@@ -160,8 +155,6 @@ pub struct ResolvedConfig {
     pub observe_sample_hz: u64,
     /// Effective pressure suspend window in milliseconds.
     pub observe_pressure_suspend_ms: u64,
-    /// Effective max bundle bytes.
-    pub observe_max_bundle_bytes: u64,
 }
 
 /// Runtimo persistent configuration.
@@ -666,7 +659,6 @@ profile = "minimal"
             self.observe.sample_rate_hz.unwrap_or(50)
         };
         let observe_pressure_suspend_ms = self.observe.pressure_suspend_ms.unwrap_or(1000);
-        let observe_max_bundle_bytes = self.observe.max_bundle_bytes.unwrap_or(10 * 1024 * 1024);
 
         ResolvedConfig {
             profile,
@@ -685,7 +677,6 @@ profile = "minimal"
             telemetry_enabled,
             observe_sample_hz,
             observe_pressure_suspend_ms,
-            observe_max_bundle_bytes,
         }
     }
 
@@ -824,9 +815,10 @@ profile = "minimal"
         // Pattern: .{filename}.tmp — matches file_write::atomic_write.
         let tmp_name = format!(
             ".{}.tmp",
-            path.file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "config.toml".to_string())
+            path.file_name().map_or_else(
+                || "config.toml".to_string(),
+                |n| n.to_string_lossy().into_owned()
+            )
         );
         let tmp_path = path
             .parent()

@@ -98,7 +98,7 @@ fn writes_file_content() {
             &ctx("w1"),
         )
         .unwrap();
-    assert!(result.status == "ok");
+    assert_eq!(result.status, "ok");
     assert_eq!(fs::read_to_string(&target).unwrap(), "test data");
     cleanup(&dir);
 }
@@ -595,7 +595,7 @@ fn backup_created_on_overwrite() {
             &ctx("bk2"),
         )
         .unwrap();
-    assert!(r.status == "ok");
+    assert_eq!(r.status, "ok");
     assert_eq!(fs::read_to_string(&target).unwrap(), "modified");
 
     let bp = bd.join("bk2").join("bk.txt");
@@ -1140,9 +1140,7 @@ fn c5_concurrent_writes_no_data_loss() {
     assert!(!content.unwrap().is_empty(), "File must not be empty");
 
     // Backups must exist for at least one of the jobs (proves durability)
-    let backups_exist = std::fs::read_dir(&bw)
-        .ok()
-        .is_some_and(|entries| entries.count() > 0);
+    let backups_exist = std::fs::read_dir(&bw).is_ok_and(|entries| entries.count() > 0);
     assert!(
         backups_exist,
         "At least one backup must survive concurrent writes"

@@ -460,7 +460,7 @@ mod tests {
         // Prove that evaluate does not mutate the events slice
         let mut event = sample_event();
         event.seq = 42;
-        let events = vec![event.clone()];
+        let events = vec![event];
 
         let spec = spec::PropertySpec {
             name: "readonly-check".to_string(),

@@ -291,6 +291,8 @@ No in-target code, no LD_PRELOAD, no stop >1 ms.\n\
 Bundles are WAL-backed with hash chains and TRUNCATED markers.\n\n\
 CUT WARNING: L1 sampling only — not L2 line/branch coverage.\n\
 Use --self-test to verify the pipeline and --verify to check bundle integrity.\n\
+Use --burst to enable file-watch (deferred; returns -32601 observe_burst deferred).\n\
+Use --properties to evaluate a spec against the bundle's WAL events.\n\
 Default out: {data_dir}/bundles/<run_id>.jsonl (7d retention).\n\
 Rate from --sample-rate-hz or RUNTIMO_OBSERVE_SAMPLE_HZ or config observe.sample_rate_hz (default 50 Hz)."
     )]
@@ -307,7 +309,11 @@ Rate from --sample-rate-hz or RUNTIMO_OBSERVE_SAMPLE_HZ or config observe.sample
         /// Samples per second (default 50 Hz, via ObserveConfig).
         #[arg(long)]
         sample_rate_hz: Option<u64>,
-        /// Enable burst file-watch (P2B — bundle-path watch; deferred if non-trivial, currently no-op with note).
+        /// Enable burst file-watch (P2B — bundle-path watch).
+        /// When `true`, the CLI prints a deferred note to stdout
+        /// (`burst_deferred:true`) and forwards `burst` to the daemon,
+        /// which returns `-32601 observe_burst deferred`.
+        /// Not yet trivial; falls back to out-of-process polling.
         #[arg(long, default_value = "false")]
         burst: bool,
         /// DAL A–E (default from config, controls watermark on shed).
@@ -319,7 +325,9 @@ Rate from --sample-rate-hz or RUNTIMO_OBSERVE_SAMPLE_HZ or config observe.sample
         /// Run self-test and exit 0/1.
         #[arg(long, default_value = "false")]
         self_test: bool,
-        /// Verify a bundle file offline and print trailer (hash chain + truncated gaps).
+        /// Verify a bundle file offline and print a full verification report
+        /// (6 predicates + admissible + hash_ok + watermark + property_verdicts).
+        /// Exit code 0 if admissible, 1 otherwise.
         #[arg(long)]
         verify: Option<PathBuf>,
         /// Property specification as a JSON string (e.g. {"name":"p","predicates":[...]})
@@ -3234,7 +3242,6 @@ mod tests {
     fn test_evaluate_satisfied() {
         use runtimo_core::oracle::Verdict;
         use runtimo_core::wal::WalEvent;
-        use serde_json::json;
 
         let event = WalEvent {
             event_type: runtimo_core::WalEventType::JobStarted,

@@ -105,6 +105,7 @@ pub struct BundleWriter {
     base: Instant,
 }
 
+#[allow(clippy::arithmetic_side_effects, clippy::cast_possible_truncation)]
 impl BundleWriter {
     /// Creates a bundle writer for `run_id`.
     ///
@@ -124,7 +125,16 @@ impl BundleWriter {
         let _ = WalWriter::create(&path).map_err(|e| e.to_string())?;
         // Recover next_seq from existing file if any.
         let next_seq = if path.exists() {
-            let content = std::fs::read_to_string(&path).unwrap_or_default();
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(e) => {
+                    log::warn!(
+                        "Failed to read bundle for seq recovery: {e}; \
+                         fail-closed verify treats as empty chain (bundle.rs:511)"
+                    );
+                    String::new()
+                }
+            };
             content
                 .lines()
                 .filter_map(|l| serde_json::from_str::<WalEvent>(l).ok())
@@ -151,6 +161,12 @@ impl BundleWriter {
     /// Creates a bundle writer at an explicit path (for tests).
     ///
     /// Validates via `validation::path` and asserts not ending in `wal.jsonl`.
+    ///
+    /// # Panics
+    /// Panics if `path` would cause the path to end in `wal.jsonl`.
+    ///
+    /// # Errors
+    /// Returns error if path validation fails or WAL creation fails.
     pub fn create_at(path: &Path) -> Result<Self, String> {
         let s = path.to_string_lossy().to_string();
         assert!(
@@ -172,7 +188,16 @@ impl BundleWriter {
         }
         let _ = WalWriter::create(path).map_err(|e| e.to_string())?;
         let next_seq = if path.exists() {
-            let content = std::fs::read_to_string(path).unwrap_or_default();
+            let content = match std::fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(e) => {
+                    log::warn!(
+                        "Failed to read bundle for seq recovery: {e}; \
+                         fail-closed verify treats as empty chain (bundle.rs:511)"
+                    );
+                    String::new()
+                }
+            };
             content
                 .lines()
                 .filter_map(|l| serde_json::from_str::<WalEvent>(l).ok())
@@ -216,6 +241,9 @@ impl BundleWriter {
     ///
     /// Dual-clock: `mono_ns` is `base.elapsed().as_nanos()` (strictly
     /// increasing since writer creation); `wall_ns` is wall-clock time.
+    ///
+    /// # Errors
+    /// Returns error if the batch flush or checkpoint fails.
     pub fn append(&mut self, mut event: WalEvent) -> Result<(), String> {
         event.seq = self.next_seq;
         self.next_seq += 1;
@@ -240,6 +268,9 @@ impl BundleWriter {
     }
 
     /// Flushes if the batch window (100 ms) has elapsed and batch is non-empty.
+    ///
+    /// # Errors
+    /// Returns error if the batch flush fails.
     pub fn maybe_flush_time(&mut self) -> Result<(), String> {
         if !self.batch.is_empty() && self.last_flush.elapsed() >= BATCH_WINDOW {
             self.flush_batch()?;
@@ -256,6 +287,9 @@ impl BundleWriter {
     ///
     /// Computes `sha256(prev_hash ++ batch_json)` and stamps `bundle_hash` on
     /// each event before writing. Performs one `fsync` for the entire batch.
+    ///
+    /// # Errors
+    /// Returns error if the batch write or fsync fails.
     pub fn flush_batch(&mut self) -> Result<(), String> {
         if self.batch.is_empty() {
             return Ok(());
@@ -377,6 +411,9 @@ impl BundleWriter {
     /// Finalizes the bundle with a watermark `fsync`.
     ///
     /// Flushes any pending batch and fsyncs the file to guarantee durability.
+    ///
+    /// # Errors
+    /// Returns error if the flush, fsync, or checkpoint fails.
     pub fn finalize(&mut self) -> Result<(), String> {
         self.flush_batch()?;
         // Watermark fsync: ensure file is durable even if batch was empty.
@@ -406,14 +443,24 @@ impl Drop for BundleWriter {
 /// `truncated_gaps > 0 ? TRUNCATED : Complete`.
 #[derive(Debug, Clone)]
 #[allow(clippy::exhaustive_structs)]
+#[must_use]
 pub struct VerifyResult {
     /// Total events read.
     pub total: usize,
     /// Number of TRUNCATED markers found (seq gaps).
     pub truncated_gaps: usize,
     /// Whether hash chain verified.
+    ///
+    /// **Deprecated alias**: `hash_ok` is a legacy boolean equivalent to
+    /// `structurally_parseable && integrity_valid`. Prefer checking the
+    /// individual predicates on [`VerifyReport`] for granular diagnostics.
     pub hash_ok: bool,
     /// First error, if any.
+    ///
+    /// In `verify_bundle_inner`, `error` is always [`None`] — all error
+    /// conditions are captured by the predicate fields (`structurally_parseable`,
+    /// `integrity_valid`, `lifecycle_valid`, `completeness_known`). This field
+    /// is reserved for future use where errors may not map cleanly to predicates.
     pub error: Option<String>,
     /// Honest watermark from final `ObserveCompleted` event, if present.
     ///
@@ -425,7 +472,9 @@ pub struct VerifyResult {
 /// Multi-predicate verification report for a bundle.
 ///
 /// Each predicate captures a distinct verification dimension.
-/// `admissible` is the conjunction of all predicates plus `error` is [`None`].
+/// `admissible` is the conjunction of the four predicates
+/// (`structurally_parseable`, `integrity_valid`, `lifecycle_valid`,
+/// `completeness_known`). `error` is always [`None`] in `verify_bundle_inner`.
 ///
 /// # Predicates
 /// * `structurally_parseable` — all lines parse as valid [`WalEvent`] with valid UTF-8 and non-empty content.
@@ -433,6 +482,7 @@ pub struct VerifyResult {
 /// * `lifecycle_valid` — no missing-first-terminal, duplicate seqs, reopen, or run-id-mismatch.
 /// * `completeness_known` — all seq gaps carry TRUNCATED markers; no gaps without markers.
 /// * `admissible` — conjunction of all four predicates plus `error` is [`None`].
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 #[allow(clippy::exhaustive_structs)]
 #[must_use]
@@ -454,7 +504,9 @@ pub struct VerifyReport {
     /// First error, if any.
     pub error: Option<String>,
     /// Conjunction of `structurally_parseable`, `integrity_valid`,
-    /// `lifecycle_valid`, `completeness_known`, and `error` is [`None`].
+    /// `lifecycle_valid`, `completeness_known` (the four predicates).
+    /// `error` is always [`None`] in `verify_bundle_inner`, so admissibility
+    /// is fully determined by the four predicate fields.
     pub admissible: bool,
 }
 
@@ -475,7 +527,7 @@ pub struct VerifyReport {
 ///     println!("Bundle failed: {:?}", report.error);
 /// }
 /// ```
-#[must_use]
+#[must_use = "VerifyReport must be inspected for admissibility"]
 pub fn verify_report(path: &Path) -> VerifyReport {
     verify_bundle_inner(path)
 }
@@ -485,6 +537,14 @@ pub fn verify_report(path: &Path) -> VerifyReport {
 /// Performs the full offline bundle analysis and returns a [`VerifyReport`].
 /// This avoids duplicating the parsing, seq-gap detection, hash recomputation,
 /// and watermark extraction logic across the two public APIs.
+///
+/// # Panics (none after fix)
+/// This function never panics. All indexing is replaced with `.first()`/`.get()`.
+///
+/// # Errors
+/// Returns a `VerifyReport` with `error` set if the file cannot be read.
+/// All other error conditions are captured by the predicate fields.
+#[allow(clippy::arithmetic_side_effects)]
 fn verify_bundle_inner(path: &Path) -> VerifyReport {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
@@ -505,10 +565,6 @@ fn verify_bundle_inner(path: &Path) -> VerifyReport {
     let mut events: Vec<WalEvent> = Vec::new();
     let mut structurally_parseable = true;
     for line in content.lines().filter(|l| !l.trim().is_empty()) {
-        if line.trim().is_empty() {
-            structurally_parseable = false;
-            continue;
-        }
         match serde_json::from_str::<WalEvent>(line) {
             Ok(ev) => events.push(ev),
             Err(_) => {
@@ -534,24 +590,24 @@ fn verify_bundle_inner(path: &Path) -> VerifyReport {
     let mut lifecycle_valid = true;
     let mut completeness_known = true;
     // Check first terminal: first seq must be 0.
-    if events[0].seq != 0 {
+    // # Panics (none after fix)
+    // # Errors: none; returns same verdict via lifecycle_valid flag.
+    if events.first().is_some_and(|e| e.seq != 0) {
         lifecycle_valid = false;
     }
     // Check for duplicate seqs or reopen (seq restarts at 0 after non-zero).
-    for w in events.windows(2) {
-        let a = w[0].seq;
-        let b = w[1].seq;
-        if b != a + 1 {
+    // # Panics (none after fix)
+    // # Errors: none; returns same verdicts via lifecycle_valid/completeness_known.
+    for (prev, curr) in events.iter().zip(events.iter().skip(1)) {
+        if curr.seq != prev.seq + 1 {
             // If next event is explicit TRUNCATED, it's an accounted gap.
-            if w[1].event_type == WalEventType::ObserveTruncated {
-                truncated_gaps += 1;
-            } else {
-                truncated_gaps += 1;
+            truncated_gaps += 1;
+            if curr.event_type != WalEventType::ObserveTruncated {
                 completeness_known = false;
             }
         }
         // Check for duplicate seqs or reopen.
-        if b <= a {
+        if curr.seq <= prev.seq {
             lifecycle_valid = false;
         }
     }
@@ -560,10 +616,15 @@ fn verify_bundle_inner(path: &Path) -> VerifyReport {
     let mut prev_hash = "0".repeat(64);
     let mut idx = 0;
     while idx < events.len() {
-        let current_hash = events[idx].bundle_hash.clone().unwrap_or_default();
+        let current_hash = events
+            .get(idx)
+            .and_then(|e| e.bundle_hash.as_ref())
+            .cloned()
+            .unwrap_or_default();
         let mut batch_end = idx;
         while batch_end < events.len()
-            && events[batch_end].bundle_hash.as_deref() == Some(current_hash.as_str())
+            && events.get(batch_end).and_then(|e| e.bundle_hash.as_deref())
+                == Some(current_hash.as_str())
         {
             batch_end += 1;
         }
@@ -576,11 +637,11 @@ fn verify_bundle_inner(path: &Path) -> VerifyReport {
             idx += 1;
             continue;
         }
+        let trailing = events.get(batch_end - 1);
         let has_trailing_drop = batch_end > idx + 1
-            && events[batch_end - 1].event_type == WalEventType::ObserveTruncated
-            && events[batch_end - 1]
-                .output
-                .as_ref()
+            && trailing.is_some_and(|e| e.event_type == WalEventType::ObserveTruncated)
+            && trailing
+                .and_then(|e| e.output.as_ref())
                 .is_some_and(|v| v.get("bundle_dropped").is_some());
         let hash_end = if has_trailing_drop {
             batch_end - 1
@@ -589,7 +650,8 @@ fn verify_bundle_inner(path: &Path) -> VerifyReport {
         };
         let mut hasher = Sha256::new();
         hasher.update(prev_hash.as_bytes());
-        for ev in &events[idx..hash_end] {
+        let batch_slice = events.get(idx..hash_end).unwrap_or(&[]);
+        for ev in batch_slice {
             let mut tmp = ev.clone();
             tmp.bundle_hash = None;
             if let Ok(json) = serde_json::to_vec(&tmp) {
@@ -616,11 +678,10 @@ fn verify_bundle_inner(path: &Path) -> VerifyReport {
         .map(|s| s.to_string());
 
     let error: Option<String> = None;
-    let admissible = structurally_parseable
-        && integrity_valid
-        && lifecycle_valid
-        && completeness_known
-        && error.is_none();
+    // error is always None here: all error conditions are captured by the
+    // four predicates above. Admissible is their conjunction (fail-closed).
+    let admissible =
+        structurally_parseable && integrity_valid && lifecycle_valid && completeness_known;
 
     VerifyReport {
         total: events.len(),
@@ -649,7 +710,7 @@ fn verify_bundle_inner(path: &Path) -> VerifyReport {
 ///
 /// # Errors
 /// Returns `VerifyResult` with `error` if file cannot be read.
-#[must_use]
+#[must_use = "VerifyResult must be inspected for hash_ok and errors"]
 pub fn verify_bundle(path: &Path) -> VerifyResult {
     let report = verify_bundle_inner(path);
     // Fail-closed mapping: hash_ok requires both structural parseability and integrity.

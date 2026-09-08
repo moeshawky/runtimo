@@ -264,7 +264,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(result.status == "ok");
+        assert_eq!(result.status, "ok");
         let content = result
             .data
             .as_ref()
@@ -332,7 +332,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(result.status == "ok");
+        assert_eq!(result.status, "ok");
         assert_eq!(
             result
                 .data
@@ -383,7 +383,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(result.status == "ok");
+        assert_eq!(result.status, "ok");
         assert_eq!(
             result
                 .data
@@ -412,7 +412,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(result.status == "ok");
+        assert_eq!(result.status, "ok");
         let data = result.data.as_ref().unwrap();
         assert!(data.get("content").unwrap().is_object());
         assert_eq!(
@@ -454,7 +454,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(result.status == "ok");
+        assert_eq!(result.status, "ok");
         let data = result.data.as_ref().unwrap();
         assert_eq!(
             data.get("content_type").and_then(|v| v.as_str()),
@@ -482,7 +482,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(result.status == "ok");
+        assert_eq!(result.status, "ok");
         let content = result
             .data
             .as_ref()
@@ -510,7 +510,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(result.status == "ok");
+        assert_eq!(result.status, "ok");
         // bytes_read should be 6 (raw file bytes), not String::len() which is 5
         assert_eq!(
             result

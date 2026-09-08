@@ -72,10 +72,12 @@ impl CollectorFailure {
     }
 }
 
-/// DAL-aware decision for a failure: `Halt` never kills the target, it only
-/// marks the bundle `INCOMPLETE`. Documented here because the name `Halt`
-/// otherwise suggests the target would be halted — it is not. The target
-/// exits naturally; the collector's `Halt` only affects the bundle watermark.
+/// DAL-aware decision for a failure: `Halt` never kills the target,
+/// it only marks the bundle `INCOMPLETE`.
+///
+/// Documented here because the name `Halt` otherwise suggests the
+/// target would be halted — it is not. The target exits naturally;
+/// the collector's `Halt` only affects the bundle watermark.
 ///
 /// | DAL | Mapping (via `llmosafe::apply_dal_to_decision`) |
 /// |-----|-----------------------------------------------|
@@ -101,8 +103,9 @@ pub enum DalDecision {
 pub fn dal_decision_for(dal: DesignAssuranceLevel, _failure: &CollectorFailure) -> DalDecision {
     match dal {
         DesignAssuranceLevel::A => DalDecision::Halt,
-        DesignAssuranceLevel::B => DalDecision::Degraded,
-        DesignAssuranceLevel::C | DesignAssuranceLevel::D => DalDecision::Degraded,
+        DesignAssuranceLevel::B | DesignAssuranceLevel::C | DesignAssuranceLevel::D => {
+            DalDecision::Degraded
+        }
         DesignAssuranceLevel::E => DalDecision::Proceed,
     }
 }
@@ -386,6 +389,8 @@ impl ObserveSupervisor {
         let mut sup = Self::new(run_id, sample_hz, dal, 1000)?;
         sup.attach(target_pid);
         let interval = sup.sampler.interval();
+        // Fix arithmetic_side_effects: Instant::now() + duration is idiomatic
+        #[allow(clippy::arithmetic_side_effects)]
         let deadline = Instant::now() + duration;
         for _ in 0..ticks {
             if Instant::now() >= deadline {

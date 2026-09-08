@@ -28,7 +28,7 @@ Runtimo is a Rust workspace providing a **capability execution engine**. Every c
 - **Backup/undo** — Files backed up before mutation, rollback by job ID
 - **Input validation** — Capabilities validate arguments including path traversal, symlink, and null byte protection
 
-**Version:** 0.8.3 | **Rust Edition:** 2021 | **Tests:** 566
+**Version:** 0.9.0 | **Rust Edition:** 2021 | **Tests:** 617 (39 cli + 397 core-lib + 65 integration + 46 robust + 63 daemon + 7 doctest)
 
 See [CHANGELOG.md](CHANGELOG.md) for full release history.
 
@@ -329,21 +329,21 @@ runtimo status                  # job summaries from WAL
 
 ## Observe — L1 sampling without modifying the target
 
-Observe is a sibling collector that samples a target process out-of-process (P1A) and writes a WAL-backed, hash-chained bundle; it never injects code into the target, never uses `ptrace` stop >1 ms, and never uses `LD_PRELOAD`. Every tick is gated through `LlmoSafeGuard::execute` with `ObserveBudget::should_suspend` (pressure >80% suspends). Bounded channels (512) drop newest on overflow and emit a `TRUNCATED` marker — never silent zeros; fallback on `EPERM`/unknown runtime emits a `TRUNCATED`/`SAMPLED` marker with an error note. Sampling is L1 only: stack snapshots at 50 Hz plus exhaustive low-volume audit for imports/spawns/raises/dynamic loads — it does NOT provide L2 line/branch coverage; do not use for line-level CUT decisions. Source: `core/src/observe/mod.rs:1-18`, `core/src/observe/sampler.rs:1-21`, `core/src/observe/supervisor.rs:1-14`, `cli/src/main.rs:274-285`, `cli/src/main.rs:288-295`.
+Observe is a sibling collector that samples a target process out-of-process (P1A) and writes a WAL-backed, hash-chained bundle; it never injects code into the target, never uses `ptrace` stop >1 ms, and never uses `LD_PRELOAD`. Every tick is gated through `LlmoSafeGuard::execute` with `ObserveBudget::should_suspend` (pressure >80% suspends). Bounded channels (512) drop newest on overflow and emit a `TRUNCATED` marker — never silent zeros; fallback on `EPERM`/unknown runtime emits a `TRUNCATED`/`SAMPLED` marker with an error note. Sampling is L1 only: stack snapshots at 50 Hz plus exhaustive low-volume audit for imports/spawns/raises/dynamic loads — it does NOT provide L2 line/branch coverage; do not use for line-level CUT decisions. Source: `core/src/observe/mod.rs`, `core/src/observe/sampler.rs`, `core/src/observe/supervisor.rs`, `cli/src/main.rs` (observe subcommand), `daemon/src/engine.rs` (observe handlers).
 
 ### DAL-graded rigor
 
-Collector failures never kill the target; only the bundle watermark changes via the DAL ladder (`core/src/observe/supervisor.rs:76-107`, `core/src/observe/supervisor.rs:268-301`, `core/src/llmosafe.rs:210` mirror).
+Collector failures never kill the target; only the bundle watermark changes via the DAL ladder (`core/src/observe/supervisor.rs`, `core/src/llmosafe.rs`).
 
 | DAL | Collector decision | Bundle watermark | Meaning |
 |-----|------------------|----------------|---------|
-| A | `Halt` | `INCOMPLETE` | Strict: shed collection, bundle incomplete (`core/src/observe/supervisor.rs:102-103`). Target still exits naturally — collector `Halt` never kills the target. |
-| B | `Degraded` | `Truncated` | `Halt→Escalate` maps to `Truncated` with markers (`core/src/observe/supervisor.rs:104`). |
-| C | `Degraded` | `Truncated` | `Halt/Escalate→Warn` maps to `Truncated` (`core/src/observe/supervisor.rs:105`). |
-| D | `Degraded` | `Truncated` | Same as C (`core/src/observe/supervisor.rs:105`). |
-| E | `Proceed` | `Truncated` | Permissive: keep sampling with markers (`core/src/observe/supervisor.rs:106`). |
+| A | `Halt` | `INCOMPLETE` | Strict: shed collection, bundle incomplete (`core/src/observe/supervisor.rs`). Target still exits naturally — collector `Halt` never kills the target. |
+| B | `Degraded` | `Truncated` | `Halt→Escalate` maps to `Truncated` with markers (`core/src/observe/supervisor.rs`). |
+| C | `Degraded` | `Truncated` | `Halt/Escalate→Warn` maps to `Truncated` (`core/src/observe/supervisor.rs`). |
+| D | `Degraded` | `Truncated` | Same as C (`core/src/observe/supervisor.rs`). |
+| E | `Proceed` | `Truncated` | Permissive: keep sampling with markers (`core/src/observe/supervisor.rs`). |
 
-Five honest failure reasons: `collector-killed`, `disk-full`, `clock-skew`, `restart`, `pressure-spike` (`core/src/observe/supervisor.rs:45-73`). Every `ObserveSuspended`/`ObserveTruncated` event carries `"note": "target never signalled; collector Halt never kills target"` (`core/src/observe/supervisor.rs:296`).
+Five honest failure reasons: `collector-killed`, `disk-full`, `clock-skew`, `restart`, `pressure-spike` (`core/src/observe/supervisor.rs`). Every `ObserveSuspended`/`ObserveTruncated` event carries `"note": "target never signalled; collector Halt never kills target"` (`core/src/observe/supervisor.rs`).
 
 ### CLI reference
 
@@ -351,22 +351,25 @@ Five honest failure reasons: `collector-killed`, `disk-full`, `clock-skew`, `res
 runtimo observe --pid <PID>                  # attach to live pid
 runtimo observe --cmd "python app.py"        # spawn as sibling target (shares parent with collector)
 runtimo observe --pid 123 --out /tmp/b.jsonl # explicit bundle path (validated via allowed prefixes + data_dir)
-runtimo observe --sample-rate-hz 50          # 0→50, >1000→1000 cap (core/src/observe/sampler.rs:196-206)
-runtimo observe --dal A                      # A–E, case-insensitive, default from config (core/src/observe/supervisor.rs:174-180)
+runtimo observe --sample-rate-hz 50          # 0→50, >1000→1000 cap (core/src/observe/sampler.rs)
+runtimo observe --dal A                      # A–E, case-insensitive, default from config (core/src/observe/supervisor.rs)
 runtimo observe --self-test                  # 4 checks, exit 0/1
 runtimo observe --verify /path/bundle.jsonl  # offline verify, prints trailer
 runtimo observe --pid 123 --json             # JSON output
+runtimo observe --properties '<spec>'        # property spec JSON, verdicts reported but never alter verify exit code
+runtimo observe --suspend-ms <MS>            # override pressure_suspend_ms from config
+# Global flags: --output, --color/--no-color, --emoji/--no-emoji, --table-style, --timestamps/--no-timestamps
 ```
 
-Flags derived from code: `cli/src/main.rs:296-324` `Commands::Observe { pid, cmd, out, sample_rate_hz, burst, dal, self_test, verify, json }`. `--burst` exists but is deferred (P2B bundle-path watch not yet implemented — prints `note: --burst ... deferred` and uses polling, `cli/src/main.rs:634-636`; daemon surfaces `-32601 observe_burst deferred`, `daemon/src/engine.rs:110-117`). Global flags `--output`, `--color/--no-color`, `--emoji/--no-emoji`, `--table-style`, `--timestamps/--no-timestamps` apply as for other subcommands.
+Flags derived from code: `cli/src/main.rs` (Observe subcommand), `daemon/src/engine.rs` (burst handler). `--burst` exists but is deferred (P2B bundle-path watch not yet implemented — prints `note: --burst ... deferred` and uses polling, `daemon/src/engine.rs`). Global flags (`--output`, `--color/--no-color`, `--emoji/--no-emoji`, `--table-style`, `--timestamps/--no-timestamps`) apply as for other subcommands.
 
 Exit codes:
 
 | Invocation | 0 | 1 |
 |------------|---|---|
-| `--self-test` | all 4 checks `ok` (`core/src/observe/self_test.rs:52-76`) | at least one `FAIL` |
-| `--verify <path>` | `admissible` (`cli/src/main.rs:2742`) | hash mismatch or read error; also prints `truncated_gaps` |
-| `--pid`/`--cmd` normal | bundle finalized + `verify.total`/`hash_ok` printed (`cli/src/main.rs:2717-2742`) | invalid path, spawn failure, or finalize failure |
+| `--self-test` | all 4 checks `ok` (`core/src/observe/self_test.rs`) | at least one `FAIL` |
+| `--verify <path>` | `admissible` (`cli/src/main.rs`) | hash mismatch or read error; also prints `truncated_gaps` |
+| `--pid`/`--cmd` normal | bundle finalized + `verify.total`/`hash_ok` printed (`cli/src/main.rs`) | invalid path, spawn failure, or finalize failure |
 
 #### --help (verbatim, `runtimo observe --help`, 2026-09-04, exit 0)
 
@@ -425,7 +428,7 @@ Source: live run `cargo build --release && ./target/release/runtimo observe --he
 
 ### Bundle file location and verify semantics
 
-Default bundle: `{data_dir}/bundles/<run_id>.jsonl` where `data_dir` is `XDG_DATA_HOME` or `~/.local/share` → `.../runtimo` (`core/src/lib.rs:206-224`), `run_id` is 32 hex chars (`core/src/lib.rs:242-267`), and `bundle_path()` asserts never ending in `wal.jsonl` (`core/src/observe/bundle.rs:43-56`). Explicit `--out` is validated against `RuntimoConfig::get_allowed_prefixes()` plus `data_dir` (`cli/src/main.rs:2603-2654`, `daemon/src/engine.rs:693-712`). Batching: ≤256 events or 100 ms, one `fsync` per batch plus watermark `fsync` on close/drop; checkpoint every 1 000 events or 5 s at `{bundle}.checkpoint` preserving `.jsonl` (`core/src/observe/bundle.rs:27-34`, `core/src/observe/bundle.rs:353-372`). Dual-clock: `mono_ns = base.elapsed()` strictly increasing, `wall_ns` is wall-clock since epoch (`core/src/observe/bundle.rs:81-84`, `core/src/observe/bundle.rs:220-230`).
+Default bundle: `{data_dir}/bundles/<run_id>.jsonl` where `data_dir` is `XDG_DATA_HOME` or `~/.local/share` → `.../runtimo` (`core/src/lib.rs`), `run_id` is 32 hex chars (`core/src/lib.rs`), and `bundle_path()` asserts never ending in `wal.jsonl` (`core/src/observe/bundle.rs`). Explicit `--out` is validated against `RuntimoConfig::get_allowed_prefixes()` plus `data_dir` (`cli/src/main.rs`, `daemon/src/engine.rs`). Batching: ≤256 events or 100 ms, one `fsync` per batch plus watermark `fsync` on close/drop; checkpoint every 1 000 events or 5 s at `{bundle}.checkpoint` preserving `.jsonl` (`core/src/observe/bundle.rs`). Dual-clock: `mono_ns = base.elapsed()` strictly increasing, `wall_ns` is wall-clock since epoch (`core/src/observe/bundle.rs`).
 
 `verify_report(path)` returns five predicates plus metadata. Exit 0 from `--verify` iff `admissible` (conjunction of all predicates and no error):
 
@@ -444,18 +447,18 @@ Default bundle: `{data_dir}/bundles/<run_id>.jsonl` where `data_dir` is `XDG_DAT
 
 CLI `--verify` prints `verify <path>: structurally_parseable=… integrity_valid=… lifecycle_valid=… completeness_known=… admissible=… error=… watermark=…` and `trailer: bundle … — hash chain ok/FAIL — watermark TRUNCATED/Complete`, exits 0 only if `admissible`. Daemon `observe_verify` does the same read-only check with path validation, returning the full predicate set with `hash_ok` retained as a deprecated alias.
 
-Retention: daemon hourly task runs `WalWriter::cleanup(..., 86400*7)` and `BackupManager::cleanup(..., 86400*7)` — 7 days for WAL and backups/bundles (`daemon/src/engine.rs:1144-1151`, `core/src/config.rs:109` provisional `7d bundle retention — observe provisional 7d`).
+Retention: daemon hourly task runs `WalWriter::cleanup(..., 86400*7)` and `BackupManager::cleanup(..., 86400*7)` — 7 days for WAL and backups/bundles (`daemon/src/engine.rs`, `core/src/config.rs` provisional `7d bundle retention — observe provisional 7d`).
 
 ### Self-test — 4 checks
 
-`runtimo observe --self-test` (`cli/src/main.rs:2599-2602` → `core/src/observe/self_test.rs:52-76` `run()`) runs `checks()` (`core/src/observe/self_test.rs:44-51`):
+`runtimo observe --self-test` (`cli/src/main.rs` → `core/src/observe/self_test.rs` `run()`) runs `checks()` (`core/src/observe/self_test.rs`):
 
 | # | Name | What it proves | Source |
 |---|------|----------------|--------|
-| 1 | `fixture A exactness` | `AuditHook` 10 imports + 2 spawns + 1 raise + 1 dynamic = 14 events exact, `Complete` (no drops, no `TRUNCATED`) | `core/src/observe/self_test.rs:84-115`, `core/src/observe/audit.rs:268-307` |
-| 2 | `fixture B sampling bounds` | `OutOfProcessSampler` at 50 Hz, 10 ticks: observed rate within bounds or ≥5 samples, coverage via frames or fallback marker (never silent zeros) | `core/src/observe/self_test.rs:126-176` |
-| 3 | `DAL-A gate` | `inject_drop_next` + `PressureSpike` → watermark `INCOMPLETE`, never `COMPLETE` on DAL A; target never signalled | `core/src/observe/self_test.rs:181-221`, `core/src/observe/supervisor.rs:440-463` |
-| 4 | `tamper detection` | corrupt one byte → `verify_bundle` reports `!v.hash_ok || v.error.is_some() || v.truncated_gaps > 0 || v.total != 3` | `core/src/observe/self_test.rs:225-292` |
+| 1 | `fixture A exactness` | `AuditHook` 10 imports + 2 spawns + 1 raise + 1 dynamic = 14 events exact, `Complete` (no drops, no `TRUNCATED`) | `core/src/observe/self_test.rs`, `core/src/observe/audit.rs` |
+| 2 | `fixture B sampling bounds` | `OutOfProcessSampler` at 50 Hz, 10 ticks: observed rate within bounds or ≥5 samples, coverage via frames or fallback marker (never silent zeros) | `core/src/observe/self_test.rs` |
+| 3 | `DAL-A gate` | `inject_drop_next` + `PressureSpike` → watermark `INCOMPLETE`, never `COMPLETE` on DAL A; target never signalled | `core/src/observe/self_test.rs`, `core/src/observe/supervisor.rs` |
+| 4 | `tamper detection` | corrupt one byte → `verify_bundle` reports `!v.hash_ok || v.error.is_some() || v.truncated_gaps > 0 || v.total != 3` | `core/src/observe/self_test.rs` |
 
 #### Live transcript (verbatim, `runtimo observe --self-test`, exit 0, 2026-09-04)
 
@@ -471,28 +474,28 @@ Source: live run `cargo build --release && ./target/release/runtimo observe --se
 
 ### Daemon RPC
 
-Unix socket `{data_dir}/runtimo.sock` (`cli/src/main.rs:482`). JSON-RPC line-delimited. Observe methods (`daemon/src/engine.rs:99-117`, `daemon/src/rpc.rs:86-132`):
+Unix socket `{data_dir}/runtimo.sock` (`cli/src/main.rs`). JSON-RPC line-delimited. Observe methods (`daemon/src/engine.rs`, `daemon/src/rpc.rs`):
 
 | Method | Params struct | Effect |
 |--------|---------------|--------|
-| `observe_start` | `ObserveStartParams { pid, cmd, out, sample_rate_hz, dal, burst, run_id }` (`daemon/src/rpc.rs:87-110`) | Validates `out` (allowed prefixes + `data_dir`), resolves `run_id`/`dal`/`hz` (file/env/default), reserves `BackgroundJob` slot (16 max), `spawn_blocking` `ObserveSupervisor` loop (2 s or 100 ticks, `interval.min(20ms)`, `gated_tick`), never signals target |
-| `observe_status` | `ObserveStatusParams { run_id, limit }` (`daemon/src/rpc.rs:113-125`) | Queries `BackgroundJobRegistry` then WAL `ObserveStarted`/`ObserveCompleted` fallback; list mode filters `capability=="Observe"` (`daemon/src/engine.rs:806-865`) |
-| `observe_verify` | `ObserveVerifyParams { path }` (`daemon/src/rpc.rs:128-132`) | Validates path, calls `bundle::verify_bundle` read-only, returns `{ path, total, truncated_gaps, hash_ok, error }` (`daemon/src/engine.rs:867-911`) |
-| `observe_burst` | — | **DEFERRED — not GA.** Returns `-32601 observe_burst deferred: P2B file-watch burst not yet implemented (use out-of-process polling; see audit.rs)` (`daemon/src/engine.rs:110-117`). Do not document as working. |
+| `observe_start` | `ObserveStartParams { pid, cmd, out, sample_rate_hz, dal, burst, run_id }` (`daemon/src/rpc.rs`) | Validates `out` (allowed prefixes + `data_dir`), resolves `run_id`/`dal`/`hz` (file/env/default), reserves `BackgroundJob` slot (16 max), `spawn_blocking` `ObserveSupervisor` loop (2 s or 100 ticks, `interval.min(20ms)`, `gated_tick`), never signals target |
+| `observe_status` | `ObserveStatusParams { run_id, limit }` (`daemon/src/rpc.rs`) | Queries `BackgroundJobRegistry` then WAL `ObserveStarted`/`ObserveCompleted` fallback; list mode filters `capability=="Observe"` (`daemon/src/engine.rs`) |
+| `observe_verify` | `ObserveVerifyParams { path }` (`daemon/src/rpc.rs`) | Validates path, calls `bundle::verify_report` read-only, returns full predicate set with `hash_ok` deprecated alias (`daemon/src/engine.rs`) |
+| `observe_burst` | — | **DEFERRED — not GA.** Returns `-32601 observe_burst deferred: P2B file-watch burst not yet implemented (use out-of-process polling; see audit.rs)` (`daemon/src/engine.rs`). Do not document as working. |
 
-Burst note: CLI `--burst` prints `note: --burst file-watch burst (P2B bundle-path watch) deferred — not yet trivial; using polling` (`cli/src/main.rs:634-636`); daemon `observe_start` logs `observe burst (P2B bundle-path watch) deferred — using polling` when `burst==true` (`daemon/src/engine.rs:688-690`).
+Burst note: CLI `--burst` prints `note: --burst file-watch burst (P2B bundle-path watch) deferred — not yet trivial; using polling` (`cli/src/main.rs`); daemon `observe_start` logs `observe burst (P2B bundle-path watch) deferred — using polling` when `burst==true` (`daemon/src/engine.rs`).
 
 ### Configuration
 
-`core/src/config.rs:95-122` `ObserveConfig`, `core/src/config.rs:153-158` `ResolvedConfig` fields.
+`core/src/config.rs` `ObserveConfig`, `core/src/config.rs` `ResolvedConfig` fields.
 
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
-| `observe.sample_rate_hz` | `u64` | `50` | Samples per second; `0` coerces to 50, >1000 caps to 1000 (`core/src/observe/sampler.rs:196-206`, `core/src/observe/supervisor.rs:171`). |
-| `observe.pressure_suspend_ms` | `u64` | `1000` | Suspension window under high pressure (`core/src/config.rs:637`). |
-| `observe.max_bundle_bytes` | `u64` | `10485760` (10 MiB) | Bundle size before rotation (`core/src/config.rs:641`). `unverified` — rotation wiring not yet observed; how to verify: grep daemon `engine.rs` for `observe_max_bundle_bytes` usage. |
+| `observe.sample_rate_hz` | `u64` | `50` | Samples per second; `0` coerces to 50, >1000 caps to 1000 (`core/src/observe/sampler.rs`, `core/src/observe/supervisor.rs`). |
+| `observe.pressure_suspend_ms` | `u64` | `1000` | Suspension window under high pressure (`core/src/config.rs`). |
+| `observe.max_bundle_bytes` | `u64` | `10485760` (10 MiB) | Bundle size before rotation (`core/src/config.rs`). **Unverified** — rotation wiring not yet observed; how to verify: grep daemon `engine.rs` for `observe_max_bundle_bytes` usage. |
 
-Precedence (highest to lowest): CLI `--sample-rate-hz` > env `RUNTIMO_OBSERVE_SAMPLE_HZ` > file `observe.sample_rate_hz` > default `50` (`core/src/config.rs:97-98`, `core/src/config.rs:622-693` `resolved()` and `effective_observe_sample_hz()`). Malformed env value falls through to file, not to hard 50 (`core/src/config.rs:625-629`, `core/src/config.rs:681-688`). Example:
+Precedence (highest to lowest): CLI `--sample-rate-hz` > env `RUNTIMO_OBSERVE_SAMPLE_HZ` > file `observe.sample_rate_hz` > default `50` (`core/src/config.rs`). Malformed env value falls through to file, not to hard 50 (`core/src/config.rs`). Example:
 
 ```toml
 # $XDG_CONFIG_HOME/runtimo/config.toml
@@ -507,11 +510,11 @@ RUNTIMO_OBSERVE_SAMPLE_HZ=100 runtimo observe --pid 123      # env beats file
 runtimo observe --pid 123 --sample-rate-hz 25                # CLI beats env
 ```
 
-Verify: `RUNTIMO_OBSERVE_SAMPLE_HZ=bad runtimo observe --pid $$ --json` falls through to file (`core/src/config.rs:681-688` — `unverified` live, how to verify: run with bad env and inspect `hz` in JSON output).
+Verify: `RUNTIMO_OBSERVE_SAMPLE_HZ=bad runtimo observe --pid $$ --json` falls through to file (`core/src/config.rs` — `unverified` live, how to verify: run with bad env and inspect `hz` in JSON output).
 
 ### Safety contract
 
-Collector `Halt` never kills the target — only the bundle watermark becomes `INCOMPLETE` (`core/src/observe/supervisor.rs:75-77`, `core/src/observe/supervisor.rs:262-301` emitting `ObserveTruncated`/`ObserveSuspended` with note, never signalling). All bounded channels (sampler 512, audit 512) drop newest and emit a `TRUNCATED` marker; never silent (`core/src/observe/sampler.rs:332-343`, `core/src/observe/audit.rs:189-241`). Secrets are redacted at every WAL boundary: any `target`, `location`, `frame`, or `error` containing `auth_token`/`bearer`/`api_key` (case-insensitive) is replaced with `REDACTED` before serialization (`core/src/observe/audit.rs:61-64`, `core/src/observe/audit.rs:99-137`, `core/src/observe/sampler.rs:71-88`, `core/src/observe/sampler.rs:94-100`). Bundle hash chain detects tamper (`core/src/observe/bundle.rs:463-517`).
+Collector `Halt` never kills the target — only the bundle watermark becomes `INCOMPLETE` (`core/src/observe/supervisor.rs`). All bounded channels (sampler 512, audit 512) drop newest and emit a `TRUNCATED` marker; never silent (`core/src/observe/sampler.rs`, `core/src/observe/audit.rs`). Secrets are redacted at every WAL boundary: any `target`, `location`, `frame`, or `error` containing `auth_token`/`bearer`/`api_key` (case-insensitive) is replaced with `REDACTED` before serialization (`core/src/observe/audit.rs`, `core/src/observe/sampler.rs`). Bundle hash chain detects tamper (`core/src/observe/bundle.rs`).
 
 ## Project Structure
 
@@ -576,10 +579,10 @@ runtimo/
 
 ```bash
 cargo test                           # all tests
-cargo test -p runtimo-core --lib    # 291 unit tests
-cargo test -p runtimo-core --test integration  # 58 integration tests
-cargo test -p runtimo-core --test robust       # 46 property-based tests
-cargo test -p runtimo-core --doc    # 6 doc tests
+cargo test -p runtimo-core --lib    # 397 unit tests
+cargo test -p runtimo-core --test integration  # 65 integration tests
+cargo test -p runtimo-core --test robust       # property-based (proptest)
+cargo test -p runtimo-core --doc    # doc tests
 cargo clippy --all-targets          # zero warnings required
 ```
 
@@ -595,7 +598,7 @@ cargo clippy --all-targets          # zero warnings required
 | `RUNTIMO_ENABLE_PUBLIC_IP` | (unset) | Set to `1` to enable public IP discovery in telemetry |
 | `RUNTIMO_ENABLE_NETWORK` | (unset) | Set to `1` to allow outbound network tools (curl, wget, ssh, etc.) in ShellExec |
 | `RUNTIMO_DAL` | (unset = A) | Design Assurance Level for cognitive safety pipeline (A-E). A=strict, E=permissive. Also configurable via `runtimo config dal` or config file `dal` field. |
-| `RUNTIMO_OBSERVE_SAMPLE_HZ` | `50` | Observe samples per second; precedence CLI `--sample-rate-hz` > env > `observe.sample_rate_hz` file > 50 (`core/src/config.rs:623-641`, `core/src/config.rs:680-693`). Malformed env falls through to file. |
+| `RUNTIMO_OBSERVE_SAMPLE_HZ` | `50` | Observe samples per second; precedence CLI `--sample-rate-hz` > env > `observe.sample_rate_hz` file > 50 (`core/src/config.rs`). Malformed env falls through to file. |
 | `RUNTIMO_STATE_DIR` | `$XDG_DATA_HOME/runtimo` | Override state directory for WAL/backups/sessions |
 
 ## License

@@ -4,7 +4,7 @@
 # Canonical source: /workspace/.github/workflows/publish-cratesio.yml
 # Reference:        /workspace/PUBLISHING.md
 #
-# REQUIRED REPO SECRET: CARGO_REGISTRY_TOKEN (from crates.io Account Settings)
+# REQUIRED REPO SECRET: CRATES_IO (from crates.io Account Settings)
 # REQUIRED: The crate must already exist on crates.io (first publish is manual)
 #
 # Only the PROJECT and PUBLISH_FLAGS env vars differ between copies.
@@ -30,13 +30,13 @@ jobs:
     steps:
       - id: check
         run: |
-          if [[ -n "${{ secrets.CARGO_REGISTRY_TOKEN }}" ]]; then
+          if [[ -n "${{ secrets.CRATES_IO }}" ]]; then
             echo "has-token=true" >> "$GITHUB_OUTPUT"
-            echo "✅ CARGO_REGISTRY_TOKEN is configured"
+            echo "✅ CRATES_IO is configured"
           else
-            echo "::error::CARGO_REGISTRY_TOKEN secret is not configured for this repo"
+            echo "::error::CRATES_IO secret is not configured for this repo"
             echo "has-token=false" >> "$GITHUB_OUTPUT"
-            echo "❌ Set CARGO_REGISTRY_TOKEN in repo Settings > Secrets > Actions"
+            echo "❌ Set CRATES_IO in repo Settings > Secrets > Actions"
           fi
 
   # ── Dry-run: verify the crate can be published ──────────────────────────
@@ -64,5 +64,5 @@ jobs:
 
       - name: Publish to crates.io
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO }}
         run: cargo publish ${{ env.PUBLISH_FLAGS }} --locked

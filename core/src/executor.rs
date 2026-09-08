@@ -349,8 +349,10 @@ pub fn execute_with_telemetry_and_session(
     let ctx = Context::with_working_dir(
         dry_run,
         job_id_str.clone(),
-        working_dir
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))),
+        working_dir.unwrap_or_else(|| {
+            log::warn!("working_dir not set, falling back to /");
+            PathBuf::from("/")
+        }),
     );
 
     let start_seq = wal.seq();

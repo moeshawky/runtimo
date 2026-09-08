@@ -69,7 +69,7 @@ struct DaemonState {
 /// # Errors
 /// Returns `JsonRpcError` with code `-32602` when the path fails validation.
 fn resolve_working_dir(
-    working_dir: &Option<String>,
+    working_dir: Option<&String>,
 ) -> std::result::Result<Option<PathBuf>, JsonRpcError> {
     match working_dir {
         Some(wd) if !wd.is_empty() => {
@@ -210,7 +210,7 @@ async fn handle_run(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonR
     };
 
     // Unified working_dir validation (T2): reject invalid working_dir with -32602.
-    let resolved_wd = match resolve_working_dir(&run_params.working_dir) {
+    let resolved_wd = match resolve_working_dir(run_params.working_dir.as_ref()) {
         Ok(wd) => wd,
         Err(e) => {
             return JsonRpcResponse {
@@ -363,7 +363,7 @@ async fn handle_dispatch(state: &Arc<DaemonState>, params: Value, id: Value) -> 
     let dry = run_params.dry_run;
     let args = run_params.args;
     // Unified working_dir validation (T2): reject invalid working_dir with -32602, never swallow to None.
-    let working_dir = match resolve_working_dir(&run_params.working_dir) {
+    let working_dir = match resolve_working_dir(run_params.working_dir.as_ref()) {
         Ok(wd) => wd.map(|p| p.to_string_lossy().to_string()),
         Err(e) => {
             return JsonRpcResponse {
@@ -1035,6 +1035,18 @@ async fn handle_observe_status(
 /// Handles `observe_verify` — offline bundle verification.
 ///
 /// Calls `verify_report` synchronously (no WAL mutex needed — read-only).
+///
+/// # Response shape (6 core verification fields)
+/// The `result` JSON object contains these fields from [`VerifyReport`]:
+/// * `total` — total events read
+/// * `truncated_gaps` — number of TRUNCATED markers found (seq gaps)
+/// * `structurally_parseable` — whether all lines parse as valid [`WalEvent`]
+/// * `integrity_valid` — whether the hash chain verifies
+/// * `lifecycle_valid` — whether seqs are strictly increasing by 1
+/// * `completeness_known` — whether all seq gaps carry TRUNCATED markers
+///
+/// Additional fields in the response: `admissible`, `hash_ok`, `error`,
+/// `watermark`, and `path`.
 #[allow(clippy::unused_async)]
 async fn handle_observe_verify(
     _state: &Arc<DaemonState>,
@@ -1339,7 +1351,7 @@ fn reconcile_orphaned_jobs(wal_path: &std::path::Path) {
         if matches!(e.event_type, WalEventType::JobStarted) {
             started
                 .entry(e.job_id.clone())
-                .or_insert((e.ts, e.capability.clone()));
+                .or_insert_with(|| (e.ts, e.capability.clone()));
         }
         if matches!(
             e.event_type,
@@ -1359,7 +1371,7 @@ fn reconcile_orphaned_jobs(wal_path: &std::path::Path) {
         return;
     }
 
-    println!(
+    log::info!(
         "Reconciling {} orphaned job(s) from previous session",
         orphaned.len()
     );
@@ -2581,7 +2593,7 @@ mod tests {
         };
         let params = serde_json::json!({
             "path": bundle_path.to_str().unwrap(),
-            "properties": r#"{not-valid-json"#
+            "properties": "{not-valid-json}"
         });
         let resp = handle_observe_evaluate(&state, params, serde_json::Value::from(1)).await;
         assert!(

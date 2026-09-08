@@ -5,17 +5,23 @@ All notable changes to Runtimo are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.9.0] - 2026-09-08
 
 ### Changed
 - **Oracle layer + predicate unify** — New `core/src/oracle/` module (`spec.rs`, `eval.rs`, `benchmark.rs`) providing `PropertySpec`, `Predicate`, `Op`, `Verdict`, `PropertyVerdict`, `evaluate`, `parse_spec`. Property evaluation uses AND semantics over WAL events with typed predicates and field-path resolution; `bundle_hash` is never read. `cli/src/main.rs` and `daemon/src/engine.rs` consume oracle verdicts for property-gated observe flows. (`core/src/oracle/`, `cli/src/main.rs`, `daemon/src/engine.rs`)
 - **`--verify` exit keys off `admissible`** — CLI `--verify` now exits 0 iff `admissible` (conjunction of `structurally_parseable`, `integrity_valid`, `lifecycle_valid`, `completeness_known`, and no error). `hash_ok` is retained as a deprecated alias equal to `structurally_parseable && integrity_valid`. (`cli/src/main.rs`, `core/src/observe/bundle.rs`)
 - **Daemon `observe_verify` gains predicate fields** — `handle_observe_verify` now switches from `verify_bundle` to `verify_report`, returning the full 5-predicate set (`structurally_parseable`, `integrity_valid`, `lifecycle_valid`, `completeness_known`, `admissible`) plus `total`/`truncated_gaps`/`watermark`/`error`, with `hash_ok` retained as a deprecated alias. (`daemon/src/engine.rs`, `core/src/observe/bundle.rs`)
+- **Version bump 0.8.3 → 0.9.0** — workspace `package.version` set to 0.9.0. Crate dependency versions (`runtimo-core` ^0.8 in daemon/cli) still pinned to 0.8 — fix pending Unit B.
 
 ### Removed
 - **`max_bundle_bytes` vaporware** — Removed `max_bundle_bytes` from `ObserveConfig`, `observe_max_bundle_bytes` from `ResolvedConfig`, and the corresponding resolution logic in `RuntimoConfig::resolved()`. The field was never wired to any actual bundle rotation logic. (`core/src/config.rs`, `cli/src/output.rs`)
 
-## [0.8.3] - 2026-09-05
+### Migration Notes
+- **Verify exit code change**: `--verify` now exits 0 only when `admissible` (all 5 predicates true + no error). Previously `hash_ok` was the sole exit criterion. Update scripts that grep for `hash_ok` — use `admissible` instead.
+- **Burst deferred contract**: `observe --burst` / `observe_start` with `burst:true` returns `-32601 observe_burst deferred`. Do not document burst as working. CLI prints `burst_deferred:true` note to stdout.
+- **Oracle property evaluation**: `bundle_hash` is never read by the oracle. Property verdicts are available via `--properties` CLI flag and `observe_evaluate` RPC.
+- **Per-guard llmosafe history**: `LlmoSafeGuard` now holds `Mutex<ResourceHistory>` per instance (30s window, 1s cooldown). Cooldown is a `Cached` path returning `Ok` on cached average ≤80% without fresh sampling. No cross-guard interference.
+- **Config field removal**: `max_bundle_bytes` / `observe_max_bundle_bytes` removed from config resolution. The struct fields still exist but are not wired to rotation logic.
 
 ### Fixed
 - **Guard accessors → resolved (RC1)** — `blocklist_enabled()`, `critical_files_enabled()`, `path_restriction_enabled()`, `path_sanitization_enabled()` now delegate to `RuntimoConfig::load().resolved()` (precedence: top-level > `[guards]` > profile > builtin `true`; `ephemeral` resolves to `false`). Fixes divergence where `[guards]` table was ignored. (`core/src/config.rs`)

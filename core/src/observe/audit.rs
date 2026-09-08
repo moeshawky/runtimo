@@ -72,9 +72,15 @@ impl AuditEvent {
     /// `debug_assert!`) so release builds also redact.
     #[must_use]
     pub fn new(id: u64, kind: AuditKind, target: impl Into<String>) -> Self {
-        let ts_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos() as u64);
+        let ts_ns = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos()),
+        )
+        .unwrap_or(u64::MAX);
+        // SAFETY: SystemTime duration is always non-negative and fits in u64
+        // on all supported platforms; unwrap_or(u64::MAX) is a defensive
+        // fallback for the theoretically impossible overflow case.
         let mut t: String = target.into();
         if t.len() > 1024 {
             t.truncate(1024);
@@ -186,8 +192,16 @@ impl AuditHook {
     /// If the bounded channel is full, the new event is dropped and `dropped`
     /// increments. A `TRUNCATED` marker is inserted lazily on `drain`/`flush`
     /// — never silent.
+    ///
+    /// # Panics
+    /// Panics if the mutex is poisoned and `into_inner()` fails to recover
+    /// the inner data (indicates a bug in another thread).
+    #[allow(clippy::arithmetic_side_effects)]
+    // u64 sequential IDs and drop counters; bounded channel cap prevents overflow.
     pub fn record(&self, kind: AuditKind, target: impl Into<String>) -> Option<AuditEvent> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: poisoned mutex indicates a bug in another thread;
+        // recovering the inner data preserves audit events rather than crashing.
         if inner.queue.len() >= self.cap {
             inner.dropped += 1;
             return None;
@@ -200,13 +214,21 @@ impl AuditHook {
     }
 
     /// Records with location.
+    ///
+    /// # Panics
+    /// Panics if the mutex is poisoned and `into_inner()` fails to recover
+    /// the inner data (indicates a bug in another thread).
+    #[allow(clippy::arithmetic_side_effects)]
+    // u64 sequential IDs and drop counters; bounded channel cap prevents overflow.
     pub fn record_with_location(
         &self,
         kind: AuditKind,
         target: impl Into<String>,
         location: impl Into<String>,
     ) -> Option<AuditEvent> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: poisoned mutex indicates a bug in another thread;
+        // recovering the inner data preserves audit events rather than crashing.
         if inner.queue.len() >= self.cap {
             inner.dropped += 1;
             return None;
@@ -228,8 +250,17 @@ impl AuditHook {
     /// Drains all queued events, appending a `TRUNCATED` marker if drops occurred.
     ///
     /// The marker has `truncated: true` and `target` encodes the count.
+    ///
+    /// # Panics
+    /// Panics if the mutex is poisoned and `into_inner()` fails to recover
+    /// the inner data (indicates a bug in another thread).
+    #[must_use]
+    #[allow(clippy::arithmetic_side_effects)]
+    // u64 sequential IDs; bounded channel cap prevents overflow.
     pub fn drain(&self) -> Vec<AuditEvent> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: poisoned mutex indicates a bug in another thread;
+        // recovering the inner data preserves audit events rather than crashing.
         let mut out: Vec<AuditEvent> = inner.queue.drain(..).collect();
         if inner.dropped > 0 {
             let mut marker = AuditEvent::new(
@@ -246,9 +277,17 @@ impl AuditHook {
     }
 
     /// Returns current queue length.
+    ///
+    /// # Panics
+    /// Panics if the mutex is poisoned and `into_inner()` fails to recover
+    /// the inner data (indicates a bug in another thread).
     #[must_use]
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().queue.len()
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .queue
+            .len()
     }
 
     /// Whether queue is empty.
@@ -258,9 +297,13 @@ impl AuditHook {
     }
 
     /// Returns dropped count (not yet materialized as marker).
+    ///
+    /// # Panics
+    /// Panics if the mutex is poisoned and `into_inner()` fails to recover
+    /// the inner data (indicates a bug in another thread).
     #[must_use]
     pub fn dropped(&self) -> u64 {
-        self.inner.lock().unwrap().dropped
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).dropped
     }
 }
 

@@ -109,7 +109,11 @@ impl SampleEvent {
             } else {
                 e.clone()
             };
-            output["error"] = serde_json::Value::String(safe_e);
+            // SAFETY: output is always a serde_json::Object from json! macro,
+            // so indexing is safe; as_object_mut().unwrap() is sound here.
+            if let Some(obj) = output.as_object_mut() {
+                obj.insert("error".to_string(), serde_json::Value::String(safe_e));
+            }
         }
         WalEvent {
             seq: self.seq,
@@ -135,6 +139,10 @@ pub trait StackSampler: Send {
     /// Returns a `SampleEvent` on success or a fallback marker on
     /// `EPERM`/unknown-runtime; never silent zeros. On hard I/O error
     /// returns `Err`.
+    ///
+    /// # Errors
+    /// Returns `Err` if the remote read fails with a hard I/O error
+    /// (not `EPERM`/`ENOENT` which produce fallback markers).
     fn sample(&mut self) -> Result<SampleEvent, String>;
 
     /// Gated tick: `guard.execute(|| sample)` plus budget suspension.
@@ -142,6 +150,10 @@ pub trait StackSampler: Send {
     /// Returns `Ok(Some(event))` on a successful sample (enqueued),
     /// `Ok(None)` when suspended by pressure or on overflow-drop (newest
     /// dropped, counted in `dropped`), and `Err` on hard failure.
+    ///
+    /// # Errors
+    /// Returns `Err` only for unexpected non-pressure errors from
+    /// `guard.execute`; pressure suspensions are mapped to `Ok(None)`.
     fn gated_tick(
         &mut self,
         guard: &LlmoSafeGuard,
@@ -207,6 +219,9 @@ impl OutOfProcessSampler {
     /// `rate_hz` of `0` is coerced to `50` (default `Q3`). `rate_hz`
     /// above `1000` is capped to `1000` to avoid busy-loop.
     #[must_use]
+    #[allow(clippy::arithmetic_side_effects)]
+    // 1_000_000 / hz is safe because hz is coerced to min 50;
+    // result fits in u64 for all valid rate_hz values.
     pub fn new(pid: u32, rate_hz: u64) -> Self {
         let hz = match rate_hz {
             0 => 50,
@@ -229,6 +244,9 @@ impl OutOfProcessSampler {
 
     /// Creates with explicit capacity (for tests).
     #[must_use]
+    #[allow(clippy::arithmetic_side_effects)]
+    // 1_000_000 / hz is safe because hz is coerced to min 50;
+    // result fits in u64 for all valid rate_hz values.
     pub fn with_capacity(pid: u32, rate_hz: u64, cap: usize) -> Self {
         let hz = match rate_hz {
             0 => 50,
@@ -260,11 +278,18 @@ impl OutOfProcessSampler {
     /// Returns frames on success; on `EPERM`/`ENOENT`/other, returns a
     /// fallback marker (`truncated=true`) with `error` set, never silent
     /// zeros. No `ptrace` stop `>1 ms`.
+    #[allow(clippy::arithmetic_side_effects)]
+    // u64 monotonic counters; bounded channel cap prevents overflow.
     fn try_remote_read(&mut self) -> SampleEvent {
-        let mono = self.base.elapsed().as_nanos() as u64;
-        let wall = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos() as u64);
+        let mono = u64::try_from(self.base.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let wall = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos()),
+        )
+        .unwrap_or(u64::MAX);
+        // SAFETY: SystemTime duration is always non-negative and fits in u64;
+        // unwrap_or(u64::MAX) is a defensive fallback for the impossible overflow case.
         let seq = self.next_seq;
         self.next_seq += 1;
 
@@ -341,6 +366,8 @@ impl OutOfProcessSampler {
     }
 
     /// Enqueues a sample into the bounded channel (drop-newest on full).
+    #[allow(clippy::arithmetic_side_effects)]
+    // u64 drop counter; bounded channel cap prevents overflow.
     fn enqueue(&mut self, ev: SampleEvent) -> Option<SampleEvent> {
         // Bounded channel discipline: copy of audit.rs — drop newest.
         if self.queue.len() >= self.cap {
@@ -363,6 +390,8 @@ impl StackSampler for OutOfProcessSampler {
         budget: &mut ObserveBudget,
     ) -> Result<Option<SampleEvent>, String> {
         // Injected drop for self_test DAL-A gate (simulates overflow).
+        #[allow(clippy::arithmetic_side_effects)]
+        // u64 drop counter; bounded channel cap prevents overflow.
         if self.inject_drop {
             self.inject_drop = false;
             self.dropped += 1;
@@ -385,7 +414,7 @@ impl StackSampler for OutOfProcessSampler {
         match res {
             Ok(()) => {
                 if let Some(ev) = sampled.take() {
-                    let enq = self.enqueue(ev.clone());
+                    let enq = self.enqueue(ev);
                     // If enqueued, return the event; if dropped (overflow) return None but counted.
                     Ok(enq)
                 } else {
@@ -412,13 +441,20 @@ impl StackSampler for OutOfProcessSampler {
         }
     }
 
+    #[allow(clippy::arithmetic_side_effects)]
+    // u64 monotonic counters; bounded channel cap prevents overflow.
     fn drain(&mut self) -> Vec<SampleEvent> {
         let mut out: Vec<SampleEvent> = self.queue.drain(..).collect();
         if self.dropped > 0 {
-            let mono = self.base.elapsed().as_nanos() as u64;
-            let wall = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos() as u64);
+            let mono = u64::try_from(self.base.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let wall = u64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos()),
+            )
+            .unwrap_or(u64::MAX);
+            // SAFETY: SystemTime duration is always non-negative and fits in u64;
+            // unwrap_or(u64::MAX) is a defensive fallback for the impossible overflow case.
             let marker = SampleEvent {
                 seq: self.next_seq,
                 pid: self.pid,
