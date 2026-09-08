@@ -60,7 +60,7 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO }}
         run: |
           VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
-          if cargo search runtimo-core --limit 1 2>/dev/null | grep -q "^runtimo-core = \"$VERSION\""; then
+          if cargo search runtimo-core --limit 1 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | grep -q "^runtimo-core = \"$VERSION\""; then
             echo "── runtimo-core $VERSION already on crates.io, skipping ──"
           else
             cargo publish -p runtimo-core --locked
@@ -82,7 +82,7 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO }}
         run: |
           VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
-          if cargo search runtimo-daemon --limit 1 2>/dev/null | grep -q "^runtimo-daemon = \"$VERSION\""; then
+          if cargo search runtimo-daemon --limit 1 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | grep -q "^runtimo-daemon = \"$VERSION\""; then
             echo "── runtimo-daemon $VERSION already on crates.io, skipping ──"
           else
             cargo publish -p runtimo-daemon --locked
@@ -107,7 +107,7 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO }}
         run: |
           VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
-          if cargo search runtimo-cli --limit 1 2>/dev/null | grep -q "^runtimo-cli = \"$VERSION\""; then
+          if cargo search runtimo-cli --limit 1 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | grep -q "^runtimo-cli = \"$VERSION\""; then
             echo "── runtimo-cli $VERSION already on crates.io, skipping ──"
           else
             cargo publish -p runtimo-cli --locked
