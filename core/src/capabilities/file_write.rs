@@ -53,7 +53,7 @@ const CRITICAL_FILES: &[&str] = &[
     ".ssh/id_rsa",
     ".ssh/id_ed25519",
     ".ssh/config",
-    ".ssh/",
+    ".ssh",
     ".vimrc",
     ".gitconfig",
     ".git-credentials",

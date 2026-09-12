@@ -27,13 +27,20 @@ pub struct OutputConfig {
 }
 
 /// WAL configuration.
+///
+/// `mode` is resolved by [`Self::resolved`] (file `wal.mode` > profile > builtin).
+/// `enabled` is a dead config field — it is never read by `resolved()` or any
+/// other code path; the WAL is always active. Kept for backward-compatible
+/// parsing of existing config files. Documented here as reporting-only;
+/// callers should treat `[wal] enabled = false` as a no-op.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[allow(clippy::exhaustive_structs)]
 pub struct WalConfig {
     /// WAL mode: `always` or `batch`.
     #[serde(default)]
     pub mode: Option<String>,
-    /// Whether WAL is enabled.
+    /// Dead field — never read; WAL is always enabled.
+    /// See [`WalConfig`] struct doc for details.
     #[serde(default)]
     pub enabled: Option<bool>,
 }
@@ -777,9 +784,10 @@ profile = "minimal"
         }
     }
 
-    /// Prints a warning to stderr for any top-level config key that is not
-    /// recognized. Unknown keys are silently ignored by serde — surfacing
-    /// them catches typos before they cause silent behavior changes.
+    /// Prints warnings to stderr for any unknown config key, including
+    /// keys within nested tables (e.g. `[wal]`, `[output]`, `[guards]`).
+    /// Unknown nested keys are warnings only — they are silently ignored
+    /// by serde and never cause a load failure (NEVER deny).
     fn warn_unknown_keys(value: &toml::Value, path: &std::path::Path) {
         if let toml::Value::Table(table) = value {
             for key in table.keys() {
@@ -789,6 +797,41 @@ profile = "minimal"
                         key,
                         path.display()
                     );
+                }
+            }
+            // Check nested tables for unknown keys (warning-only, never deny).
+            let known_subkeys: &[(&str, &[&str])] = &[
+                ("wal", &["mode", "enabled"]),
+                ("output", &["format", "renderer"]),
+                ("backup", &["enabled"]),
+                (
+                    "guards",
+                    &[
+                        "dal",
+                        "blocklist_enabled",
+                        "critical_files_enabled",
+                        "path_restriction_enabled",
+                        "path_sanitization_enabled",
+                    ],
+                ),
+                ("session", &["max_sessions", "timeout_secs", "on_limit"]),
+                ("telemetry", &["enabled"]),
+                ("observe", &["sample_rate_hz", "pressure_suspend_ms"]),
+                ("env", &[]), // arbitrary key-value pairs — no sub-key validation
+                ("capability_timeouts", &[]), // arbitrary key-value pairs
+            ];
+            for (table_name, subkeys) in known_subkeys {
+                if let Some(toml::Value::Table(ntable)) = table.get::<str>(table_name) {
+                    for key in ntable.keys() {
+                        if !subkeys.contains(&key.as_str()) {
+                            eprintln!(
+                                "[runtimo] Warning: unknown config key `[{}].{}` in {} (ignored)",
+                                table_name,
+                                key,
+                                path.display()
+                            );
+                        }
+                    }
                 }
             }
         }

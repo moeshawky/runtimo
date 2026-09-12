@@ -11,7 +11,9 @@
 //! or authorization. They are not security tokens and should not be treated
 //! as such. The current ID generation uses 16 random bytes from `/dev/urandom`
 //! (via `utils::generate_id()`), which provides sufficient collision resistance
-//! for audit purposes.
+//! for audit purposes. If `/dev/urandom` is unreadable (non-Linux hosts,
+//! restricted containers), generation falls back to a nanosecond-timestamp
+//! hex string and the collision bound below does not apply.
 //!
 //! If cryptographic uniqueness is required (e.g., for auth tokens), switch to
 //! UUID v4 via the `uuid` crate. For audit grouping, the current approach is
@@ -42,21 +44,31 @@ pub struct Session {
     /// Optional human-readable name.
     pub name: Option<String>,
     /// Job IDs executed in this session.
+    #[serde(default)]
     pub job_ids: Vec<String>,
     /// Unix timestamp when session was created.
     pub created_at: u64,
     /// Unix timestamp of last activity.
     pub updated_at: u64,
     /// Session status.
+    #[serde(default)]
     pub status: SessionStatus,
 }
 
 /// Session lifecycle status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Defaults to [`SessionStatus::Active`] so session files written without
+/// a `status` key (older builds, partial writes) still parse.
+/// Migration note: a file that predates the `status` field reopens as
+/// Active even if the session had ended — the file carries no end state,
+/// so Active (accepting jobs) is the fail-open-but-audited reading; the
+/// subsequent `updated_at` bump records the reopening.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 #[allow(clippy::exhaustive_enums)]
 pub enum SessionStatus {
     /// Session is active and accepting jobs.
+    #[default]
     Active,
     /// Session has been paused (e.g., disconnect).
     Paused,
@@ -132,6 +144,15 @@ impl SessionManager {
     /// Returns `SessionError` if the session ID is invalid (empty, contains
     /// `/`, `\`, a NUL byte, or `..`), if the session cannot be loaded, or
     /// if the session cannot be saved.
+    ///
+    /// # BLOCKED — cross-process race
+    /// `add_job` performs a read-modify-write cycle (`load_session` →
+    /// push `job_id` → `save_session`) without any file locking. Two
+    /// processes can load the same session concurrently, both push a
+    /// job, and one `save_session` overwrites the other's change.
+    /// Fixing this requires either a file lock held across the entire
+    /// read-modify-write cycle, or an append-only journal design.
+    /// This is left BLOCKED pending operator design decision.
     pub fn add_job(&mut self, session_id: &str, job_id: &str) -> Result<()> {
         let mut session = self.load_session(session_id)?;
         session.job_ids.push(job_id.to_string());

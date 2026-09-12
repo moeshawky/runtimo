@@ -2,7 +2,7 @@
 
 **Last Updated:** 2026-09-08
 **Build:** `cargo clippy --all-targets` — clean, 0 warnings
-**Tests:** 618 (39 cli + 398 core-lib + 65 integration + 46 robust + 63 daemon + 7 doctest)
+**Tests:** 620 (39 cli + 400 core-lib + 65 integration + 46 robust + 63 daemon + 7 doctest)
 **Version:** 0.9.0 (workspace) — crate deps still pinned ^0.8 (Unit B follow-up)
 
 ---

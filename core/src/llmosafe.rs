@@ -3,7 +3,12 @@
 //! Uses `llmosafe::ResourceGuard` (Tier 0: Resource Body) for physical resource
 //! monitoring. Maps RSS memory and CPU load to the CognitiveEntropy/Synapse system.
 //!
-//! The guard checks actual `/proc/stat` and `/proc/self/status` — no approximations.
+//! The guard checks actual `/proc/stat` and resource usage via the
+//! `llmosafe` crate's `getrusage`-based reader (`ru_maxrss`, i.e. peak RSS
+//! since process start, converted from KB to bytes), with `/proc/self/status`
+//! `VmRSS` as a fallback when `getrusage` fails. Because `ru_maxrss` is a
+//! peak, a transient spike keeps pressure elevated until process exit —
+//! compare against peak, not current `VmRSS`, when debugging gate decisions.
 //!
 //! # Example
 //!
@@ -27,6 +32,9 @@ use llmosafe::{
 };
 use std::fs;
 
+/// Re-export of `llmosafe::DesignAssuranceLevel` so callers can name the
+/// DAL without importing the `llmosafe` crate. Accepted by
+/// [`LlmoSafeGuard::with_dal`] and returned by [`LlmoSafeGuard::dal`].
 pub use llmosafe::DesignAssuranceLevel;
 pub use llmosafe::SafetyDecision;
 use std::path::PathBuf;
@@ -57,7 +65,11 @@ fn dal_from_config() -> DesignAssuranceLevel {
 /// Rolling resource usage tracker for cooldown enforcement (FINDING #16).
 ///
 /// Persists the last-check timestamp to disk so that process restarts
-/// cannot bypass the cooldown period.
+/// cannot bypass the cooldown period. Only `last_check` is persisted
+/// (not the full measurements window) — after a restart within cooldown,
+/// `rolling_average()` returns `None` and the safety gate passes
+/// unconditionally until a new measurement is taken (vacuous-restore
+/// limitation: the cooldown is honored but no pressure data survives).
 struct ResourceHistory {
     measurements: Vec<(Instant, u8)>,
     window_secs: u64,
@@ -67,6 +79,15 @@ struct ResourceHistory {
 }
 
 impl ResourceHistory {
+    /// Creates a new `ResourceHistory` with the given window and cooldown.
+    ///
+    /// # Input
+    ///
+    /// * `window_secs` — rolling average window duration
+    /// * `cooldown_secs` — minimum time between checks
+    /// * `persist_path` — optional path for crash/restart recovery of `last_check`
+    ///
+    /// Restores `last_check` from disk on creation (see [`restore_last_check`]).
     fn new(window_secs: u64, cooldown_secs: u64, persist_path: Option<PathBuf>) -> Self {
         let mut history = Self {
             measurements: Vec::with_capacity(60),
@@ -79,9 +100,18 @@ impl ResourceHistory {
         history
     }
 
-    /// Restores the last_check timestamp from a persisted file.
-    /// Prevents cooldown bypass via process restart.
-    /// NOTE: Only last_check is restored, not measurements. After restart within cooldown, rolling_average() returns None and the safety gate passes unconditionally until a new measurement is taken.
+    /// Restores the `last_check` timestamp from a persisted file.
+    ///
+    /// Prevents cooldown bypass via process restart. Only `last_check` is
+    /// restored, not the measurements window — after a restart within
+    /// cooldown, `rolling_average()` returns `None` and the safety gate
+    /// passes unconditionally (vacuous-restore: the cooldown is honored
+    /// but no pressure data survives the restart).
+    ///
+    /// The persisted value is the Unix timestamp of the last check.
+    /// If the elapsed time since that check is less than `cooldown_secs`,
+    /// `last_check` is reconstructed by subtracting the elapsed time from
+    /// `Instant::now()`, preserving the remaining cooldown.
     fn restore_last_check(&mut self) {
         if let Some(ref path) = self.persist_path {
             if let Ok(content) = fs::read_to_string(path) {
@@ -103,6 +133,10 @@ impl ResourceHistory {
     }
 
     /// Persists the current timestamp to disk for crash/restart recovery.
+    ///
+    /// Writes `last_check` as a Unix timestamp string to `persist_path`.
+    /// Best-effort: failures are logged as warnings and do not block
+    /// the check path. The parent directory is created if missing.
     fn persist_last_check(&self) {
         if let Some(ref path) = self.persist_path {
             if let Some(parent) = path.parent() {
@@ -120,6 +154,10 @@ impl ResourceHistory {
     }
 
     /// Records a pressure measurement and returns the rolling average.
+    ///
+    /// Evicts measurements older than `window_secs` before appending
+    /// the new reading. Returns the arithmetic mean of all retained
+    /// measurements (including the new one).
     fn record(&mut self, pressure: u8) -> f64 {
         let now = Instant::now();
         let cutoff = now
@@ -128,9 +166,8 @@ impl ResourceHistory {
         self.measurements.retain(|(t, _)| *t > cutoff);
         self.measurements.push((now, pressure));
 
-        if self.measurements.is_empty() {
-            return pressure as f64;
-        }
+        // The vec is non-empty here (the push above guarantees it), so the
+        // mean below is always defined.
         #[allow(clippy::cast_precision_loss)]
         {
             let count = self.measurements.len() as f64;
@@ -143,6 +180,11 @@ impl ResourceHistory {
     }
 
     /// Returns the rolling average pressure over the tracking window.
+    ///
+    /// Returns `None` if no measurements exist (e.g., after a process
+    /// restart within cooldown — the vacuous-restore case where
+    /// `restore_last_check` set `last_check` but no measurements were
+    /// persisted). Callers should treat `None` as "no data, gate passes".
     fn rolling_average(&self) -> Option<f64> {
         if self.measurements.is_empty() {
             return None;
@@ -161,6 +203,10 @@ impl ResourceHistory {
     }
 
     /// Checks if we're in a cooldown period after a recent check.
+    ///
+    /// Returns `true` if `last_check` is set and the elapsed time since
+    /// it is less than `cooldown_secs`. Returns `false` if no prior check
+    /// exists (first run after restart).
     fn is_in_cooldown(&self) -> bool {
         if let Some(last) = self.last_check {
             last.elapsed() < Duration::from_secs(self.cooldown_secs)
@@ -169,6 +215,12 @@ impl ResourceHistory {
         }
     }
 
+    /// Marks a check as completed: sets `last_check` to `Instant::now()`
+    /// and persists it to disk.
+    ///
+    /// This consumes the cooldown slot — after `mark_checked()`,
+    /// `is_in_cooldown()` returns `false` until `cooldown_secs` elapses.
+    /// The persist write is best-effort (failures are logged, not fatal).
     fn mark_checked(&mut self) {
         self.last_check = Some(Instant::now());
         self.persist_last_check();
@@ -198,6 +250,23 @@ fn resource_history_path() -> Option<PathBuf> {
     base.map(|b| b.join(".runtimo").join("resource_history.state"))
 }
 
+/// Wraps [`llmosafe::ResourceGuard`] (per-instance memory ceiling;
+/// `new()` uses 80% of system memory) with an [`EscalationPolicy`].
+///
+///
+///
+/// # State Architecture
+///
+/// `check()` samples at most once per second per process and holds
+/// the per-guard `history` lock through `ResourceGuard::check()`
+/// (which double-reads `/proc/stat` with a 100ms sleep). A failed
+/// sample is still recorded in the window and consumes the cooldown
+/// slot, so the failing value gates the next second's checks through
+/// the rolling average. Threshold (80%) and window (30s) / cooldown
+/// (1s) are hardcoded and not derived from [`RuntimoConfig`].
+///
+/// The `history` field is per-guard (previously a static
+/// `RESOURCE_HISTORY` caused cross-guard interference).
 pub struct LlmoSafeGuard {
     guard: ResourceGuard,
     policy: EscalationPolicy,
@@ -226,6 +295,11 @@ pub struct LlmoSafeGuard {
 ///
 /// This is called after the cognitive pipeline produces a decision, applying
 /// the runtime's configured risk tolerance before the decision gates execution.
+/// DAL ladder: `Exit` passes through unchanged at B and C (falls into
+/// the `other` arm) but is capped at `Warn` at D — the ladder is
+/// non-monotone by design and matches the crate's
+/// `apply_dal_to_decision` exactly. The B arm also discards the
+/// halt's original entropy (`entropy: 0`).
 pub(crate) fn apply_dal_to_decision(
     dal: DesignAssuranceLevel,
     decision: SafetyDecision,
@@ -312,12 +386,32 @@ impl LlmoSafeGuard {
     /// During cooldown, the error is based on the cached rolling average.
     ///
     /// # Panics
-    /// Panics if the per-guard history mutex is poisoned.
+    /// Never panics on a poisoned mutex — the lock is recovered via
+    /// `into_inner` (line 317) and the guard state is shared after the
+    /// poison.
+    ///
+    /// # Ordering
+    ///
+    /// The sample is recorded in the rolling window and the cooldown slot
+    /// is consumed (`mark_checked`, which also writes the persist file)
+    /// **before** the threshold checks — a check that fails on pressure > 80
+    /// still gates the next second's checks through the recorded spike.
+    ///
+    /// # Magic Numbers
+    ///
+    /// The 30 s rolling window and 1 s cooldown are hardcoded constants
+    /// (see `ResourceHistory::new(30, 1, ...)`); the 80 % threshold appears
+    /// at lines 324 and 339. None are derived from [`RuntimoConfig`].
     pub fn check(&self) -> Result<(), String> {
         let mut hist = self.history.lock().unwrap_or_else(|e| e.into_inner());
 
         // FINDING #16 + T9b: Enforce per-guard cooldown between checks.
         // This is a Cached path — no fresh sampling, Ok uses cached average.
+        // Magic numbers: 30s window / 1s cooldown (ResourceHistory::new(30, 1, ...)),
+        // 80% threshold (hardcoded, not from RuntimoConfig).
+        // Vacuous-restore: if rolling_average() is None (no measurements survived
+        // a process restart), the gate passes unconditionally — the cooldown
+        // is honored but no pressure data exists to gate on.
         if hist.is_in_cooldown() {
             // During cooldown, check() takes no fresh sample; if rolling_average() is None, the safety gate passes unconditionally (Ok(())). This is a known limitation.
             if let Some(avg) = hist.rolling_average() {
@@ -333,7 +427,7 @@ impl LlmoSafeGuard {
 
         let pressure = self.guard.pressure();
         let avg = hist.record(pressure);
-        hist.mark_checked();
+        hist.mark_checked(); // consumes cooldown slot + persists — runs BEFORE threshold checks
 
         // Check both instantaneous and rolling average
         if pressure > 80 {
@@ -416,13 +510,35 @@ impl LlmoSafeGuard {
         self.policy.dal
     }
 
-    /// Processes an observation through a CognitivePipeline under the current guard's resource policy.
+    /// Runs one observation through the llmosafe **sifter** stage only and
+    /// returns the resulting decision.
     ///
-    /// This integrates the 5-stage CognitivePipeline with the physical ResourceGuard.
+    /// The full 5-stage [`CognitivePipeline`] is **not** run here — it
+    /// requires multi-observation state. Only the sifter (TF-IDF classifier
+    /// + keyword bias backstop) executes; `stages_executed` is
+    ///   [`STAGE_SIFT`].
+    ///
+    /// `_objective` is accepted but unused.
+    ///
+    /// Decision: for inputs under 40 bytes without a bias keyword match,
+    /// `policy.decide(0, 0, false)` is used (no classifier signal on short
+    /// technical inputs); otherwise `policy.decide_with_pressure(...)` is
+    /// used with resource pressure. The policy decision is already
+    /// DAL-gated inside the `llmosafe` crate; the local
+    /// [`apply_dal_to_decision`] call on line 456 is an **idempotent
+    /// duplicate** of the crate's ladder — if the crate's DAL semantics
+    /// change, this copy will drift.
+    ///
+    /// Result fields the sifter alone cannot fill are placeholders:
+    /// `monitor_state: StabilityResult::Stable`, `step_count: 0`,
+    /// `kernel_output: None`, and `classifier_score: 0.0` (the classifier
+    /// score is dropped by `sift_text`; 0.0 is also the crate's
+    /// no-classification sentinel — a sentinel collision).
     ///
     /// # Errors
     ///
-    /// Returns an error if configuring or executing the cognitive safety pipeline fails.
+    /// Never returns `Err` — every path ends in `Ok(PipelineResult)`; the
+    /// `Result` wrapper keeps the executor call site uniform.
     pub fn check_cognitive_pipeline(
         &self,
         _objective: &str,
@@ -453,6 +569,12 @@ impl LlmoSafeGuard {
             )
         };
 
+        // Second DAL application: policy.decide / decide_with_pressure
+        // already route every return path through the crate's
+        // apply_dal_to_decision (crate invariant: no call path can
+        // bypass DAL), so this local re-application is an idempotent
+        // duplicate of the crate's ladder — if the crate's DAL
+        // semantics change, this copy will drift.
         let decision = apply_dal_to_decision(self.policy.dal, decision);
 
         let oov_ratio = synapse.oov_ratio();
@@ -470,7 +592,9 @@ impl LlmoSafeGuard {
             body_pressure: Some(pressure),
             step_count: 0,
             kernel_output: None,
-            classifier_score: 0.0,
+            classifier_score: 0.0, // sentinel collision: 0.0 = "no score computed"
+                                   // even though sift_text did classify; matches the crate's
+                                   // no-classification sentinel value
         })
     }
 

@@ -1154,7 +1154,10 @@ fn redact_stderr(s: &str) -> String {
             result = result
                 .lines()
                 .map(|line| {
-                    if line.to_lowercase().contains(&pattern.to_lowercase()) {
+                    // Skip lines already redacted by a prior pass
+                    if line.contains("[REDACTED") {
+                        line
+                    } else if line.to_lowercase().contains(&pattern.to_lowercase()) {
                         "[REDACTED - secret pattern detected]"
                     } else {
                         line

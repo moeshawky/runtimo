@@ -54,7 +54,11 @@ use std::process::Command;
 fn get_process_start_time(pid: u32) -> Option<u64> {
     let stat_path = format!("/proc/{}/stat", pid);
     let content = std::fs::read_to_string(&stat_path).ok()?;
+    // The comm field is enclosed in parentheses; find the LAST ')'
+    // to handle process names that may contain parentheses.
     let last_paren = content.rfind(')')?;
+    // After the closing paren and space, fields are whitespace-separated.
+    // Field 22 (starttime) is at index 19 (0-based) after the comm field.
     let fields: Vec<&str> = content[last_paren + 2..].split_whitespace().collect();
     fields.get(19)?.parse::<u64>().ok()
 }

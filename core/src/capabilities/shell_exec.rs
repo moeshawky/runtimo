@@ -67,7 +67,7 @@ use crate::capabilities::file_write::is_critical_file;
 use crate::capability::{CapabilityError, Context, Output, TypedCapability};
 use crate::config::RuntimoConfig;
 use crate::validation::path::{validate_path, PathContext};
-use crate::{Error, Result};
+use crate::Error;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
@@ -104,7 +104,7 @@ struct WaitOutcome {
     timed_out: bool,
 }
 
-type WaitResult = Result<WaitOutcome>;
+type WaitResult = std::result::Result<WaitOutcome, crate::Error>;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024;

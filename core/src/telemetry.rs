@@ -91,10 +91,13 @@ pub struct SystemInfo {
     /// capacity planning.
     pub ram_available: String,
     /// Total disk space in human-readable form (e.g. `"100G"`) from `df -h /`.
+    /// Falls back to `"unknown"` when df is unavailable.
     pub disk_total: String,
     /// Free disk space in human-readable form from `df -h /`.
+    /// Falls back to `"unknown"` when df is unavailable.
     pub disk_free: String,
     /// Disk usage percentage as a string without `%` sign (e.g. `"45"`).
+    /// Falls back to `"unknown"` when df is unavailable.
     pub disk_used_percent: String,
     /// Human-readable uptime (e.g. `"up 6 days, 3 hours"`) computed from
     /// `/proc/uptime`.
@@ -280,6 +283,12 @@ impl Telemetry {
     /// Results are cached for 30 seconds to avoid
     /// repeated filesystem reads on consecutive calls. Network queries
     /// (public_ip, tunnel) are included in the cached value.
+    ///
+    /// The cache check and store are not held under a single guard:
+    /// two concurrent cold calls may both miss the cache and run the
+    /// full capture, with the last writer winning. The data is
+    /// idempotent, so this is a best-effort duplicate-capture window
+    /// rather than a corruption risk.
     ///
     /// Use [`capture_lightweight`](Telemetry::capture_lightweight) for
     /// execution paths that don't need accelerator detection or network
@@ -561,8 +570,8 @@ impl Telemetry {
 // ── SystemInfo capture — direct /proc reads ──────────────────────────────
 
 impl SystemInfo {
-    /// Captures system information from `/proc` files with three separate
-    /// `df` invocations (disk_total, disk_free, disk_used_percent). No accelerator or network probing.
+    /// Captures system information from `/proc` files with a single `df`
+    /// invocation (disk_total, disk_free, disk_used_percent). No accelerator or network probing.
     ///
     /// Reads `/proc/cpuinfo` (model, count), `/proc/meminfo` (MemTotal,
     /// MemFree, MemAvailable), `/proc/uptime`, and `/proc/loadavg`.
@@ -615,11 +624,23 @@ impl SystemInfo {
             }
         };
 
-        // Disk: no /proc equivalent; keep df shell-out
-        let disk_total = run_cmd("df -h / | tail -1 | awk '{print $2}'").unwrap_or_default();
-        let disk_free = run_cmd("df -h / | tail -1 | awk '{print $4}'").unwrap_or_default();
-        let disk_pct_str = run_cmd("df / | tail -1 | awk '{print $5}'").unwrap_or_default();
-        let disk_used_percent = disk_pct_str.replace('%', "");
+        // Disk: no /proc equivalent; single df invocation for all fields.
+        // Results are sampled at a single instant to avoid inconsistency
+        // across three separate subprocess calls.
+        let df_output = run_cmd("df -h / | tail -1").unwrap_or_default();
+        let df_parts: Vec<&str> = df_output.split_whitespace().collect();
+        let disk_total = df_parts.get(1).unwrap_or(&"unknown").to_string();
+        let disk_free = df_parts.get(3).unwrap_or(&"unknown").to_string();
+        let disk_pct_str = df_parts
+            .get(4)
+            .unwrap_or(&"unknown")
+            .to_string()
+            .replace('%', "");
+        let disk_used_percent = if disk_pct_str.is_empty() {
+            "unknown".to_string()
+        } else {
+            disk_pct_str
+        };
 
         Self {
             cpu_model,
@@ -691,11 +712,16 @@ impl HardwareInfo {
             });
         }
 
-        // NVIDIA GPUs via nvidia-smi
-        let nvidia_gpu_count: usize = run_cmd("nvidia-smi --list-gpus 2>/dev/null | wc -l")
-            .unwrap_or_default()
-            .parse()
-            .unwrap_or(0);
+        // NVIDIA GPUs via nvidia-smi.
+        // Use --query-gpu=count to get the actual GPU count,
+        // avoiding the "No devices were found" sentinel line
+        // that some driver versions print to stdout.
+        let nvidia_gpu_count: usize = run_cmd(
+            "nvidia-smi --query-gpu=count --format=csv,noheader 2>/dev/null | tr -d '[:space:]'",
+        )
+        .unwrap_or_default()
+        .parse()
+        .unwrap_or(0);
         if nvidia_gpu_count > 0 {
             let model =
                 run_cmd("nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1")
@@ -747,13 +773,12 @@ impl HardwareInfo {
         .unwrap_or_default()
             == "yes";
         let jax_version = if jax_available {
-            Some(
-                run_cmd(&format!(
-                    "timeout {} python3 -c 'import jax; print(jax.__version__)'",
-                    probe_timeout
-                ))
-                .unwrap_or_default(),
-            )
+            run_cmd(&format!(
+                "timeout {} python3 -c 'import jax; print(jax.__version__)'",
+                probe_timeout
+            ))
+            .ok()
+            .filter(|s| !s.is_empty())
         } else {
             None
         };
@@ -845,29 +870,35 @@ fn detect_cloudflared() -> (bool, Option<u32>) {
         return (false, None);
     };
 
-    for entry in dir.flatten() {
-        let path = entry.path();
-        // Only consider entries whose filename is purely numeric (PIDs)
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if !name.chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
-
-        let comm_path = path.join("comm");
-        let Ok(content) = std::fs::read_to_string(&comm_path) else {
-            continue;
-        };
-
-        if content.trim() == "cloudflared" {
-            if let Ok(pid) = name.parse::<u32>() {
-                return (true, Some(pid));
+    // Collect all matching PIDs and return the smallest, so that
+    // when several cloudflared instances run the reported PID is
+    // deterministic rather than an arbitrary filesystem-order pick.
+    let mut matches: Vec<u32> = dir
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?;
+            if !name.chars().all(|c| c.is_ascii_digit()) {
+                return None;
             }
-        }
-    }
+            let comm_path = path.join("comm");
+            let Ok(content) = std::fs::read_to_string(&comm_path) else {
+                return None;
+            };
+            if content.trim() == "cloudflared" {
+                name.parse::<u32>().ok()
+            } else {
+                None
+            }
+        })
+        .collect();
 
-    (false, None)
+    if matches.is_empty() {
+        (false, None)
+    } else {
+        matches.sort_unstable();
+        (true, matches.first().copied())
+    }
 }
 
 /// Reads listening TCP ports from `/proc/net/tcp` and `/proc/net/tcp6`.
@@ -1059,6 +1090,10 @@ mod tests {
         assert_eq!(empty.network.public_ip, "unknown");
         assert!(!empty.network.tunnel_running);
         assert!(empty.network.listening_ports.is_empty());
+        // Disk fields fall back to "unknown" when df is unavailable
+        assert_eq!(empty.system.disk_total, "unknown");
+        assert_eq!(empty.system.disk_free, "unknown");
+        assert_eq!(empty.system.disk_used_percent, "unknown");
     }
 
     #[test]
@@ -1323,6 +1358,7 @@ mod tests {
         // boxes where JAX/XLA init takes longer than 10s).
         assert_eq!(jax_probe_timeout(), DEFAULT_JAX_PROBE_TIMEOUT_SECS);
 
+        let _guard = TELEMETRY_TEST_MUTEX.lock().unwrap();
         std::env::set_var("RUNTIMO_TELEMETRY_PROBE_TIMEOUT", "120");
         assert_eq!(jax_probe_timeout(), 120);
         std::env::set_var("RUNTIMO_TELEMETRY_PROBE_TIMEOUT", "0");

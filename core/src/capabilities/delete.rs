@@ -136,12 +136,14 @@ impl TypedCapability for Delete {
 
         // Backup unless explicitly skipped (no_backup) — large-file deletion
         // under disk pressure is the opt-out case.
-        let backup_path = if args.no_backup {
-            std::path::PathBuf::new()
+        let backup_path: Option<std::path::PathBuf> = if args.no_backup {
+            None
         } else {
-            self.backup_mgr
-                .create_backup(&path, &ctx.job_id)
-                .map_err(|e| CapabilityError::Internal(format!("backup: {}", e)))?
+            Some(
+                self.backup_mgr
+                    .create_backup(&path, &ctx.job_id)
+                    .map_err(|e| CapabilityError::Internal(format!("backup: {}", e)))?,
+            )
         };
 
         std::fs::remove_file(&path).map_err(|e| {
@@ -154,6 +156,10 @@ impl TypedCapability for Delete {
 
         // Durability: sync the parent directory so the unlink is not lost
         // on crash after WAL/telemetry processing.
+        // Fragile sentinel: sync_all failure is silently discarded
+        // (let _ = dir.sync_all()) — the unlink has already succeeded,
+        // and failing the entire operation over a missing fsync would
+        // be worse than accepting the durability risk.
         if let Ok(dir) =
             std::fs::File::open(path.parent().unwrap_or_else(|| std::path::Path::new(".")))
         {
@@ -166,10 +172,10 @@ impl TypedCapability for Delete {
         let mut out = Output::ok(format!("Deleted {}", path.display()));
         out.data = Some(serde_json::json!({
             "path": path.display().to_string(),
-            "backup_path": if backup_path.as_os_str().is_empty() {
-                Value::Null
+            "backup_path": if let Some(ref bp) = backup_path {
+                Value::String(bp.to_string_lossy().to_string())
             } else {
-                Value::String(backup_path.to_string_lossy().to_string())
+                Value::Null
             },
             "no_backup": args.no_backup,
             "telemetry_before": serde_json::to_value(&telemetry_before).unwrap_or(Value::Null),

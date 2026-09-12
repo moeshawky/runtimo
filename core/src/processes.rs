@@ -252,25 +252,23 @@ impl ProcessSnapshot {
         println!(" Zombies: {}", self.summary.zombie_count);
 
         if let Some(ref top_cpu) = self.summary.top_cpu_consumer {
-            println!(
-                " Top CPU: {} ({:.1}%)",
-                top_cpu,
-                self.processes
-                    .iter()
-                    .find(|p| p.command == *top_cpu)
-                    .map_or(0.0, |p| p.cpu_percent)
-            );
+            let top_cpu_pct = self
+                .processes
+                .iter()
+                .filter(|p| p.command == *top_cpu)
+                .map(|p| p.cpu_percent)
+                .fold(0.0f32, |a, b| a.max(b));
+            println!(" Top CPU: {} ({:.1}%)", top_cpu, top_cpu_pct);
         }
 
         if let Some(ref top_mem) = self.summary.top_mem_consumer {
-            println!(
-                " Top Memory: {} ({:.1}%)",
-                top_mem,
-                self.processes
-                    .iter()
-                    .find(|p| p.command == *top_mem)
-                    .map_or(0.0, |p| p.mem_percent)
-            );
+            let top_mem_pct = self
+                .processes
+                .iter()
+                .filter(|p| p.command == *top_mem)
+                .map(|p| p.mem_percent)
+                .fold(0.0f32, |a, b| a.max(b));
+            println!(" Top Memory: {} ({:.1}%)", top_mem, top_mem_pct);
         }
 
         println!("\n--- TOP 10 BY CPU ---");
@@ -313,7 +311,10 @@ impl ProcessSnapshot {
 ///
 /// Expected format: PID PPID USER %CPU %MEM VSZ RSS STAT START TIME COMMAND
 /// Returns `None` if the line has fewer than 10 whitespace-separated fields.
-/// Note: USER column with spaces shifts all subsequent column positions; may misalign CPU/command fields.
+/// The `stat` field is validated against known Linux process states
+/// (R, S, D, Z, T, t, X, x, K, W, P, I) to reject rows where
+/// column misalignment (e.g., whitespace in the USER field) has
+/// shifted the stat token.
 #[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 fn parse_ps_line(line: &str) -> Option<ProcessInfo> {
     let parts: Vec<&str> = line.split_whitespace().collect();
@@ -329,6 +330,16 @@ fn parse_ps_line(line: &str) -> Option<ProcessInfo> {
     let vsz: u64 = parts[5].parse().unwrap_or(0);
     let rss: u64 = parts[6].parse().unwrap_or(0);
     let stat = parts[7].to_string();
+    // Validate stat against known Linux process states to catch
+    // column-shift errors from whitespace in the USER field.
+    if !stat.starts_with(|c| {
+        matches!(
+            c,
+            'R' | 'S' | 'D' | 'Z' | 'T' | 't' | 'X' | 'x' | 'K' | 'W' | 'P' | 'I'
+        )
+    }) {
+        return None;
+    }
     let start_time = parts[8].to_string();
     let elapsed = parts[9].to_string();
     let command = parts.get(10..).map(|s| s.join(" ")).unwrap_or_default();

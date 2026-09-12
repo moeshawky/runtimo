@@ -1,13 +1,25 @@
 //! Execution engine — telemetry-wrapped capability execution.
 //!
 //! Wraps every capability execution with:
-//! telemetry capture → resource check → WAL log → validate → execute → WAL log
+//! telemetry capture → WAL create → resource check → cognitive safety check
+//! → execute → after-snapshot → backup audit → WAL log
 //!
-//! Capabilities execute with an advisory 30-second post-hoc timeout check.
+//! There is no standalone validation step: [`TypedCapability`] implementations
+//! validate during deserialization in `execute()`, and direct [`Capability`]
+//! implementers validate inside `execute()`.
 //!
-//! WAL goes to `/tmp` by default since the daemon may not have write access to
-//! `/var/lib` in all deployment environments. Override with `RUNTIMO_WAL_PATH`
-//! env var.
+//! Capabilities run under a post-hoc timeout: the per-capability value is
+//! resolved via [`RuntimoConfig::get_capability_timeout`] (default
+//! [`CAPABILITY_TIMEOUT_SECS`] = 30s) and injected into the args so
+//! subprocess-based capabilities (ShellExec, GitExec) enforce it internally.
+//! Pure-Rust capabilities run to completion and the elapsed time is checked
+//! after the fact — they cannot be interrupted without subprocess isolation.
+//!
+//! WAL path: the caller (the CLI) passes [`crate::utils::wal_path()`] —
+//! [`RUNTIMO_WAL_PATH`] if set, otherwise `data_dir()/wal.jsonl` (the XDG
+//! data dir, e.g. `~/.local/share/runtimo/wal.jsonl`). `/tmp/runtimo` is
+//! only the last-resort fallback when neither `XDG_DATA_HOME` nor `HOME` is
+//! set. Override with the `RUNTIMO_WAL_PATH` env var.
 //!
 //! # Subprocess Isolation Limitation (FINDING #17)
 //!
@@ -20,7 +32,7 @@
 //!
 //! **Mitigations in place:**
 //! - Path validation restricts file access to allowed prefixes
-//! - LlmoSafeGuard provides CPU/RAM circuit breakers
+//! - [`LlmoSafeGuard`] provides CPU/RAM circuit breakers
 //! - WAL logging provides audit trail for all operations
 //! - Process snapshot tracks spawned PIDs
 //! - Zombie process guard rejects execution if zombie_count > 10
@@ -102,15 +114,17 @@ pub struct ExecutionResult {
 /// # Execution Flow
 ///
 /// 1. Capture hardware telemetry and process snapshot (before)
-/// 2. Check resource limits via `LlmoSafeGuard` (circuit breaker at 80%)
-/// 3. Check zombie count (reject if > 10)
-/// 4. Check args size (reject if > 1MB)
-/// 5. Log `JobStarted` event to WAL
-/// 6. Validate arguments against capability schema
-/// 7. Execute the capability
-/// 8. Capture hardware telemetry and process snapshot (after)
-/// 9. Identify spawned PIDs
-/// 10. Log `JobCompleted` or `JobFailed` event to WAL
+/// 2. Create the WAL (before the guard checks, so every rejection is audited)
+/// 3. Check resource limits via [`LlmoSafeGuard`] (circuit breaker)
+/// 4. Check zombie count (reject if > 10)
+/// 5. Check args size (reject if > 1MB)
+/// 6. Log `JobStarted` event to WAL
+/// 7. Run the cognitive safety check on user-authored natural language content
+/// 8. Execute the capability (timeout injected into args for subprocess caps)
+/// 9. Capture hardware telemetry and process snapshot (after)
+/// 10. Audit any backup the capability created ([`WalEventType::BackupCreated`])
+/// 11. Identify spawned PIDs
+/// 12. Log `JobCompleted` or `JobFailed` event to WAL
 ///
 /// # Arguments
 ///
@@ -122,21 +136,24 @@ pub struct ExecutionResult {
 /// # Returns
 ///
 /// An [`ExecutionResult`] with before/after snapshots and the capability output.
-/// Even on validation or execution failure, returns `Ok` with `success: false`
-/// so the caller can inspect telemetry deltas.
+/// On execution failure (including a post-hoc timeout), returns `Ok` with
+/// `success: false` so the caller can inspect telemetry deltas.
 ///
 /// # Errors
 ///
-/// Returns [`Error::ResourceLimitExceeded`] if the `LlmoSafeGuard` circuit breaker
-/// trips, zombie count exceeds 10, or args exceed 1MB. WAL write failures also
-/// propagate as errors.
+/// Returns [`Error::ResourceLimitExceeded`] if the [`LlmoSafeGuard`] circuit
+/// breaker trips, zombie count exceeds 10, or args exceed 1MB. Returns
+/// [`Error::CognitiveSafetyViolation`] if the cognitive pipeline blocks the
+/// input, and [`Error::ExecutionFailed`] if the pipeline itself fails. WAL
+/// write failures also propagate as errors.
 ///
-/// # Timeout Limitation
+/// # Timeout
 ///
-/// The `timeout_secs` parameter is currently **not enforced**. Rust's
-/// `std::thread` cannot be interrupted once started. A true timeout requires
-/// either subprocess isolation or `tokio::spawn_blocking` with cancellation.
-/// This is tracked for v0.2.0 (see FINDING #17 in module docs).
+/// The per-capability timeout is resolved here via
+/// [`RuntimoConfig::get_capability_timeout`] (default [`CAPABILITY_TIMEOUT_SECS`])
+/// and injected into the args for subprocess-based capabilities, which enforce
+/// it internally. Pure-Rust capabilities cannot be interrupted; the timeout is
+/// checked after completion (see [`execute_with_timeout_check`]).
 pub fn execute_with_telemetry(
     capability: &dyn Capability,
     args: &Value,
@@ -246,8 +263,12 @@ fn fresh_process_after() -> ProcessSnapshot {
 ///
 /// # Errors
 ///
-/// Returns an error if capability execution fails, if WAL operations fail,
-/// or if a session cannot be created for the job.
+/// Returns [`Error::ResourceLimitExceeded`] (guard, zombie, or args-size
+/// rejection), [`Error::CognitiveSafetyViolation`] (pipeline blocks the
+/// input), [`Error::ExecutionFailed`] (pipeline failure, or output/WAL
+/// serialization), or a WAL error. A capability execution failure
+/// (including a post-hoc timeout) returns `Ok` with `success: false`,
+/// not an error. Session add failures are logged, not returned.
 #[allow(clippy::too_many_lines)]
 pub fn execute_with_telemetry_and_session(
     capability: &dyn Capability,
@@ -424,7 +445,10 @@ pub fn execute_with_telemetry_and_session(
                 "Cognitive safety violation: decision {:?}",
                 pipeline_result.decision
             );
-            log_job_failed_with_snapshots(
+            // Best-effort audit (matches the pre-execution rejection sites):
+            // a WAL write failure must not mask the cognitive violation.
+            // The failure is logged so dropped audits stay visible.
+            if let Err(e) = log_job_failed_with_snapshots(
                 &mut wal,
                 &job_id_str,
                 &cap_name,
@@ -435,7 +459,9 @@ pub fn execute_with_telemetry_and_session(
                 &process_after.summary,
                 Some(pipeline_result.oov_ratio),
                 Some(pipeline_result.detection_flags),
-            )?;
+            ) {
+                log::warn!("WAL audit append failed for job {}: {}", job_id_str, e);
+            }
             return Err(Error::CognitiveSafetyViolation(err_msg));
         }
     }
@@ -519,7 +545,11 @@ pub fn execute_with_telemetry_and_session(
             }
             let end_seq = wal.seq();
             let err_msg = format!("Execution failed: {}", e);
-            log_job_failed_with_snapshots(
+            // Best-effort audit (matches the pre-execution rejection sites):
+            // a WAL write failure must not mask the execution failure, and
+            // this arm returns Ok(fail_result) by contract, never Err.
+            // The failure is logged so dropped audits stay visible.
+            if let Err(e) = log_job_failed_with_snapshots(
                 &mut wal,
                 &job_id_str,
                 &cap_name,
@@ -530,7 +560,9 @@ pub fn execute_with_telemetry_and_session(
                 &process_after.summary,
                 None,
                 None,
-            )?;
+            ) {
+                log::warn!("WAL audit append failed for job {}: {}", job_id_str, e);
+            }
 
             return Ok(fail_result(
                 job_id_str,
@@ -952,14 +984,15 @@ fn execute_with_timeout_check(
     output
 }
 
-/// Constructs an observation string for the cognitive safety pipeline.
+/// Returns whether `args` carries a user-authored natural-language
+/// field that should pass through the cognitive safety pipeline.
 ///
-/// Inspects `args` for high-risk keywords (`risk`, `ignore`, `instruction`,
-/// `system`, `manipulate`, `unstable`, `suspicious`). When detected, appends
-/// an injection-attack prompt suffix to increase cognitive safety sensitivity.
-///
-/// On benign inputs, returns only the capability description without
-/// padding — no injected text that could trigger content classifiers.
+/// True when any of `cmd`, `content`, `url`, or `message` is a JSON
+/// string. These are the fields whose text is manipulation-prone;
+/// structured-only args (paths, PIDs, job IDs) have none of these
+/// fields and return false, skipping the TF-IDF check. This tests
+/// field presence only — it does not inspect the text's keywords
+/// (that happens downstream in the sifter).
 fn has_natural_content(args: &Value) -> bool {
     args.get("cmd").and_then(|v| v.as_str()).is_some()
         || args.get("content").and_then(|v| v.as_str()).is_some()
@@ -967,6 +1000,14 @@ fn has_natural_content(args: &Value) -> bool {
         || args.get("message").and_then(|v| v.as_str()).is_some()
 }
 
+/// Selects the natural-language field to run through the cognitive
+/// sifter.
+///
+/// Returns the first present string among `cmd`, `content`, `url`,
+/// `message` (in that order). `cmd`, `content`, and `message` are
+/// passed through [`truncate_for_sift`]; `url` is returned whole.
+/// When none of those fields is a string, falls back to the
+/// capability description.
 fn sift_observation(description: &str, args: &Value) -> String {
     if let Some(cmd) = args.get("cmd").and_then(|v| v.as_str()) {
         return truncate_for_sift(cmd);
@@ -983,6 +1024,14 @@ fn sift_observation(description: &str, args: &Value) -> String {
     description.to_string()
 }
 
+/// Truncates a string to at most `SIFT_MAX_CHARS` (8192) bytes of
+/// original content for the cognitive sifter.
+///
+/// When the string is longer, backs off from 8192 to the nearest
+/// UTF-8 char boundary so the cut never splits a multi-byte
+/// character, then appends `... [truncated N bytes]` (N = bytes
+/// dropped) — so the returned [`String`] can exceed 8192 bytes by
+/// the length of that marker.
 fn truncate_for_sift(s: &str) -> String {
     const SIFT_MAX_CHARS: usize = 8192;
     if s.len() <= SIFT_MAX_CHARS {

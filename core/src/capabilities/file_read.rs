@@ -223,14 +223,17 @@ fn detect_binary(data: &[u8]) -> bool {
 /// Convert raw bytes to a UTF-8 String, trimming trailing bytes that would
 /// split a multibyte character boundary.
 fn bytes_to_utf8_string(bytes: &[u8]) -> String {
-    match String::from_utf8(bytes.to_vec()) {
-        Ok(s) => s,
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
         Err(e) => {
-            let valid_up_to = e.utf8_error().valid_up_to();
-            bytes
-                .get(..valid_up_to)
-                .map(|s| String::from_utf8(s.to_vec()).unwrap_or_default())
-                .unwrap_or_default()
+            let valid_up_to = e.valid_up_to();
+            match bytes.get(..valid_up_to) {
+                Some(valid_bytes) => match std::str::from_utf8(valid_bytes) {
+                    Ok(s) => s.to_string(),
+                    Err(_) => String::new(),
+                },
+                None => String::new(),
+            }
         }
     }
 }

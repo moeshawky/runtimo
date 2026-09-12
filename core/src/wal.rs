@@ -33,6 +33,7 @@ use crate::telemetry::Telemetry;
 use crate::Result;
 
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::Path;
 
 /// Reads the last event's sequence number from a WAL file without loading
@@ -102,6 +103,9 @@ fn read_last_seq(path: &Path, tail_bytes: usize) -> Option<u64> {
 #[allow(clippy::exhaustive_structs)]
 pub struct WalEvent {
     /// Sequence number (monotonically increasing within a writer session).
+    /// Numbering restarts at 0 when the WAL file is rotated: each file
+    /// carries its own per-file sequence, so consumers must not assume
+    /// global monotonicity across rotations or in `load_all` output.
     pub seq: u64,
     /// Unix timestamp (seconds) when the event occurred.
     pub ts: u64,
@@ -278,6 +282,19 @@ impl WalWriter {
     ///
     /// Returns [`Error::WalError`](crate::Error::WalError) if the file cannot
     /// be created or opened.
+    ///
+    /// # BLOCKED — cross-process seq collision
+    /// `create()` recovers the next sequence number from the existing
+    /// WAL file (lines 316-335), releases the exclusive lock at
+    /// line 334, and returns. Between lock release and the first
+    /// `append()`, another process can call `create()` on the same
+    /// file and recover the identical base seq. Both writers then
+    /// start with the same `seq`, producing duplicate sequence
+    /// numbers across processes. The lock is held only during seq
+    /// recovery, not during the write phase. Fixing this requires
+    /// holding the lock across the entire create+append lifecycle
+    /// or using a separate seq-lock file. Left BLOCKED pending
+    /// operator design decision.
     pub fn create(path: &Path) -> Result<Self> {
         // Ensure parent directory exists
         if let Some(parent) = path.parent() {
@@ -383,12 +400,18 @@ impl WalWriter {
     ///
     /// Increments the internal sequence counter after a successful write.
     ///
+    /// The caller supplies `event.seq`: append serializes the event as-is
+    /// and never assigns the counter into it. Callers must read
+    /// [`WalWriter::seq`] first and write that value (the executor does
+    /// `let s = wal.seq()` before every append). Passing `seq: 0` by
+    /// convention (as `BundleWriter::append` allows) yields duplicate seq
+    /// lines in a `WalWriter` log.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::WalError`](crate::Error::WalError) on serialization
     /// or I/O failure.
     pub fn append(&mut self, event: WalEvent) -> Result<()> {
-        use std::io::Write;
         let line =
             serde_json::to_string(&event).map_err(|e| crate::Error::WalError(e.to_string()))?;
 
@@ -539,6 +562,8 @@ impl WalReader {
                 let mut combined = file_events;
                 combined.extend(events);
                 events = combined;
+            } else {
+                log::warn!("WAL load_all: cannot read archive {}", rotated.display());
             }
         }
 
@@ -560,9 +585,12 @@ impl WalReader {
         &self.events
     }
 
-    /// Reads only the last `n` lines from the WAL file.
+    /// Reads the last `n` parseable events from the WAL file.
     ///
-    /// More efficient than [`WalReader::load`] when only recent events are needed.
+    /// Streams the whole file line-by-line and retains the last `n`
+    /// parseable events (I/O is the full file; only retention is
+    /// bounded). More efficient than [`WalReader::load`] in memory,
+    /// not in I/O, when only recent events are needed.
     /// Malformed lines are silently skipped.
     ///
     /// # Errors
@@ -575,7 +603,7 @@ impl WalReader {
         let file = std::fs::File::open(path).map_err(|e| crate::Error::WalError(e.to_string()))?;
         let reader = BufReader::new(file);
 
-        let mut window: VecDeque<WalEvent> = VecDeque::with_capacity(n + 1);
+        let mut window: VecDeque<WalEvent> = VecDeque::with_capacity(n.saturating_add(1));
         for line in reader.lines() {
             let line = line.map_err(|e| crate::Error::WalError(e.to_string()))?;
             if let Ok(event) = serde_json::from_str(&line) {
@@ -621,7 +649,7 @@ impl WalWriter {
     /// P1 FIX: Acquires exclusive lock to prevent concurrent append loss during rotation.
     ///
     /// # Errors
-    /// Returns `IoError` or `BackupError` if WAL file operations fail.
+    /// Returns `WalError` if WAL file operations fail.
     pub fn rotate(path: &Path, max_size_bytes: u64, max_rotations: usize) -> Result<()> {
         let Ok(metadata) = std::fs::metadata(path) else {
             return Ok(()); // No WAL to rotate
@@ -687,7 +715,7 @@ impl WalWriter {
     /// * `Ok(usize)` - Number of entries removed
     ///
     /// # Errors
-    /// Returns `IoError` if the WAL file cannot be read, the temp file cannot
+    /// Returns `WalError` if the WAL file cannot be read, the temp file cannot
     /// be written, or the atomic rename fails.
     pub fn cleanup(path: &Path, max_age_secs: u64) -> Result<usize> {
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -750,7 +778,9 @@ impl WalWriter {
     }
 }
 
-/// Truncates a string to at most `max_bytes` bytes, respecting UTF-8 boundaries.
+/// Truncates a string to at most `max_bytes` bytes of content plus the
+/// 14-byte `...[truncated]` marker (so at most `max_bytes + 14` bytes
+/// total), respecting UTF-8 boundaries.
 ///
 /// Used to bound command output stored in WAL events. 1KB is sufficient
 /// for error messages and pattern analysis while preventing WAL bloat.

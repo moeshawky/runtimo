@@ -122,6 +122,27 @@ impl TypedCapability for Undo {
                     )));
                 }
             }
+        } else {
+            // Fallback when WAL is unavailable: map each backup to a /tmp
+            // target of the same file name. Downstream restore re-validates
+            // every target against allowed prefixes, so this guess is
+            // fail-closed (usable only when the original really was in /tmp).
+            if let Ok(entries) = std::fs::read_dir(&job_backup_dir) {
+                for entry in entries.flatten() {
+                    let backup_path = entry.path();
+                    if backup_path.is_file() {
+                        if let Some(backup_name) = backup_path
+                            .file_name()
+                            .map(|f| f.to_string_lossy().into_owned())
+                        {
+                            original_paths.insert(
+                                backup_path.to_string_lossy().to_string(),
+                                format!("/tmp/{}", backup_name),
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         // Restore files in the job's backup directory

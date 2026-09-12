@@ -288,12 +288,11 @@ impl OutOfProcessSampler {
     // u64 monotonic counters; bounded channel cap prevents overflow.
     fn try_remote_read(&mut self) -> SampleEvent {
         let mono = u64::try_from(self.base.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        let wall = u64::try_from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos()),
-        )
-        .unwrap_or(u64::MAX);
+        let wall = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(u64::MAX, |d| {
+                u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+            });
         // SAFETY: SystemTime duration is always non-negative and fits in u64;
         // unwrap_or(u64::MAX) is a defensive fallback for the impossible overflow case.
         let seq = self.next_seq;
@@ -453,12 +452,11 @@ impl StackSampler for OutOfProcessSampler {
         let mut out: Vec<SampleEvent> = self.queue.drain(..).collect();
         if self.dropped > 0 {
             let mono = u64::try_from(self.base.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            let wall = u64::try_from(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_nanos()),
-            )
-            .unwrap_or(u64::MAX);
+            let wall = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(u64::MAX, |d| {
+                    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+                });
             // SAFETY: SystemTime duration is always non-negative and fits in u64;
             // unwrap_or(u64::MAX) is a defensive fallback for the impossible overflow case.
             let marker = SampleEvent {
@@ -601,13 +599,22 @@ mod tests {
         let src = include_str!("sampler.rs");
         // Guard: no LD_PRELOAD injection and no ptrace attach with stop >1ms in code.
         // Docs mention these as forbidden, so allow doc occurrences.
+        // Filter out comment lines to count code-region occurrences only.
+        let code_lines: Vec<&str> = src
+            .lines()
+            .filter(|l| {
+                let trimmed = l.trim();
+                !trimmed.starts_with("//") && !trimmed.starts_with("//!")
+            })
+            .collect();
+        let code_src = code_lines.join("\n");
         let needle_preload = format!("{}{}", "LD", "_PRELOAD");
-        let count_preload = src.matches(&needle_preload).count();
+        let count_preload = code_src.matches(&needle_preload).count();
         assert!(
             count_preload <= 6,
             "LD_PRELOAD mentions should be doc-only (forbidden in code), got {count_preload}"
         );
-        let ptrace_uses = src.matches("ptrace").count();
+        let ptrace_uses = code_src.matches("ptrace").count();
         assert!(
             ptrace_uses <= 12,
             "ptrace mentions should be doc-only, got {ptrace_uses}"

@@ -68,6 +68,7 @@
     )
 )]
 
+/// Undo support via pre-mutation file backups.
 pub mod backup;
 /// Pluggable capability implementations (file I/O, shell, git, etc.).
 pub mod capabilities;
@@ -124,6 +125,11 @@ pub use wal::{WalEvent, WalEventType, WalReader, WalWriter};
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// Invalid job state transition attempted.
+    ///
+    /// Reserved typed channel for state-machine errors. [`Job::transition_to`]
+    /// currently reports transition failures as formatted strings for
+    /// backwards compatibility; this variant is constructed by future
+    /// callers that need structured `from`/`to` data.
     #[error("Invalid job state transition: {from:?} -> {to:?}")]
     InvalidTransition { from: JobState, to: JobState },
 

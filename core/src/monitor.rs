@@ -29,7 +29,7 @@ use crate::processes::ProcessSnapshot;
 use crate::telemetry::Telemetry;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
@@ -126,8 +126,8 @@ pub struct HealthMonitor {
     state: Arc<RwLock<HealthState>>,
     /// Stop flag for background thread.
     stop_flag: Arc<AtomicBool>,
-    /// Background thread handle.
-    _thread: thread::JoinHandle<()>,
+    /// Background thread handle, wrapped for safe access from `&self`.
+    thread_handle: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
     /// Alert history (last 100 alerts).
     alerts: Arc<RwLock<Vec<HealthAlert>>>,
 }
@@ -135,6 +135,13 @@ pub struct HealthMonitor {
 impl Drop for HealthMonitor {
     fn drop(&mut self) {
         self.stop_flag.store(true, Ordering::Relaxed);
+        // Join the background thread so panics are observed
+        // and shutdown is deterministic.
+        if let Ok(mut guard) = self.thread_handle.lock() {
+            if let Some(handle) = guard.take() {
+                let _ = handle.join();
+            }
+        }
     }
 }
 
@@ -159,10 +166,12 @@ impl HealthMonitor {
         let state = Arc::new(RwLock::new(HealthState::default()));
         let alerts = Arc::new(RwLock::new(Vec::new()));
         let stop_flag = Arc::new(AtomicBool::new(false));
+        let thread_handle: Arc<Mutex<Option<thread::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
 
         let state_clone = Arc::clone(&state);
         let alerts_clone = Arc::clone(&alerts);
         let stop_flag_clone = Arc::clone(&stop_flag);
+        let thread_handle_clone = Arc::clone(&thread_handle);
 
         let handle = thread::spawn(move || {
             while !stop_flag_clone.load(Ordering::Relaxed) {
@@ -245,10 +254,14 @@ impl HealthMonitor {
             }
         });
 
+        *thread_handle_clone
+            .lock()
+            .map_err(|e| format!("monitor thread handle lock poisoned: {}", e))? = Some(handle);
+
         Ok(Self {
             state,
             stop_flag,
-            _thread: handle,
+            thread_handle,
             alerts,
         })
     }
@@ -268,9 +281,15 @@ impl HealthMonitor {
             .clone()
     }
 
-    /// Stops the background monitoring thread.
+    /// Stops the background monitoring thread and waits for it
+    /// to finish.
     pub fn stop(&self) {
         self.stop_flag.store(true, Ordering::Relaxed);
+        if let Ok(mut guard) = self.thread_handle.lock() {
+            if let Some(handle) = guard.take() {
+                let _ = handle.join();
+            }
+        }
     }
 
     /// Returns whether the stop flag is clear.
@@ -319,9 +338,14 @@ fn parse_ram_percent(ram_total: &str, ram_available: &str) -> f32 {
     }
 }
 
-/// Parses a size string (e.g., "13Gi", "512Mi", "16384MB") into a numeric value in GB.
+/// Parses a size string (e.g., "13Gi", "512Mi", "16384MB") into a numeric value
+/// in GiB-equivalent bytes divided by 1024^3.
 ///
-/// Note: Gi and GB tiers use same divisor (/1); binary (MiB/GB) and decimal (KiB/GB) magnitudes are conflated.
+/// All suffixes are first converted to bytes, then divided by a fixed
+/// 1024^3 base so that binary (Gi/Mi/Ki) and decimal (GB/MB) suffixes
+/// are not conflated. For example, "1Gi" parses to 1.0 and "1GB" parses
+/// to approximately 0.931 (10^9 / 1024^3), correctly distinguishing the
+/// two bases.
 ///
 /// # Input
 ///
@@ -329,35 +353,24 @@ fn parse_ram_percent(ram_total: &str, ram_available: &str) -> f32 {
 ///
 /// # Output
 ///
-/// `Some(f32)` — Parsed value in GB.
+/// `Some(f32)` — Parsed value in GiB-equivalent units.
 /// `None` — Unrecognized suffix or non-numeric prefix (e.g. empty string, "invalid").
 fn parse_size_value(size_str: &str) -> Option<f32> {
     let size_str = size_str.trim();
-    if size_str.ends_with("Gi") {
-        size_str.trim_end_matches("Gi").parse().ok()
+    let bytes = if size_str.ends_with("Gi") {
+        size_str.trim_end_matches("Gi").parse::<f32>().ok()? * 1024.0 * 1024.0 * 1024.0
     } else if size_str.ends_with("Mi") {
-        size_str
-            .trim_end_matches("Mi")
-            .parse::<f32>()
-            .ok()
-            .map(|v| v / 1024.0)
+        size_str.trim_end_matches("Mi").parse::<f32>().ok()? * 1024.0 * 1024.0
     } else if size_str.ends_with("Ki") {
-        size_str
-            .trim_end_matches("Ki")
-            .parse::<f32>()
-            .ok()
-            .map(|v| v / (1024.0 * 1024.0))
-    } else if size_str.ends_with("MB") {
-        size_str
-            .trim_end_matches("MB")
-            .parse::<f32>()
-            .ok()
-            .map(|v| v / 1000.0)
+        size_str.trim_end_matches("Ki").parse::<f32>().ok()? * 1024.0
     } else if size_str.ends_with("GB") {
-        size_str.trim_end_matches("GB").parse::<f32>().ok()
+        size_str.trim_end_matches("GB").parse::<f32>().ok()? * 1000.0 * 1000.0 * 1000.0
+    } else if size_str.ends_with("MB") {
+        size_str.trim_end_matches("MB").parse::<f32>().ok()? * 1000.0 * 1000.0
     } else {
-        None
-    }
+        return None;
+    };
+    Some(bytes / (1024.0 * 1024.0 * 1024.0))
 }
 
 /// Adds an alert to the alert history (max 100 alerts).

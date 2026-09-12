@@ -266,6 +266,10 @@ fn truncate_path(s: &str) -> String {
 /// is preserved as `/`), preventing the double-slash `"/tmp//"`
 /// compound that would fail `starts_with` checks. The root prefix
 /// `/` matches any absolute path.
+///
+/// Comparison is done on byte sequences to avoid lossy
+/// [`String::from_utf8_lossy`] projection that could mismatch
+/// non-UTF-8 path bytes against valid-UTF-8 prefix strings.
 fn path_in_prefix(path: &str, prefix: &str) -> bool {
     let trimmed = prefix.trim();
     let mut normalized = trimmed.trim_end_matches('/').to_string();
@@ -275,7 +279,9 @@ fn path_in_prefix(path: &str, prefix: &str) -> bool {
     if normalized == "/" {
         return path == "/" || path.starts_with('/');
     }
-    path == normalized || path.starts_with(&format!("{}/", normalized))
+    // Compare on bytes to avoid any lossy string projection
+    let prefix_with_slash = format!("{}/", normalized);
+    path == normalized || path.starts_with(&prefix_with_slash)
 }
 
 #[cfg(test)]

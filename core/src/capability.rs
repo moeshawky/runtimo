@@ -508,9 +508,15 @@ impl CapabilityRegistry {
     /// Registers a capability in the registry.
     ///
     /// The capability is stored under its [`Capability::name`]. If a capability
-    /// with the same name already exists, it is replaced.
+    /// with the same name already exists, it is replaced. Case-insensitive
+    /// duplicates (e.g. "ShellExec" and "shellexec") are also replaced —
+    /// the later registration wins, ensuring deterministic lookup.
     pub fn register<C: Capability + 'static>(&mut self, capability: C) {
         let name = capability.name().to_string();
+        let name_lower = name.to_lowercase();
+        // Remove any existing entry whose name matches case-insensitively
+        self.capabilities
+            .retain(|_, v| v.name().to_lowercase() != name_lower);
         self.capabilities.insert(name, Box::new(capability));
     }
 
@@ -596,6 +602,24 @@ mod tests {
             "Should still find capability after duplicate registration"
         );
         assert_eq!(cap.unwrap().name(), "Beta");
+    }
+
+    #[test]
+    fn test_registry_case_insensitive_replace() {
+        let mut reg = CapabilityRegistry::new();
+        reg.register(TestCap { name: "ShellExec" });
+        reg.register(TestCap { name: "shellexec" }); // case-variant replaces
+
+        let cap = reg.get("ShellExec");
+        assert!(
+            cap.is_some(),
+            "Should find capability after case-variant registration"
+        );
+        assert_eq!(
+            cap.unwrap().name(),
+            "shellexec",
+            "Later registration wins case-insensitively"
+        );
     }
 
     #[test]
