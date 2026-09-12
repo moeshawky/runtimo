@@ -1,0 +1,33 @@
+# ixd watch/index scope for runtimo.
+#
+# Purpose: keep filesystem-event churn out of the trigram index. Without
+# this file the daemon falls back to built-in defaults that exclude only
+# .codegraph/.git/node_modules/target (ix src/lib/config.rs:81-86), so
+# metadata writes (.annotations rewrites, agent drops, pipeline outputs)
+# all become index work — including the known annotation rewrite/poll
+# feedback loop documented in codegraph-ferrari sync_watch.py:226-231.
+#
+# Matching semantics (ix src/lib/builder.rs:156-180, watcher.rs:90-115):
+# patterns are EXACT directory/file names (p == name). Globs are NOT
+# supported — "*.zip" would never equal a real name (and .zip is already
+# skipped by the binary-extension rule). Only exact names take effect.
+#
+# Effect: applies on daemon (re)load. Does NOT move the codegraph
+# convergence label — that advances only via commit + sync(once).
+
+exclude_patterns = [
+  ".annotations",
+  ".opencode",
+  ".ix",
+  ".codegraph",
+  ".git",
+  "node_modules",
+  "target",
+  "telebox",
+]
+
+# 2000 ms batching window (default 500, range 50-10000). This repo's writes
+# come in agent-driven bursts (annotation passes rewriting dozens of YAMLs);
+# a wider window trades ~2 s of searchability lag for far fewer rebuilds
+# during bursty writes. Revert to 500 if interactive feedback feels slow.
+debounce_ms = 2000
