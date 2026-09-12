@@ -32,7 +32,7 @@
 
 use crate::Result;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A session groups related jobs for audit and recovery.
@@ -85,6 +85,91 @@ pub enum SessionStatus {
 #[allow(clippy::exhaustive_structs)]
 pub struct SessionManager {
     sessions_dir: PathBuf,
+}
+
+/// File lock for session operations, reusing the `flock` pattern from [`WalWriter`].
+///
+/// On unix, acquires `LOCK_EX` via `libc::flock`. On non-unix, this is a no-op.
+/// The lock is released when the `FileLock` is dropped.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let lock = FileLock::lock(&sessions_dir, "my-session")?;
+/// // ... session operations ...
+/// // lock is released when `lock` goes out of scope
+/// ```
+#[allow(clippy::exhaustive_structs)]
+pub struct FileLock {
+    file: std::fs::File,
+}
+
+impl FileLock {
+    /// Acquires an exclusive lock on `<sessions_dir>/<session_id>.lock`.
+    ///
+    /// Validates `session_id` to prevent path traversal before constructing
+    /// the lock file path.
+    ///
+    /// # Errors
+    /// Returns `SessionError` if the lock file cannot be created or locked.
+    pub fn lock(sessions_dir: &Path, session_id: &str) -> Result<Self> {
+        if session_id.is_empty()
+            || session_id.contains('/')
+            || session_id.contains('\\')
+            || session_id.contains('\0')
+            || session_id.contains("..")
+        {
+            return Err(crate::Error::SessionError(format!(
+                "Invalid session ID '{}': must be non-empty without '/', '\\', NUL, or '..'",
+                session_id
+            )));
+        }
+        let lock_path = sessions_dir.join(format!("{}.lock", session_id));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| crate::Error::SessionError(format!("Failed to open lock file: {}", e)))?;
+        Self::lock_file(&file)?;
+        Ok(Self { file })
+    }
+
+    /// Acquires an exclusive file lock (FINDING #14).
+    #[cfg(unix)]
+    fn lock_file(file: &std::fs::File) -> Result<()> {
+        use std::os::unix::io::AsRawFd;
+        let fd = file.as_raw_fd();
+        // SAFETY: fd is a valid open file descriptor; flock(2) with LOCK_EX
+        // is a well-defined POSIX operation for acquiring an exclusive lock.
+        let result = unsafe { libc::flock(fd, libc::LOCK_EX) };
+        if result != 0 {
+            return Err(crate::Error::SessionError(format!(
+                "Failed to acquire session lock: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Acquires an exclusive file lock (no-op on non-unix).
+    #[cfg(not(unix))]
+    fn lock_file(_file: &std::fs::File) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = self.file.as_raw_fd();
+            // SAFETY: fd is a valid open file descriptor; flock(2) with LOCK_UN
+            // is a well-defined POSIX operation for releasing a lock.
+            unsafe { libc::flock(fd, libc::LOCK_UN) };
+        }
+    }
 }
 
 impl SessionManager {
@@ -145,15 +230,13 @@ impl SessionManager {
     /// `/`, `\`, a NUL byte, or `..`), if the session cannot be loaded, or
     /// if the session cannot be saved.
     ///
-    /// # BLOCKED — cross-process race
-    /// `add_job` performs a read-modify-write cycle (`load_session` →
-    /// push `job_id` → `save_session`) without any file locking. Two
-    /// processes can load the same session concurrently, both push a
-    /// job, and one `save_session` overwrites the other's change.
-    /// Fixing this requires either a file lock held across the entire
-    /// read-modify-write cycle, or an append-only journal design.
-    /// This is left BLOCKED pending operator design decision.
+    /// The entire read-modify-write cycle is protected by an exclusive
+    /// file lock on `<sessions_dir>/<session_id>.lock`, preventing
+    /// concurrent processes from losing updates. The lock is held from
+    /// `load_session` through `save_session` and released when this
+    /// method returns (or panics).
     pub fn add_job(&mut self, session_id: &str, job_id: &str) -> Result<()> {
+        let _lock = FileLock::lock(&self.sessions_dir, session_id)?;
         let mut session = self.load_session(session_id)?;
         session.job_ids.push(job_id.to_string());
         session.updated_at = SystemTime::now()
@@ -350,6 +433,53 @@ mod tests {
                 id
             );
         }
+    }
+
+    #[test]
+    fn test_add_job_concurrent() {
+        let dir = tmp_dir("concurrent");
+        let mut mgr = SessionManager::new(dir.clone()).unwrap();
+        let session = mgr.create_session(None).unwrap();
+        let session_id = session.id;
+        drop(mgr);
+
+        let dir1 = dir.clone();
+        let dir2 = dir.clone();
+        let id1 = session_id.clone();
+        let id2 = session_id.clone();
+
+        let handle1 = std::thread::spawn(move || {
+            let mut mgr = SessionManager::new(dir1).unwrap();
+            mgr.add_job(&id1, "job-1").unwrap();
+        });
+        let handle2 = std::thread::spawn(move || {
+            let mut mgr = SessionManager::new(dir2).unwrap();
+            mgr.add_job(&id2, "job-2").unwrap();
+        });
+
+        handle1.join().unwrap();
+        handle2.join().unwrap();
+
+        let mgr = SessionManager::new(dir).unwrap();
+        let loaded = mgr.load_session(&session_id).unwrap();
+        assert_eq!(loaded.job_ids.len(), 2, "both jobs should be present");
+        assert!(loaded.job_ids.contains(&"job-1".to_string()));
+        assert!(loaded.job_ids.contains(&"job-2".to_string()));
+    }
+
+    #[test]
+    fn test_lock_release() {
+        let dir = tmp_dir("lock_release");
+        let mut mgr = SessionManager::new(dir.clone()).unwrap();
+        let session = mgr.create_session(None).unwrap();
+        let session_id = session.id;
+
+        {
+            let _lock = FileLock::lock(&dir, &session_id).unwrap();
+            assert!(mgr.load_session(&session_id).is_ok());
+        }
+        // Lock released after `_lock` is dropped — should be able to re-acquire
+        let _lock2 = FileLock::lock(&dir, &session_id).unwrap();
     }
 
     #[test]

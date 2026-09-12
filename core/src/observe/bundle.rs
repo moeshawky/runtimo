@@ -138,6 +138,7 @@ impl BundleWriter {
             content
                 .lines()
                 .filter_map(|l| serde_json::from_str::<WalEvent>(l).ok())
+                .filter(|e| e.event_type != WalEventType::WriterInitialized)
                 .map(|e| e.seq)
                 .max()
                 .map_or(0, |m| m + 1)
@@ -201,6 +202,7 @@ impl BundleWriter {
             content
                 .lines()
                 .filter_map(|l| serde_json::from_str::<WalEvent>(l).ok())
+                .filter(|e| e.event_type != WalEventType::WriterInitialized)
                 .map(|e| e.seq)
                 .max()
                 .map_or(0, |m| m + 1)
@@ -566,7 +568,8 @@ fn verify_bundle_inner(path: &Path) -> VerifyReport {
     let mut structurally_parseable = true;
     for line in content.lines().filter(|l| !l.trim().is_empty()) {
         match serde_json::from_str::<WalEvent>(line) {
-            Ok(ev) => events.push(ev),
+            Ok(ev) if ev.event_type != WalEventType::WriterInitialized => events.push(ev),
+            Ok(_) => {} // skip WriterInitialized marker
             Err(_) => {
                 structurally_parseable = false;
             }
@@ -752,7 +755,13 @@ mod tests {
         }
         w.finalize().unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
-        let lines: Vec<&str> = content.lines().collect();
+        let lines: Vec<&str> = content
+            .lines()
+            .filter(|l| {
+                serde_json::from_str::<WalEvent>(l)
+                    .map_or(true, |e| e.event_type != WalEventType::WriterInitialized)
+            })
+            .collect();
         assert_eq!(lines.len(), 10);
         for line in &lines {
             let ev: WalEvent = serde_json::from_str(line).unwrap();
@@ -798,7 +807,8 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         let events: Vec<WalEvent> = content
             .lines()
-            .filter_map(|l| serde_json::from_str(l).ok())
+            .filter_map(|l| serde_json::from_str::<WalEvent>(l).ok())
+            .filter(|e| e.event_type != WalEventType::WriterInitialized)
             .collect();
         // Last event should be TRUNCATED marker
         assert_eq!(
@@ -927,7 +937,16 @@ mod tests {
         w.flush_batch().unwrap();
         let mono_first = {
             let content = std::fs::read_to_string(&path).unwrap();
-            let ev: WalEvent = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+            let ev: WalEvent = serde_json::from_str(
+                content
+                    .lines()
+                    .find(|l| {
+                        serde_json::from_str::<WalEvent>(l)
+                            .map_or(true, |e| e.event_type != WalEventType::WriterInitialized)
+                    })
+                    .unwrap(),
+            )
+            .unwrap();
             ev.mono_ns.unwrap()
         };
         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -941,7 +960,17 @@ mod tests {
         w.flush_batch().unwrap();
         let mono_second = {
             let content = std::fs::read_to_string(&path).unwrap();
-            let ev: WalEvent = serde_json::from_str(content.lines().nth(1).unwrap()).unwrap();
+            let ev: WalEvent = serde_json::from_str(
+                content
+                    .lines()
+                    .filter(|l| {
+                        serde_json::from_str::<WalEvent>(l)
+                            .map_or(true, |e| e.event_type != WalEventType::WriterInitialized)
+                    })
+                    .nth(1)
+                    .unwrap(),
+            )
+            .unwrap();
             ev.mono_ns.unwrap()
         };
         assert!(

@@ -118,7 +118,7 @@ const MAX_STDIN_BYTES: usize = 1024 * 1024;
 /// GAP-07: This is prefix/suffix-based, not regex. Pattern variants
 /// like `MYPRIVATEKEY` (no underscore) are not caught.
 const SENSITIVE_ENV_PREFIXES: &[&str] = &[
-    "RUSTIMO_",
+    "RUNTIMO_",
     "AWS_",
     "GITHUB_",
     "GITLAB_",

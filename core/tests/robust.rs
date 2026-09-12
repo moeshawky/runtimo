@@ -1098,7 +1098,7 @@ fn t_layergap_wal_boundary_structural_integrity() {
 
     let e = &events[0];
     // T-LAYERGAP: verify all field groups are present
-    assert_eq!(e.seq, 0, "seq must be 0");
+    assert_eq!(e.seq, 1, "seq must be 1");
     assert!(e.ts > 0, "timestamp must be populated");
     assert_eq!(e.job_id, "layer-j-1");
     assert_eq!(e.event_type, WalEventType::JobCompleted);
@@ -1173,7 +1173,9 @@ fn g_drift_wal_event_json_schema_stability() {
     }
 
     let raw = std::fs::read_to_string(&wp).expect("read raw WAL");
-    let parsed: serde_json::Value = serde_json::from_str(raw.trim()).expect("parse WAL line");
+    // Skip the WriterInitialized marker line (first line) and parse the event
+    let event_line = raw.lines().last().expect("event line");
+    let parsed: serde_json::Value = serde_json::from_str(event_line).expect("parse WAL line");
 
     // Golden schema: every field must exist with expected type
     assert!(

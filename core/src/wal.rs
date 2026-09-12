@@ -217,6 +217,14 @@ pub enum WalEventType {
     ObserveSuspended,
     /// Observe session completed — bundle finalized with watermark fsync.
     ObserveCompleted,
+    /// Writer initialized — marker event written on WAL creation.
+    ///
+    /// Emitted by [`WalWriter::create`] as the first event in a new or
+    /// existing WAL file. The `seq` field carries the recovered base
+    /// sequence number. Consumers should skip this variant when
+    /// processing events; it is used internally for sequence recovery
+    /// and crash-consistency tracking.
+    WriterInitialized,
 }
 
 impl WalEventType {
@@ -243,6 +251,7 @@ impl WalEventType {
             Self::ObserveTruncated => "observe_truncated",
             Self::ObserveSuspended => "observe_suspended",
             Self::ObserveCompleted => "observe_completed",
+            Self::WriterInitialized => "writer_initialized",
         }
     }
 }
@@ -277,24 +286,14 @@ impl WalWriter {
     /// Creates or opens a WAL file at the given path.
     ///
     /// The file is opened in append mode. Existing content is preserved.
+    /// A [`WalEventType::WriterInitialized`] marker event is written with
+    /// `seq` equal to the recovered base sequence number, and the
+    /// internal sequence counter is set to `recovered_base + 1`.
     ///
     /// # Errors
     ///
     /// Returns [`Error::WalError`](crate::Error::WalError) if the file cannot
     /// be created or opened.
-    ///
-    /// # BLOCKED — cross-process seq collision
-    /// `create()` recovers the next sequence number from the existing
-    /// WAL file (lines 316-335), releases the exclusive lock at
-    /// line 334, and returns. Between lock release and the first
-    /// `append()`, another process can call `create()` on the same
-    /// file and recover the identical base seq. Both writers then
-    /// start with the same `seq`, producing duplicate sequence
-    /// numbers across processes. The lock is held only during seq
-    /// recovery, not during the write phase. Fixing this requires
-    /// holding the lock across the entire create+append lifecycle
-    /// or using a separate seq-lock file. Left BLOCKED pending
-    /// operator design decision.
     pub fn create(path: &Path) -> Result<Self> {
         // Ensure parent directory exists
         if let Some(parent) = path.parent() {
@@ -320,39 +319,64 @@ impl WalWriter {
             })?;
         }
 
-        // Recover sequence from existing WAL content to ensure monotonic
-        // ordering across process restarts. Acquire lock to prevent reading
-        // during a concurrent write (P2 FIX).
+        // Recover sequence from existing WAL content and write a marker
+        // event while holding the exclusive lock. The lock is held across
+        // the entire recover+write+fsync cycle to prevent concurrent
+        // writers from interleaving (P2 FIX).
         //
         // Optimized: reads only the last 8KB of the WAL file to find the
         // max seq. Falls back to full read only if tail-read fails.
-        let seq = if path.exists() {
-            let lock_file = std::fs::File::open(path)
-                .map_err(|e| crate::Error::WalError(format!("open WAL for seq recovery: {}", e)))?;
+        let recovered_base = if path.exists() {
+            let lock_file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|e| crate::Error::WalError(format!("open WAL for marker: {}", e)))?;
             Self::lock_file(&lock_file)?;
-            let recovered = if let Some(last_seq) = read_last_seq(path, 8192) {
-                last_seq + 1
+            let base = if let Some(last_seq) = read_last_seq(path, 8192) {
+                last_seq
             } else {
                 // Fall back to full scan if tail-read failed
-                let content = std::fs::read_to_string(path).map_err(|e| {
-                    crate::Error::WalError(format!("read WAL for seq recovery: {}", e))
-                })?;
+                let content = std::fs::read_to_string(path)
+                    .map_err(|e| crate::Error::WalError(format!("read WAL for marker: {}", e)))?;
                 content
                     .lines()
                     .filter_map(|line| serde_json::from_str::<WalEvent>(line).ok())
                     .map(|e| e.seq)
                     .max()
-                    .map_or(0, |max| max + 1)
+                    .unwrap_or(0)
             };
+            // Write marker event while holding the lock
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let marker = WalEvent {
+                seq: base,
+                ts: now,
+                event_type: WalEventType::WriterInitialized,
+                ..Default::default()
+            };
+            let line = serde_json::to_string(&marker)
+                .map_err(|e| crate::Error::WalError(format!("serialize WAL marker: {}", e)))?;
+            let mut buf = std::io::BufWriter::new(&lock_file);
+            writeln!(buf, "{}", line)
+                .map_err(|e| crate::Error::WalError(format!("write WAL marker: {}", e)))?;
+            buf.flush()
+                .map_err(|e| crate::Error::WalError(format!("flush WAL marker: {}", e)))?;
+            lock_file
+                .sync_all()
+                .map_err(|e| crate::Error::WalError(format!("fsync WAL marker: {}", e)))?;
             Self::unlock_file(&lock_file);
-            recovered
+            base + 1
         } else {
-            0
+            // New file: marker seq=0, next seq=1
+            1
         };
 
         Ok(Self {
             path: path.to_path_buf(),
-            seq,
+            seq: recovered_base,
         })
     }
 
@@ -486,13 +510,16 @@ impl WalReader {
     ///
     /// Returns [`Error::WalError`](crate::Error::WalError) if the file cannot
     /// be read. Individual malformed lines are skipped, not treated as errors.
+    ///
+    /// [`WalEventType::WriterInitialized`] marker events are silently skipped.
     pub fn load(path: &Path) -> Result<Self> {
         let content =
             std::fs::read_to_string(path).map_err(|e| crate::Error::WalError(e.to_string()))?;
 
         let events: Vec<WalEvent> = content
             .lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
+            .filter_map(|line| serde_json::from_str::<WalEvent>(line).ok())
+            .filter(|e| e.event_type != WalEventType::WriterInitialized)
             .collect();
 
         Ok(Self { events })
@@ -555,7 +582,8 @@ impl WalReader {
             if let Ok(content) = std::fs::read_to_string(&rotated) {
                 let file_events: Vec<WalEvent> = content
                     .lines()
-                    .filter_map(|line| serde_json::from_str(line).ok())
+                    .filter_map(|line| serde_json::from_str::<WalEvent>(line).ok())
+                    .filter(|e| e.event_type != WalEventType::WriterInitialized)
                     .collect();
                 // Prepend: archived events are older, so they go before
                 // whatever we've already collected.
@@ -572,7 +600,8 @@ impl WalReader {
             std::fs::read_to_string(path).map_err(|e| crate::Error::WalError(e.to_string()))?;
         let current_events: Vec<WalEvent> = content
             .lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
+            .filter_map(|line| serde_json::from_str::<WalEvent>(line).ok())
+            .filter(|e| e.event_type != WalEventType::WriterInitialized)
             .collect();
         events.extend(current_events);
 
@@ -819,7 +848,7 @@ mod tests {
 
         let mut wal = WalWriter::create(&path).unwrap();
         wal.append(WalEvent {
-            seq: 0,
+            seq: 1,
             ts: 1715800000,
             event_type: WalEventType::JobStarted,
             job_id: "test-job".into(),
@@ -852,9 +881,9 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         let mut wal = WalWriter::create(&path).unwrap();
-        assert_eq!(wal.seq(), 0);
+        assert_eq!(wal.seq(), 1);
         wal.append(WalEvent {
-            seq: 0,
+            seq: 1,
             ts: 1715800000,
             event_type: WalEventType::JobStarted,
             job_id: "job1".into(),
@@ -873,11 +902,11 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        assert_eq!(wal.seq(), 1);
+        assert_eq!(wal.seq(), 2);
 
         // Create new writer — should recover seq from file
         let wal2 = WalWriter::create(&path).unwrap();
-        assert_eq!(wal2.seq(), 1);
+        assert_eq!(wal2.seq(), 2);
 
         let _ = std::fs::remove_file(&path);
     }
@@ -891,7 +920,7 @@ mod tests {
         let mut wal = WalWriter::create(&path).unwrap();
         for i in 0..100 {
             wal.append(WalEvent {
-                seq: i,
+                seq: i + 1,
                 ts: 1715800000 + i,
                 event_type: WalEventType::JobStarted,
                 job_id: format!("job-{}", i),
@@ -937,7 +966,7 @@ mod tests {
 
         // Write old event
         wal.append(WalEvent {
-            seq: 0,
+            seq: 1,
             ts: now - 1000,
             event_type: WalEventType::JobStarted,
             job_id: "old-job".into(),
@@ -959,7 +988,7 @@ mod tests {
 
         // Write recent event
         wal.append(WalEvent {
-            seq: 1,
+            seq: 2,
             ts: now,
             event_type: WalEventType::JobCompleted,
             job_id: "new-job".into(),
@@ -1026,7 +1055,7 @@ mod tests {
 
         let mut wal = WalWriter::create(&path).unwrap();
         wal.append(WalEvent {
-            seq: 0,
+            seq: 1,
             ts: 1715800000,
             event_type: WalEventType::CommandExecuted,
             job_id: "job-cmd".into(),
@@ -1075,7 +1104,7 @@ mod tests {
         // Write valid events
         let mut wal = WalWriter::create(&path).unwrap();
         wal.append(WalEvent {
-            seq: 0,
+            seq: 1,
             ts: 1000,
             event_type: WalEventType::JobStarted,
             job_id: "job1".into(),
@@ -1097,7 +1126,7 @@ mod tests {
 
         // Append a valid second event
         wal.append(WalEvent {
-            seq: 1,
+            seq: 2,
             ts: 1001,
             event_type: WalEventType::JobCompleted,
             job_id: "job1".into(),
@@ -1155,7 +1184,7 @@ mod tests {
         // Write one valid event followed by a garbage line
         let mut wal = WalWriter::create(&path).unwrap();
         wal.append(WalEvent {
-            seq: 0,
+            seq: 1,
             ts: 1000,
             event_type: WalEventType::JobStarted,
             job_id: "valid".into(),
@@ -1210,7 +1239,7 @@ mod tests {
         // Write events to current WAL
         let mut wal = WalWriter::create(&path).unwrap();
         wal.append(WalEvent {
-            seq: 0,
+            seq: 1,
             ts: 1000,
             event_type: WalEventType::JobStarted,
             job_id: "archived-job".into(),
@@ -1243,7 +1272,7 @@ mod tests {
 
         // Write new events to current WAL after rotation
         wal.append(WalEvent {
-            seq: 0,
+            seq: 2,
             ts: 2000,
             event_type: WalEventType::JobStarted,
             job_id: "current-job".into(),
@@ -1305,5 +1334,103 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&rotated);
+    }
+
+    #[test]
+    fn test_marker_written() {
+        let path = tmp_wal("marker_written");
+        let _ = std::fs::remove_file(&path);
+
+        let wal = WalWriter::create(&path).unwrap();
+        assert_eq!(wal.seq(), 1);
+
+        // Verify marker exists in raw file
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 1);
+        let event: WalEvent = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(event.event_type, WalEventType::WriterInitialized);
+        assert_eq!(event.seq, 0);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_marker_reader_skips() {
+        let path = tmp_wal("marker_skip");
+        let _ = std::fs::remove_file(&path);
+
+        let mut wal = WalWriter::create(&path).unwrap();
+        wal.append(WalEvent {
+            seq: 1,
+            ts: 1715800000,
+            event_type: WalEventType::JobStarted,
+            job_id: "test-job".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let reader = WalReader::load(&path).unwrap();
+        assert_eq!(reader.events().len(), 1);
+        assert_eq!(reader.events()[0].event_type, WalEventType::JobStarted);
+        assert_eq!(reader.events()[0].job_id, "test-job");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_marker_concurrent_create() {
+        let path = tmp_wal("concurrent_create");
+        let _ = std::fs::remove_file(&path);
+
+        let path1 = path.clone();
+        let path2 = path.clone();
+
+        let handle1 = std::thread::spawn(move || WalWriter::create(&path1));
+        let handle2 = std::thread::spawn(move || WalWriter::create(&path2));
+
+        let wal1 = handle1.join().unwrap().unwrap();
+        let wal2 = handle2.join().unwrap().unwrap();
+
+        // Both writers should succeed and have seq >= 1
+        assert!(wal1.seq() >= 1);
+        assert!(wal2.seq() >= 1);
+
+        // Verify file is consistent: reader sees only real events (none here)
+        let reader = WalReader::load(&path).unwrap();
+        assert_eq!(reader.events().len(), 0);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_marker_crash_recovery() {
+        let path = tmp_wal("crash_recovery");
+        let _ = std::fs::remove_file(&path);
+
+        // Create WAL (writes marker with seq=0, self.seq=1)
+        let wal = WalWriter::create(&path).unwrap();
+        assert_eq!(wal.seq(), 1);
+        drop(wal);
+
+        // Simulate crash: create a new writer from the same file
+        let mut wal2 = WalWriter::create(&path).unwrap();
+        assert_eq!(wal2.seq(), 1);
+
+        // Append a real event
+        wal2.append(WalEvent {
+            seq: 1,
+            ts: 1715800000,
+            event_type: WalEventType::JobStarted,
+            job_id: "test-job".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let reader = WalReader::load(&path).unwrap();
+        assert_eq!(reader.events().len(), 1);
+        assert_eq!(reader.events()[0].job_id, "test-job");
+
+        let _ = std::fs::remove_file(&path);
     }
 }

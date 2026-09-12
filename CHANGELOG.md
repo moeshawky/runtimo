@@ -370,6 +370,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Annotation bug fixes (f243a4f)** — Closed 20 verified annotation bugs: hardened `session.rs` (atomic temp+fsync+rename, tmp cleanup), `sampler.rs` truncation at UTF-8 boundaries, `config.rs` rejects relative `XDG_CONFIG_HOME`, `job.rs` docs match urandom implementation. Added relative-XDG and hex-ID regression tests; test counts 617→618. (`core/src/config.rs`, `core/src/job.rs`, `core/src/observe/sampler.rs`, `core/src/session.rs`, `core/tests/robust.proptest-regressions`)
+- **Deferred annotation triage (82f6ea3)** — Closed 91 deferred annotation bugs (89 PATCHED/REJECTED with evidence, 2 BLOCKED by design: `add_job` cross-process race needs file-lock design; `wal create` cross-process seq needs marker-event design). Highlights: monitor thread-join + bytes-normalized sizes, telemetry df/nvidia/jax/cloudflared/stat fixes, executor WAL-audit best-effort unification, session serde defaults, capability register dedup, cmd 127/-1 handling, capabilities hardening, sampler wall_ns MAX, wal docs/warn/saturating, llmosafe dead-branch + RSS docs, config nested warnings + wal reporting-only docs. Test counts 618→620. (`core/src/capabilities/`, `core/src/cmd.rs`, `core/src/config.rs`, `core/src/executor.rs`, `core/src/llmosafe.rs`, `core/src/monitor.rs`, `core/src/observe/sampler.rs`, `core/src/processes.rs`, `core/src/session.rs`, `core/src/telemetry.rs`, `core/src/validation/path.rs`, `core/src/wal.rs`)
+- **Watch index scope + debounce (b225b8a)** — Added `.ixd.toml` to exclude metadata dirs (`.annotations`, `.opencode`, `.ix`, `.codegraph`, `.git`, `node_modules`, `target`, `telebox`) from trigram index churn; 2000ms debounce for agent-driven write bursts. Takes effect on daemon reload. (`.ixd.toml`)
+
 ## [0.6.5] - 2026-06-15
 
 ### Security Fixes

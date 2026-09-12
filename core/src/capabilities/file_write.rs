@@ -9,7 +9,6 @@
 //!
 //! ```rust,ignore
 //! use runtimo_core::capabilities::FileWrite;
-//!;
 //! use runtimo_core::capability::{Capability, Context};
 //! use serde_json::json;
 //!

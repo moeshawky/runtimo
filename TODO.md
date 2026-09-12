@@ -87,4 +87,4 @@
 - [ ] "How to add a new capability" runbook
 - [ ] "How to recover from runaway jobs" runbook
 - [ ] Version bump consistency: workspace 0.9.0 but daemon/cli deps pinned ^0.8 — fix Cargo.toml dependency versions
-- [ ] Test count accuracy: README 566 / TODO 401 / CHANGELOG 233 all stale — actual: 39 cli + 397 core-lib + 65 integration + 46 robust + 63 daemon + 7 doctest = 617 total
+- [ ] Test count accuracy: README 566 / TODO 401 / CHANGELOG 233 all stale — actual: 39 cli + 400 core-lib + 65 integration + 46 robust + 63 daemon + 7 doctest = 620 total
