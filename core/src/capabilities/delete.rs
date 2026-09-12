@@ -204,6 +204,8 @@ mod tests {
 
     #[test]
     fn deletes_file_within_allowed_prefix() {
+        let backup_dir = crate::utils::backup_dir();
+        std::fs::create_dir_all(&backup_dir).ok();
         let target = std::env::temp_dir().join("runtimo_del_ok.txt");
         std::fs::write(&target, "stale").unwrap();
         let cap = Delete::new().unwrap();
@@ -226,8 +228,6 @@ mod tests {
                 .is_some(),
             "delete must create a backup for undo"
         );
-
-        std::fs::remove_dir_all(crate::utils::backup_dir()).ok();
     }
 
     #[test]
@@ -243,7 +243,6 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("traversal"));
-        std::fs::remove_dir_all(crate::utils::backup_dir()).ok();
     }
 
     #[test]
@@ -259,7 +258,6 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("blocked"), "got: {}", err);
-        std::fs::remove_dir_all(crate::utils::backup_dir()).ok();
     }
 
     #[test]
@@ -278,7 +276,6 @@ mod tests {
         assert!(
             err.to_string().contains("not found") || err.to_string().contains("does not exist")
         );
-        std::fs::remove_dir_all(crate::utils::backup_dir()).ok();
     }
 
     #[test]
@@ -297,7 +294,6 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("not a file"), "got: {}", err);
         std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(crate::utils::backup_dir()).ok();
     }
 
     #[test]
@@ -316,7 +312,6 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("critical file"), "got: {}", err);
         std::fs::remove_file(&target).ok();
-        std::fs::remove_dir_all(crate::utils::backup_dir()).ok();
     }
 
     #[test]
@@ -340,7 +335,6 @@ mod tests {
         assert!(result.data.as_ref().unwrap()["dry_run"].as_bool().unwrap());
 
         std::fs::remove_file(&target).ok();
-        std::fs::remove_dir_all(crate::utils::backup_dir()).ok();
     }
 
     #[test]
@@ -370,7 +364,5 @@ mod tests {
         assert!(result.data.as_ref().unwrap()["no_backup"]
             .as_bool()
             .unwrap());
-
-        std::fs::remove_dir_all(crate::utils::backup_dir()).ok();
     }
 }

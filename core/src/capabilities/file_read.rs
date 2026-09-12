@@ -78,6 +78,7 @@ impl TypedCapability for FileRead {
         })
     }
 
+    /// FileRead is side-effect-free; context (dry_run etc.) is ignored.
     fn execute(
         &self,
         args: FileReadArgs,
@@ -191,6 +192,9 @@ fn open_file_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> 
 }
 
 #[cfg(not(unix))]
+/// Opens a file without O_NOFOLLOW on non-Unix platforms.
+///
+/// Note: does not use O_NOFOLLOW on non-Unix; symlink swaps between validate and open can redirect reads.
 fn open_file_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     std::fs::File::open(path)
 }

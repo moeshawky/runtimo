@@ -19,6 +19,7 @@
 //! ```
 
 use crate::cmd::run_cmd;
+use log;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 
@@ -70,7 +71,7 @@ pub struct ProcessInfo {
 }
 
 /// Aggregated summary of a process snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[allow(clippy::exhaustive_structs)]
 pub struct ProcessSummary {
     /// Total number of processes.
@@ -92,15 +93,17 @@ impl ProcessSnapshot {
     ///
     /// Results are cached for 30 seconds to avoid re-parsing on
     /// repeated calls within the same execution window.
+    ///
+    /// The cache lock is held across the entire check-capture-write
+    /// cycle so that `clear_cache()` + `capture()` form one atomic
+    /// critical section — preventing a stale write after a clear
+    /// (the split-lock TOCTOU bug).
     pub fn capture() -> Self {
+        let mut cache = PROCESS_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         let now = std::time::Instant::now();
-        {
-            // Handle poison error by recovering from the poisoned state
-            let cache = PROCESS_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some((cached, instant)) = cache.as_ref() {
-                if now.duration_since(*instant).as_secs() < CACHE_TTL_SECS {
-                    return cached.clone();
-                }
+        if let Some((cached, instant)) = cache.as_ref() {
+            if now.duration_since(*instant).as_secs() < CACHE_TTL_SECS {
+                return cached.clone();
             }
         }
 
@@ -111,9 +114,19 @@ impl ProcessSnapshot {
         let mut processes = Vec::new();
         // Use ps with explicit format to get PPID: PID,PPID,USER,CPU,MEM,VSZ,RSS,STAT,START,TIME,COMMAND
         // This gives us parent process ID for lineage tracking
-        let ps_output =
-            run_cmd("ps -eo pid,ppid,user,%cpu,%mem,vsz,rss,stat,start,time,comm --no-headers")
-                .unwrap_or_default();
+        let ps_output = match run_cmd(
+            "ps -eo pid,ppid,user,%cpu,%mem,vsz,rss,stat,start,time,comm --no-headers",
+        ) {
+            Ok(output) => output,
+            Err(e) => {
+                log::warn!("ps command failed: {}", e);
+                return Self {
+                    timestamp,
+                    processes: Vec::new(),
+                    summary: ProcessSummary::default(),
+                };
+            }
+        };
 
         for line in ps_output.lines() {
             if let Some(proc) = parse_ps_line(line) {
@@ -129,8 +142,54 @@ impl ProcessSnapshot {
             summary,
         };
 
-        // Handle poison error by recovering from the poisoned state
+        *cache = Some((snapshot.clone(), now));
+        snapshot
+    }
+
+    /// Captures a fresh process snapshot, bypassing the cache
+    /// so the after snapshot never aliases the before snapshot.
+    ///
+    /// This clears the cache and captures a new snapshot under a
+    /// single lock acquisition, ensuring `clear_cache()` + `capture()`
+    /// form one atomic critical section (no stale write after clear).
+    pub fn capture_fresh() -> Self {
         let mut cache = PROCESS_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        *cache = None;
+
+        let now = std::time::Instant::now();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+
+        let mut processes = Vec::new();
+        let ps_output = match run_cmd(
+            "ps -eo pid,ppid,user,%cpu,%mem,vsz,rss,stat,start,time,comm --no-headers",
+        ) {
+            Ok(output) => output,
+            Err(e) => {
+                log::warn!("ps command failed: {}", e);
+                return Self {
+                    timestamp,
+                    processes: Vec::new(),
+                    summary: ProcessSummary::default(),
+                };
+            }
+        };
+
+        for line in ps_output.lines() {
+            if let Some(proc) = parse_ps_line(line) {
+                processes.push(proc);
+            }
+        }
+
+        let summary = ProcessSummary::compute(&processes);
+
+        let snapshot = Self {
+            timestamp,
+            processes,
+            summary,
+        };
+
         *cache = Some((snapshot.clone(), now));
         snapshot
     }
@@ -254,6 +313,7 @@ impl ProcessSnapshot {
 ///
 /// Expected format: PID PPID USER %CPU %MEM VSZ RSS STAT START TIME COMMAND
 /// Returns `None` if the line has fewer than 10 whitespace-separated fields.
+/// Note: USER column with spaces shifts all subsequent column positions; may misalign CPU/command fields.
 #[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 fn parse_ps_line(line: &str) -> Option<ProcessInfo> {
     let parts: Vec<&str> = line.split_whitespace().collect();

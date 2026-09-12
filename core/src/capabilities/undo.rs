@@ -124,7 +124,10 @@ impl TypedCapability for Undo {
             }
         }
 
-        // Restore all files in the job's backup directory
+        // Restore files in the job's backup directory
+        // If args.file is specified, restore only that file; otherwise restore all.
+        let target_file: Option<String> = args.file.clone();
+
         if let Ok(entries) = std::fs::read_dir(&job_backup_dir) {
             for entry in entries.flatten() {
                 let backup_path = entry.path();
@@ -133,6 +136,17 @@ impl TypedCapability for Undo {
                         .to_str()
                         .ok_or_else(|| CapabilityError::Internal("Invalid backup path".into()))?
                         .to_string();
+
+                    // If a specific file was requested, skip others
+                    if let Some(ref specific_file) = target_file {
+                        let backup_name = backup_path
+                            .file_name()
+                            .map(|f| f.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        if backup_name != *specific_file {
+                            continue;
+                        }
+                    }
 
                     // FINDING #12: Look up by full backup path, not just filename
                     let target_path = original_paths

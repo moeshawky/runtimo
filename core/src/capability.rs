@@ -391,6 +391,7 @@ pub trait TypedCapability: Send + Sync {
     ///
     /// Default implementation calls `execute` — capabilities that support
     /// dry-run should override this.
+    /// Note: no production caller invokes this; working dry_run is via ctx.dry_run inside execute().
     ///
     /// # Errors
     ///
@@ -516,6 +517,7 @@ impl CapabilityRegistry {
     /// Looks up a capability by name (case-insensitive).
     ///
     /// Returns `None` if no capability with the given name is registered.
+    /// Note: case-insensitive fallback iterates HashMap in seeded-random order; first match may vary across processes.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&dyn Capability> {
         if let Some(cap) = self.capabilities.get(name) {

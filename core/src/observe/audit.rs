@@ -60,7 +60,13 @@ pub struct AuditEvent {
 /// always-on in release (not `debug_assert!`), consistent with G-SEC.
 fn redact_secret(input: &str) -> bool {
     let lower = input.to_ascii_lowercase();
-    lower.contains("auth_token") || lower.contains("bearer") || lower.contains("api_key")
+    lower.contains("auth_token")
+        || lower.contains("bearer")
+        || lower.contains("api_key")
+        || lower.contains("password")
+        || lower.contains("secret")
+        || lower.contains("token")
+        || lower.contains("credential")
 }
 
 impl AuditEvent {
@@ -250,6 +256,7 @@ impl AuditHook {
     /// Drains all queued events, appending a `TRUNCATED` marker if drops occurred.
     ///
     /// The marker has `truncated: true` and `target` encodes the count.
+    /// Note: TRUNCATED markers use AuditKind::Raise (no Truncated variant exists); considered error-level audit event.
     ///
     /// # Panics
     /// Panics if the mutex is poisoned and `into_inner()` fails to recover

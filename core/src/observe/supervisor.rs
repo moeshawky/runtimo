@@ -96,11 +96,14 @@ pub enum DalDecision {
     Proceed,
 }
 
-/// Maps a DAL + failure to a `DalDecision` mirroring `llmosafe.rs:210`
-/// `apply_dal_to_decision`. Kept local so core does not expose that private
-/// helper; logic is identical and tested against it.
+/// Maps a `DesignAssuranceLevel` to a `DalDecision` (A → Halt,
+/// B/C/D → Degraded, E → Proceed).
+///
+/// Parameter name references failure for API symmetry with
+/// `llmosafe.rs:210` but the failure type is unused. Mirrors
+/// `apply_dal_to_decision` at `llmosafe.rs:210` for the DAL portion.
 #[must_use]
-pub fn dal_decision_for(dal: DesignAssuranceLevel, _failure: &CollectorFailure) -> DalDecision {
+pub fn dal_decision_for(dal: DesignAssuranceLevel) -> DalDecision {
     match dal {
         DesignAssuranceLevel::A => DalDecision::Halt,
         DesignAssuranceLevel::B | DesignAssuranceLevel::C | DesignAssuranceLevel::D => {
@@ -308,7 +311,7 @@ impl ObserveSupervisor {
     /// Returns the resulting `BundleWatermark`.
     pub fn on_failure(&mut self, failure: CollectorFailure) -> BundleWatermark {
         self.last_failure = Some(failure.clone());
-        let decision = dal_decision_for(self.dal, &failure);
+        let decision = dal_decision_for(self.dal);
         let wm = match decision {
             DalDecision::Halt => BundleWatermark::Incomplete,
             DalDecision::Degraded | DalDecision::Proceed => BundleWatermark::Truncated,
@@ -670,7 +673,7 @@ mod tests {
         // Test dal_decision_for strictness: A→Halt, E→Proceed, B/C/D→Degraded.
         let dal_decisions: Vec<_> = dals
             .iter()
-            .map(|&dal| (dal, dal_decision_for(dal, &CollectorFailure::PressureSpike)))
+            .map(|&dal| (dal, dal_decision_for(dal)))
             .collect();
 
         // A must be strictly stricter than E.
@@ -724,10 +727,8 @@ mod tests {
         for i in 0..dals.len() - 1 {
             let stricter_dal = dals[i];
             let more_permissive_dal = dals[i + 1];
-            let stricter_via_dal_decision =
-                dal_decision_for(stricter_dal, &CollectorFailure::PressureSpike);
-            let more_permissive_via_dal_decision =
-                dal_decision_for(more_permissive_dal, &CollectorFailure::PressureSpike);
+            let stricter_via_dal_decision = dal_decision_for(stricter_dal);
+            let more_permissive_via_dal_decision = dal_decision_for(more_permissive_dal);
             // Halt is stricter than Degraded, which is stricter than Proceed.
             let stricter_is_halt = matches!(stricter_via_dal_decision, DalDecision::Halt);
             let more_permissive_is_proceed =

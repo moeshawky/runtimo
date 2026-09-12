@@ -186,8 +186,7 @@ fn fresh_telemetry_after(enabled: bool) -> Telemetry {
 /// Captures a fresh after-execution process snapshot, bypassing the cache
 /// so the after snapshot never aliases the before snapshot via a cache hit.
 fn fresh_process_after() -> ProcessSnapshot {
-    ProcessSnapshot::clear_cache();
-    ProcessSnapshot::capture()
+    ProcessSnapshot::capture_fresh()
 }
 
 /// Execute a capability with session tracking and specified timeout.
@@ -345,6 +344,24 @@ pub fn execute_with_telemetry_and_session(
         return Err(Error::ResourceLimitExceeded(msg));
     }
     drop(args_bytes);
+
+    if timeout_secs == 0 {
+        let msg = "Capability timeout must be greater than 0".to_string();
+        let tel = telemetry_opt(telemetry_on, &telemetry_before);
+        let _ = log_job_failed_with_snapshots(
+            &mut wal,
+            &job_id_str,
+            &cap_name,
+            &msg,
+            tel.as_ref(),
+            tel.as_ref(),
+            &process_before.summary,
+            &process_before.summary,
+            None,
+            None,
+        );
+        return Err(Error::ExecutionFailed(msg));
+    }
 
     let ctx = Context::with_working_dir(
         dry_run,

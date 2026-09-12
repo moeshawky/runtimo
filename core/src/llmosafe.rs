@@ -81,6 +81,7 @@ impl ResourceHistory {
 
     /// Restores the last_check timestamp from a persisted file.
     /// Prevents cooldown bypass via process restart.
+    /// NOTE: Only last_check is restored, not measurements. After restart within cooldown, rolling_average() returns None and the safety gate passes unconditionally until a new measurement is taken.
     fn restore_last_check(&mut self) {
         if let Some(ref path) = self.persist_path {
             if let Ok(content) = fs::read_to_string(path) {
@@ -104,10 +105,17 @@ impl ResourceHistory {
     /// Persists the current timestamp to disk for crash/restart recovery.
     fn persist_last_check(&self) {
         if let Some(ref path) = self.persist_path {
+            if let Some(parent) = path.parent() {
+                if let Err(e) = fs::create_dir_all(parent) {
+                    log::warn!("persist_last_check: create_dir_all failed: {}", e);
+                }
+            }
             let secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs());
-            let _ = fs::write(path, secs.to_string());
+            if let Err(e) = fs::write(path, secs.to_string()) {
+                log::warn!("persist_last_check: write failed: {}", e);
+            }
         }
     }
 
@@ -167,12 +175,6 @@ impl ResourceHistory {
     }
 }
 
-/// Global fallback history (legacy — retained for compatibility, no longer used
-/// for sampling; per-guard history is authoritative). Kept to avoid breaking
-/// external linkage, but `LlmoSafeGuard::check` now uses per-instance history.
-#[allow(dead_code)]
-static RESOURCE_HISTORY: Mutex<Option<ResourceHistory>> = Mutex::new(None);
-
 /// Returns the path for persisting resource history state.
 ///
 /// # Input
@@ -201,7 +203,7 @@ pub struct LlmoSafeGuard {
     policy: EscalationPolicy,
     /// Per-instance resource history for cooldown enforcement.
     ///
-    /// Previously shared via `RESOURCE_HISTORY` static, which caused cross-guard
+    /// Previously shared via a static `RESOURCE_HISTORY`, which caused cross-guard
     /// interference (one guard's cooldown suppressed sampling for all guards).
     /// Now scoped per-guard so each guard's 1 s cooldown and 30 s rolling window
     /// are independent. The 1 s cooldown returns `Ok` using the cached rolling
@@ -317,6 +319,7 @@ impl LlmoSafeGuard {
         // FINDING #16 + T9b: Enforce per-guard cooldown between checks.
         // This is a Cached path — no fresh sampling, Ok uses cached average.
         if hist.is_in_cooldown() {
+            // During cooldown, check() takes no fresh sample; if rolling_average() is None, the safety gate passes unconditionally (Ok(())). This is a known limitation.
             if let Some(avg) = hist.rolling_average() {
                 if avg > 80.0 {
                     return Err(format!(

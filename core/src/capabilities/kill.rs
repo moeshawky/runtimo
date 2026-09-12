@@ -354,11 +354,9 @@ impl TypedCapability for Kill {
         // Delay to let process terminate and be removed from process table
         std::thread::sleep(Duration::from_millis(500));
 
-        // Clear cache to ensure fresh snapshot (cached data would show pre-kill state)
-        ProcessSnapshot::clear_cache();
-
-        // Capture process snapshot after kill
-        let process_after = ProcessSnapshot::capture();
+        // Clear cache and capture fresh process snapshot after kill
+        // (atomic: clear+capture under one lock, no stale write after clear)
+        let process_after = ProcessSnapshot::capture_fresh();
 
         // Check if process still exists (zombies count as dead — they've been terminated)
         let process_still_exists = process_after

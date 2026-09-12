@@ -273,7 +273,8 @@ impl HealthMonitor {
         self.stop_flag.store(true, Ordering::Relaxed);
     }
 
-    /// Returns whether the monitor is still running.
+    /// Returns whether the stop flag is clear.
+    /// Note: does not reflect thread join state; may report running after thread dropped.
     #[must_use]
     pub fn is_running(&self) -> bool {
         !self.stop_flag.load(Ordering::Relaxed)
@@ -319,6 +320,8 @@ fn parse_ram_percent(ram_total: &str, ram_available: &str) -> f32 {
 }
 
 /// Parses a size string (e.g., "13Gi", "512Mi", "16384MB") into a numeric value in GB.
+///
+/// Note: Gi and GB tiers use same divisor (/1); binary (MiB/GB) and decimal (KiB/GB) magnitudes are conflated.
 ///
 /// # Input
 ///

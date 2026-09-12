@@ -90,7 +90,7 @@ pub struct FileWriteArgs {
 
 /// Capability that writes file contents with backup-before-mutate.
 ///
-/// Every write creates a timestamped backup via [`BackupManager`], enabling
+/// Every write creates a numbered backup (e.g., .1, .2) via [`BackupManager`], enabling
 /// rollback through the undo system. The backup is created *before* the
 /// mutation, so a failed write still leaves a recoverable state.
 pub struct FileWrite {

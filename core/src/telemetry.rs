@@ -1,6 +1,6 @@
 //! System Telemetry — Via Negativa: raw observation, no interpretation.
 //!
-//! Captures a snapshot of the host machine by reading `/proc` and `/sys`
+//! Captures a snapshot of the host machine by reading `/proc`
 //! directly. Every field is backed by a raw kernel filesystem read — no
 //! shell-out for data available in `/proc`, no pgrep, no service name
 //! guessing, no version detection.
@@ -213,8 +213,7 @@ fn parse_meminfo_kb(data: &str, key: &str) -> u64 {
 
 /// Converts a kilobyte count to a human-readable string.
 ///
-/// Uses binary suffixes (KiB, MiB, GiB, TiB). Values >= 1000 KiB are
-/// displayed with the next-higher unit. The output format matches the
+/// Uses binary suffixes (KiB, MiB, GiB, TiB). Values >= 1024 KiB displayed with next-higher unit (binary threshold). The output format matches the
 /// `free -h` style: e.g. `"16Gi"`, `"750Mi"`, `"512Ki"`.
 ///
 /// # Examples
@@ -562,8 +561,8 @@ impl Telemetry {
 // ── SystemInfo capture — direct /proc reads ──────────────────────────────
 
 impl SystemInfo {
-    /// Captures system information from `/proc` and `/sys` files with a single
-    /// `df` shell-out for disk usage. No accelerator or network probing.
+    /// Captures system information from `/proc` files with three separate
+    /// `df` invocations (disk_total, disk_free, disk_used_percent). No accelerator or network probing.
     ///
     /// Reads `/proc/cpuinfo` (model, count), `/proc/meminfo` (MemTotal,
     /// MemFree, MemAvailable), `/proc/uptime`, and `/proc/loadavg`.

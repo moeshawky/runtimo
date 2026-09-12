@@ -210,6 +210,7 @@ pub mod utils {
     pub fn data_dir() -> PathBuf {
         let base = std::env::var("XDG_DATA_HOME")
             .ok()
+            .filter(|p| std::path::Path::new(p).is_absolute())
             .map(PathBuf::from)
             .or_else(|| {
                 std::env::var("HOME")

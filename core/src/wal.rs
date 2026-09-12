@@ -738,15 +738,13 @@ impl WalWriter {
                     }
                 }
             }
-            // Release lock before rename
-            Self::unlock_file(&lock_file);
-            // Atomic rename replaces original — no window for lost events
+            // Rename while still holding the lock to prevent
+            // concurrent appends from writing to the original inode.
             std::fs::rename(&temp_path, path).map_err(|e| {
                 crate::Error::WalError(format!("atomic rename during cleanup: {}", e))
             })?;
-        } else {
-            Self::unlock_file(&lock_file);
         }
+        Self::unlock_file(&lock_file);
 
         Ok(removed)
     }

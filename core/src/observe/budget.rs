@@ -66,20 +66,33 @@ impl ObserveBudget {
     /// Restores `last_check` from persisted epoch seconds if within cooldown.
     fn restore_last_check(&mut self) {
         if let Some(ref path) = self.persist_path {
-            if let Ok(content) = fs::read_to_string(path) {
-                if let Ok(secs) = content.trim().parse::<u64>() {
-                    let now_epoch = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0, |d| d.as_secs());
-                    let elapsed_secs = now_epoch.saturating_sub(secs);
-                    if elapsed_secs < self.cooldown_secs {
-                        self.last_check = Some(
-                            Instant::now()
-                                .checked_sub(Duration::from_secs(elapsed_secs))
-                                .unwrap_or_else(Instant::now),
-                        );
-                    }
+            let content = match fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(e) => {
+                    log::warn!("Failed to read observe_budget.state: {}", e);
+                    return;
                 }
+            };
+            let secs = match content.trim().parse::<u64>() {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!("Failed to parse observe_budget.state: {}", e);
+                    return;
+                }
+            };
+            let now_epoch = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let elapsed_secs = now_epoch.saturating_sub(secs);
+            if elapsed_secs < self.cooldown_secs {
+                self.last_check = Some(
+                    Instant::now()
+                        .checked_sub(Duration::from_secs(elapsed_secs))
+                        .unwrap_or_else(|| {
+                            log::warn!("persist: overflow restoring last_check");
+                            Instant::now()
+                        }),
+                );
             }
         }
     }
@@ -88,12 +101,16 @@ impl ObserveBudget {
     fn persist_last_check(&self) {
         if let Some(ref path) = self.persist_path {
             if let Some(parent) = path.parent() {
-                let _ = fs::create_dir_all(parent);
+                if let Err(e) = fs::create_dir_all(parent) {
+                    log::warn!("persist: mkdir failed: {}", e);
+                }
             }
             let secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs());
-            let _ = fs::write(path, secs.to_string());
+            if let Err(e) = fs::write(path, secs.to_string()) {
+                log::warn!("persist: write failed: {}", e);
+            }
         }
     }
 
@@ -182,6 +199,7 @@ impl ObserveBudget {
 /// Derived from `RUNTIMO_STATE_DIR` or `HOME` + `.runtimo/observe_budget.state`,
 /// sibling to `resource_history.state` (`llmosafe.rs:182-189`). `None` if
 /// neither env var is set — then state is in-memory only for this process.
+/// Note: both env var error variants (unset/unreadable) are silently collapsed to None.
 #[must_use]
 pub fn observe_budget_path() -> Option<PathBuf> {
     let base: Option<PathBuf> = std::env::var("RUNTIMO_STATE_DIR")

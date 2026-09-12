@@ -146,7 +146,13 @@ impl BackupManager {
             }
             Ok(total)
         } else {
-            Ok(0)
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "non-regular file type not allowed: {} (FIFOs, sockets, and device nodes are unsupported)",
+                    path.display()
+                ),
+            ))
         }
     }
 
@@ -230,8 +236,26 @@ impl BackupManager {
     /// Returns [`crate::Error::BackupError`] if the source
     /// does not exist, exceeds the 100MB size limit, or the copy fails.
     pub fn create_backup(&self, file_path: &Path, job_id: &str) -> Result<PathBuf> {
+        std::fs::create_dir_all(&self.backup_dir).map_err(|e| {
+            crate::Error::BackupError(format!("Failed to create backup directory: {}", e))
+        })?;
+        verify_real_directory(&self.backup_dir)?;
+
         if file_path.symlink_metadata().is_err() {
             return Err(crate::Error::BackupError("File does not exist".to_string()));
+        }
+
+        // Validate job_id to prevent path traversal
+        if job_id.is_empty()
+            || job_id.contains('/')
+            || job_id.contains('\\')
+            || job_id == ".."
+            || job_id.split('/').any(|p| p == "..")
+        {
+            return Err(crate::Error::BackupError(format!(
+                "Invalid job_id: {} (must be a single path component without traversal)",
+                job_id
+            )));
         }
 
         let size = Self::calculate_size(file_path)
@@ -270,6 +294,21 @@ impl BackupManager {
             }
         };
 
+        // Re-check destination immediately before copy to prevent
+        // symlink TOCTOU attacks
+        if backup_path
+            .symlink_metadata()
+            .map_err(|e| {
+                crate::Error::BackupError(format!("cannot stat {}: {}", backup_path.display(), e))
+            })
+            .is_ok_and(|meta| meta.file_type().is_symlink())
+        {
+            return Err(crate::Error::BackupError(format!(
+                "backup destination is a symlink: {} (symlink attacks not allowed)",
+                backup_path.display()
+            )));
+        }
+
         Self::copy_recursive(file_path, &backup_path)
             .map_err(|e| crate::Error::BackupError(e.to_string()))?;
 
@@ -291,13 +330,18 @@ impl BackupManager {
     /// Returns [`crate::Error::BackupError`] if the backup
     /// does not exist, the pre-restore backup fails, or the copy fails.
     pub fn restore(&self, backup_path: &Path, target_path: &Path) -> Result<()> {
+        std::fs::create_dir_all(&self.backup_dir).map_err(|e| {
+            crate::Error::BackupError(format!("Failed to create backup directory: {}", e))
+        })?;
+        verify_real_directory(&self.backup_dir)?;
+
         if backup_path.symlink_metadata().is_err() {
             return Err(crate::Error::BackupError(
                 "Backup does not exist".to_string(),
             ));
         }
 
-        if target_path.symlink_metadata().is_ok() {
+        let pre_restore_path = if target_path.symlink_metadata().is_ok() {
             let pre_restore_dir = target_path
                 .parent()
                 .map_or_else(|| PathBuf::from("."), |p| p.to_path_buf())
@@ -314,10 +358,52 @@ impl BackupManager {
             Self::copy_recursive(target_path, &pre_restore_path).map_err(|e| {
                 crate::Error::BackupError(format!("Pre-restore backup failed: {}", e))
             })?;
+            Some(pre_restore_path)
+        } else {
+            None
+        };
+
+        // Copy to a temp path next to target for atomic rename
+        let temp_filename = format!(
+            ".runtimo_restore_tmp_{}",
+            target_path.file_name().map_or_else(
+                || "target".to_string(),
+                |f| f.to_string_lossy().into_owned()
+            )
+        );
+        let temp_path = target_path
+            .parent()
+            .map_or_else(|| PathBuf::from(&temp_filename), |p| p.join(&temp_filename));
+        let _ = std::fs::remove_dir_all(&temp_path);
+        let _ = std::fs::remove_file(&temp_path);
+
+        Self::copy_recursive(backup_path, &temp_path)
+            .map_err(|e| crate::Error::BackupError(e.to_string()))?;
+
+        // Verify integrity before atomic rename
+        if let Err(e) = Self::verify_integrity(backup_path, &temp_path) {
+            let _ = std::fs::remove_dir_all(&temp_path);
+            // Roll back from pre-restore on verification failure
+            if let Some(ref pre_restore) = pre_restore_path {
+                let _ = std::fs::remove_dir_all(target_path);
+                let _ = Self::copy_recursive(pre_restore, target_path);
+            }
+            return Err(crate::Error::BackupError(format!(
+                "Integrity check failed: {}",
+                e
+            )));
         }
 
-        Self::copy_recursive(backup_path, target_path)
-            .map_err(|e| crate::Error::BackupError(e.to_string()))?;
+        // Atomic rename: replace target with the verified copy.
+        // Remove target first if it's a non-empty directory (std::fs::rename
+        // cannot replace a non-empty directory on Linux).
+        if target_path.symlink_metadata().is_ok() && target_path.is_dir() {
+            std::fs::remove_dir_all(target_path).map_err(|e| {
+                crate::Error::BackupError(format!("Cannot remove target for atomic rename: {}", e))
+            })?;
+        }
+        std::fs::rename(&temp_path, target_path)
+            .map_err(|e| crate::Error::BackupError(format!("Atomic rename failed: {}", e)))?;
 
         Ok(())
     }
@@ -339,6 +425,10 @@ impl BackupManager {
     /// symlink metadata queries fail.
     pub fn cleanup(&self, older_than_secs: u64) -> Result<()> {
         use std::time::{SystemTime, UNIX_EPOCH};
+        std::fs::create_dir_all(&self.backup_dir).map_err(|e| {
+            crate::Error::BackupError(format!("Failed to create backup directory: {}", e))
+        })?;
+        verify_real_directory(&self.backup_dir)?;
 
         let cutoff = SystemTime::now()
             .duration_since(UNIX_EPOCH)

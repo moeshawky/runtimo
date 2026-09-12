@@ -110,7 +110,7 @@ fn get_allowed_prefixes(ctx: &PathContext) -> Vec<String> {
     prefixes
 }
 
-/// Validates a path with canonicalization and prefix checking.
+/// R-C26-01: identical results or identical errors when relative paths are resolved against CWD.
 ///
 /// For existing paths, resolves symlinks via `canonicalize()` to prevent
 /// symlink-based escapes. For non-existent paths (writes), canonicalizes
@@ -154,9 +154,11 @@ pub fn validate_path(path_str: &str, ctx: &PathContext) -> Result<PathBuf, Strin
     }
 
     // NFC-normalize the path to prevent Unicode-based traversal (FINDING #7)
+    // Note: input is NFC-normalized before exists() check; on-disk NFD-named files may fail NFC input on ext4.
     let normalized: String = path_str.nfc().collect();
 
     // Reject path traversal sequences before any filesystem interaction
+    // Note: uses substring contains(".."); paths like /tmp/report..final.txt are rejected despite no .. component.
     if normalized.contains("..") {
         return Err("path traversal not allowed".to_string());
     }
@@ -218,6 +220,7 @@ pub fn validate_path(path_str: &str, ctx: &PathContext) -> Result<PathBuf, Strin
     // from a plain shell) can disable it via config `path_restriction_enabled
     // = false`. Input-hygiene checks above (null bytes, control characters,
     // traversal) always apply.
+    // Note: prefix check runs on to_string_lossy(); non-UTF-8 bytes in canonical paths may compare lossily.
     let resolved_str = resolved.to_string_lossy();
     if crate::config::RuntimoConfig::path_restriction_enabled() {
         let allowed = get_allowed_prefixes(ctx);
