@@ -10,13 +10,15 @@
 
 - [x] Project name + one-line description
 - [x] Badges row (CI, version, license, MSRV)
-- [x] Installation instructions (`cargo add runtimo-core`)
+- [x] Installation instructions (`cargo install runtimo-cli`)
 - [x] Quick start example (compilable)
 - [x] API docs link ([docs.rs](https://docs.rs/runtimo-core))
 - [x] [CHANGELOG](CHANGELOG.md)
 - [x] [License](LICENSE)
 - [x] [Contributing](CONTRIBUTING.md)
 - [x] MSRV badge (1.70.0)
+
+> **One program, one version.** `runtimo-core`, `runtimo-daemon`, and `runtimo-cli` are a single program at a single workspace version. Never version, bump, or release one crate independently. `cargo install runtimo-cli` installs **both** `runtimo` (CLI) and `runtimo-daemon` binaries. The `runtimo-daemon` package is the daemon *library*; the `runtimo-daemon` *binary* is bundled inside the `runtimo-cli` package. Never `cargo install runtimo-daemon` or `cargo install runtimo-core` alone for deployment.
 
 ## What Is Runtimo?
 
@@ -28,13 +30,30 @@ Runtimo is a Rust workspace providing a **capability execution engine**. Every c
 - **Backup/undo** — Files backed up before mutation, rollback by job ID
 - **Input validation** — Capabilities validate arguments including path traversal, symlink, and null byte protection
 
-**Version:** 0.9.0 | **Rust Edition:** 2021 | **Tests:** 620 (39 cli + 400 core-lib + 65 integration + 46 robust + 63 daemon + 7 doctest)
+**Version:** 0.9.1 | **Rust Edition:** 2021 | **Tests:** 620 (39 cli + 400 core-lib + 65 integration + 46 robust + 63 daemon + 7 doctest)
 
 See [CHANGELOG.md](CHANGELOG.md) for full release history.
 
 ## Quick Start
 
-### Library
+### Install (one command, both binaries)
+
+```bash
+cargo install runtimo-cli
+```
+
+This installs **both** `runtimo` (CLI) and `runtimo-daemon` binaries. The daemon auto-starts on `runtimo run`/`runtimo dispatch` via `{data_dir}/runtimo.sock`.
+
+```bash
+# Verify both binaries are present
+runtimo --help
+runtimo-daemon --help
+
+# Show current configuration
+runtimo config show
+```
+
+### Library (for crate consumers)
 
 ```bash
 cargo add runtimo-core
@@ -52,44 +71,46 @@ let result = execute_with_telemetry(&cap, &args, false, Path::new("/tmp/wal.json
 println!("Success: {}  Job: {}  WAL seq: {}", result.success, result.job_id, result.wal_seq);
 ```
 
-### CLI
+## Integrate in 5 Minutes
+
+Copy-paste every line. No inference needed.
 
 ```bash
-cargo build --release
+# 1. Install (both runtimo + runtimo-daemon binaries)
+cargo install runtimo-cli
 
-# List capabilities
-runtimo list
+# 2. Verify config and allowed paths
+runtimo config show
+# Allowed paths: /tmp + /var/tmp (extend via RUNTIMO_ALLOWED_PATHS or config.toml)
 
-# Read a file
-runtimo run -c FileRead -a '{"path":"/tmp/hostname.txt"}'
+# 3. Run FileRead on /tmp (allowed path)
+runtimo run -c FileRead -a '{"path":"/tmp/hostname.txt"}' --args-file /tmp/args.json
 
-# Write a file (creates automatic backup)
-runtimo run -c FileWrite -a '{"path":"/tmp/hello.txt","content":"hello runtimo"}'
+# 4. Dispatch a background job and wait
+runtimo dispatch -c FileRead -a '{"path":"/tmp/hostname.txt"}'
+runtimo wait --job <job_id>
 
-# Shell command
-runtimo run -c ShellExec -a '{"cmd":"ls | head -3"}'
-
-# Dry run (validate without executing)
-runtimo run -c FileWrite -a '{"path":"/tmp/test.txt","content":"test"}' --dry-run
-
-# View system telemetry
-runtimo telemetry
-
-# View process snapshot
-runtimo processes
-
-# View WAL events
+# 5. Check jobs and WAL logs
+runtimo jobs
 runtimo logs
 
-# Undo a job
+# 6. Verify output integrity (exit 0 iff admissible)
+runtimo observe --verify /tmp/bundle.jsonl
+# Must assert admissible, NOT hash_ok (hash_ok is deprecated)
+
+# 7. Undo a job by ID
 runtimo undo -j <job_id>
 
-# Show current configuration
-runtimo config show
-
-# Set DAL level (A=strict, E=permissive)
-runtimo config dal B
+# 8. View telemetry
+runtimo telemetry
+runtimo processes
 ```
+
+**Critical notes — no agent may infer these:**
+- **Allowed paths**: Only `/tmp` and `/var/tmp` are built-in. All file paths must resolve under these prefixes (or `RUNTIMO_ALLOWED_PATHS`). Use `--args-file` for payloads >130 KB.
+- **`--verify` exits on `admissible`**, not `hash_ok`. `hash_ok` is a deprecated alias (`structurally_parseable && integrity_valid`). Scripts must assert `admissible`.
+- **`runtimo-daemon` is a library**, not a standalone install target. The binary is bundled with `runtimo-cli`. Never `cargo install runtimo-daemon`.
+- **`observe --burst` is deferred** (returns `-32601 observe_burst deferred`), not broken.
 
 ## Architecture
 
@@ -579,7 +600,7 @@ runtimo/
 
 ```bash
 cargo test                           # all tests
-cargo test -p runtimo-core --lib    # 397 unit tests
+cargo test -p runtimo-core --lib    # 400 unit tests
 cargo test -p runtimo-core --test integration  # 65 integration tests
 cargo test -p runtimo-core --test robust       # property-based (proptest)
 cargo test -p runtimo-core --doc    # doc tests

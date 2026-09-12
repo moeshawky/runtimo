@@ -5,6 +5,36 @@ All notable changes to Runtimo are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] - 2026-09-12
+
+### Changed
+- **Annotation bug fixes (f243a4f)** — Closed 20 verified annotation bugs: hardened `session.rs` (atomic temp+fsync+rename, tmp cleanup), `sampler.rs` truncation at UTF-8 boundaries, `config.rs` rejects relative `XDG_CONFIG_HOME`, `job.rs` docs match urandom implementation. Added relative-XDG and hex-ID regression tests; test counts 617→618. (`core/src/config.rs`, `core/src/job.rs`, `core/src/observe/sampler.rs`, `core/src/session.rs`, `core/tests/robust.proptest-regressions`)
+- **Deferred annotation triage (82f6ea3)** — Closed 91 deferred annotation bugs (89 PATCHED/REJECTED with evidence, 2 BLOCKED by design: `add_job` cross-process race needs file-lock design; `wal create` cross-process seq needs marker-event design). Highlights: monitor thread-join + bytes-normalized sizes, telemetry df/nvidia/jax/cloudflared/stat fixes, executor WAL-audit best-effort unification, session serde defaults, capability register dedup, cmd 127/-1 handling, capabilities hardening, sampler wall_ns MAX, wal docs/warn/saturating, llmosafe dead-branch + RSS docs, config nested warnings + wal reporting-only docs. Test counts 618→620. (`core/src/capabilities/`, `core/src/cmd.rs`, `core/src/config.rs`, `core/src/executor.rs`, `core/src/llmosafe.rs`, `core/src/monitor.rs`, `core/src/observe/sampler.rs`, `core/src/processes.rs`, `core/src/session.rs`, `core/src/telemetry.rs`, `core/src/validation/path.rs`, `core/src/wal.rs`)
+- **Env var `RUNTIMO_` prefix convention** — All configuration env vars use the `RUNTIMO_` prefix consistently (`RUNTIMO_ALLOWED_PATHS`, `RUNTIMO_DAL`, `RUNTIMO_ENABLE_NETWORK`, `RUNTIMO_ENABLE_PUBLIC_IP`, `RUNTIMO_OBSERVE_SAMPLE_HZ`, `RUNTIMO_STATE_DIR`, `RUNTIMO_SESSIONS_DIR`, `RUNTIMO_WAL_PATH`). Malformed env values fall through to file, not to hardcoded defaults (`core/src/config.rs`).
+
+### Added
+- **`FileLock` in session management** — `core/src/session.rs` introduces `FileLock` struct with `lock()`, `unlock()`, and `Drop` impl for session file locking. Lock is released on drop; supports concurrent access detection via `flock`. (`core/src/session.rs`)
+- **`WalEventType::WriterInitialized` marker** — New WAL event variant `WriterInitialized` written on WAL writer initialization. Used as a sentinel in bundle verification to skip the initial marker event (`core/src/wal.rs`, `core/src/observe/bundle.rs`).
+- **Watch index scope + debounce (b225b8a)** — Added `.ixd.toml` to exclude metadata dirs (`.annotations`, `.opencode`, `.ix`, `.codegraph`, `.git`, `node_modules`, `target`, `telebox`) from trigram index churn; 2000ms debounce for agent-driven write bursts. Takes effect on daemon reload. (`.ixd.toml`)
+
+### Fixed
+- **Guard accessors → resolved (RC1)** — `blocklist_enabled()`, `critical_files_enabled()`, `path_restriction_enabled()`, `path_sanitization_enabled()` now delegate to `RuntimoConfig::load().resolved()` (precedence: top-level > `[guards]` > profile > builtin `true`; `ephemeral` resolves to `false`). Fixes divergence where `[guards]` table was ignored. (`core/src/config.rs`)
+- **Unified `working_dir` validation (RC1)** — single `resolve_working_dir()` validates via `validate_path(require_exists:true)` and returns `-32602` on failure; both `handle_run` and `handle_dispatch` use it, eliminating the `eprintln!+None` swallow that silently dropped the override and fell back to `"/"`. (`daemon/src/engine.rs`, `core/src/validation/path.rs`)
+- **Observe shell gate (RC1)** — `handle_observe_start` gates sibling `cmd` through `is_dangerous_command` (same blocklist as `ShellExec` dispatch) and rejects with `-32602` before spawning, closing the `cmd` injection bypass. (`daemon/src/engine.rs`, `core/src/capabilities/shell_exec.rs`)
+- **Err-audit multi-key + WAL durability (RC2)** — Err-path `BackupCreated` audit now scans `path`, `repo_path`, `dir` keys via `find_backup_candidate()` (collision suffixes `.1`–`.10` mirroring `BackupManager::create_backup`) so `FileWrite` and `GitExec` backups are not missed; WAL `BackupCreated` append failures are `log::error!`-observed instead of `let _ =` dropped. (`core/src/executor.rs`, `core/src/backup.rs`)
+- **Reconcile provenance (RC2)** — `reconcile_orphaned_jobs` preserves `capability` from the original `JobStarted` event and sets `output: {"reconciled": true}` on the synthesized `JobFailed`, so restarted daemons retain provenance for audit/undo consumers. (`daemon/src/engine.rs`, `core/src/wal.rs`)
+- **Watermark propagation (RC2)** — `verify_bundle()` parses honest `watermark` (`Complete` | `Truncated` | `Incomplete`) from the final `ObserveCompleted.output.watermark` instead of deriving from `truncated_gaps`; `handle_observe_verify` returns `watermark` (with fallback parse of the bundle file) and CLI `verify`/`trailer` consume `VerifyResult.watermark`. (`core/src/observe/bundle.rs`, `core/src/observe/sampler.rs`, `daemon/src/engine.rs`, `cli/src/main.rs`)
+- **Honest `timed_out` flag (RC3)** — `ShellExec::wait_with_timeout` returns explicit `WaitOutcome{timed_out}` (true only on timeout-kill `SIGKILL` to `-pgid`), `signal: Option<i32>` via `ExitStatusExt::signal()`, and captures stdout/stderr even on timeout; `executor::execute_with_timeout_check` enriches slow successes with `data.timed_out:true` instead of converting to `Err` (preserving output); success is `!timed_out && status.success()`. Fixes `code().is_none()` false-positives (signal kills) and false-negatives (timeout `Ok` discarded). (`core/src/capabilities/shell_exec.rs`, `core/src/executor.rs`)
+- **Bundle `bundle_dropped` sentinel + job-slot `checked_sub` (RC3)** — `BundleWriter` truncates with `bundle_dropped` (not `dropped`) to disambiguate writer overflow from sampler `TRUNCATED` frames; `BackgroundJobRegistry::release` uses `fetch_update(checked_sub)` so double-release is a no-op (avoids `0 → MAX` wrap that permanently blocks `try_reserve`). (`core/src/observe/bundle.rs`, `daemon/src/jobs.rs`, `core/src/observe/sampler.rs`)
+- **Per-guard `llmosafe` history (RC3)** — `LlmoSafeGuard` now holds `Mutex<ResourceHistory>` per instance (30 s window, 1 s cooldown) instead of the global `RESOURCE_HISTORY` static; cooldown is a `Cached` path returning `Ok` on cached average ≤80 % without fresh sampling, fixing cross-guard interference. (`core/src/llmosafe.rs`)
+- **Burst `-32601` deferred contract (RC3)** — `ObserveStartParams.burst` is now a gated deferred feature: `handle_observe_start` returns `-32601 observe_burst deferred` when `burst:true` (mirroring `engine.rs:110`), CLI forwards `burst` in RPC params and prints `burst_deferred:true` note to stdout (not only daemon stderr). (`daemon/src/rpc.rs`, `daemon/src/engine.rs`, `cli/src/main.rs`, `cli/src/output.rs`)
+- **DAL divergence, prefix normalization, atomic save** — unified `get_dal()` to delegate to `resolved().dal` (E for bare installs); stripped trailing `/` in path prefixes with root preservation; `save()` uses temp+fsync+rename with EISDIR failure test proving byte-identical recovery. (`core/src/config.rs`, `core/src/validation/path.rs`, `core/src/llmosafe.rs`)
+- **CPU unit normalization, lightweight monitor, RAM basis** — `normalize_cpu_percent` divides by logical cores keeping threshold 90; `capture_lightweight` covers all `HealthMonitor`-read fields (no accelerator/network probes); `ram_available` (`MemAvailable`) replaces `MemFree` for percent and leak detection. (`core/src/monitor.rs`)
+
+### Testing
+- **Total test count: 620** (39 cli + 400 core-lib + 65 integration + 46 robust + 63 daemon + 7 doctest). All passing except `oracle::benchmark::tests::bench_eval_under_1ms_per_1k` (benchmark, non-blocking).
+- **Annotation regression tests** — Relative-XDG and hex-ID regression tests added; test counts 617→618→620. (`core/tests/robust.proptest-regressions`)
+
 ## [0.9.0] - 2026-09-08
 
 ### Changed
@@ -367,13 +397,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compound symptoms: dual CapabilityRegistry (registry mismatch), working_dir silent drop
   (lost context), and TOCTOU window on working_dir validation.
   (`daemon/src/main.rs`)
-
-## [Unreleased]
-
-### Changed
-- **Annotation bug fixes (f243a4f)** — Closed 20 verified annotation bugs: hardened `session.rs` (atomic temp+fsync+rename, tmp cleanup), `sampler.rs` truncation at UTF-8 boundaries, `config.rs` rejects relative `XDG_CONFIG_HOME`, `job.rs` docs match urandom implementation. Added relative-XDG and hex-ID regression tests; test counts 617→618. (`core/src/config.rs`, `core/src/job.rs`, `core/src/observe/sampler.rs`, `core/src/session.rs`, `core/tests/robust.proptest-regressions`)
-- **Deferred annotation triage (82f6ea3)** — Closed 91 deferred annotation bugs (89 PATCHED/REJECTED with evidence, 2 BLOCKED by design: `add_job` cross-process race needs file-lock design; `wal create` cross-process seq needs marker-event design). Highlights: monitor thread-join + bytes-normalized sizes, telemetry df/nvidia/jax/cloudflared/stat fixes, executor WAL-audit best-effort unification, session serde defaults, capability register dedup, cmd 127/-1 handling, capabilities hardening, sampler wall_ns MAX, wal docs/warn/saturating, llmosafe dead-branch + RSS docs, config nested warnings + wal reporting-only docs. Test counts 618→620. (`core/src/capabilities/`, `core/src/cmd.rs`, `core/src/config.rs`, `core/src/executor.rs`, `core/src/llmosafe.rs`, `core/src/monitor.rs`, `core/src/observe/sampler.rs`, `core/src/processes.rs`, `core/src/session.rs`, `core/src/telemetry.rs`, `core/src/validation/path.rs`, `core/src/wal.rs`)
-- **Watch index scope + debounce (b225b8a)** — Added `.ixd.toml` to exclude metadata dirs (`.annotations`, `.opencode`, `.ix`, `.codegraph`, `.git`, `node_modules`, `target`, `telebox`) from trigram index churn; 2000ms debounce for agent-driven write bursts. Takes effect on daemon reload. (`.ixd.toml`)
 
 ## [0.6.5] - 2026-06-15
 

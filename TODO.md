@@ -1,9 +1,9 @@
 # Runtimo Status
 
-**Last Updated:** 2026-09-08
+**Last Updated:** 2026-09-12
 **Build:** `cargo clippy --all-targets` — clean, 0 warnings
 **Tests:** 620 (39 cli + 400 core-lib + 65 integration + 46 robust + 63 daemon + 7 doctest)
-**Version:** 0.9.0 (workspace) — crate deps still pinned ^0.8 (Unit B follow-up)
+**Version:** 0.9.1 (pending) — crate deps pinned ^0.9 (verified: daemon/Cargo.toml:18, cli/Cargo.toml:23-24)
 
 ---
 
@@ -86,5 +86,5 @@
 ### P5: Documentation
 - [ ] "How to add a new capability" runbook
 - [ ] "How to recover from runaway jobs" runbook
-- [ ] Version bump consistency: workspace 0.9.0 but daemon/cli deps pinned ^0.8 — fix Cargo.toml dependency versions
+- [ ] Version bump consistency: workspace 0.9.1 with daemon/cli deps pinned ^0.9 (verified) — no action needed
 - [ ] Test count accuracy: README 566 / TODO 401 / CHANGELOG 233 all stale — actual: 39 cli + 400 core-lib + 65 integration + 46 robust + 63 daemon + 7 doctest = 620 total

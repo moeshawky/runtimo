@@ -1,4 +1,12 @@
-//! runtimo CLI — Agent capability runtime with background dispatch
+//! runtimo CLI — Agent capability runtime with background dispatch.
+//!
+//! Part of the single-program runtimo suite: `runtimo-core` + `runtimo-daemon` + `runtimo-cli`
+//! are one program at one version. `cargo install runtimo-cli` installs both `runtimo` and
+//! `runtimo-daemon` binaries. The `runtimo-daemon` package is the library; the
+//! `runtimo-daemon` binary delegates to [`runtimo_daemon::run`].
+//!
+//! The `runtimo-daemon` lib vs bin are distinguished by the binary name —
+//! the lib is `runtimo_daemon`, the bin is `runtimo-daemon`.
 
 mod format;
 mod output;
@@ -36,11 +44,24 @@ const MAX_ARGS_SIZE_BYTES: usize = 130 * 1024;
 #[derive(Parser)]
 #[command(
     name = "runtimo",
-    about = "capability runtime with telemetry, WAL, process tracking, and background dispatch",
+    about = "runtimo — capability runtime with telemetry, WAL, process tracking, and background dispatch. One program, one version (core+daemon+cli). Install via `cargo install runtimo-cli` (both bins). The runtimo-daemon package is the library; the runtimo-daemon binary delegates to it.",
     long_about = "runtimo — capability runtime with telemetry, WAL, and process tracking\n\n\
 Every exec: telemetry + process snapshot + WAL audit\n\
 Background: dispatch jobs to daemon, check status later",
-    after_help = "USAGE:\n runtimo run -c <Capability> -a '<json>'\n runtimo dispatch -c <Capability> -a '<json>'\n runtimo jobs\n runtimo wait -j <job_id>\n runtimo list\n runtimo logs\n runtimo telemetry\n runtimo processes\n\nCAPABILITIES:\n FileRead  Read file. Path validated (allowed dirs only). No dirs, no traversal.\n FileWrite Write file. Auto-backup for undo. Append mode ok.\n Delete    Delete a file. Auto-backup for undo unless no_backup=true. Path-validated (no rm bypass).\n ShellExec Exec via sh -c. Blocks many dangerous commands (see `runtimo list` for full blocklist). Network tools and interpreters are opt-in.\n GitExec   Git ops: clone|pull|commit|revert|clean|status.\n Kill      Kill process by PID. Protected: init, kthreadd, self, parent, session/group leaders, systemd services.\n Undo      Restore from backup. Find job IDs with `runtimo jobs` or `runtimo logs`.\n\nTIP: Use `runtimo run -c <Cap> --schema` to see the JSON args a capability expects.\nTIP: Use `runtimo list --schemas` to see all schemas at once.\nTIP: ShellExec timeout has no upper bound (default: 30).\n\nDaemon starts on first dispatch if runtimo-daemon is installed.",
+    after_help = "USAGE:\n runtimo run -c <Capability> -a '<json>'\n runtimo dispatch -c <Capability> -a '<json>'\n runtimo jobs\n runtimo wait -j <job_id>\n runtimo list\n runtimo logs\n runtimo telemetry\n runtimo processes\n\nCAPABILITIES:\n FileRead  Read file. Path validated (allowed dirs only). No dirs, no traversal.\n FileWrite Write file. Auto-backup for undo. Append mode ok.\n Delete    Delete a file. Auto-backup for undo unless no_backup=true. Path-validated (no rm bypass).\n ShellExec Exec via sh -c. Blocks many dangerous commands (see `runtimo list` for full blocklist). Network tools and interpreters are opt-in.\n GitExec   Git ops: clone|pull|commit|revert|clean|status.\n Kill      Kill process by PID. Protected: init, kthreadd, self, parent, session/group leaders, systemd services.\n Undo      Restore from backup. Find job IDs with `runtimo jobs` or `runtimo logs`.\n\nTIP: Use `runtimo run -c <Cap> --schema` to see the JSON args a capability expects.\nTIP: Use `runtimo list --schemas` to see all schemas at once.\nTIP: ShellExec timeout has no upper bound (default: 30).\n\nDaemon starts on first dispatch if runtimo-daemon is installed.
+
+ONE-PROGRAM RULE:
+runtimo is one program at one version: runtimo-core + runtimo-daemon + runtimo-cli.
+Install via `cargo install runtimo-cli` (both bins: runtimo + runtimo-daemon).
+The runtimo-daemon package is the library; the runtimo-daemon binary delegates to it.
+
+Quick commands:
+ runtimo run -c <Cap> -a '<json>'
+ runtimo dispatch -c <Cap> -a '<json>'
+ runtimo status
+ runtimo logs
+ runtimo undo -j <job_id>
+ runtimo telemetry",
     version
 )]
 #[allow(clippy::struct_excessive_bools)] // 6 bools map to 3 orthogonal flag pairs (color/no_color, emoji/no_emoji, timestamps/no_timestamps); enum refactor would churn CLI without safety gain

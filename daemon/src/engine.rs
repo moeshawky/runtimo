@@ -1,17 +1,30 @@
-//! Runtimo Daemon - Unix socket JSON-RPC server for capability execution
+//! Runtimo Daemon - Unix socket JSON-RPC server for capability execution.
 //!
-//! Usage: runtimo `[OPTIONS]`
+//! Part of the single-program runtimo suite: `runtimo-core` + `runtimo-daemon` + `runtimo-cli`
+//! are one program at one version. `cargo install runtimo-cli` installs both `runtimo` and
+//! `runtimo-daemon` binaries. The `runtimo-daemon` lib vs bin are distinguished by the binary
+//! name — the lib is `runtimo_daemon`, the bin is `runtimo-daemon`.
+//!
+//! Usage: runtimo-daemon `[OPTIONS]`
 //!
 //! Options:
 //!   --socket `PATH`    Unix socket path (default: `data`/runtimo.sock)
 //!   --http             Enable HTTP listener (placeholder)
 //!   --http-port `PORT` HTTP port (default: 8080)
 //!
+//! # One-Program Rule
+//!
+//! runtimo is a single program at a single version. Install via
+//! `cargo install runtimo-cli` which provides both `runtimo` and
+//! `runtimo-daemon` binaries. The `runtimo-daemon` package is the
+//! library; the `runtimo-daemon` binary delegates to it.
+//!
 //! # Background Mode
 //!
 //! Supports `dispatch` — submit a capability, get job ID immediately, check later.
 //! Uses `status` and `jobs` RPC methods for queriable job history.
 
+use clap::Parser;
 use runtimo_core::oracle::{evaluate, parse_spec, Verdict};
 use runtimo_core::{
     capabilities::{
@@ -1281,40 +1294,29 @@ async fn handle_client(
     Ok(())
 }
 
-// ── Argument parsing ────────────────────────────────────────────────────────
+// ── Argument parsing ────────────────────────────────────────────────
 
 /// Parsed command-line arguments for the daemon binary.
-struct Args {
+#[derive(Parser)]
+#[command(
+    name = "runtimo-daemon",
+    about = "Daemon for the Runtimo capability runtime — part of the single-program runtimo suite (core+daemon+cli X.Y.Z). Install via `cargo install runtimo-cli` (both bins). The runtimo-daemon lib vs bin are distinguished by binary name.",
+    long_about = "runtimo-daemon — part of the single-program runtimo suite.\n\nruntimo is one program at one version: runtimo-core + runtimo-daemon + runtimo-cli.\nInstall via `cargo install runtimo-cli` which provides both `runtimo` and `runtimo-daemon`.\nThe `runtimo-daemon` package is the library; the `runtimo-daemon` binary delegates to it.\n\nQuick commands:\n  runtimo run -c <Cap> -a '<json>'   — execute a capability\n  runtimo dispatch -c <Cap> -a '<json>' — dispatch to daemon\n  runtimo status                     — check job status\n  runtimo logs                       — view WAL events\n  runtimo undo -j <job_id>           — restore from backup\n  runtimo telemetry                  — system telemetry",
+    version
+)]
+struct DaemonArgs {
     /// Unix socket path (default: `{data_dir}/runtimo.sock`).
-    socket: PathBuf,
+    #[arg(long)]
+    socket: Option<PathBuf>,
 }
 
-/// Parses command-line arguments, returning a `--socket` path if specified.
+/// Parses daemon command-line arguments using clap.
 ///
-/// Falls back to `default_socket_path()` when `--socket` is absent.
-fn parse_args() -> Args {
-    let args: Vec<String> = std::env::args().collect();
-    let mut socket = default_socket_path();
-
-    let mut i: usize = 1;
-    while i < args.len() {
-        match args.get(i).map(|s| s.as_str()) {
-            Some("--socket") => {
-                if let Some(val) = args.get(i.saturating_add(1)) {
-                    socket = PathBuf::from(val);
-                    i = i.saturating_add(2);
-                } else {
-                    eprintln!("--socket requires a path argument");
-                    std::process::exit(1);
-                }
-            }
-            _ => {
-                i = i.saturating_add(1);
-            }
-        }
-    }
-
-    Args { socket }
+/// Returns [`DaemonArgs`]. `--help` and `--version` are handled
+/// automatically by clap, printing and exiting before any blocking
+/// daemon startup occurs.
+fn parse_args() -> DaemonArgs {
+    DaemonArgs::parse()
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
@@ -1419,25 +1421,29 @@ fn reconcile_orphaned_jobs(wal_path: &std::path::Path) {
 /// Returns an error if socket binding fails, WAL initialization fails, or the
 /// accept loop encounters an unrecoverable error.
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Parse args BEFORE tokio runtime so --help/-h/--version exit immediately.
+    // clap handles these automatically — it prints and exits on help/version.
+    let args = parse_args();
+    let socket_path = args.socket.unwrap_or_else(default_socket_path);
+
     // Initialize logging backend — log::error! calls are no-ops without this
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        let args = parse_args();
         let wal_path = PathBuf::from(
             std::env::var("RUNTIMO_WAL_PATH")
                 .unwrap_or_else(|_| default_wal_path().to_string_lossy().to_string()),
         );
 
         println!("Runtimo Daemon v{}", env!("CARGO_PKG_VERSION"));
-        println!("Socket: {}", args.socket.display());
+        println!("Socket: {}", socket_path.display());
         println!("WAL:    {}", wal_path.display());
 
         ensure_data_dir()?;
 
-        if args.socket.exists() {
-            std::fs::remove_file(&args.socket)?;
+        if socket_path.exists() {
+            std::fs::remove_file(&socket_path)?;
             println!("Removed stale socket file");
         }
 
@@ -1495,8 +1501,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             // If we didn't acquire it, the CLI already holds it and will release when done.
         }
 
-        let listener = tokio::net::UnixListener::bind(&args.socket)?;
-        println!("Listening on {}", args.socket.display());
+        let listener = tokio::net::UnixListener::bind(&socket_path)?;
+        println!("Listening on {}", socket_path.display());
 
         loop {
             let (stream, addr) = listener.accept().await?;
@@ -2354,12 +2360,15 @@ mod tests {
 
     #[test]
     fn test_parse_args_accepted_flags() {
-        // Verify `Args` struct can be constructed with a socket path.
+        // Verify `DaemonArgs` struct can be constructed with a socket path.
         // `parse_args` is private; this test validates the struct shape.
-        let args = Args {
-            socket: std::path::PathBuf::from("/tmp/test.sock"),
+        let args = DaemonArgs {
+            socket: Some(std::path::PathBuf::from("/tmp/test.sock")),
         };
-        assert_eq!(args.socket, std::path::PathBuf::from("/tmp/test.sock"));
+        assert_eq!(
+            args.socket,
+            Some(std::path::PathBuf::from("/tmp/test.sock"))
+        );
     }
 
     #[tokio::test]
