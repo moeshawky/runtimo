@@ -9,7 +9,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Unique identifier for a job.
 ///
-/// Generated from the current timestamp in nanoseconds, formatted as hex.
+/// Generated from 16 random bytes read from `/dev/urandom` (32 hex chars)
+/// via `crate::utils::generate_id`. When `/dev/urandom` cannot be read,
+/// falls back to a nanosecond-timestamp hex string (ordering and collision
+/// bounds do not apply on the fallback path).
 ///
 /// # Example
 ///
@@ -48,7 +51,8 @@ impl Default for JobId {
 /// Valid transitions:
 /// ```text
 /// Pending → Validating → Validated → Executing → Completed → RolledBack
-///                     ↘ Failed      ↘ Failed
+///                     ↘ Failed (from Validating)
+///                                        ↘ Failed (from Executing)
 /// ```
 #[allow(clippy::exhaustive_enums)] // new states are breaking changes regardless
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -248,7 +252,13 @@ mod tests {
             let id = JobId::new();
             let s = id.as_str().to_string();
             assert!(!s.is_empty(), "JobId should not be empty");
-            assert_eq!(s.len(), 32, "JobId should be 32 hex chars for urandom mode");
+            // urandom path yields 32 hex chars; the timestamp fallback yields
+            // variable-length hex — accept either, but require hex alphabet.
+            assert!(
+                s.chars().all(|c| c.is_ascii_hexdigit()),
+                "JobId should be hex chars, got {:?}",
+                s
+            );
             assert!(
                 seen.insert(s),
                 "JobId collision detected after {} IDs",

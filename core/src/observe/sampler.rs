@@ -83,9 +83,15 @@ impl SampleEvent {
                 {
                     "REDACTED".to_string()
                 } else {
-                    // Truncate long frame to 512 chars to bound WAL.
+                    // Truncate long frame to 512 bytes to bound WAL, cutting
+                    // only at a UTF-8 char boundary so multi-byte characters
+                    // are never split (byte slicing at a non-boundary panics).
                     if f.len() > 512 {
-                        let mut s = f[..512].to_string();
+                        let mut end = 512.min(f.len());
+                        while !f.is_char_boundary(end) {
+                            end = end.saturating_sub(1);
+                        }
+                        let mut s = f.get(..end).map_or_else(String::new, str::to_string);
                         s.push_str("...[truncated]");
                         s
                     } else {

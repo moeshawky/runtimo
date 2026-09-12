@@ -144,9 +144,13 @@ impl SessionManager {
 
     /// Lists all sessions.
     ///
+    /// Unreadable or unparseable session files are silently skipped (they do
+    /// not appear in the returned listing) so one torn file cannot hide all
+    /// sessions.
+    ///
     /// # Errors
-    /// Returns `SessionError` if the sessions directory cannot be read
-    /// or a session file cannot be parsed.
+    /// Returns `SessionError` only if the sessions directory itself cannot
+    /// be read. Per-file read/parse failures are skipped, not returned.
     pub fn list_sessions(&self) -> Result<Vec<Session>> {
         let mut sessions = Vec::new();
         if !self.sessions_dir.exists() {
@@ -227,8 +231,31 @@ impl SessionManager {
         let content = serde_json::to_string_pretty(session).map_err(|e| {
             crate::Error::SessionError(format!("Failed to serialize session: {}", e))
         })?;
-        std::fs::write(&path, content)
-            .map_err(|e| crate::Error::SessionError(format!("Failed to write session: {}", e)))?;
+        // Atomic durable write: temp file in the same directory + fsync +
+        // rename, so a crash mid-write never leaves a truncated `<id>.json`
+        // that load_session would reject and list_sessions would silently
+        // skip. Tmp files are removed on either failure path so a full disk
+        // cannot accumulate `.json.tmp` debris. Mirrors `RuntimoConfig::save`.
+        let tmp_path = path.with_extension("json.tmp");
+        let write_result: std::result::Result<(), String> = (|| {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&tmp_path).map_err(|e| e.to_string())?;
+            file.write_all(content.as_bytes())
+                .map_err(|e| e.to_string())?;
+            file.sync_all().map_err(|e| e.to_string())?;
+            Ok(())
+        })();
+        if let Err(e) = write_result {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(crate::Error::SessionError(format!(
+                "Failed to write session: {}",
+                e
+            )));
+        }
+        std::fs::rename(&tmp_path, &path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            crate::Error::SessionError(format!("Failed to write session: {}", e))
+        })?;
         Ok(())
     }
 }

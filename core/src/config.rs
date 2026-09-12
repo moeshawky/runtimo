@@ -311,9 +311,13 @@ impl RuntimoConfig {
     /// neither `XDG_CONFIG_HOME` nor `HOME` is set. Configuration in `/tmp`
     /// is not persistent across reboots.
     pub fn config_path() -> PathBuf {
+        // Per the XDG Base Directory spec, a non-absolute XDG_CONFIG_HOME is
+        // invalid and must be ignored (fall through to HOME / /tmp) so the
+        // config location never varies with CWD.
         let base = std::env::var("XDG_CONFIG_HOME")
             .ok()
             .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
             .or_else(|| {
                 std::env::var("HOME")
                     .ok()
@@ -1086,6 +1090,26 @@ mod tests {
     fn config_path_is_absolute() {
         let path = RuntimoConfig::config_path();
         assert!(path.is_absolute());
+    }
+
+    #[test]
+    fn config_path_rejects_relative_xdg() {
+        let _guard = CONFIG_TEST_MUTEX.lock().unwrap();
+        // A relative XDG_CONFIG_HOME is invalid per the XDG spec and must be
+        // ignored so the config location never varies with CWD.
+        std::env::set_var("XDG_CONFIG_HOME", "relative/path");
+        let path = RuntimoConfig::config_path();
+        assert!(
+            path.is_absolute(),
+            "relative XDG_CONFIG_HOME must fall through, got {:?}",
+            path
+        );
+        assert!(
+            !path.to_string_lossy().contains("relative/path"),
+            "relative base must not leak into {:?}",
+            path
+        );
+        std::env::remove_var("XDG_CONFIG_HOME");
     }
 
     #[test]
