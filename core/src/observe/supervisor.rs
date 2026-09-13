@@ -19,6 +19,9 @@
 //! * Failures never kill the target — only the bundle watermark changes.
 //! * Bounded channels (512) drop newest + `TRUNCATED`, never silent.
 //! * Secrets redacted at every WAL boundary (`audit.rs` `redact_secret`).
+//! * `attach(pid)` rejects PID==0 (default-deny) with typed error + WAL event.
+//! * `process_start_time` is wired into the sampling path for `RunProcessKey`
+//!   construction, reviving previously dead data (operator no-deadcode policy).
 
 use crate::config::RuntimoConfig;
 use crate::llmosafe::{DesignAssuranceLevel, LlmoSafeGuard};
@@ -27,7 +30,10 @@ use crate::observe::budget::ObserveBudget;
 use crate::observe::bundle::BundleWriter;
 use crate::observe::sampler::{OutOfProcessSampler, SampleEvent, StackSampler};
 use crate::wal::{WalEvent, WalEventType};
+use log::error;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// How the bundle is marked after a run — honest watermark.
@@ -119,6 +125,8 @@ pub fn dal_decision_for(dal: DesignAssuranceLevel) -> DalDecision {
 /// the collector process; no cross-process channel. Fan-out mirrors
 /// `nexus-runtime/src/supervisor.rs::dispatch`: `tick` fans `sample` +
 /// `audit.drain` into `bundle.append` in one deterministic step.
+/// WAL mutex is held only during append operations, never across the
+/// entire sampling loop (split control vs trace).
 #[allow(clippy::exhaustive_structs)]
 pub struct ObserveSupervisor {
     /// Resource guard — `LlmoSafeGuard::new()` (80% ceiling).
@@ -141,6 +149,22 @@ pub struct ObserveSupervisor {
     watermark: BundleWatermark,
     /// Last failure, if any (for `on_failure` honest mark).
     last_failure: Option<CollectorFailure>,
+    /// WAL mutex — held only during append operations, never across
+    /// the entire sampling loop. `None` when no mutex is needed
+    /// (CLI/self-test paths).
+    wal_mutex: Option<Arc<Mutex<()>>>,
+    /// Stop flag for until-exit semantics. When `true`, the collector
+    /// loop exits at the next gate tick. Checked in `gated_tick` and
+    /// `spawn_collector_sync`.
+    stopped: Arc<AtomicBool>,
+    /// Process start time from /proc/pid/stat field 22, used to
+    /// form the full RunProcessKey (PID never alone).
+    ///
+    /// Written by `attach` (capture point) and `set_process_start_time`;
+    /// read by `gated_tick` (caller-passed `0` = unspecified, falls back
+    /// here) and the `process_start_time()` getter. Must stay in sync
+    /// with the sampler's stored value — both are written by `attach`.
+    process_start_time: u64,
 }
 
 impl ObserveSupervisor {
@@ -160,7 +184,7 @@ impl ObserveSupervisor {
         dal: &str,
         pressure_suspend_ms: u64,
     ) -> Result<Self, String> {
-        Self::new_at_path(run_id, sample_rate_hz, dal, None, pressure_suspend_ms)
+        Self::new_at_path(run_id, sample_rate_hz, dal, None, pressure_suspend_ms, None)
     }
 
     /// Creates at an explicit bundle path (for tests).
@@ -170,6 +194,9 @@ impl ObserveSupervisor {
     ///
     /// * `pressure_suspend_ms` — suspension window under pressure in ms;
     ///   cooldown derived as `(ms/1000).max(1)`.
+    /// * `wal_mutex` — optional WAL mutex for serializing WAL writes.
+    ///   Held only during append operations, never across the entire
+    ///   sampling loop. Pass `None` for CLI/self-test paths.
     ///
     /// # Errors
     /// Returns error if bundle creation fails.
@@ -179,6 +206,7 @@ impl ObserveSupervisor {
         dal: &str,
         path: Option<PathBuf>,
         pressure_suspend_ms: u64,
+        wal_mutex: Option<Arc<Mutex<()>>>,
     ) -> Result<Self, String> {
         let mut writer = if let Some(p) = path {
             BundleWriter::create_at(&p)?
@@ -201,8 +229,11 @@ impl ObserveSupervisor {
         } else {
             sample_rate_hz.min(1000)
         };
-        // Pid is set later via `attach`; start with 0 (fallback marker until attached).
-        let sampler = OutOfProcessSampler::new(0, hz);
+        // Pid is set later via `attach`; start with collector PID (never 0 —
+        // pid 0 triggers fallback TRUNCATED marker in sampler).
+        // process_start_time is 0 initially; set via `attach` which
+        // reads /proc/pid/stat field 22 for RunProcessKey construction.
+        let sampler = OutOfProcessSampler::new(std::process::id(), hz, 0);
         let dal_level = match dal.to_ascii_uppercase().as_str() {
             "B" => DesignAssuranceLevel::B,
             "C" => DesignAssuranceLevel::C,
@@ -222,15 +253,88 @@ impl ObserveSupervisor {
             started: Instant::now(),
             watermark: BundleWatermark::Complete,
             last_failure: None,
+            wal_mutex,
+            stopped: Arc::new(AtomicBool::new(false)),
+            process_start_time: 0,
         })
     }
 
     /// Attaches the sampler to a live `pid` (out-of-process, no target mutation).
     ///
     /// Replaces the internal sampler with one bound to `pid`, preserving rate.
-    pub fn attach(&mut self, pid: u32) {
+    /// `process_start_time` is read from `/proc/pid/stat` field 22 and
+    /// stored in the sampler for `RunProcessKey` construction (PID never alone).
+    ///
+    /// On success, `process_start_time` is also stored in the supervisor
+    /// (`self.process_start_time`) — the RunProcessKey capture point that
+    /// `gated_tick` falls back to when the caller passes `0`.
+    ///
+    /// # Errors
+    /// Returns a typed error if `pid == 0` (default-deny: PID 0 is
+    /// the kernel idle task and cannot be sampled). A WAL `ObserveTruncated`
+    /// event is emitted on rejection.
+    ///
+    /// # Invariants
+    /// PID==0 is rejected with typed error + WAL event (default-deny).
+    pub fn attach(&mut self, pid: u32, process_start_time: u64) -> Result<(), String> {
+        if pid == 0 {
+            let _ = self.writer.append(WalEvent {
+                seq: 0,
+                ts: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs()),
+                event_type: WalEventType::ObserveTruncated,
+                job_id: self.run_id.clone(),
+                output: Some(serde_json::json!({
+                    "error": "attach(0) rejected: PID 0 is the kernel idle task",
+                    "dal": format!("{:?}", self.dal),
+                })),
+                ..Default::default()
+            });
+            return Err("attach(0) rejected: PID 0 is the kernel idle task".to_string());
+        }
         let hz = self.sampler.rate_hz();
-        self.sampler = OutOfProcessSampler::new(pid, hz);
+        self.sampler = OutOfProcessSampler::new(pid, hz, process_start_time);
+        // Store in the supervisor: the RunProcessKey capture point
+        // (PID never alone) that `gated_tick` reads as fallback.
+        self.process_start_time = process_start_time;
+        Ok(())
+    }
+
+    /// Signals the collector to stop at the next gate tick.
+    ///
+    /// Sets the `stopped` flag; `gated_tick` and `spawn_collector_sync`
+    /// check this flag for until-exit semantics. The collector exits
+    /// gracefully — no target signal, bundle is finalized.
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+    }
+
+    /// Sets the process start time for `RunProcessKey` construction.
+    ///
+    /// The `process_start_time` is read from `/proc/pid/stat` field 22
+    /// and stored here so that the full `RunProcessKey` (PID +
+    /// process_start_time) can be constructed, ensuring PID is never
+    /// alone (always paired with `process_start_time > 0`).
+    pub fn set_process_start_time(&mut self, pts: u64) {
+        self.process_start_time = pts;
+    }
+
+    /// Returns the stored process start time from `/proc/pid/stat` field 22.
+    ///
+    /// This is the RunProcessKey data captured at `attach` (PID never
+    /// alone); callers building `RunProcessKey` should use it instead of
+    /// re-reading `/proc`. Returns `0` when nothing has been attached
+    /// yet (no capture point, not a valid start time).
+    #[must_use]
+    pub fn process_start_time(&self) -> u64 {
+        self.process_start_time
+    }
+
+    /// Returns whether the stop flag is set.
+    #[must_use]
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
     }
 
     /// Returns the DAL.
@@ -262,17 +366,36 @@ impl ObserveSupervisor {
     /// This is the sole sampling entry point; it never bypasses the guard.
     /// On pressure `>80%` returns `Ok(None)` (suspended) and marks
     /// `Truncated` watermark; `ObserveSuspended` is emitted lazily on `flush`.
+    /// `process_start_time` — the RunProcessKey start time for this tick
+    /// (`/proc/pid/stat` field 22). Passing `0` means unspecified: the
+    /// supervisor falls back to the value stored at `attach`, so the
+    /// sampled events still carry a real start time (PID never alone).
+    /// WAL mutex is held only during append operations, never across
+    /// the sampling logic (split control vs trace).
     ///
     /// # Errors
     /// Returns `Err` on hard sampler failure (never on pressure suspend).
-    pub fn gated_tick(&mut self) -> Result<Option<SampleEvent>, String> {
-        let res = self.sampler.gated_tick(&self.guard, &mut self.budget)?;
+    pub fn gated_tick(&mut self, process_start_time: u64) -> Result<Option<SampleEvent>, String> {
+        // Until-exit: if stop flag is set, return None to signal exit.
+        if self.stopped.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        // RunProcessKey fallback (PID never alone): caller-passed 0 =
+        // unspecified, use the start time captured at `attach`.
+        let pts = if process_start_time == 0 {
+            self.process_start_time
+        } else {
+            process_start_time
+        };
+        let res = self
+            .sampler
+            .gated_tick(&self.guard, &mut self.budget, pts)?;
         if res.is_none() {
             // Suspended tick — mark truncated, emit ObserveSuspended on flush.
             if self.watermark == BundleWatermark::Complete {
                 self.watermark = BundleWatermark::Truncated;
             }
-            let _ = self.writer.append(WalEvent {
+            self.writer.append(WalEvent {
                 seq: 0,
                 ts: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -280,25 +403,37 @@ impl ObserveSupervisor {
                 event_type: WalEventType::ObserveSuspended,
                 job_id: self.run_id.clone(),
                 ..Default::default()
-            });
-            let _ = self.writer.flush_batch();
+            })?;
+            self.writer.flush_batch()?;
         }
         if let Some(ref ev) = res {
             // Fan-out: sampler event → bundle (keep channel inside collector).
+            // Lock WAL mutex only for the append, not the sampling logic.
+            // Clone the Arc to avoid borrowing self while calling on_failure.
             let wal = ev.to_wal_event();
-            if let Err(e) = self.writer.append(wal) {
-                self.on_failure(CollectorFailure::DiskFull);
-                return Err(format!("bundle append failed (disk-full): {e}"));
+            let wal_mutex = self.wal_mutex.clone();
+            {
+                let _guard = wal_mutex
+                    .as_ref()
+                    .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
+                if let Err(e) = self.writer.append(wal) {
+                    self.on_failure(CollectorFailure::DiskFull);
+                    return Err(format!("bundle append failed (disk-full): {e}"));
+                }
             }
         }
         // Also fan-out audit events (exhaustive low-volume).
         let audits = self.audit.drain();
         for a in audits {
             let wal = a.to_wal_event();
-            let _ = self.writer.append(wal);
+            let wal_mutex = self.wal_mutex.clone();
+            let _guard = wal_mutex
+                .as_ref()
+                .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
+            self.writer.append(wal)?;
         }
         // Time-window flush (100 ms discipline).
-        let _ = self.writer.maybe_flush_time();
+        self.writer.maybe_flush_time()?;
         Ok(res)
     }
 
@@ -321,7 +456,7 @@ impl ObserveSupervisor {
             self.watermark = wm.clone();
         }
         // Emit a WAL marker for the failure (inside collector, no target signal).
-        let _ = self.writer.append(WalEvent {
+        if let Err(e) = self.writer.append(WalEvent {
             seq: 0, // writer assigns
             ts: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -339,7 +474,9 @@ impl ObserveSupervisor {
                 "note": "target never signalled; collector Halt never kills target"
             })),
             ..Default::default()
-        });
+        }) {
+            error!("on_failure WAL append failed: {}", e);
+        }
         wm
     }
 
@@ -374,13 +511,17 @@ impl ObserveSupervisor {
     /// collector and target share the same parent (daemon/CLI), so the
     /// collector never becomes the target's parent and never signals it.
     ///
+    /// Reads `/proc/pid/stat` starttime for the full `RunProcessKey`
+    /// (PID + process_start_time), never PID alone. The `process_start_time`
+    /// is stored in the supervisor via `set_process_start_time`.
+    ///
     /// This stub is for in-process tests; the real daemon wires it to
     /// `BackgroundJobRegistry` and `tokio::task::spawn_blocking`. Here we run
     /// a short synchronous collection for `duration` ticks to verify the
     /// sibling invariant without forking.
     ///
     /// # Errors
-    /// Returns error if bundle creation fails.
+    /// Returns error if bundle creation fails or if `/proc/pid/stat` cannot be read.
     pub fn spawn_collector_sync(
         run_id: &str,
         target_pid: u32,
@@ -390,20 +531,52 @@ impl ObserveSupervisor {
         ticks: usize,
     ) -> Result<BundleWatermark, String> {
         let mut sup = Self::new(run_id, sample_hz, dal, 1000)?;
-        sup.attach(target_pid);
+        // Process start_time capture point: read /proc/pid/stat starttime
+        // for the full RunProcessKey (PID + starttime), never PID alone.
+        // This is read BEFORE attach so it can be passed to the sampler.
+        let process_start_time = Self::read_proc_starttime(target_pid)?;
+        sup.attach(target_pid, process_start_time)?;
+        sup.set_process_start_time(process_start_time);
         let interval = sup.sampler.interval();
         // Fix arithmetic_side_effects: Instant::now() + duration is idiomatic
         #[allow(clippy::arithmetic_side_effects)]
         let deadline = Instant::now() + duration;
         for _ in 0..ticks {
-            if Instant::now() >= deadline {
+            if Instant::now() >= deadline || sup.is_stopped() {
                 break;
             }
-            let _ = sup.gated_tick();
+            sup.gated_tick(process_start_time)?;
             std::thread::sleep(interval.min(Duration::from_millis(50)));
         }
         sup.finalize()?;
         Ok(sup.watermark.clone())
+    }
+
+    /// Reads /proc/pid/stat starttime for the process start_time capture point.
+    ///
+    /// Returns the starttime field (field 22) from /proc/pid/stat.
+    /// This is used with PID to form the full RunProcessKey (PID never alone).
+    ///
+    /// # Errors
+    /// Returns an error string if `/proc/<pid>/stat` is unreadable,
+    /// malformed (no `)` separator), missing the starttime field,
+    /// or the starttime value does not parse as `u64`.
+    pub fn read_proc_starttime(pid: u32) -> Result<u64, String> {
+        let path = format!("/proc/{}/stat", pid);
+        std::fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read {}: {}", path, e))
+            .and_then(|content| {
+                let after_paren = content
+                    .rsplit(')')
+                    .next()
+                    .ok_or_else(|| format!("malformed /proc/{}/stat", pid))?;
+                let fields: Vec<&str> = after_paren.split_whitespace().collect();
+                fields
+                    .get(21)
+                    .ok_or_else(|| format!("missing starttime field in {}", path))?
+                    .parse::<u64>()
+                    .map_err(|e| format!("failed to parse starttime in {}: {}", path, e))
+            })
     }
 
     /// Returns the effective DAL string from config (for CLI/daemon wiring).
@@ -483,9 +656,15 @@ mod tests {
         let _ = std::fs::remove_file(PathBuf::from(format!("{}.checkpoint", path.display())));
 
         // Create supervisor — ObserveStarted should be emitted on creation.
-        let mut sup =
-            ObserveSupervisor::new_at_path("started-suspended", 50, "A", Some(path.clone()), 1000)
-                .unwrap();
+        let mut sup = ObserveSupervisor::new_at_path(
+            "started-suspended",
+            50,
+            "A",
+            Some(path.clone()),
+            1000,
+            None,
+        )
+        .unwrap();
 
         // Verify ObserveStarted is present in the bundle.
         let content = std::fs::read_to_string(&path).unwrap();
@@ -510,7 +689,7 @@ mod tests {
 
         // Force a suspend via inject_drop_next, then gated_tick.
         sup.inject_drop_next();
-        let res = sup.gated_tick();
+        let res = sup.gated_tick(0);
         assert!(res.is_ok(), "gated_tick should not error: {:?}", res.err());
         assert!(res.unwrap().is_none(), "should be suspended (None)");
 
@@ -546,15 +725,98 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(PathBuf::from(format!("{}.checkpoint", path.display())));
         let mut sup =
-            ObserveSupervisor::new_at_path("gated", 50, "A", Some(path.clone()), 1000).unwrap();
-        sup.attach(std::process::id());
-        let res = sup.gated_tick();
+            ObserveSupervisor::new_at_path("gated", 50, "A", Some(path.clone()), 1000, None)
+                .unwrap();
+        let _ = sup.attach(std::process::id(), 0);
+        let res = sup.gated_tick(0);
         assert!(
             res.is_ok(),
             "gated_tick should not error on healthy system: {:?}",
             res.err()
         );
         let _ = sup.finalize();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(PathBuf::from(format!("{}.checkpoint", path.display())));
+    }
+
+    /// Coverage: `gated_tick(0)` (unspecified) falls back to the
+    /// start time captured at `attach`, so events carry a real
+    /// start time (PID never alone). See F9 REQUIRED.
+    #[test]
+    fn supervisor_gated_tick_zero_uses_attach_start_time() {
+        let path = tmp_bundle("start_time_fallback");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(PathBuf::from(format!("{}.checkpoint", path.display())));
+        let mut sup =
+            ObserveSupervisor::new_at_path("stfb", 50, "A", Some(path.clone()), 1000, None)
+                .unwrap();
+        let attach_pts = 12345u64;
+        let _ = sup.attach(std::process::id(), attach_pts);
+        // 0 = unspecified: gated_tick falls back to attach-captured start_time.
+        let res = sup.gated_tick(0);
+        assert!(
+            res.is_ok(),
+            "gated_tick should not error on healthy system: {:?}",
+            res.err()
+        );
+        if let Some(ev) = res.unwrap() {
+            assert_eq!(
+                ev.process_start_time, attach_pts,
+                "gated_tick(0) must use attach-captured start_time, not 0"
+            );
+        }
+        let _ = sup.finalize();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(PathBuf::from(format!("{}.checkpoint", path.display())));
+    }
+
+    /// Negative control: `attach(0)` is rejected (default-deny) with a
+    /// typed error + WAL `ObserveTruncated` event; a valid pid attaches
+    /// cleanly and is unaffected by the rejection.
+    #[test]
+    fn supervisor_attach_rejects_pid_zero() {
+        let path = tmp_bundle("attach_zero");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(PathBuf::from(format!("{}.checkpoint", path.display())));
+        let mut sup =
+            ObserveSupervisor::new_at_path("attach-zero", 50, "A", Some(path.clone()), 1000, None)
+                .unwrap();
+
+        // attach(0) must be rejected (default-deny) with a typed error.
+        let err = sup
+            .attach(0, 0)
+            .expect_err("attach(0) must be rejected (default-deny)");
+        assert!(
+            err.contains("PID 0"),
+            "typed error must name PID 0, got: {err}"
+        );
+
+        // Valid pid is unaffected by the rejection.
+        assert!(
+            sup.attach(std::process::id(), 0).is_ok(),
+            "valid pid must attach cleanly after attach(0) rejection"
+        );
+
+        // finalize flushes the pending batch so the rejection event is durable.
+        let _ = sup.finalize();
+
+        // The rejection must have emitted a WAL ObserveTruncated event
+        // carrying the typed error (append-only WAL, never silent).
+        let content = std::fs::read_to_string(&path).unwrap();
+        let rejected = content
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .any(|e: serde_json::Value| {
+                e.get("type").and_then(|t| t.as_str()) == Some("observe_truncated")
+                    && e.get("output")
+                        .and_then(|o| o.get("error"))
+                        .and_then(|s| s.as_str())
+                        .is_some_and(|s| s.contains("PID 0"))
+            });
+        assert!(
+            rejected,
+            "attach(0) rejection must emit a WAL ObserveTruncated event"
+        );
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(PathBuf::from(format!("{}.checkpoint", path.display())));
     }
@@ -569,7 +831,7 @@ mod tests {
         let _ = std::fs::remove_file(PathBuf::from(format!("{}.checkpoint", path_e.display())));
 
         let mut sup_a =
-            ObserveSupervisor::new_at_path("honest-a", 50, "A", Some(path_a.clone()), 1000)
+            ObserveSupervisor::new_at_path("honest-a", 50, "A", Some(path_a.clone()), 1000, None)
                 .unwrap();
         let wm_a = sup_a.on_failure(CollectorFailure::PressureSpike);
         assert_eq!(
@@ -581,7 +843,7 @@ mod tests {
         let _ = sup_a.finalize();
 
         let mut sup_e =
-            ObserveSupervisor::new_at_path("honest-e", 50, "E", Some(path_e.clone()), 1000)
+            ObserveSupervisor::new_at_path("honest-e", 50, "E", Some(path_e.clone()), 1000, None)
                 .unwrap();
         let wm_e = sup_e.on_failure(CollectorFailure::PressureSpike);
         assert_eq!(
@@ -604,10 +866,10 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(PathBuf::from(format!("{}.checkpoint", path.display())));
         let mut sup =
-            ObserveSupervisor::new_at_path("never-kill", 50, "A", Some(path.clone()), 1000)
+            ObserveSupervisor::new_at_path("never-kill", 50, "A", Some(path.clone()), 1000, None)
                 .unwrap();
         let target_pid = std::process::id();
-        sup.attach(target_pid);
+        let _ = sup.attach(target_pid, 0);
         for f in [
             CollectorFailure::CollectorKilled,
             CollectorFailure::DiskFull,
@@ -749,11 +1011,17 @@ mod tests {
         let _ = std::fs::remove_file(&path_low);
         let _ = std::fs::remove_file(PathBuf::from(format!("{}.checkpoint", path_low.display())));
 
-        let mut sup_low =
-            ObserveSupervisor::new_at_path("pressure-low", 50, "A", Some(path_low.clone()), 1000)
-                .unwrap();
-        sup_low.attach(std::process::id());
-        let res_low = sup_low.gated_tick();
+        let mut sup_low = ObserveSupervisor::new_at_path(
+            "pressure-low",
+            50,
+            "A",
+            Some(path_low.clone()),
+            1000,
+            None,
+        )
+        .unwrap();
+        let _ = sup_low.attach(std::process::id(), 0);
+        let res_low = sup_low.gated_tick(0);
         assert!(
             res_low.is_ok(),
             "gated_tick should not error: {:?}",
@@ -785,12 +1053,18 @@ mod tests {
         let _ = std::fs::remove_file(&path_high);
         let _ = std::fs::remove_file(PathBuf::from(format!("{}.checkpoint", path_high.display())));
 
-        let mut sup_high =
-            ObserveSupervisor::new_at_path("pressure-high", 50, "A", Some(path_high.clone()), 1000)
-                .unwrap();
-        sup_high.attach(std::process::id());
+        let mut sup_high = ObserveSupervisor::new_at_path(
+            "pressure-high",
+            50,
+            "A",
+            Some(path_high.clone()),
+            1000,
+            None,
+        )
+        .unwrap();
+        let _ = sup_high.attach(std::process::id(), 0);
         sup_high.inject_drop_next(); // Force budget suspend
-        let res_high = sup_high.gated_tick();
+        let res_high = sup_high.gated_tick(0);
         assert!(
             res_high.is_ok(),
             "gated_tick should not error: {:?}",

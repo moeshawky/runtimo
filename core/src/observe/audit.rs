@@ -6,6 +6,14 @@
 //!
 //! No per-line tracer — grep-guard the CUT (no per-line analogue).
 //!
+//! # AuditHook Gap (Documented)
+//! The `AuditHook` is **collector-side only** — it records events
+//! emitted by the collector itself. There are **no target producers**
+//! yet: the target process does not inject audit events into the
+//! collector's channel. This gap is tracked and deferred; target-side
+//! audit production is planned for a future phase. Callers should
+//! not assume target-originated `AuditEvent`s exist today.
+//!
 //! # Nexus reuse
 //! * `message.rs` envelope fields (`message_id`, `correlation_id`, etc.) —
 //!   audit events carry `id` + `ts` + `kind` envelope, REDACTED tokens never logged.
@@ -56,8 +64,12 @@ pub struct AuditEvent {
 
 /// Returns `REDACTED` if `input` contains a secret pattern case-insensitively.
 ///
-/// Matches `auth_token`, `bearer`, or `api_key` (case-insensitive). This is
+/// Matches `auth_token`, `bearer`, `api_key`, `password`, `secret`,
+/// `_token`, or `credential` (case-insensitive). This is
 /// always-on in release (not `debug_assert!`), consistent with G-SEC.
+/// The `_token` pattern narrows the match to key names containing
+/// `_token` (e.g., `auth_token`, `access_token`), avoiding false
+/// positives on standalone "token" substrings in non-secret text.
 fn redact_secret(input: &str) -> bool {
     let lower = input.to_ascii_lowercase();
     lower.contains("auth_token")
@@ -65,7 +77,7 @@ fn redact_secret(input: &str) -> bool {
         || lower.contains("api_key")
         || lower.contains("password")
         || lower.contains("secret")
-        || lower.contains("token")
+        || lower.contains("_token")
         || lower.contains("credential")
 }
 
@@ -73,7 +85,8 @@ impl AuditEvent {
     /// Creates an audit event.
     ///
     /// `target` is truncated to 1 KiB and secrets are redacted — any target
-    /// containing `auth_token`, `bearer`, or `api_key` (case-insensitive) is
+    /// containing `auth_token`, `bearer`, `api_key`, `password`, `secret`,
+    /// `_token`, or `credential` (case-insensitive) is
     /// replaced with `REDACTED` before storage. This is always-on (not
     /// `debug_assert!`) so release builds also redact.
     #[must_use]
@@ -109,7 +122,9 @@ impl AuditEvent {
     /// Converts to a WAL event for bundle persistence.
     ///
     /// Redacts `target` again at this boundary: if the stored `target` (or
-    /// `location`) contains a secret pattern, it is replaced with `REDACTED`
+    /// `location`) contains a secret pattern (`auth_token`, `bearer`,
+    /// `api_key`, `password`, `secret`, `_token`, `credential` —
+    /// case-insensitive), it is replaced with `REDACTED`
     /// before serialization, so WAL never contains secrets even if `AuditEvent`
     /// was constructed via direct struct literal.
     #[must_use]

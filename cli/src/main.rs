@@ -2868,6 +2868,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     &dal_str,
                     Some(bundle_path.clone()),
                     pressure_suspend_ms,
+                    None,
                 ) {
                     Ok(s) => s,
                     Err(e) => {
@@ -2875,7 +2876,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         std::process::exit(1);
                     }
                 };
-                sup.attach(target_pid);
+                let _ = sup.attach(target_pid, 0);
                 // Short burst collection (demo: 50 ticks or 2s).
                 let interval = sup.sampler_interval();
                 #[allow(clippy::arithmetic_side_effects)]
@@ -2883,7 +2884,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
                 let mut ticks = 0;
                 while std::time::Instant::now() < deadline && ticks < 50 {
-                    let _ = sup.gated_tick();
+                    // 0 = unspecified: gated_tick falls back to the attach-captured process_start_time.
+                    let _ = sup.gated_tick(0);
                     std::thread::sleep(interval.min(std::time::Duration::from_millis(20)));
                     ticks += 1;
                 }

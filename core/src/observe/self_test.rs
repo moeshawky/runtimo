@@ -145,14 +145,14 @@ fn fixture_a_exactness() -> SelfTestCheck {
 fn fixture_b_sampling_bounds() -> SelfTestCheck {
     let hz: u64 = 50;
     let ticks = 10usize;
-    let mut s = OutOfProcessSampler::new(std::process::id(), hz);
+    let mut s = OutOfProcessSampler::new(std::process::id(), hz, 0);
     let guard = crate::llmosafe::LlmoSafeGuard::new();
     let mut budget = crate::observe::budget::ObserveBudget::new_with_path(30, 1, None);
     let start = std::time::Instant::now();
     let mut got = 0usize;
     let mut any_coverage = false;
     for _ in 0..ticks {
-        match s.gated_tick(&guard, &mut budget) {
+        match s.gated_tick(&guard, &mut budget, 0) {
             Ok(Some(ev)) => {
                 got += 1;
                 if !ev.frames.is_empty() {
@@ -176,7 +176,7 @@ fn fixture_b_sampling_bounds() -> SelfTestCheck {
     // Because we cap sleep at 30 ms, elapsed ~0.3 s for 10 ticks → 33 Hz, below 45 low.
     // So we relax: if we got at least half the ticks, rate is considered within bounds for this fixture.
     // The key invariant is we produced samples (not silent zeros) and topped fallback markers.
-    let rate_ok = (observed_hz >= low && observed_hz <= high) || (got >= ticks / 2);
+    let rate_ok = (observed_hz >= low && observed_hz <= high) || (got as f64 >= ticks as f64 / 2.0);
     // Also drain to check TRUNCATED discipline not needed — coverage already checked.
     let drained = s.drain();
     if !any_coverage && !drained.is_empty() {
@@ -213,6 +213,7 @@ fn dal_a_gate() -> SelfTestCheck {
         "A",
         Some(path.clone()),
         RuntimoConfig::load().resolved().observe_pressure_suspend_ms,
+        None,
     ) {
         Ok(s) => s,
         Err(e) => {
@@ -223,10 +224,10 @@ fn dal_a_gate() -> SelfTestCheck {
             }
         }
     };
-    sup.attach(std::process::id());
+    let _ = sup.attach(std::process::id(), 0);
     // Induce a drop (simulates overflow) then tick once.
     sup.inject_drop_next();
-    let _ = sup.gated_tick();
+    let _ = sup.gated_tick(0);
     // Also exercise the honest-mark path directly.
     let wm = sup.on_failure(CollectorFailure::PressureSpike);
     let passed =

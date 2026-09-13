@@ -98,7 +98,6 @@ struct WaitOutcome {
     /// Captured stderr (bounded to `MAX_OUTPUT_BYTES`).
     stderr: Vec<u8>,
     /// Descendant PIDs seen just before return (for audit).
-    #[allow(dead_code)] // audit trail — retained for future WAL `spawned_pids` parity
     descendants: Vec<u32>,
     /// `true` iff the timeout-kill path fired (lines 1177-1192).
     timed_out: bool,
@@ -1583,7 +1582,8 @@ impl TypedCapability for ShellExec {
             "timeout_secs": timeout,
             "timed_out": outcome.timed_out,
             "signal": signal,
-            "truncated": outcome.stdout.len() >= MAX_OUTPUT_BYTES || outcome.stderr.len() >= MAX_OUTPUT_BYTES
+            "truncated": outcome.stdout.len() >= MAX_OUTPUT_BYTES || outcome.stderr.len() >= MAX_OUTPUT_BYTES,
+            "descendants": outcome.descendants,
         }));
         Ok(out)
     }

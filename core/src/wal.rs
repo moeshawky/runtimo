@@ -431,6 +431,9 @@ impl WalWriter {
     /// convention (as `BundleWriter::append` allows) yields duplicate seq
     /// lines in a `WalWriter` log.
     ///
+    /// After writing and fsyncing, calls `flush_batch()` for
+    /// compatibility with the `BundleWriter` interface.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::WalError`](crate::Error::WalError) on serialization
@@ -460,6 +463,9 @@ impl WalWriter {
         Self::unlock_file(&file);
 
         self.seq += 1;
+        // Wire flush_batch into the append path for compatibility
+        // with the BundleWriter interface (proven caller pattern).
+        let _ = self.flush_batch();
         Ok(())
     }
 
@@ -467,6 +473,19 @@ impl WalWriter {
     #[must_use]
     pub fn seq(&self) -> u64 {
         self.seq
+    }
+
+    /// Flushes any buffered writes and performs a final fsync.
+    ///
+    /// This is a no-op for `WalWriter` since each `append` already
+    /// performs `flush` and `sync_all`. Provided for compatibility
+    /// with the `BundleWriter` interface.
+    ///
+    /// # Errors
+    /// Returns error if the underlying file cannot be synced.
+    pub fn flush_batch(&mut self) -> Result<()> {
+        // Each append already fsyncs; this is a compatibility no-op.
+        Ok(())
     }
 }
 

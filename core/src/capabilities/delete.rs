@@ -304,7 +304,36 @@ mod tests {
 
     #[test]
     fn rejects_critical_file() {
-        let target = std::env::temp_dir().join(".bashrc");
+        // Set up a config that enables critical_files_enabled
+        // to avoid flakiness from the default config state.
+        let config_dir = std::env::temp_dir().join(format!(
+            "runtimo_del_critical_cfg_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[guards]\ncritical_files_enabled = true\npath_restriction_enabled = false\n",
+        )
+        .unwrap();
+        let old_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        std::env::set_var("XDG_CONFIG_HOME", &config_dir);
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "runtimo_del_critical_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let target = tmp_dir.join(".bashrc");
         std::fs::write(&target, "alias ll='ls -la'").unwrap();
         let cap = Delete::new().unwrap();
         let err = TypedCapability::execute(
@@ -317,7 +346,13 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("critical file"), "got: {}", err);
-        std::fs::remove_file(&target).ok();
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        let _ = std::fs::remove_dir_all(&config_dir);
+        if let Some(old) = old_xdg {
+            std::env::set_var("XDG_CONFIG_HOME", old);
+        } else {
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
     }
 
     #[test]

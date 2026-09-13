@@ -1,0 +1,76 @@
+# imodent configuration for the runtimo Rust workspace.
+# Loaded automatically by imodent as .imodent.yaml in the project root.
+# See https://github.com/moeshawky/imodent for details.
+
+# ── Analysis ──────────────────────────────────────────────────────
+check_imports: true
+check_syntax: true
+check_lint: true
+check_types: false
+check_rust: true
+run_cargo_check: true
+run_cargo_clippy: true
+
+# ── Fix behavior ──────────────────────────────────────────────────
+# Rust files are advisory-only (no formatting, no auto-fix).
+# Set auto_fix_safe to false to avoid attempting fixes on .rs files
+# that imodent cannot modify.
+auto_fix_safe: false
+auto_fix_all: false
+interactive: false
+
+# ── Include patterns ──────────────────────────────────────────────
+# Default is Python-only. Add Rust source files for the workspace.
+include_patterns:
+  - "*.py"
+  - "**/*.py"
+  - "*.rs"
+  - "**/*.rs"
+  - "*.toml"
+  - "**/*.toml"
+  - "*.yaml"
+  - "**/*.yaml"
+  - "*.json"
+  - "**/*.json"
+
+# ── Exclude patterns ──────────────────────────────────────────────
+# Default Python excludes plus runtimo-specific artifacts.
+exclude_patterns:
+  # Python defaults
+  - "**/test_*.py"
+  - "test_*.py"
+  - "**/__pycache__/**"
+  - "__pycache__/**"
+  - "**/.pytest_cache/**"
+  - ".pytest_cache/**"
+  - "**/.ruff_cache/**"
+  - ".ruff_cache/**"
+  - "**/.mypy_cache/**"
+  - ".mypy_cache/**"
+  - "**/.venv/**"
+  - ".venv/**"
+  - "**/venv/**"
+  - "venv/**"
+  - "**/build/**"
+  - "build/**"
+  - "**/dist/**"
+  - "dist/**"
+  - "**/*.egg-info/**"
+  - "*.egg-info/**"
+  - "**/target/**"
+  - "target/**"
+  # Rust / build artifacts
+  - "**/*.rs.bak"
+  - "**/*.bak"
+  # Runtimo-specific directories
+  - ".codegraph/**"
+  - ".ix/**"
+  - ".opencode/**"
+  - ".git/**"
+  - "telebox/**"
+  # Cargo lock is generated; don't analyze
+  - "Cargo.lock"
+
+# ── External tools ────────────────────────────────────────────────
+use_ruff: true
+use_pyright: false

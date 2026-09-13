@@ -11,6 +11,7 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Rolling resource usage tracker for observe throttling.
@@ -21,12 +22,15 @@ use std::time::{Duration, Instant};
 /// # Invariants
 /// * Persist file is `observe_budget.state` next to `resource_history.state`.
 /// * Restart restores `last_check` if within cooldown window.
+/// * `measurements` is protected by `Mutex<Vec<(Instant, u8)>>` (mirrors
+///   `LlmoSafeGuard::history: Mutex<ResourceHistory>` at `llmosafe.rs:283`)
+///   so `should_suspend(&self)` and `record(&self)` are thread-safe.
 #[allow(clippy::exhaustive_structs)]
 pub struct ObserveBudget {
-    measurements: Vec<(Instant, u8)>,
+    measurements: Mutex<Vec<(Instant, u8)>>,
     window_secs: u64,
     cooldown_secs: u64,
-    last_check: Option<Instant>,
+    last_check: Mutex<Option<Instant>>,
     persist_path: Option<PathBuf>,
 }
 
@@ -46,11 +50,11 @@ impl ObserveBudget {
         cooldown_secs: u64,
         persist_path: Option<PathBuf>,
     ) -> Self {
-        let mut b = Self {
-            measurements: Vec::with_capacity(60),
+        let b = Self {
+            measurements: Mutex::new(Vec::with_capacity(60)),
             window_secs,
             cooldown_secs,
-            last_check: None,
+            last_check: Mutex::new(None),
             persist_path,
         };
         b.restore_last_check();
@@ -64,7 +68,10 @@ impl ObserveBudget {
     }
 
     /// Restores `last_check` from persisted epoch seconds if within cooldown.
-    fn restore_last_check(&mut self) {
+    ///
+    /// Poison-tolerant: a poisoned `last_check` mutex is reclaimed via
+    /// `into_inner()` instead of panicking on lock.
+    fn restore_last_check(&self) {
         if let Some(ref path) = self.persist_path {
             let content = match fs::read_to_string(path) {
                 Ok(c) => c,
@@ -85,7 +92,7 @@ impl ObserveBudget {
                 .map_or(0, |d| d.as_secs());
             let elapsed_secs = now_epoch.saturating_sub(secs);
             if elapsed_secs < self.cooldown_secs {
-                self.last_check = Some(
+                *self.last_check.lock().unwrap_or_else(|e| e.into_inner()) = Some(
                     Instant::now()
                         .checked_sub(Duration::from_secs(elapsed_secs))
                         .unwrap_or_else(|| {
@@ -115,50 +122,58 @@ impl ObserveBudget {
     }
 
     /// Records a pressure measurement and returns rolling average.
-    pub fn record(&mut self, pressure: u8) -> f64 {
+    ///
+    /// Thread-safe: acquires `Mutex<Vec<(Instant, u8)>>`
+    /// following `LlmoSafeGuard::history: Mutex<ResourceHistory>`
+    /// at `llmosafe.rs:283`.
+    pub fn record(&self, pressure: u8) -> f64 {
         let now = Instant::now();
         let cutoff = now
             .checked_sub(Duration::from_secs(self.window_secs))
             .unwrap_or_else(Instant::now);
-        self.measurements.retain(|(t, _)| *t > cutoff);
-        self.measurements.push((now, pressure));
-        if self.measurements.is_empty() {
+        let mut guard = self.measurements.lock().unwrap_or_else(|e| e.into_inner());
+        guard.retain(|(t, _)| *t > cutoff);
+        guard.push((now, pressure));
+        if guard.is_empty() {
             return f64::from(pressure);
         }
         #[allow(clippy::cast_precision_loss)]
         {
-            let count = self.measurements.len() as f64;
-            self.measurements
-                .iter()
-                .map(|(_, p)| f64::from(*p))
-                .sum::<f64>()
-                / count
+            let count = guard.len() as f64;
+            guard.iter().map(|(_, p)| f64::from(*p)).sum::<f64>() / count
         }
     }
 
     /// Rolling average over window, if any.
+    ///
+    /// Thread-safe: acquires `Mutex<Vec<(Instant, u8)>>`
+    /// following `LlmoSafeGuard::history: Mutex<ResourceHistory>`
+    /// at `llmosafe.rs:283`.
     #[must_use]
     pub fn rolling_average(&self) -> Option<f64> {
-        if self.measurements.is_empty() {
+        let guard = self.measurements.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_empty() {
             return None;
         }
         #[allow(clippy::cast_precision_loss)]
         {
-            let count = self.measurements.len() as f64;
-            Some(
-                self.measurements
-                    .iter()
-                    .map(|(_, p)| f64::from(*p))
-                    .sum::<f64>()
-                    / count,
-            )
+            let count = guard.len() as f64;
+            Some(guard.iter().map(|(_, p)| f64::from(*p)).sum::<f64>() / count)
         }
     }
 
     /// Whether in cooldown since last check.
+    ///
+    /// Poison-tolerant: a poisoned `last_check` mutex is reclaimed via
+    /// `into_inner()` instead of panicking on lock.
     #[must_use]
     pub fn is_in_cooldown(&self) -> bool {
-        if let Some(last) = self.last_check {
+        if let Some(last) = self
+            .last_check
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
             last.elapsed() < Duration::from_secs(self.cooldown_secs)
         } else {
             false
@@ -166,8 +181,11 @@ impl ObserveBudget {
     }
 
     /// Marks checked and persists.
-    pub fn mark_checked(&mut self) {
-        self.last_check = Some(Instant::now());
+    ///
+    /// Poison-tolerant: a poisoned `last_check` mutex is reclaimed via
+    /// `into_inner()` instead of panicking on lock.
+    pub fn mark_checked(&self) {
+        *self.last_check.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
         self.persist_last_check();
     }
 
@@ -227,7 +245,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         // First instance writes checkpoint.
         {
-            let mut b = ObserveBudget::new_with_path(30, 60, Some(path.clone()));
+            let b = ObserveBudget::new_with_path(30, 60, Some(path.clone()));
             b.mark_checked();
             assert!(b.is_in_cooldown());
         }
@@ -244,7 +262,7 @@ mod tests {
 
     #[test]
     fn budget_rolling_average() {
-        let mut b = ObserveBudget::new_with_path(30, 1, None);
+        let b = ObserveBudget::new_with_path(30, 1, None);
         b.record(50);
         b.record(70);
         let avg = b.rolling_average().unwrap();
@@ -253,7 +271,7 @@ mod tests {
 
     #[test]
     fn budget_should_suspend_on_high_pressure() {
-        let mut b = ObserveBudget::new_with_path(30, 1, None);
+        let b = ObserveBudget::new_with_path(30, 1, None);
         assert!(b.should_suspend(90));
         assert!(!b.should_suspend(50));
         b.record(90);

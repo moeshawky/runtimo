@@ -68,6 +68,11 @@
     )
 )]
 
+/// Versioned runtime contracts — taxonomy + provenance, not acquisition.
+pub mod runtime;
+
+/// Provider adapters — Tetragon + JFR with raw artifact custody.
+pub mod adapters;
 /// Undo support via pre-mutation file backups.
 pub mod backup;
 /// Pluggable capability implementations (file I/O, shell, git, etc.).
@@ -103,6 +108,7 @@ pub mod wal;
 
 pub use oracle::{evaluate, Op, OracleError, Predicate, PropertySpec, PropertyVerdict, Verdict};
 
+pub use adapters::{ArtifactReducer, JfrAdapter, JfrConfig, TetragonAdapter, TetragonConfig};
 pub use backup::BackupManager;
 pub use capabilities::{Delete, FileRead, FileWrite, GitExec, Kill, ShellExec, Undo};
 pub use capability::{
@@ -114,7 +120,12 @@ pub use job::{Job, JobId, JobState};
 pub use llmosafe::LlmoSafeGuard;
 pub use monitor::HealthMonitor;
 pub use processes::ProcessSnapshot;
+pub use runtime::{
+    resolve_locator, EvidenceFidelity, ProviderStatus, RunManifestV1, RunProcessKey,
+    RuntimeFactExport, RuntimeFactV1, RuntimeLocator, SymbolUID, SymbolUidResolution,
+};
 pub use telemetry::Telemetry;
+pub use validation::{validate_path, PathContext};
 pub use wal::{WalEvent, WalEventType, WalReader, WalWriter};
 
 /// Error types for runtimo-core.

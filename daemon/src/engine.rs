@@ -63,6 +63,8 @@ struct DaemonState {
     wal_mutex: Arc<Mutex<()>>,
     /// Background job registry for dispatch/status tracking.
     bg_jobs: BackgroundJobRegistry,
+    /// Opt-in capability allow-list. `None` means unrestricted.
+    allowed_capabilities: Option<Vec<String>>,
 }
 
 /// Resolves and validates an optional working directory string.
@@ -104,7 +106,21 @@ fn resolve_working_dir(
 }
 
 impl DaemonState {
-    fn new(wal_path: &Path) -> std::result::Result<Self, Box<dyn std::error::Error>> {
+    /// Creates a new [`DaemonState`] with the given WAL path and
+    /// optional capability allow-list.
+    ///
+    /// # Parameters
+    /// * `wal_path` — Path to the Write-Ahead Log file.
+    /// * `allowed_capabilities` — `None` for unrestricted (back-compat),
+    ///   `Some(vec)` for opt-in allow-list.
+    ///
+    /// # Errors
+    /// Returns an error if the WAL directory cannot be created or a
+    /// capability fails to initialize.
+    fn new(
+        wal_path: &Path,
+        allowed_capabilities: Option<Vec<String>>,
+    ) -> std::result::Result<Self, Box<dyn std::error::Error>> {
         let mut registry = CapabilityRegistry::new();
         registry.register(FileRead);
 
@@ -135,11 +151,51 @@ impl DaemonState {
             wal_path: wal_path.to_path_buf(),
             wal_mutex: Arc::new(Mutex::new(())),
             bg_jobs: BackgroundJobRegistry::new(),
+            allowed_capabilities,
         })
     }
 }
 
 // ── Request routing ─────────────────────────────────────────────────────────
+
+/// Checks whether a capability is permitted under the daemon's
+/// allow-list.
+///
+/// When `allowed_capabilities` is `None`, all capabilities are
+/// permitted (back-compat default). When `Some`, the capability
+/// name must appear in the list; unknown names in the list are
+/// silently ignored (they are not validated against the registry).
+///
+/// # Returns
+/// `Ok(())` if the capability is allowed. `Err(JsonRpcError)` with
+/// code `-32604` if the capability is not in the allow-list.
+///
+/// # Invariants
+/// This function does not execute the capability and does not
+/// touch the WAL. A denied attempt returns before any execution
+/// or mutation occurs.
+fn check_capability_allowed(
+    capability: &str,
+    allowed: Option<&Vec<String>>,
+) -> std::result::Result<(), JsonRpcError> {
+    match allowed {
+        None => Ok(()),
+        Some(list) => {
+            if list.iter().any(|c| c == capability) {
+                Ok(())
+            } else {
+                let allowed_set = list.join(", ");
+                Err(JsonRpcError {
+                    code: -32604,
+                    message: format!(
+                        "Capability '{}' not in allowed set [{}]",
+                        capability, allowed_set
+                    ),
+                })
+            }
+        }
+    }
+}
 
 /// Routes an incoming JSON-RPC request to the appropriate handler.
 ///
@@ -149,7 +205,25 @@ impl DaemonState {
 /// under 80 lines, so we surface `observe_burst` as unimplemented with a clear
 /// note).
 /// Returns a `JsonRpcResponse` with `error.code = -32601` for unknown methods.
+///
+/// Before dispatching, checks the capability allow-list when configured.
+/// The gate extracts the capability name from `params` for `run` and
+/// `dispatch` methods and rejects with `-32604` if the capability is
+/// not in the allow-list. This covers all dispatch entries through
+/// a single gate in `handle_request`.
 async fn handle_request(state: &Arc<DaemonState>, req: JsonRpcRequest) -> JsonRpcResponse {
+    // Capability allow-list gate — covers all dispatch entries.
+    // Extracts the capability name from params for run/dispatch.
+    if let Some(cap_name) = req.params.get("capability").and_then(|v| v.as_str()) {
+        if let Err(e) = check_capability_allowed(cap_name, state.allowed_capabilities.as_ref()) {
+            return JsonRpcResponse {
+                result: None,
+                error: Some(e),
+                id: req.id,
+            };
+        }
+    }
+
     match req.method.as_str() {
         "run" => handle_run(state, req.params, req.id).await,
         "dispatch" => handle_dispatch(state, req.params, req.id).await,
@@ -916,10 +990,18 @@ async fn handle_observe_start(
                 &dal_clone,
                 Some(out_clone.clone()),
                 pressure_suspend_ms,
+                Some(state_arc.wal_mutex.clone()),
             )
             .map_err(|e| format!("supervisor create: {e}"))?;
+            // 0 = unspecified: gated_tick falls back to the attach-captured process_start_time.
+            let mut process_start_time = 0u64;
             if let Some(pid) = target_pid {
-                sup.attach(pid);
+                // Read process_start_time for RunProcessKey construction.
+                process_start_time =
+                    runtimo_core::observe::ObserveSupervisor::read_proc_starttime(pid)
+                        .unwrap_or_default();
+                sup.attach(pid, process_start_time)
+                    .map_err(|e| format!("attach: {e}"))?;
             }
             // Short collection window (2s or 100 ticks) — sibling; target never signalled.
             let interval = sup.sampler_interval();
@@ -927,7 +1009,7 @@ async fn handle_observe_start(
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
             let mut ticks = 0;
             while std::time::Instant::now() < deadline && ticks < 100 {
-                let _ = sup.gated_tick();
+                let _ = sup.gated_tick(process_start_time);
                 std::thread::sleep(interval.min(std::time::Duration::from_millis(20)));
                 #[allow(clippy::arithmetic_side_effects)]
                 {
@@ -1308,6 +1390,18 @@ struct DaemonArgs {
     /// Unix socket path (default: `{data_dir}/runtimo.sock`).
     #[arg(long)]
     socket: Option<PathBuf>,
+
+    /// Opt-in capability allow-list (comma-separated names).
+    ///
+    /// When provided, only the named capabilities may be executed
+    /// through the daemon. Any capability not in this list is
+    /// rejected with a JSON-RPC error before execution or WAL
+    /// mutation. `None` (default) means unrestricted — all
+    /// registered capabilities are allowed (back-compat).
+    ///
+    /// Example: `--allow-capabilities FileRead,FileWrite,Undo`
+    #[arg(long)]
+    allow_capabilities: Option<String>,
 }
 
 /// Parses daemon command-line arguments using clap.
@@ -1386,12 +1480,12 @@ fn reconcile_orphaned_jobs(wal_path: &std::path::Path) {
     if let Ok(mut wal) = WalWriter::create(wal_path) {
         for jid in &orphaned {
             let capability = started.get(jid).and_then(|(_, c)| c.clone());
-            let _ = wal.append(WalEvent {
+            if let Err(e) = wal.append(WalEvent {
                 seq: wal.seq(),
                 ts: now,
                 event_type: WalEventType::JobFailed,
                 job_id: jid.clone(),
-                capability,
+                capability: capability.clone(),
                 output: Some(serde_json::json!({"reconciled": true})),
                 error: Some(
                     "daemon terminated before job completion (reconciled on restart)".into(),
@@ -1406,7 +1500,14 @@ fn reconcile_orphaned_jobs(wal_path: &std::path::Path) {
                 cmd_exit_code: None,
                 cmd_corrected: None,
                 ..Default::default()
-            });
+            }) {
+                log::error!(
+                    "reconcile_orphaned_jobs: failed to append JobFailed event for job {} (capability: {:?}): {}",
+                    jid,
+                    capability,
+                    e
+                );
+            }
         }
         println!("Reconciled {} orphaned job(s).", orphaned.len());
     }
@@ -1425,6 +1526,15 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     // clap handles these automatically — it prints and exits on help/version.
     let args = parse_args();
     let socket_path = args.socket.unwrap_or_else(default_socket_path);
+
+    // Parse --allow-capabilities as comma-separated list.
+    // Empty strings after splitting are filtered out.
+    let allowed_capabilities = args.allow_capabilities.map(|s| {
+        s.split(',')
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty())
+            .collect()
+    });
 
     // Initialize logging backend — log::error! calls are no-ops without this
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
@@ -1447,7 +1557,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("Removed stale socket file");
         }
 
-        let state = Arc::new(DaemonState::new(&wal_path)?);
+        let state = Arc::new(DaemonState::new(&wal_path, allowed_capabilities)?);
 
         // Reconcile orphaned jobs left from a previous crash/termination
         reconcile_orphaned_jobs(&wal_path);
@@ -1945,7 +2055,7 @@ mod tests {
         std::env::set_var("XDG_DATA_HOME", dir.to_str().unwrap());
 
         let wal_path = dir.join("test.wal");
-        let state = DaemonState::new(&wal_path).expect("DaemonState::new should succeed");
+        let state = DaemonState::new(&wal_path, None).expect("DaemonState::new should succeed");
 
         // Registry should have all 7 capabilities
         let caps = state.registry.list();
@@ -1976,7 +2086,7 @@ mod tests {
         std::env::set_var("XDG_DATA_HOME", dir.to_str().unwrap());
 
         let wal_path = dir.join("wal.jsonl");
-        let state = DaemonState::new(&wal_path).unwrap();
+        let state = DaemonState::new(&wal_path, None).unwrap();
 
         let caps = state.registry.list();
         assert_eq!(caps.len(), 7);
@@ -2004,7 +2114,7 @@ mod tests {
 
         // Use a non-standard WAL path
         let custom_wal = dir.join("custom_wal_dir").join("audit.jsonl");
-        let state = DaemonState::new(&custom_wal).unwrap();
+        let state = DaemonState::new(&custom_wal, None).unwrap();
 
         assert_eq!(state.wal_path, custom_wal);
 
@@ -2021,7 +2131,7 @@ mod tests {
         let deep_wal = dir.join("deep").join("nested").join("wal.jsonl");
         assert!(!deep_wal.parent().unwrap().exists());
 
-        let state = DaemonState::new(&deep_wal).unwrap();
+        let state = DaemonState::new(&deep_wal, None).unwrap();
         assert_eq!(state.wal_path, deep_wal);
         assert!(deep_wal.parent().unwrap().exists());
 
@@ -2082,7 +2192,7 @@ mod tests {
             let _guard = ENV_MUTEX.lock().unwrap();
             std::env::set_var("XDG_DATA_HOME", dir.to_str().unwrap());
             let wp = dir.join("wal.jsonl");
-            let s = Arc::new(DaemonState::new(&wp).unwrap());
+            let s = Arc::new(DaemonState::new(&wp, None).unwrap());
             (s, wp)
         };
         // MutexGuard dropped here — env var still set for the duration of the test
@@ -2115,7 +2225,7 @@ mod tests {
             let _guard = ENV_MUTEX.lock().unwrap();
             std::env::set_var("XDG_DATA_HOME", dir.to_str().unwrap());
             let wp = dir.join("wal.jsonl");
-            Arc::new(DaemonState::new(&wp).unwrap())
+            Arc::new(DaemonState::new(&wp, None).unwrap())
         };
 
         // Valid params for a capability that doesn't exist
@@ -2139,7 +2249,7 @@ mod tests {
             let _guard = ENV_MUTEX.lock().unwrap();
             std::env::set_var("XDG_DATA_HOME", dir.to_str().unwrap());
             let wp = dir.join("wal.jsonl");
-            Arc::new(DaemonState::new(&wp).unwrap())
+            Arc::new(DaemonState::new(&wp, None).unwrap())
         };
 
         let response = handle_dispatch(
@@ -2166,7 +2276,7 @@ mod tests {
             let _guard = ENV_MUTEX.lock().unwrap();
             std::env::set_var("XDG_DATA_HOME", dir.to_str().unwrap());
             let wp = dir.join("wal.jsonl");
-            Arc::new(DaemonState::new(&wp).unwrap())
+            Arc::new(DaemonState::new(&wp, None).unwrap())
         };
 
         let params = serde_json::json!({"capability": "NoSuchCapability"});
@@ -2308,7 +2418,7 @@ mod tests {
             let _guard = ENV_MUTEX.lock().unwrap();
             std::env::set_var("XDG_DATA_HOME", dir.to_str().unwrap());
             let wp = dir.join("wal.jsonl");
-            Arc::new(DaemonState::new(&wp).unwrap())
+            Arc::new(DaemonState::new(&wp, None).unwrap())
         };
 
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -2339,7 +2449,7 @@ mod tests {
             let _guard = ENV_MUTEX.lock().unwrap();
             std::env::set_var("XDG_DATA_HOME", dir.to_str().unwrap());
             let wp = dir.join("wal.jsonl");
-            Arc::new(DaemonState::new(&wp).unwrap())
+            Arc::new(DaemonState::new(&wp, None).unwrap())
         };
 
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -2364,6 +2474,7 @@ mod tests {
         // `parse_args` is private; this test validates the struct shape.
         let args = DaemonArgs {
             socket: Some(std::path::PathBuf::from("/tmp/test.sock")),
+            allow_capabilities: None,
         };
         assert_eq!(
             args.socket,
@@ -2379,7 +2490,7 @@ mod tests {
             let _guard = ENV_MUTEX.lock().unwrap();
             std::env::set_var("XDG_DATA_HOME", dir.to_str().unwrap());
             let wp = dir.join("wal.jsonl");
-            Arc::new(DaemonState::new(&wp).unwrap())
+            Arc::new(DaemonState::new(&wp, None).unwrap())
         };
         // working_dir that does not exist and is absolute — should be rejected with -32602, not dispatched:true
         let params = serde_json::json!({"capability": "FileRead", "args": {"path": "/tmp/test.txt"}, "working_dir": "/nonexistent_xyz_invalid_12345"});
@@ -2405,7 +2516,7 @@ mod tests {
             let _guard = ENV_MUTEX.lock().unwrap();
             std::env::set_var("XDG_DATA_HOME", dir.to_str().unwrap());
             let wp = dir.join("wal.jsonl");
-            Arc::new(DaemonState::new(&wp).unwrap())
+            Arc::new(DaemonState::new(&wp, None).unwrap())
         };
         let params = serde_json::json!({"capability": "FileRead", "args": {"path": "/tmp/test.txt"}, "working_dir": "/nonexistent_xyz_invalid_12345"});
         let response = handle_run(&state, params, serde_json::Value::from(1)).await;
@@ -2423,7 +2534,7 @@ mod tests {
             let _guard = ENV_MUTEX.lock().unwrap();
             std::env::set_var("XDG_DATA_HOME", dir.to_str().unwrap());
             let wp = dir.join("wal.jsonl");
-            Arc::new(DaemonState::new(&wp).unwrap())
+            Arc::new(DaemonState::new(&wp, None).unwrap())
         };
         // Use a known dangerous command — mkfs is blocked by is_dangerous_command
         let params = serde_json::json!({"cmd": "mkfs /dev/sda1"});
@@ -2508,7 +2619,7 @@ mod tests {
             let _guard = ENV_MUTEX.lock().unwrap();
             std::env::set_var("XDG_DATA_HOME", dir.to_str().unwrap());
             let wp = dir.join("wal.jsonl");
-            Arc::new(DaemonState::new(&wp).unwrap())
+            Arc::new(DaemonState::new(&wp, None).unwrap())
         };
         let params = serde_json::json!({"path": bundle_path.to_str().unwrap()});
         let resp = handle_observe_verify(&state, params, serde_json::Value::from(1)).await;
@@ -2549,7 +2660,7 @@ mod tests {
             let _guard = ENV_MUTEX.lock().unwrap();
             std::env::set_var("XDG_DATA_HOME", dir.to_str().unwrap());
             let wp = dir.join("wal.jsonl");
-            Arc::new(DaemonState::new(&wp).unwrap())
+            Arc::new(DaemonState::new(&wp, None).unwrap())
         };
         let spec = r#"{"name":"job-type-check","predicates":[{"field":"event_type","op":"Eq","value":"job_started"}]}"#;
         let params = serde_json::json!({
@@ -2598,7 +2709,7 @@ mod tests {
             let _guard = ENV_MUTEX.lock().unwrap();
             std::env::set_var("XDG_DATA_HOME", dir.to_str().unwrap());
             let wp = dir.join("wal.jsonl");
-            Arc::new(DaemonState::new(&wp).unwrap())
+            Arc::new(DaemonState::new(&wp, None).unwrap())
         };
         let params = serde_json::json!({
             "path": bundle_path.to_str().unwrap(),
@@ -2631,5 +2742,122 @@ mod tests {
         // shape by confirming it deserializes with the old schema.
         let back: serde_json::Value = serde_json::from_value(json).unwrap();
         assert!(back.get("path").is_some());
+    }
+
+    // ── Capability allow-list gate tests ───────────────────────────
+
+    #[test]
+    fn test_check_capability_allowed_denies_when_listed() {
+        // When allowed_capabilities is Some and the capability is
+        // NOT in the list, check_capability_allowed returns Err(-32604).
+        let allowed = Some(vec!["FileRead".to_string(), "FileWrite".to_string()]);
+        let result = check_capability_allowed("ShellExec", allowed.as_ref());
+        assert!(result.is_err(), "ShellExec should be denied");
+        let err = result.unwrap_err();
+        assert_eq!(err.code, -32604, "denied capability must use -32604");
+        assert!(
+            err.message.contains("ShellExec"),
+            "error message must name the denied capability"
+        );
+        assert!(
+            err.message.contains("FileRead"),
+            "error message must name the allowed set"
+        );
+    }
+
+    #[test]
+    fn test_check_capability_allowed_allows_when_listed() {
+        // When allowed_capabilities is Some and the capability IS
+        // in the list, check_capability_allowed returns Ok(()).
+        let allowed = Some(vec!["ShellExec".to_string(), "Delete".to_string()]);
+        let result = check_capability_allowed("ShellExec", allowed.as_ref());
+        assert!(result.is_ok(), "ShellExec should be allowed");
+    }
+
+    #[test]
+    fn test_check_capability_allowed_backcompat_none() {
+        // When allowed_capabilities is None (default, no flag),
+        // ALL capabilities are allowed — back-compat.
+        let allowed: Option<Vec<String>> = None;
+        assert!(check_capability_allowed("ShellExec", allowed.as_ref()).is_ok());
+        assert!(check_capability_allowed("Delete", allowed.as_ref()).is_ok());
+        assert!(check_capability_allowed("Kill", allowed.as_ref()).is_ok());
+    }
+
+    #[test]
+    fn test_check_capability_allowed_unknown_name_ignored() {
+        // Unknown capability names in the allow-list are silently
+        // ignored — they do not cause an error. The list is an
+        // allow-list, not a validation list.
+        let allowed = Some(vec!["FileRead".to_string(), "NonExistentCap".to_string()]);
+        // FileRead is in the list → allowed
+        assert!(check_capability_allowed("FileRead", allowed.as_ref()).is_ok());
+        // ShellExec is NOT in the list → denied
+        assert!(check_capability_allowed("ShellExec", allowed.as_ref()).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_denies_disallowed_capability() {
+        // Integration test: handle_request rejects a disallowed
+        // capability before execution or WAL mutation.
+        let dir = unique_test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let state = {
+            let _guard = ENV_MUTEX.lock().unwrap();
+            std::env::set_var("XDG_DATA_HOME", dir.to_str().unwrap());
+            let wp = dir.join("wal.jsonl");
+            let allowed = Some(vec!["FileRead".to_string()]);
+            Arc::new(DaemonState::new(&wp, allowed).unwrap())
+        };
+
+        // Request to run ShellExec should be denied at the gate
+        let req = JsonRpcRequest {
+            method: "run".to_string(),
+            params: serde_json::json!({"capability": "ShellExec"}),
+            id: serde_json::Value::from(1),
+        };
+        let response = handle_request(&state, req).await;
+        assert!(response.error.is_some(), "disallowed capability must error");
+        assert_eq!(response.error.unwrap().code, -32604);
+        assert!(
+            response.result.is_none(),
+            "denied request must have no result"
+        );
+
+        std::env::remove_var("XDG_DATA_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_allows_when_no_flag() {
+        // Back-compat: when no --allow-capabilities flag is set,
+        // handle_request passes through all capabilities.
+        let dir = unique_test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let state = {
+            let _guard = ENV_MUTEX.lock().unwrap();
+            std::env::set_var("XDG_DATA_HOME", dir.to_str().unwrap());
+            let wp = dir.join("wal.jsonl");
+            Arc::new(DaemonState::new(&wp, None).unwrap())
+        };
+
+        let req = JsonRpcRequest {
+            method: "run".to_string(),
+            params: serde_json::json!({"capability": "ShellExec"}),
+            id: serde_json::Value::from(1),
+        };
+        let response = handle_request(&state, req).await;
+        // ShellExec is not found in registry with empty params,
+        // but the gate passed — it reached handle_run's registry check.
+        // The key assertion: no -32604 from the allow-list gate.
+        // (It may error for other reasons, but NOT -32604.)
+        if let Some(err) = &response.error {
+            assert_ne!(err.code, -32604, "back-compat must not deny with -32604");
+        }
+
+        std::env::remove_var("XDG_DATA_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

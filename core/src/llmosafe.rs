@@ -70,6 +70,7 @@ fn dal_from_config() -> DesignAssuranceLevel {
 /// `rolling_average()` returns `None` and the safety gate passes
 /// unconditionally until a new measurement is taken (vacuous-restore
 /// limitation: the cooldown is honored but no pressure data survives).
+#[derive(Debug)]
 struct ResourceHistory {
     measurements: Vec<(Instant, u8)>,
     window_secs: u64,
@@ -267,6 +268,7 @@ fn resource_history_path() -> Option<PathBuf> {
 ///
 /// The `history` field is per-guard (previously a static
 /// `RESOURCE_HISTORY` caused cross-guard interference).
+#[derive(Debug)]
 pub struct LlmoSafeGuard {
     guard: ResourceGuard,
     policy: EscalationPolicy,

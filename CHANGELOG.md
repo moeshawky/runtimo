@@ -5,6 +5,22 @@ All notable changes to Runtimo are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-09-13
+
+### Added
+- **Runtime evidence contracts** — `RuntimeFactV1`, `RuntimeLocator`, `RunManifestV1`, `RunProcessKey`, `ProviderStatus`, `EvidenceFidelity`, `runtime_fact_export` (`core/src/`).
+- **Tetragon (1.7.1) + JFR (JDK17) provider adapters** — Raw-artifact custody + `ArtifactReducer`; daemon `--allow-capabilities` allow-list (`None`=default-open, `-32604` pre-exec deny, 6 tests).
+- **Honest experimental labels** — Tetragon/JFR adapters partial (`ObservedCall` deferred/OTel blocked, no enforcement, provider-absent → `Degraded`/`Unavailable`).
+
+### Changed
+- **ObserveBudget** `Mutex<RwLock>` → `Mutex<Vec>` (no API change); supervisor/observe hardening.
+
+### Fixed
+- **Review B blockers** — WAL flush propagation, dead params, unwrap panic, doc drift; tracked-file clippy idioms; auth `Limitation` note staleness.
+
+### Testing
+- **Total test count: 740** (39 cli + 473 core-lib + 65 integration + 69 daemon + 46 robust + 28 adapters_integration + 12 runtime_fact_export + 8 doctest). All passing.
+
 ## [0.9.1] - 2026-09-12
 
 ### Changed

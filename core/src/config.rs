@@ -162,6 +162,8 @@ pub struct ResolvedConfig {
     pub observe_sample_hz: u64,
     /// Effective pressure suspend window in milliseconds.
     pub observe_pressure_suspend_ms: u64,
+    /// Allowed capabilities when opt-in restricted. `None` means unrestricted (back-compat).
+    pub allowed_capabilities: Option<Vec<String>>,
 }
 
 /// Runtimo persistent configuration.
@@ -256,6 +258,26 @@ pub struct RuntimoConfig {
     #[serde(default)]
     pub profile: Option<String>,
 
+    /// Opt-in capability allow-list.
+    ///
+    /// When set to `Some(vec![...])`, only the named capabilities may be
+    /// executed through the daemon. Any capability not in this list is
+    /// rejected with a JSON-RPC error (`-32604`) before execution or WAL
+    /// mutation. `None` (the default) means **unrestricted** — all
+    /// registered capabilities are allowed, preserving back-compat for
+    /// existing single-user deployments.
+    ///
+    /// Intended for multi-tenant or sandboxed daemon deployments. Does
+    /// not affect local CLI execution (the CLI bypasses the daemon).
+    ///
+    /// # Example
+    /// ```toml
+    /// [core]
+    /// allowed_capabilities = ["FileRead", "FileWrite", "Undo"]
+    /// ```
+    #[serde(default)]
+    pub allowed_capabilities: Option<Vec<String>>,
+
     /// Output rendering table.
     #[serde(default)]
     pub output: OutputConfig,
@@ -301,6 +323,7 @@ impl RuntimoConfig {
         "path_restriction_enabled",
         "path_sanitization_enabled",
         "profile",
+        "allowed_capabilities",
         "output",
         "wal",
         "backup",
@@ -688,6 +711,7 @@ profile = "minimal"
             telemetry_enabled,
             observe_sample_hz,
             observe_pressure_suspend_ms,
+            allowed_capabilities: self.allowed_capabilities.clone(),
         }
     }
 
@@ -823,7 +847,7 @@ profile = "minimal"
             for (table_name, subkeys) in known_subkeys {
                 if let Some(toml::Value::Table(ntable)) = table.get::<str>(table_name) {
                     for key in ntable.keys() {
-                        if !subkeys.contains(&key.as_str()) {
+                        if !subkeys.is_empty() && !subkeys.contains(&key.as_str()) {
                             eprintln!(
                                 "[runtimo] Warning: unknown config key `[{}].{}` in {} (ignored)",
                                 table_name,

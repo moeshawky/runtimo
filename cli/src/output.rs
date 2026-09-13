@@ -268,6 +268,7 @@ mod tests {
             telemetry_enabled: true,
             observe_sample_hz: 50,
             observe_pressure_suspend_ms: 1000,
+            allowed_capabilities: None,
         }
     }
 

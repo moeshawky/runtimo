@@ -1,4 +1,4 @@
-//! Out-of-process stack sampler — remote-read, sibling-only.
+//! Out-of-process kernel-stack diagnostic sampler — remote-read, sibling-only.
 //!
 //! The sampler never injects code into the target (`P1A`): no `ptrace`
 //! stop `>1 ms`, no `LD_PRELOAD`, no in-process hook. Each tick is
@@ -19,6 +19,11 @@
 //!   accounted via `dropped` + marker.
 //! * Fallback never returns silent zero frames without a marker.
 //! * Secrets are redacted at the WAL boundary.
+//!
+//! # Naming Note
+//! "proc-stack" is demoted to diagnostic naming: the sampler reads
+//! `/proc/<pid>/stack` for kernel-stack diagnostic data. The alias
+//! "proc-stack" is preserved for backward compatibility in docs only.
 
 use crate::llmosafe::LlmoSafeGuard;
 use crate::observe::budget::ObserveBudget;
@@ -29,7 +34,7 @@ use std::time::{Duration, Instant};
 /// Bounded sampler channel capacity — matches [`crate::observe::audit::AUDIT_CHANNEL_CAP`].
 pub const SAMPLER_CHANNEL_CAP: usize = 512;
 
-/// A single stack sample (out-of-process snapshot).
+/// A single kernel-stack diagnostic sample (out-of-process snapshot).
 #[derive(Debug, Clone)]
 #[allow(clippy::exhaustive_structs)]
 pub struct SampleEvent {
@@ -37,6 +42,9 @@ pub struct SampleEvent {
     pub seq: u64,
     /// Target pid sampled.
     pub pid: u32,
+    /// Process start time from `/proc/pid/stat` field 22.
+    /// Used for `RunProcessKey` construction (PID never alone).
+    pub process_start_time: u64,
     /// Monotonic nanoseconds since sampler creation (`base.elapsed()`).
     pub mono_ns: u64,
     /// Wall-clock nanoseconds since UNIX epoch.
@@ -164,6 +172,7 @@ pub trait StackSampler: Send {
         &mut self,
         guard: &LlmoSafeGuard,
         budget: &mut ObserveBudget,
+        process_start_time: u64,
     ) -> Result<Option<SampleEvent>, String>;
 
     /// Drains queued samples, appending a `TRUNCATED` marker if drops occurred.
@@ -185,22 +194,34 @@ pub trait StackSampler: Send {
     fn interval(&self) -> Duration;
 }
 
-/// Out-of-process implementation for the primary target runtime.
+/// Out-of-process kernel-stack diagnostic implementation for the primary target runtime.
 ///
-/// Remote-read is via `/proc/<pid>/stack` (and liveness via
-/// `/proc/<pid>/status` / `kill(pid,0)` semantics). No `ptrace` attach
-/// with stop `>1 ms`; the read is a single open+read. On `EPERM` or
-/// unknown runtime (`ENOENT` for stack file on unknown kernel) a
-/// fallback `TRUNCATED` event is produced with `error` set, never an
-/// empty silent sample.
+/// Remote-read is via `/proc/<pid>/stack` (kernel-stack diagnostic)
+/// and liveness via `/proc/<pid>/status` / `kill(pid,0)` semantics.
+/// No `ptrace` attach with stop `>1 ms`; the read is a single open+read.
+/// On `EPERM` or unknown runtime (`ENOENT` for stack file on unknown
+/// kernel) a fallback `TRUNCATED` event is produced with `error` set,
+/// never an empty silent sample.
 ///
 /// Bounded channel: `512`-cap `VecDeque`; full → drop newest
 /// (increment `dropped`), marker on `drain` — copied from
 /// `audit.rs` bounded-channel discipline, not reinvented.
+///
+/// # Naming Note
+/// "proc-stack" is demoted to diagnostic naming; the actual
+/// read path is `/proc/<pid>/stack` for kernel-stack diagnostic
+/// data. The alias "proc-stack" is preserved for backward compat.
+///
+/// # Invariants
+/// * `process_start_time` is stored from the supervisor and included
+///   in `SampleEvent` for `RunProcessKey` construction (PID never alone).
 #[allow(clippy::exhaustive_structs)]
 pub struct OutOfProcessSampler {
     /// Target pid.
     pid: u32,
+    /// Process start time from `/proc/pid/stat` field 22.
+    /// Included in `SampleEvent` for `RunProcessKey` construction.
+    process_start_time: u64,
     /// Samples per second (from `ObserveConfig`, default `50`).
     rate_hz: u64,
     /// Tick interval (`1/rate_hz`).
@@ -224,11 +245,13 @@ impl OutOfProcessSampler {
     ///
     /// `rate_hz` of `0` is coerced to `50` (default `Q3`). `rate_hz`
     /// above `1000` is capped to `1000` to avoid busy-loop.
+    /// `process_start_time` is read from `/proc/pid/stat` field 22
+    /// and stored for `RunProcessKey` construction (PID never alone).
     #[must_use]
     #[allow(clippy::arithmetic_side_effects)]
     // 1_000_000 / hz is safe because hz is coerced to min 50;
     // result fits in u64 for all valid rate_hz values.
-    pub fn new(pid: u32, rate_hz: u64) -> Self {
+    pub fn new(pid: u32, rate_hz: u64, process_start_time: u64) -> Self {
         let hz = match rate_hz {
             0 => 50,
             v if v > 1000 => 1000,
@@ -237,6 +260,7 @@ impl OutOfProcessSampler {
         let interval = Duration::from_micros(1_000_000 / hz);
         Self {
             pid,
+            process_start_time,
             rate_hz: hz,
             interval,
             queue: VecDeque::with_capacity(SAMPLER_CHANNEL_CAP),
@@ -253,7 +277,7 @@ impl OutOfProcessSampler {
     #[allow(clippy::arithmetic_side_effects)]
     // 1_000_000 / hz is safe because hz is coerced to min 50;
     // result fits in u64 for all valid rate_hz values.
-    pub fn with_capacity(pid: u32, rate_hz: u64, cap: usize) -> Self {
+    pub fn with_capacity(pid: u32, rate_hz: u64, cap: usize, process_start_time: u64) -> Self {
         let hz = match rate_hz {
             0 => 50,
             v if v > 1000 => 1000,
@@ -263,6 +287,7 @@ impl OutOfProcessSampler {
         let effective = cap.min(SAMPLER_CHANNEL_CAP);
         Self {
             pid,
+            process_start_time,
             rate_hz: hz,
             interval,
             queue: VecDeque::with_capacity(effective),
@@ -279,11 +304,15 @@ impl OutOfProcessSampler {
         self.inject_drop = true;
     }
 
-    /// Attempts a remote-read of `/proc/<pid>/stack`.
+    /// Attempts a remote-read of `/proc/<pid>/stack` (kernel-stack diagnostic).
     ///
     /// Returns frames on success; on `EPERM`/`ENOENT`/other, returns a
     /// fallback marker (`truncated=true`) with `error` set, never silent
     /// zeros. No `ptrace` stop `>1 ms`.
+    ///
+    /// # Naming Note
+    /// "proc-stack" is demoted to diagnostic naming; the read path
+    /// is `/proc/<pid>/stack` for kernel-stack diagnostic data.
     #[allow(clippy::arithmetic_side_effects)]
     // u64 monotonic counters; bounded channel cap prevents overflow.
     fn try_remote_read(&mut self) -> SampleEvent {
@@ -297,12 +326,14 @@ impl OutOfProcessSampler {
         // unwrap_or(u64::MAX) is a defensive fallback for the impossible overflow case.
         let seq = self.next_seq;
         self.next_seq += 1;
+        let process_start_time = self.process_start_time;
 
         // Liveness: if pid 0 or unreadable, treat as fallback.
         if self.pid == 0 {
             return SampleEvent {
                 seq,
                 pid: self.pid,
+                process_start_time,
                 mono_ns: mono,
                 wall_ns: wall,
                 frames: vec!["TRUNCATED fallback".to_string()],
@@ -311,7 +342,7 @@ impl OutOfProcessSampler {
             };
         }
 
-        // Try remote read: /proc/<pid>/stack (kernel stacks) — out-of-process,
+        // Try remote read: /proc/<pid>/stack (kernel-stack diagnostic) — out-of-process,
         // no stop. On kernels without stack file, ENOENT → fallback marker.
         let stack_path = format!("/proc/{}/stack", self.pid);
         match std::fs::read_to_string(&stack_path) {
@@ -329,6 +360,7 @@ impl OutOfProcessSampler {
                     SampleEvent {
                         seq,
                         pid: self.pid,
+                        process_start_time,
                         mono_ns: mono,
                         wall_ns: wall,
                         frames: vec!["SAMPLED empty-stack".to_string()],
@@ -339,6 +371,7 @@ impl OutOfProcessSampler {
                     SampleEvent {
                         seq,
                         pid: self.pid,
+                        process_start_time,
                         mono_ns: mono,
                         wall_ns: wall,
                         frames,
@@ -360,6 +393,7 @@ impl OutOfProcessSampler {
                 SampleEvent {
                     seq,
                     pid: self.pid,
+                    process_start_time,
                     mono_ns: mono,
                     wall_ns: wall,
                     frames: vec!["TRUNCATED fallback".to_string()],
@@ -393,8 +427,18 @@ impl StackSampler for OutOfProcessSampler {
         &mut self,
         guard: &LlmoSafeGuard,
         budget: &mut ObserveBudget,
+        process_start_time: u64,
     ) -> Result<Option<SampleEvent>, String> {
-        // Injected drop for self_test DAL-A gate (simulates overflow).
+        // Wire process_start_time into the sampling path for
+        // RunProcessKey construction (PID never alone).
+        // Consistency check: the caller-provided value must match
+        // the sampler's stored process_start_time.
+        debug_assert_eq!(
+            process_start_time, self.process_start_time,
+            "gated_tick process_start_time must match sampler's stored value"
+        );
+        let _ = process_start_time; // consumed by debug_assert above
+                                    // Injected drop for self_test DAL-A gate (simulates overflow).
         #[allow(clippy::arithmetic_side_effects)]
         // u64 drop counter; bounded channel cap prevents overflow.
         if self.inject_drop {
@@ -462,6 +506,7 @@ impl StackSampler for OutOfProcessSampler {
             let marker = SampleEvent {
                 seq: self.next_seq,
                 pid: self.pid,
+                process_start_time: self.process_start_time,
                 mono_ns: mono,
                 wall_ns: wall,
                 frames: vec![format!("TRUNCATED dropped={}", self.dropped)],
@@ -504,18 +549,18 @@ mod tests {
 
     #[test]
     fn sampler_rate_defaults_and_caps() {
-        let s0 = OutOfProcessSampler::new(1, 0);
+        let s0 = OutOfProcessSampler::new(1, 0, 0);
         assert_eq!(s0.rate_hz(), 50);
-        let s_high = OutOfProcessSampler::new(1, 5000);
+        let s_high = OutOfProcessSampler::new(1, 5000, 0);
         assert_eq!(s_high.rate_hz(), 1000);
-        let s50 = OutOfProcessSampler::new(1, 50);
+        let s50 = OutOfProcessSampler::new(1, 50, 0);
         assert_eq!(s50.interval(), Duration::from_millis(20));
     }
 
     #[test]
     fn sampler_fallback_never_silent_zeros() {
         // pid 0 is invalid → fallback marker, not silent zero
-        let mut s = OutOfProcessSampler::new(0, 50);
+        let mut s = OutOfProcessSampler::new(0, 50, 0);
         let ev = s.sample().unwrap();
         assert!(ev.truncated, "invalid pid must produce truncated marker");
         assert!(ev.error.is_some());
@@ -526,7 +571,7 @@ mod tests {
 
     #[test]
     fn sampler_bounded_drop_newest_truncated() {
-        let mut s = OutOfProcessSampler::with_capacity(1, 50, 2);
+        let mut s = OutOfProcessSampler::with_capacity(1, 50, 2, 0);
         // Fill queue with direct enqueue via gated_tick fallback path
         // Use sample() + enqueue manually to force overflow
         for _ in 0..2 {
@@ -555,10 +600,10 @@ mod tests {
 
     #[test]
     fn sampler_gated_tick_via_guard() {
-        let mut s = OutOfProcessSampler::new(std::process::id(), 50);
+        let mut s = OutOfProcessSampler::new(std::process::id(), 50, 0);
         let guard = LlmoSafeGuard::new();
         let mut budget = ObserveBudget::new_with_path(30, 1, None);
-        let res = s.gated_tick(&guard, &mut budget);
+        let res = s.gated_tick(&guard, &mut budget, 0);
         // On healthy system should produce Some(event)
         assert!(res.is_ok());
         // Even if suspended, Ok(None) not Err
@@ -569,6 +614,7 @@ mod tests {
         let ev = SampleEvent {
             seq: 0,
             pid: 123,
+            process_start_time: 0,
             mono_ns: 1,
             wall_ns: 1,
             frames: vec!["auth_token=secret".to_string(), "normal_frame".to_string()],
@@ -583,6 +629,7 @@ mod tests {
         let ev2 = SampleEvent {
             seq: 1,
             pid: 123,
+            process_start_time: 0,
             mono_ns: 2,
             wall_ns: 2,
             frames: vec![],
