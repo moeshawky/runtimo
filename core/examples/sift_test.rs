@@ -1,5 +1,6 @@
 use runtimo_core::LlmoSafeGuard;
 
+#[allow(deprecated)] // Demonstrates the legacy check_cognitive_pipeline shim
 fn main() {
     let guard = LlmoSafeGuard::new();
     let objective = "test objective";

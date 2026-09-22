@@ -212,9 +212,10 @@ pub fn evaluate(events: &[WalEvent], spec: &PropertySpec) -> Result<PropertyVerd
 ///
 /// # Errors
 ///
-/// Returns [`OracleError::FieldNotFound`] if a predicate references a field
-/// not present in the event schema, or [`OracleError::FieldParseError`] if
+/// Returns [`OracleError::ParseError`] if a predicate references a field
+/// not present in the event schema, or [`OracleError::EvalError`] if
 /// a field value cannot be parsed.
+#[allow(clippy::arithmetic_side_effects)]
 pub fn evaluate_v2(
     events: &[WalEvent],
     spec: &PropertySpec,
@@ -304,8 +305,9 @@ pub fn evaluate_v2(
             }
         }
         if all_hold {
-            // Safe: matched is a counter bounded by selected_count (events.len()).
-            matched = matched.wrapping_add(1);
+            // matched is bounded by selected_count (events.len()) — a
+            // mathematical invariant. Normal increment, no wrapping.
+            matched += 1;
         }
     }
 
@@ -411,7 +413,22 @@ fn evaluate_predicate(event: &WalEvent, predicate: &Predicate) -> PredicateOutco
 /// Numeric comparisons attempt to coerce both values to `f64`.
 /// String comparisons use the string representation.
 /// Returns an error string if coercion fails.
-fn compare_values(field_val: &Value, op: &Op, pred_val: &Value) -> Result<bool, String> {
+/// Compare a field value against a predicate value using the given operator.
+///
+/// Shared by the WAL evaluator and the generic item evaluator. Returns
+/// `Ok(bool)` on successful comparison, `Err(String)` on type coercion
+/// failure.
+///
+/// # Type Coercion
+/// - Numeric comparison (Gt, Lt, Gte, Lte): both values must coerce to f64.
+/// - String comparison (Contains, Regex): both values must coerce to str.
+/// - Equality (Eq, Neq): direct serde_json::Value equality.
+///
+/// # Errors
+/// Returns `Err(String)` when a value cannot be coerced to the type required
+/// by the operator (e.g., non-numeric value compared with `Gt`).
+#[allow(clippy::arithmetic_side_effects)]
+pub fn compare_values(field_val: &Value, op: &Op, pred_val: &Value) -> Result<bool, String> {
     match op {
         Op::Eq => Ok(field_val == pred_val),
         Op::Neq => Ok(field_val != pred_val),

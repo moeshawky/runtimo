@@ -30,7 +30,7 @@ Runtimo is a Rust workspace providing a **capability execution engine**. Every c
 - **Backup/undo** — Files backed up before mutation, rollback by job ID
 - **Input validation** — Capabilities validate arguments including path traversal, symlink, and null byte protection
 
-**Version:** 0.10.0 | **Rust Edition:** 2021 | **Tests:** 740 (39 cli + 473 core-lib + 65 integration + 69 daemon + 46 robust + 28 adapters_integration + 12 runtime_fact_export + 8 doctest)
+**Version:** 0.10.0 | **Rust Edition:** 2021 | **Tests:** 758 passed / 5 failed (4 sampler-environment + 1 external-service-dependent) / 27 ignored. Failing: (a) `observe::supervisor::tests::supervisor_pressure_routing` (lib), (b) `observe::self_test::tests::self_test_fixtures_pass_on_healthy` (lib), (c) `observe_fixture_b_integration` (integration), (d) `observe_self_test_run_exits_zero` (integration) — all four reproduced byte-identical on pre-change baseline; the sampler yields 0 samples at 50Hz in this container and no observe files were touched; (e) `mock_resolver_proves_resolved_with_codegraph` (runtime_fact_export_test) — requires external Codegraph service. Run `RUNTIMO_TEST_PRESSURE=10 cargo test --workspace --no-fail-fast` for current counts.
 
 See [CHANGELOG.md](CHANGELOG.md) for full release history.
 
@@ -621,12 +621,23 @@ cargo clippy --all-targets          # zero warnings required
 | `XDG_DATA_HOME` | `~/.local/share` | Default WAL/backup/session root |
 | `RUNTIMO_ENABLE_PUBLIC_IP` | (unset) | Set to `1` to enable public IP discovery in telemetry |
 | `RUNTIMO_ENABLE_NETWORK` | (unset) | Set to `1` to allow outbound network tools (curl, wget, ssh, etc.) in ShellExec |
-| `RUNTIMO_DAL` | (unset = A) | Design Assurance Level for safety assessment (A-E). A=strict, E=permissive. Also configurable via `runtimo config dal` or config file `dal` field. |
+| `RUNTIMO_DAL` | Profile-dependent (see table below) | Design Assurance Level for safety assessment (A-E). A=strict, E=permissive. Also configurable via `runtimo config dal` or config file `dal` field. |
 | `RUNTIMO_SEMANTIC_POLICY` | (unset = corroborate) | Semantic authority mode: `observe`, `corroborate`, or `enforce`. Orthogonal to DAL. |
 | `RUNTIMO_TEST_PRESSURE` | (unset = live) | Deterministic test seam: pin pressure 0-100 (e.g. `10`=nominal, `90`=denial). Production never sets. |
 | `RUNTIMO_MEMORY_CEILING_BYTES` | (unset = auto) | Deterministic test seam: explicit memory ceiling in bytes, replaces auto-detected ceiling. |
 | `RUNTIMO_OBSERVE_SAMPLE_HZ` | `50` | Observe samples per second; precedence CLI `--sample-rate-hz` > env > `observe.sample_rate_hz` file > 50 (`core/src/config.rs`). Malformed env falls through to file. |
 | `RUNTIMO_STATE_DIR` | `$XDG_DATA_HOME/runtimo` | Override state directory for WAL/backups/sessions |
+
+### DAL Truth Table (by provider kind)
+
+| Provider kind | `RUNTIMO_DAL` unset → | Override chain |
+|---------------|----------------------|----------------|
+| `bare` (no profile) | `E` (permissive) | `RUNTIMO_DAL` env → file `dal` → `[guards].dal` → `E` |
+| `minimal` (default profile) | `E` (permissive) | `RUNTIMO_DAL` env → file `dal` → `[guards].dal` → `E` |
+| `ephemeral` | `E` (permissive) | `RUNTIMO_DAL` env → file `dal` → `[guards].dal` → `E` |
+| `service` | `A` (strict) | `RUNTIMO_DAL` env → file `dal` → `[guards].dal` → `A` |
+
+Unknown DAL values fail closed to `A` (strictest). Source: `core/src/config.rs` (`resolved()`), `core/src/llmosafe.rs` (`LlmoSafeGuard::new()`).
 
 ## License
 

@@ -1,8 +1,10 @@
 //! runtimo CLI — Agent capability runtime with background dispatch.
+//!
 //! Part of the single-program runtimo suite: `runtimo-core` + `runtimo-daemon` + `runtimo-cli`
 //! are one program at one version. `cargo install runtimo-cli` installs both `runtimo` and
 //! `runtimo-daemon` binaries. The `runtimo-daemon` package is the library; the
 //! `runtimo-daemon` binary delegates to [`runtimo_daemon::run`].
+//!
 //! The `runtimo-daemon` lib vs bin are distinguished by the binary name —
 //! the lib is `runtimo_daemon`, the bin is `runtimo-daemon`.
 
@@ -18,6 +20,8 @@ use runtimo_core::{
         is_dangerous_command, is_network_command, network_enabled, Delete, FileRead, FileWrite,
         GitExec, Kill, ShellExec, Undo,
     },
+    execute_with_telemetry_and_session,
+    oracle::{evaluate, parse_spec, PropertyVerdict},
     CapabilityRegistry, ProcessSnapshot, RuntimoConfig, Telemetry, WalReader,
 };
 use serde_json::Value;
@@ -33,6 +37,7 @@ use std::time::Duration;
 
 /// Maximum seconds to wait for daemon to become ready after spawning.
 const DAEMON_STARTUP_TIMEOUT_SECS: u64 = 30;
+
 /// Maximum size for capability arguments in bytes (~130 KB).
 const MAX_ARGS_SIZE_BYTES: usize = 130 * 1024;
 
@@ -40,10 +45,26 @@ const MAX_ARGS_SIZE_BYTES: usize = 130 * 1024;
 #[command(
     name = "runtimo",
     about = "runtimo — capability runtime with telemetry, WAL, process tracking, and background dispatch. One program, one version (core+daemon+cli). Install via `cargo install runtimo-cli` (both bins). The runtimo-daemon package is the library; the runtimo-daemon binary delegates to it.",
-    long_about = "runtimo — capability runtime with telemetry, WAL, and process tracking\n\nEvery exec: telemetry + process snapshot + WAL audit\n\nBackground: dispatch jobs to daemon, check status later",
-    after_help = "USAGE:\n runtimo run -c <Capability> -a '<json>'\n runtimo dispatch -c <Capability> -a '<json>'\n runtimo jobs\n runtimo wait -j <job_id>\n runtimo list\n runtimo logs\n runtimo telemetry\n runtimo processes\n\nCAPABILITIES:\n FileRead  Read file. Path validated (allowed dirs only). No dirs, no traversal.\n FileWrite Write file. Auto-backup for undo. Append mode ok.\n Delete    Delete a file. Auto-backup for undo unless no_backup=true. Path-validated (no rm bypass).\n ShellExec Exec via sh -c. Blocks many dangerous commands (see `runtimo list` for full blocklist). Network tools and interpreters are opt-in.\n GitExec   Git ops: clone|pull|commit|revert|clean|status.\n Kill      Kill process by PID. Protected: init, kthreadd, self, parent, session/group leaders, systemd services.\n Undo      Restore from backup. Find job IDs with `runtimo jobs` or `runtimo logs`.\n\nTIP: Use `runtimo run -c <Cap> --schema` to see the JSON args a capability expects.\nTIP: Use `runtimo list --schemas` to see all schemas at once.\nTIP: ShellExec timeout has no upper bound (default: 30).\n\nDaemon starts on first dispatch if runtimo-daemon is installed.",
+    long_about = "runtimo — capability runtime with telemetry, WAL, and process tracking\n\n\
+Every exec: telemetry + process snapshot + WAL audit\n\
+Background: dispatch jobs to daemon, check status later",
+    after_help = "USAGE:\n runtimo run -c <Capability> -a '<json>'\n runtimo dispatch -c <Capability> -a '<json>'\n runtimo jobs\n runtimo wait -j <job_id>\n runtimo list\n runtimo logs\n runtimo telemetry\n runtimo processes\n\nCAPABILITIES:\n FileRead  Read file. Path validated (allowed dirs only). No dirs, no traversal.\n FileWrite Write file. Auto-backup for undo. Append mode ok.\n Delete    Delete a file. Auto-backup for undo unless no_backup=true. Path-validated (no rm bypass).\n ShellExec Exec via sh -c. Blocks many dangerous commands (see `runtimo list` for full blocklist). Network tools and interpreters are opt-in.\n GitExec   Git ops: clone|pull|commit|revert|clean|status.\n Kill      Kill process by PID. Protected: init, kthreadd, self, parent, session/group leaders, systemd services.\n Undo      Restore from backup. Find job IDs with `runtimo jobs` or `runtimo logs`.\n\nTIP: Use `runtimo run -c <Cap> --schema` to see the JSON args a capability expects.\nTIP: Use `runtimo list --schemas` to see all schemas at once.\nTIP: ShellExec timeout has no upper bound (default: 30).\n\nDaemon starts on first dispatch if runtimo-daemon is installed.
+
+ONE-PROGRAM RULE:
+runtimo is one program at one version: runtimo-core + runtimo-daemon + runtimo-cli.
+Install via `cargo install runtimo-cli` (both bins: runtimo + runtimo-daemon).
+The runtimo-daemon package is the library; the runtimo-daemon binary delegates to it.
+
+Quick commands:
+ runtimo run -c <Cap> -a '<json>'
+ runtimo dispatch -c <Cap> -a '<json>'
+ runtimo status
+ runtimo logs
+ runtimo undo -j <job_id>
+ runtimo telemetry",
     version
 )]
+#[allow(clippy::struct_excessive_bools)] // 6 bools map to 3 orthogonal flag pairs (color/no_color, emoji/no_emoji, timestamps/no_timestamps); enum refactor would churn CLI without safety gain
 struct Cli {
     /// Output format: human|json|plain|quiet
     #[arg(long, global = true, value_name = "FORMAT")]
@@ -84,7 +105,7 @@ enum Commands {
         /// Capability name (e.g., FileRead, ShellExec). Use `runtimo list` to see all.
         #[arg(short = 'c', long)]
         capability: String,
-        /// Capability arguments as JSON (e.g., '{\"path\":\"/tmp/test.txt\"}'). Use --schema to see the expected shape.
+        /// Capability arguments as JSON (e.g., '{"path":"/tmp/test.txt"}'). Use --schema to see the expected shape.
         #[arg(short = 'a', long, default_value = "{}")]
         args: String,
         /// Path to a file containing capability arguments as JSON (bypasses OS ARG_MAX for large payloads)
@@ -118,8 +139,8 @@ enum Commands {
         /// Capability name (e.g., ShellExec, FileWrite). Use `runtimo list` to see all.
         #[arg(short = 'c', long)]
         capability: String,
-        /// Capability arguments as JSON (same format as `run`)"
-        #[arg(short = 'a', long)]
+        /// Capability arguments as JSON (same format as `run`)
+        #[arg(short = 'a', long, default_value = "{}")]
         args: String,
         /// Path to a file containing capability arguments as JSON (bypasses OS ARG_MAX for large payloads)
         #[arg(long)]
@@ -132,6 +153,7 @@ enum Commands {
         dry_run: bool,
     },
     /// Wait for a dispatched job to complete
+    ///
     /// Pre-validates job existence via daemon RPC or WAL scan before entering
     /// the poll loop. Returns immediately with "Job not found" if the job ID
     /// is unknown and the daemon is unreachable.
@@ -140,10 +162,10 @@ enum Commands {
         after_help = "EXAMPLES:\n runtimo wait -j abc123\n runtimo wait -j abc123 --timeout 60"
     )]
     Wait {
-        /// Job ID to wait for (from dispatch output or `runtimo jobs`)"
+        /// Job ID to wait for (from dispatch output or `runtimo jobs`)
         #[arg(short = 'j', long)]
         job_id: String,
-        /// Maximum seconds to wait (0 = wait forever)"
+        /// Maximum seconds to wait (0 = wait forever)
         #[arg(long, default_value = "0")]
         timeout: u64,
     },
@@ -156,418 +178,346 @@ enum Commands {
         /// Show each capability's JSON argument schema
         #[arg(long)]
         schemas: bool,
-        /// Output as JSON (machine-readable)"
+        /// Output as JSON (machine-readable)
         #[arg(short = 'j', long)]
         json: bool,
     },
-    /// Check job status (via daemon RPC if running, falls back to WAL)"
+    /// Check job status (via daemon RPC if running, falls back to WAL)
     #[command(
         about = "Check job status (daemon RPC or WAL fallback)",
         after_help = "EXAMPLES:\n runtimo status             # all jobs (daemon RPC)\n runtimo status -j abc123   # specific job\n runtimo status -oj         # JSON output\n\nNote: queries daemon for live status; falls back to WAL data if daemon unreachable."
     )]
     Status {
-        /// Job ID to check (omit to list all)"
+        /// Job ID to check (omit to list all)
         #[arg(short = 'j', long)]
         job_id: Option<String>,
-        /// Output raw JSON"
+        /// Output raw JSON
         #[arg(short = 'o', long)]
         json: bool,
     },
-    /// List recent jobs from WAL (local + dispatched, read-only snapshot)"
+    /// List recent jobs from WAL (local + dispatched, read-only snapshot)
     #[command(
         about = "List recent jobs from WAL",
         after_help = "EXAMPLES:\n runtimo jobs\n runtimo jobs --limit 5\n runtimo jobs --json\n\nNote: reads from WAL directly (no daemon needed). Use `status` for live daemon query."
     )]
     Jobs {
-        /// Number of jobs to show (default: 20)"
+        /// Number of jobs to show (default: 20)
         #[arg(short = 'n', long, default_value = "20")]
         limit: usize,
-        /// Output raw JSON"
+        /// Output raw JSON
         #[arg(short = 'j', long)]
         json: bool,
     },
-    /// View WAL logs (audit trail of all events)"
+    /// View WAL logs (audit trail of all events)
     #[command(
         about = "View WAL logs",
         after_help = "EXAMPLES:\n runtimo logs              # last 10 events\n runtimo logs -j abc123    # events for a specific job\n runtimo logs -n 50        # last 50 events\n runtimo logs -oj          # JSON output"
     )]
     Logs {
-        /// Filter by job ID"
+        /// Filter by job ID
         #[arg(short = 'j', long)]
         job_id: Option<String>,
-        /// Number of events to show (default: 10)"
+        /// Number of events to show (default: 10)
         #[arg(short = 'n', long, default_value = "10")]
         limit: usize,
-        /// Output raw JSON"
-        #[arg(short = 'j', long)]
+        /// Output raw JSON
+        #[arg(short = 'o', long)]
         json: bool,
     },
-    /// Undo a completed job (restore files from backup)"
+    /// Undo a completed job (restore files from backup)
     #[command(
         about = "Undo a completed job",
-        after_help = "Find job IDs with `runtimo jobs` or `runtimo logs`.\\n\\nEXAMPLES:\\n runtimo undo -j abc123\\n runtimo undo -j abc123 --dry-run    # check what would be restored"
+        after_help = "Find job IDs with `runtimo jobs` or `runtimo logs`.\n\nEXAMPLES:\n runtimo undo -j abc123\n runtimo undo -j abc123 --dry-run    # check what would be restored"
     )]
     Undo {
-        /// Job ID to undo (from `runtimo jobs` or `runtimo logs`)"
+        /// Job ID to undo (from `runtimo jobs` or `runtimo logs`)
         #[arg(short = 'j', long)]
         job_id: String,
-        /// Show what files would be restored without actually restoring them"
+        /// Show what files would be restored without actually restoring them
         #[arg(long)]
         dry_run: bool,
     },
-    /// Print system telemetry (CPU, RAM, disk, GPU, network)"
+    /// Print system telemetry (CPU, RAM, disk, GPU, network)
     #[command(
         about = "Print system telemetry",
         after_help = "EXAMPLES:\n runtimo telemetry             # formatted\n runtimo telemetry -j          # JSON\n runtimo telemetry -v          # include listening ports\n runtimo telemetry -jv         # JSON with verbose"
     )]
     Telemetry {
-        /// Show extended details (listening ports, GPU info)"
-        #[arg(short = 'v', long)]
-        verbose: bool,
-        /// Output raw JSON"
+        /// Output raw JSON
         #[arg(short = 'j', long)]
         json: bool,
+        /// Show extended details (listening ports, GPU info)
+        #[arg(short = 'v', long)]
+        verbose: bool,
     },
-    /// Print process snapshot (top consumers, zombie count)"
+    /// Print process snapshot (top consumers, zombie count)
     #[command(
         about = "Print process snapshot",
         after_help = "EXAMPLES:\n runtimo processes             # formatted table\n runtimo processes -j          # JSON output"
     )]
     Processes {
-        /// Output raw JSON"
+        /// Output raw JSON
         #[arg(short = 'j', long)]
         json: bool,
     },
-    /// List and optionally reap zombie processes"
+    /// List and optionally reap zombie processes
     #[command(
         about = "List zombie processes",
-        after_help = "EXAMPLES:\n runtimo zombies\\n runtimo zombies --reap\\n\\nZombies are dead processes whose parents haven't called waitpid(2).\\nThey can't be killed directly. --reap kills each zombie's parent process\\ninstead, which causes the kernel to clean up the zombie."
+        after_help = "EXAMPLES:\n runtimo zombies\n runtimo zombies --reap\n\nZombies are dead processes whose parents haven't called waitpid(2).\nThey can't be killed directly. --reap kills each zombie's parent process\ninstead, which causes the kernel to clean up the zombie."
     )]
     Zombies {
-        /// Enable reaping (kills zombie parents)"
         #[arg(short = 'r', long, default_value = "false")]
         reap: bool,
     },
-    /// Manage configuration"
     #[command(
         about = "Manage configuration",
-        after_help = "Config file: ~/.config/runtimo/config.toml\n\n  allowed_paths       Extra path prefixes for FileRead/FileWrite\n  dal                 Design Assurance Level A-E\n  blocklist_overrides Additional ShellExec blocklist patterns\n  capability_timeouts Per-capability timeout overrides\n\nExample:\n  dal = \"B\"\n  ShellExec = 120"
+        after_help = "Config file: ~/.config/runtimo/config.toml\n\
+Supported fields:\n\
+  allowed_paths       Extra path prefixes for FileRead/FileWrite\n\
+  dal                 Design Assurance Level A-E\n\
+  blocklist_overrides Additional ShellExec blocklist patterns\n\
+  capability_timeouts Per-capability timeout overrides\n\
+\nExample:\n\
+  allowed_paths = [\"/srv\", \"/opt\"]\n\
+  dal = \"B\"\n\
+  [capability_timeouts]\n\
+  ShellExec = 120"
     )]
     Config {
-        /// Show current configuration"
-        #[command(about = "Show current configuration (from config.toml)")]
-        Show,
-        /// Get or set the Design Assurance Level (DAL)"
-        #[command(about = "Get or set the Design Assurance Level (A-E) for the cognitive safety pipeline")]
-        Dal {
-            /// New DAL level to set (A, B, C, D, or E). Omit to show current value.
-            level: Option<String>,
-        },
-        /// Initialize config file from profile template"
-        #[command(about = "Initialize config file from profile template (minimal/ephemeral/service)")]
-        Init {
-            /// Profile to use (minimal, ephemeral, service). Use --minimal as alias for minimal.
-            #[arg(long)]
-            profile: Option<String>,
-            /// Overwrite existing config
-            /// Alias for --profile minimal
-            /// Custom path for config file (default: XDG config path)
-            #[arg(long)]
-            path: Option<PathBuf>,
-            /// Force overwrite
-            #[arg(long)]
-            force: bool,
-            /// Minimal profile
-            #[arg(long)]
-            minimal: bool,
-        },
+        #[command(subcommand)]
+        action: ConfigAction,
     },
-    /// Session step-runner — deterministic bounded execution from a prompt file"
+    /// Session step-runner — deterministic bounded execution from a prompt file
     #[command(about = "Session step-runner (MVP)")]
     Session {
-        /// Run steps from a prompt file as a bounded session"
-        #[command(about = "Run steps from a prompt file as a bounded session")]
-        Run {
-            /// Prompt file containing JSONL or markdown ```runtimo blocks"
-            #[arg(long, value_name = "PATH")]
-            prompt_file: PathBuf,
-            /// Session name (human-readable) — reuses existing session if name or id matches, else creates a new one"
-            #[arg(long)]
-            session: Option<String>,
-            /// Maximum number of steps to execute (default: from ResolvedConfig — 20 ephemeral, 100 service/minimal)"
-            #[arg(long)]
-            max_steps: Option<u32>,
-            /// Maximum total seconds for the session run (default: from ResolvedConfig — 300 ephemeral, 3600 service)"
-            #[arg(long)]
-            max_seconds: Option<u64>,
-            /// Behavior on step failure: continue|stop (default: from ResolvedConfig — continue ephemeral, stop service)"
-            #[arg(long, value_name = "POLICY")]
-            on_failure: Option<String>,
-            /// Validate prompt file and policy only; do not execute or create a session"
-            /// Stub: dispatch each step via daemon RPC instead of local execution"
-            #[arg(long)]
-            via_daemon: bool,
-            /// Dry run
-            #[arg(long)]
-            dry_run: bool,
-        },
-        /// List sessions persisted under the sessions directory"
-        /// Show a single session by id"
-        #[command(about = "List sessions")]
-        List {
-            /// Output raw JSON"
-            #[arg(short = 'j', long)]
-            json: bool,
-        },
-        /// Show a single session by id"
-        #[command(about = "Show session")]
-        Show {
-            /// Session ID to show"
-            #[arg(long, value_name = "SESSION_ID")]
-            session_id: String,
-            /// Output raw JSON"
-            #[arg(short = 'j', long)]
-            json: bool,
-        },
+        #[command(subcommand)]
+        command: SessionCommand,
     },
-    /// Observe — low-overhead sampling without modifying the target"
-    /// Sampling is out-of-process (P1A remote-read, sibling supervision only)."
-    /// No in-target code, no stop-the-target >1 ms, no LD_PRELOAD."
-    /// Bundles are WAL-backed, hash-chained, with bounded 512-cap drop-newest"
-    /// and TRUNCATED markers — never silent."
-    /// CUT WARNING: this is L1 sampling only (stack snapshots at 50 Hz default,"
-    /// plus exhaustive low-volume audit for imports/spawns/raises/dynamic loads)."
-    /// It does NOT provide L2 line/branch coverage — do not use for line-level"
-    /// CUT decisions. Use `audit` events for import/spawn topology and `verify`"
-    /// for bundle integrity."
+    /// Observe — low-overhead sampling without modifying the target
+    ///
+    /// Sampling is out-of-process (P1A remote-read, sibling supervision only).
+    /// No in-target code, no stop-the-target >1 ms, no LD_PRELOAD.
+    /// Bundles are WAL-backed, hash-chained, with bounded 512-cap drop-newest
+    /// and TRUNCATED markers — never silent.
+    ///
+    /// CUT WARNING: this is L1 sampling only (stack snapshots at 50 Hz default,
+    /// plus exhaustive low-volume audit for imports/spawns/raises/dynamic loads).
+    /// It does NOT provide L2 line/branch coverage — do not use for line-level
+    /// CUT decisions. Use `audit` events for import/spawn topology and `verify`
+    /// for bundle integrity.
     #[command(
         about = "Observe — sampling without modifying the target (L1 sampling only, not L2 line/branch CUT)",
-        long_about = "Observe — out-of-process sampling (P1A) with sibling supervision.\n\nNo in-target code, no LD_PRELOAD, no stop >1 ms.\n\nBundles are WAL-backed with hash chains and TRUNCATED markers.\n\nCUT WARNING: L1 sampling only — not L2 line/branch coverage.\n\nUse --self-test to verify the pipeline and --verify to check bundle integrity.\n\nUse --burst to enable file-watch (deferred; returns -32601 observe_burst deferred).\n\nUse --properties to evaluate a spec against the bundle's WAL events.\n\nDefault out: {data_dir}/bundles/<run_id>.jsonl (7d retention).\n\nRate from --sample-rate-hz or RUNTIMO_OBSERVE_SAMPLE_HZ or config observe.sample_rate_hz (default 50 Hz)."
+        long_about = "Observe — out-of-process sampling (P1A) with sibling supervision.\n\
+No in-target code, no LD_PRELOAD, no stop >1 ms.\n\
+Bundles are WAL-backed with hash chains and TRUNCATED markers.\n\n\
+CUT WARNING: L1 sampling only — not L2 line/branch coverage.\n\
+Use --self-test to verify the pipeline and --verify to check bundle integrity.\n\
+Use --burst to enable file-watch (deferred; returns -32601 observe_burst deferred).\n\
+Use --properties to evaluate a spec against the bundle's WAL events.\n\
+Default out: {data_dir}/bundles/<run_id>.jsonl (7d retention).\n\
+Rate from --sample-rate-hz or RUNTIMO_OBSERVE_SAMPLE_HZ or config observe.sample_rate_hz (default 50 Hz)."
     )]
     Observe {
-        /// Target pid to sample (alternative to --cmd)."
+        /// Target pid to sample (alternative to --cmd).
         #[arg(long)]
         pid: Option<u32>,
-        /// Command to spawn as sibling target (alternative to --pid, e.g. \"python app.py\")."
+        /// Command to spawn as sibling target (alternative to --pid, e.g. "python app.py").
         #[arg(long)]
         cmd: Option<String>,
-        /// Bundle output path (default: {data_dir}/bundles/<run_id>.jsonl, validated via allowed prefixes)."
+        /// Bundle output path (default: {data_dir}/bundles/<run_id>.jsonl, validated via allowed prefixes).
         #[arg(long)]
         out: Option<PathBuf>,
-        /// Samples per second (default 50 Hz, via ObserveConfig)."
+        /// Samples per second (default 50 Hz, via ObserveConfig).
         #[arg(long)]
         sample_rate_hz: Option<u64>,
-        /// Enable burst file-watch (P2B — bundle-path watch)."
-        /// When `true`, the CLI prints a deferred note to stdout"
-        /// (`burst_deferred:true`) and forwards `burst` to the daemon,"
-        /// which returns `-32601 observe_burst deferred`."
-        /// Not yet trivial; falls back to out-of-process polling."
+        /// Enable burst file-watch (P2B — bundle-path watch).
+        /// When `true`, the CLI prints a deferred note to stdout
+        /// (`burst_deferred:true`) and forwards `burst` to the daemon,
+        /// which returns `-32601 observe_burst deferred`.
+        /// Not yet trivial; falls back to out-of-process polling.
         #[arg(long, default_value = "false")]
         burst: bool,
-        /// DAL A–E (default from config, controls watermark on shed)."
+        /// DAL A–E (default from config, controls watermark on shed).
         #[arg(long)]
         dal: Option<String>,
-        /// Override pressure_suspend_ms from config (default from config when absent)."
+        /// Override pressure_suspend_ms from config (default from config when absent).
         #[arg(long)]
         suspend_ms: Option<u64>,
-        /// Run self-test and exit 0/1."
-        #[arg(long)]
+        /// Run self-test and exit 0/1.
+        #[arg(long, default_value = "false")]
         self_test: bool,
-        /// Verify a bundle file offline and print a full verification report"
-        /// (6 predicates + admissible + hash_ok + watermark + property_verdicts)."
-        /// Exit code 0 if admissible, 1 otherwise."
+        /// Verify a bundle file offline and print a full verification report
+        /// (6 predicates + admissible + hash_ok + watermark + property_verdicts).
+        /// Exit code 0 if admissible, 1 otherwise.
         #[arg(long)]
         verify: Option<PathBuf>,
-        /// Property specification as a JSON string (e.g. {\"name\":\"p\",\"predicates\":[...]})"
-        /// to evaluate against the bundle's WAL events. Property verdicts are reported"
-        /// in the output but NEVER alter the verify exit code (exit depends solely on"
-        /// `admissible`). Parse failure exits 1 with a clear stderr message."
+        /// Property specification as a JSON string (e.g. {"name":"p","predicates":[...]})
+        /// to evaluate against the bundle's WAL events. Property verdicts are reported
+        /// in the output but NEVER alter the verify exit code (exit depends solely on
+        /// `admissible`). Parse failure exits 1 with a clear stderr message.
         #[arg(long)]
         properties: Option<String>,
-        /// Output as JSON."
+        /// Output as JSON.
         #[arg(long, short = 'j', default_value = "false")]
         json: bool,
     },
-    /// Oracle — evaluate properties over recorded evidence (read-only)."
-    /// The oracle never reruns LLMOSafe, reclassifies input, mutates WAL,"
-    /// or executes capabilities. It evaluates recorded evidence so"
-    /// historical results reproduce even if future LLMOSafe versions change."
-    /// Exit codes: 0 Satisfied, 1 Violated, 2 property/eval error,"
-    /// 3 evidence/infrastructure error."
+    /// Oracle — evaluate properties over recorded evidence (read-only).
+    ///
+    /// The oracle never reruns LLMOSafe, reclassifies input, mutates WAL,
+    /// or executes capabilities. It evaluates recorded evidence so
+    /// historical results reproduce even if future LLMOSafe versions change.
+    /// Exit codes: 0 Satisfied, 1 Violated, 2 property/eval error,
+    /// 3 evidence/infrastructure error.
     #[command(about = "Oracle — evaluate properties over recorded evidence")]
     Oracle {
-        /// Evaluate a property file (or inline JSON) over an evidence source."
-        /// Sources (exactly one required): `--wal`, `--bundle`, `--facts`."
-        /// Raw WAL is queryable directly — Observe admissibility is NOT applied"
-        /// to raw WAL (§42). Bundles verify integrity separately."
-        #[command(about = "Evaluate properties over WAL / bundle / facts")]
-        Evaluate {
-            /// Raw WAL path (`wal.jsonl`)."
-            #[arg(long)]
-            wal: Option<PathBuf>,
-            /// Observe bundle path (`observe-run.jsonl`, hash-chained)."
-            #[arg(long)]
-            bundle: Option<PathBuf>,
-            /// Runtime facts path (`runtime-facts-v1.jsonl`)."
-            #[arg(long)]
-            facts: Option<PathBuf>,
-            /// Property spec as inline JSON."
-            #[arg(long, conflicts_with = "properties_file")]
-            properties: Option<String>,
-            /// Property spec file (bounded, regular-file validated)."
-            #[arg(long, conflicts_with = "properties")]
-            properties_file: Option<PathBuf>,
-            /// Output as JSON."
-            #[arg(long, short = 'j', default_value = "false")]
-            json: bool,
-        },
-        /// Print the property-spec schema (truthful operator list, §49)."
-        #[command(about = "Print Oracle property-spec schema")]
-        Schema,
-        /// Run Oracle micro-benchmarks (evaluator throughput)."
-        #[command(about = "Run Oracle benchmarks")]
-        Benchmark,
+        #[command(subcommand)]
+        command: OracleCommand,
     },
 }
 
 #[derive(Subcommand)]
 enum SessionCommand {
-    /// Run steps from a prompt file as a bounded session"
-    /// Prompt file containing JSONL or markdown ```runtimo blocks"
-    #[command(about = "Run steps from a prompt file as a bounded session")]
+    /// Run steps from a prompt file as a bounded session
     Run {
-        /// Prompt file containing JSONL or markdown ```runtimo blocks"
+        /// Prompt file containing JSONL or markdown ```runtimo blocks
         #[arg(long, value_name = "PATH")]
         prompt_file: PathBuf,
-        /// Session name (human-readable) — reuses existing session if name or id matches, else creates a new one"
+        /// Session name (human-readable) — reuses existing session if name or id matches, else creates a new one
         #[arg(long)]
         session: Option<String>,
-        /// Maximum number of steps to execute (default: from ResolvedConfig — 20 ephemeral, 100 service/minimal)"
+        /// Maximum number of steps to execute (default: from ResolvedConfig — 20 ephemeral, 100 service/minimal)
         #[arg(long)]
         max_steps: Option<u32>,
-        /// Maximum total seconds for the session run (default: from ResolvedConfig — 300 ephemeral, 3600 service)"
+        /// Maximum total seconds for the session run (default: from ResolvedConfig — 300 ephemeral, 3600 service)
         #[arg(long)]
         max_seconds: Option<u64>,
-        /// Behavior on step failure: continue|stop (default: from ResolvedConfig — continue ephemeral, stop service)"
+        /// Behavior on step failure: continue|stop (default: from ResolvedConfig — continue ephemeral, stop service)
         #[arg(long, value_name = "POLICY")]
         on_failure: Option<String>,
-        /// Validate prompt file and policy only; do not execute or create a session"
-        /// Stub: dispatch each step via daemon RPC instead of local execution"
-        #[arg(long)]
-        via_daemon: bool,
-        /// Dry run
-        #[arg(long)]
+        /// Validate prompt file and policy only; do not execute or create a session
+        #[arg(long, default_value = "false")]
         dry_run: bool,
+        /// Stub: dispatch each step via daemon RPC instead of local execution
+        #[arg(long, default_value = "false")]
+        via_daemon: bool,
     },
-    /// List sessions persisted under the sessions directory"
-    /// Show a single session by id"
-    #[command(about = "List sessions")]
+    /// List sessions persisted under the sessions directory
     List {
-        /// Output raw JSON"
-        #[arg(short = 'j', long)]
+        /// Output raw JSON
+        #[arg(long, default_value = "false")]
         json: bool,
     },
-    /// Show a single session by id"
-    #[command(about = "Show session")]
+    /// Show a single session by id
     Show {
-        /// Session ID to show"
+        /// Session ID to show
         #[arg(long, value_name = "SESSION_ID")]
         session_id: String,
-        /// Output raw JSON"
-        #[arg(short = 'j', long)]
+        /// Output raw JSON
+        #[arg(long, default_value = "false")]
         json: bool,
     },
 }
 
 #[derive(Subcommand)]
 enum ConfigAction {
-    /// Show current configuration"
+    #[command(about = "Manage allowed path prefixes for FileRead/FileWrite")]
+    AllowedPaths {
+        #[command(subcommand)]
+        subaction: AllowedPathsAction,
+    },
+    /// Show current configuration
     #[command(about = "Show current configuration (from config.toml)")]
     Show,
-    /// Get or set the Design Assurance Level (DAL)"
-    #[command(about = "Get or set the Design Assurance Level (A-E) for the cognitive safety pipeline")]
+    /// Get or set the Design Assurance Level (DAL)
+    #[command(
+        about = "Get or set the Design Assurance Level (A-E) for the cognitive safety pipeline"
+    )]
     Dal {
         /// New DAL level to set (A, B, C, D, or E). Omit to show current value.
         level: Option<String>,
     },
-    /// Initialize config file from profile template"
+    /// Initialize config file from profile template
     #[command(about = "Initialize config file from profile template (minimal/ephemeral/service)")]
     Init {
         /// Profile to use (minimal, ephemeral, service). Use --minimal as alias for minimal.
         #[arg(long)]
         profile: Option<String>,
         /// Overwrite existing config
+        #[arg(long, default_value = "false")]
+        force: bool,
         /// Alias for --profile minimal
+        #[arg(long, default_value = "false")]
+        minimal: bool,
         /// Custom path for config file (default: XDG config path)
         #[arg(long)]
         path: Option<PathBuf>,
-        /// Force overwrite
-        #[arg(long)]
-        force: bool,
-        /// Minimal profile
-        #[arg(long)]
-        minimal: bool,
-    },
-    /// Manage allowed path prefixes for FileRead/FileWrite"
-    #[command(about = "Manage allowed path prefixes for FileRead/FileWrite")]
-    AllowedPaths {
-        /// Add { paths: Vec<String> },"
-        /// Remove { paths: Vec<String> },"
-        /// List
     },
 }
 
 #[derive(Subcommand)]
+enum AllowedPathsAction {
+    Add { paths: Vec<String> },
+    Remove { paths: Vec<String> },
+    List,
+}
+
+/// Oracle subcommands (first-class namespace, §41).
+#[derive(Subcommand)]
 enum OracleCommand {
-    /// Evaluate a property file (or inline JSON) over an evidence source."
-    /// Sources (exactly one required): `--wal`, `--bundle`, `--facts`."
-    /// Raw WAL is queryable directly — Observe admissibility is NOT applied"
-    /// to raw WAL (§42). Bundles verify integrity separately."
+    /// Evaluate a property file (or inline JSON) over an evidence source.
+    ///
+    /// Sources (exactly one required): `--wal`, `--bundle`, `--facts`.
+    /// Raw WAL is queryable directly — Observe admissibility is NOT applied
+    /// to raw WAL (§42). Bundles verify integrity separately.
     #[command(about = "Evaluate properties over WAL / bundle / facts")]
     Evaluate {
-        /// Raw WAL path (`wal.jsonl`)."
+        /// Raw WAL path (`wal.jsonl`).
         #[arg(long)]
         wal: Option<PathBuf>,
-        /// Observe bundle path (`observe-run.jsonl`, hash-chained)."
+        /// Observe bundle path (`observe-run.jsonl`, hash-chained).
         #[arg(long)]
         bundle: Option<PathBuf>,
-        /// Runtime facts path (`runtime-facts-v1.jsonl`)."
+        /// Runtime facts path (`runtime-facts-v1.jsonl`).
         #[arg(long)]
         facts: Option<PathBuf>,
-        /// Property spec as inline JSON."
+        /// Property spec as inline JSON.
         #[arg(long, conflicts_with = "properties_file")]
         properties: Option<String>,
-        /// Property spec file (bounded, regular-file validated)."
+        /// Property spec file (bounded, regular-file validated).
         #[arg(long, conflicts_with = "properties")]
         properties_file: Option<PathBuf>,
-        /// Output as JSON."
+        /// Output as JSON.
         #[arg(long, short = 'j', default_value = "false")]
         json: bool,
     },
-    /// Print the property-spec schema (truthful operator list, §49)."
+    /// Print the property-spec schema (truthful operator list, §49).
     #[command(about = "Print Oracle property-spec schema")]
     Schema,
-    /// Run Oracle micro-benchmarks (evaluator throughput)."
+    /// Run Oracle micro-benchmarks (evaluator throughput).
     #[command(about = "Run Oracle benchmarks")]
     Benchmark,
 }
 
-/// Returns the WAL file path (env-overridable via `RUNTIMO_WAL_PATH`)."
+/// Returns the WAL file path (env-overridable via `RUNTIMO_WAL_PATH`).
 fn wal_path() -> PathBuf {
     runtimo_core::utils::wal_path()
 }
 
-/// Returns the backup directory derived from `data_dir()`."
-/// Delegates to [`runtimo_core::utils::backup_dir`], which always"
-/// returns `data_dir().join("backups")` — no env var override (ADR-C28)."
+/// Returns the backup directory derived from `data_dir()`.
+///
+/// Delegates to [`runtimo_core::utils::backup_dir`], which always
+/// returns `data_dir().join("backups")` — no env var override (ADR-C28).
 fn backup_dir() -> PathBuf {
     runtimo_core::utils::backup_dir()
 }
 
-/// Creates a capability registry with all built-in capabilities registered."
-/// `Ok(CapabilityRegistry)` — All capabilities registered successfully."
-/// `Err(String)` — FileWrite or GitExec initialization failed (e.g. backup"
-/// directory cannot be created)."
+/// Creates a capability registry with all built-in capabilities registered.
+///
+/// # Returns
+///
+/// `Ok(CapabilityRegistry)` — All capabilities registered successfully.
+/// `Err(String)` — FileWrite or GitExec initialization failed (e.g. backup
+/// directory cannot be created).
 fn make_registry() -> Result<CapabilityRegistry, String> {
     let mut reg = CapabilityRegistry::new();
     reg.register(FileRead);
@@ -581,6 +531,7 @@ fn make_registry() -> Result<CapabilityRegistry, String> {
 }
 
 // Concurrency control for CLI run — mirrors daemon's MAX_CONCURRENT_JOBS = 16
+
 /// Maximum concurrent CLI `run` invocations.
 const MAX_CLI_CONCURRENT: usize = 16;
 /// Global counter of currently-running CLI jobs.
@@ -596,6 +547,7 @@ fn on_off(v: bool) -> &'static str {
 }
 
 /// Attempts to acquire a concurrency slot for a CLI `run` command.
+///
 /// Returns `false` if `MAX_CLI_CONCURRENT` slots are already in use.
 fn acquire_cli_slot() -> bool {
     let current = CLI_ACTIVE_JOBS.fetch_add(1, Ordering::AcqRel);
@@ -606,18 +558,20 @@ fn acquire_cli_slot() -> bool {
     true
 }
 
+/// Releases a concurrency slot after a CLI `run` command completes.
 fn release_cli_slot() {
     CLI_ACTIVE_JOBS.fetch_sub(1, Ordering::AcqRel);
 }
 
 // ── Daemon client ───────────────────────────────────────────────────────────
-/// Returns the path to the daemon's Unix socket (`{data_dir}/runtimo.sock`)."
+
+/// Returns the path to the daemon's Unix socket (`{data_dir}/runtimo.sock`).
 fn daemon_socket() -> PathBuf {
     runtimo_core::utils::data_dir().join("runtimo.sock")
 }
 
-/// Finds the `runtimo-daemon` binary, first checking next to the CLI binary,"
-/// then falling back to `which` and `~/.cargo/bin/`."
+/// Finds the `runtimo-daemon` binary, first checking next to the CLI binary,
+/// then falling back to `which` and `~/.cargo/bin/`.
 fn find_daemon_binary() -> Option<PathBuf> {
     let cli_path = std::env::current_exe().ok()?;
     let dir = cli_path.parent()?;
@@ -626,10 +580,11 @@ fn find_daemon_binary() -> Option<PathBuf> {
         return Some(daemon_path);
     }
     dir.join(format!("runtimo-daemon{}", std::env::consts::EXE_SUFFIX))
+        .exists()
         .then_some(daemon_path)
 }
 
-/// Searches `PATH` and `~/.cargo/bin/` for the `runtimo-daemon` binary."
+/// Searches `PATH` and `~/.cargo/bin/` for the `runtimo-daemon` binary.
 fn find_daemon_in_path() -> Option<PathBuf> {
     let output = Command::new("which").arg("runtimo-daemon").output().ok()?;
     if output.status.success() {
@@ -644,23 +599,27 @@ fn find_daemon_in_path() -> Option<PathBuf> {
     cargo_bin.exists().then_some(cargo_bin)
 }
 
-/// Returns the path to the daemon lock file (`{data_dir}/daemon.lock`)."
+/// Returns the path to the daemon lock file (`{data_dir}/daemon.lock`).
 fn daemon_lock_path() -> PathBuf {
     runtimo_core::utils::data_dir().join("daemon.lock")
 }
 
-/// Acquires an exclusive `flock` on the daemon lock file to prevent"
-/// race conditions when auto-starting the daemon from multiple processes."
-/// Uses `LOCK_EX | LOCK_NB` — fails immediately if another process holds the lock."
-/// Returns an error string if the lock file cannot be created or the lock is held."
+/// Acquires an exclusive `flock` on the daemon lock file to prevent
+/// race conditions when auto-starting the daemon from multiple processes.
+///
+/// Uses `LOCK_EX | LOCK_NB` — fails immediately if another process holds the lock.
+///
+/// # Errors
+/// Returns an error string if the lock file cannot be created or the lock is held.
 fn acquire_daemon_lock() -> Result<File, String> {
+    use libc::flock;
     let lock_path = daemon_lock_path();
     if let Some(parent) = lock_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create lock dir: {}", e))?;
-        File::create(&lock_path).map_err(|e| format!("Failed to create lock file: {}", e))?;
     }
+    let file =
+        File::create(&lock_path).map_err(|e| format!("Failed to create lock file: {}", e))?;
     // Try to acquire exclusive non-blocking lock using flock
-    let file = File::open(&lock_path).map_err(|e| format!("Failed to open lock file: {}", e))?;
     let fd = file.as_raw_fd();
     // SAFETY: fd is a valid file descriptor from File::create; LOCK_EX | LOCK_NB are valid flock flags
     let result = unsafe { flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
@@ -670,17 +629,20 @@ fn acquire_daemon_lock() -> Result<File, String> {
     Ok(file)
 }
 
-/// Checks whether the daemon is running by attempting to connect to its Unix socket."
+/// Checks whether the daemon is running by attempting to connect to its Unix socket.
 fn daemon_is_running() -> bool {
     UnixStream::connect(daemon_socket()).is_ok()
 }
 
-/// Ensures the daemon is running, auto-starting it if necessary."
-/// Uses a double-checked locking pattern with `acquire_daemon_lock` to prevent"
-/// multiple processes from spawning the daemon simultaneously. Waits up to"
-/// `DAEMON_STARTUP_TIMEOUT_SECS` (30s) for the daemon to become ready."
-/// Returns an error if the daemon binary cannot be found, the daemon fails to"
-/// start, or it doesn't become ready within the timeout."
+/// Ensures the daemon is running, auto-starting it if necessary.
+///
+/// Uses a double-checked locking pattern with `acquire_daemon_lock` to prevent
+/// multiple processes from spawning the daemon simultaneously. Waits up to
+/// `DAEMON_STARTUP_TIMEOUT_SECS` (30s) for the daemon to become ready.
+///
+/// # Errors
+/// Returns an error if the daemon binary cannot be found, the daemon fails to
+/// start, or it doesn't become ready within the timeout.
 fn ensure_daemon_running() -> Result<(), String> {
     if daemon_is_running() {
         return Ok(());
@@ -690,6 +652,10 @@ fn ensure_daemon_running() -> Result<(), String> {
     let _lock = acquire_daemon_lock()?;
 
     // Double-check after acquiring lock
+    if daemon_is_running() {
+        return Ok(());
+    }
+
     let daemon_bin = find_daemon_binary()
         .or_else(find_daemon_in_path)
         .ok_or_else(|| {
@@ -753,10 +719,11 @@ fn ensure_daemon_running() -> Result<(), String> {
     }
 }
 
-/// Resolves capability arguments from the appropriate source."
-/// Priority: --args-file > --args-stdin > -a (default)."
-/// Validates that --args-file and --args-stdin are not used simultaneously."
-/// Validates content size against MAX_ARGS_SIZE_BYTES (~130 KB)."
+/// Resolves capability arguments from the appropriate source.
+///
+/// Priority: --args-file > --args-stdin > -a (default).
+/// Validates that --args-file and --args-stdin are not used simultaneously.
+/// Validates content size against MAX_ARGS_SIZE_BYTES (~130 KB).
 fn resolve_args(
     args: &str,
     args_file: Option<PathBuf>,
@@ -765,6 +732,7 @@ fn resolve_args(
     if args_file.is_some() && args_stdin {
         return Err("Cannot use both --args-file and --args-stdin simultaneously".to_string());
     }
+
     let content = if let Some(file_path) = args_file {
         let mut content = String::new();
         File::open(&file_path)
@@ -773,29 +741,35 @@ fn resolve_args(
             .map_err(|e| format!("Failed to read args file {}: {}", file_path.display(), e))?;
         content
     } else if args_stdin {
+        let mut content = String::new();
         std::io::stdin()
-            .map_err(|e| format!("Failed to read args from stdin: {}", e))?
             .read_to_string(&mut content)
             .map_err(|e| format!("Failed to read args from stdin: {}", e))?;
         content
     } else {
         args.to_string()
-    }
+    };
+
     if content.len() > MAX_ARGS_SIZE_BYTES {
         return Err(format!(
-            "Capability args too large: {} bytes (max: {} bytes / ~130 KB). \nUse --args-file or --args-stdin for large payloads.",
+            "Capability args too large: {} bytes (max: {} bytes / ~130 KB). \
+             Use --args-file or --args-stdin for large payloads.",
             content.len(),
-            MAX_ARGS_SIZE_BYTES
+            MAX_ARGS_SIZE_BYTES,
         ));
     }
+
     Ok(content)
 }
 
-/// Sends a JSON-RPC request to the daemon over its Unix socket."
-/// Serializes `method` and `params` into a JSON-RPC request, writes it to the"
-/// socket, and reads a single-line JSON-RPC response."
-/// Returns an error string if the daemon cannot be reached, the request cannot"
-/// be serialized, or the daemon returns an error."
+/// Sends a JSON-RPC request to the daemon over its Unix socket.
+///
+/// Serializes `method` and `params` into a JSON-RPC request, writes it to the
+/// socket, and reads a single-line JSON-RPC response.
+///
+/// # Errors
+/// Returns an error string if the daemon cannot be reached, the request cannot
+/// be serialized, or the daemon returns an error.
 fn send_rpc(method: &str, params: Value) -> Result<Value, String> {
     let sock_path = daemon_socket();
     let mut stream = UnixStream::connect(&sock_path).map_err(|e| {
@@ -811,9 +785,9 @@ fn send_rpc(method: &str, params: Value) -> Result<Value, String> {
         "params": params,
         "id": 1,
     });
+    let req_str = serde_json::to_string(&request).map_err(|e| format!("JSON encode: {}", e))?;
     stream
-        .write_all(serde_json::to_string(&request).map_err(|e| format!("JSON encode: {}", e))?
-            .as_bytes())
+        .write_all(req_str.as_bytes())
         .map_err(|e| format!("Write: {}", e))?;
     stream
         .write_all(b"\n")
@@ -825,12 +799,12 @@ fn send_rpc(method: &str, params: Value) -> Result<Value, String> {
     reader
         .read_line(&mut line)
         .map_err(|e| format!("Read: {}", e))?;
-
     if line.is_empty() {
         return Err("Daemon closed connection".into());
     }
 
-    let resp: Value = serde_json::from_str(line.trim()).map_err(|e| format!("JSON parse: {}", e))?;
+    let resp: Value =
+        serde_json::from_str(line.trim()).map_err(|e| format!("JSON parse: {}", e))?;
 
     if let Some(err) = resp
         .get("error")
@@ -843,15 +817,17 @@ fn send_rpc(method: &str, params: Value) -> Result<Value, String> {
     Ok(resp.get("result").cloned().unwrap_or(Value::Null))
 }
 
-/// Sentinel WAL sequence for a dispatched step with no completion record."
-/// Real WAL sequences start at 0, so `u64::MAX` is distinct from every real"
-/// `wal_seq` — it marks "unknown", never a forged success marker like 0."
+/// Sentinel WAL sequence for a dispatched step with no completion record.
+///
+/// Real WAL sequences start at 0, so `u64::MAX` is distinct from every real
+/// `wal_seq` — it marks "unknown", never a forged success marker like 0.
 const DISPATCH_UNKNOWN_WAL_SEQ: u64 = u64::MAX;
 
-/// Emits a session-loop diagnostic respecting the output mode."
-/// In JSON mode prints a single-line JSON object to stdout (keeps stdout"
-/// parseable, stderr clean); in quiet mode suppresses loop progress noise;"
-/// otherwise writes the text to stderr as before."
+/// Emits a session-loop diagnostic respecting the output mode.
+///
+/// In JSON mode prints a single-line JSON object to stdout (keeps stdout
+/// parseable, stderr clean); in quiet mode suppresses loop progress noise;
+/// otherwise writes the text to stderr as before.
 fn emit_session_note(mode: &crate::output::OutputMode, value: Value, text: &str) {
     if mode.is_json() {
         println!(
@@ -863,9 +839,10 @@ fn emit_session_note(mode: &crate::output::OutputMode, value: Value, text: &str)
     }
 }
 
-/// Resolves the WAL sequence of a dispatched job via the daemon `logs` RPC."
-/// Returns the `seq` of the terminal (`job_completed`/`job_failed`) event,"
-/// or [`DISPATCH_UNKNOWN_WAL_SEQ`] when no completion record exists yet."
+/// Resolves the WAL sequence of a dispatched job via the daemon `logs` RPC.
+///
+/// Returns the `seq` of the terminal (`job_completed`/`job_failed`) event,
+/// or [`DISPATCH_UNKNOWN_WAL_SEQ`] when no completion record exists yet.
 fn fetch_job_wal_seq(job_id: &str) -> u64 {
     if let Ok(v) = send_rpc("logs", serde_json::json!({ "job_id": job_id, "limit": 50 })) {
         if let Some(events) = v.get("events").and_then(|e| e.as_array()) {
@@ -885,13 +862,19 @@ fn fetch_job_wal_seq(job_id: &str) -> u64 {
     DISPATCH_UNKNOWN_WAL_SEQ
 }
 
-/// Polls the daemon `status` RPC until a dispatched job reaches a terminal"
-/// state or the time budget expires."
-/// `job_id` — daemon job ID from `dispatch`. `budget_secs` — max seconds"
-/// to poll (caller passes the session's remaining `--max-seconds` budget)."
-/// `(success, error, wal_seq)` from the daemon's real terminal state —"
-/// never a synthesized success. `wal_seq` comes from the `logs` RPC, or"
-/// [`DISPATCH_UNKNOWN_WAL_SEQ`] when no completion record exists."
+/// Polls the daemon `status` RPC until a dispatched job reaches a terminal
+/// state or the time budget expires.
+///
+/// # Inputs
+///
+/// `job_id` — daemon job ID from `dispatch`. `budget_secs` — max seconds
+/// to poll (caller passes the session's remaining `--max-seconds` budget).
+///
+/// # Outputs
+///
+/// `(success, error, wal_seq)` from the daemon's real terminal state —
+/// never a synthesized success. `wal_seq` comes from the `logs` RPC, or
+/// [`DISPATCH_UNKNOWN_WAL_SEQ`] when no completion record exists.
 fn poll_dispatched_step(job_id: &str, budget_secs: u64) -> (bool, Option<String>, u64) {
     let start = std::time::Instant::now();
     let budget = std::time::Duration::from_secs(budget_secs.max(1));
@@ -919,7 +902,14 @@ fn poll_dispatched_step(job_id: &str, budget_secs: u64) -> (bool, Option<String>
         if let Ok(v) = send_rpc("status", serde_json::json!({ "job_id": job_id })) {
             match v.get("status").and_then(|s| s.as_str()) {
                 Some("completed") => return (true, None, wal_seq),
-                Some("failed") => return (false, Some(v.get("result").and_then(|r| r.as_str()).unwrap_or("execution reported failure".to_string())), wal_seq),
+                Some("failed") => {
+                    let err = v
+                        .get("result")
+                        .and_then(|r| r.as_str())
+                        .map(str::to_string)
+                        .or_else(|| Some("execution reported failure".to_string()));
+                    return (false, err, wal_seq);
+                }
                 _ => {}
             }
         }
@@ -930,6 +920,8 @@ fn poll_dispatched_step(job_id: &str, budget_secs: u64) -> (bool, Option<String>
         wal_seq,
     )
 }
+
+// ── Main ────────────────────────────────────────────────────────────────────
 
 #[allow(
     clippy::too_many_lines,
@@ -943,8 +935,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     let resolved = RuntimoConfig::load().resolved();
     let base_mode = OutputMode::from_cli(
+        &resolved,
         cli.output.as_deref(),
+        cli.color,
+        cli.no_color,
+        cli.emoji,
+        cli.no_emoji,
         cli.table_style.as_deref(),
+        cli.timestamps,
         cli.no_timestamps,
     );
 
@@ -960,8 +958,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             schema,
             timeout,
         } => {
+            let args = resolve_args(&args, args_file, args_stdin)?;
+            let reg = make_registry().map_err(|e| format!("Registry init failed: {}", e))?;
             if schema {
-                let reg = make_registry().map_err(|e| format!("Registry init failed: {}", e))?;
                 if let Some(cap) = reg.get(&capability) {
                     println!("{}", cap.schema());
                 } else {
@@ -970,7 +969,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
                 return Ok(());
             }
-            let args_val: Value = serde_json::from_str(&args).map_err(|e| format!("Invalid JSON args: {}", e))?;
+            let cap = reg.get(&capability).ok_or_else(|| {
+                format!(
+                    "Capability not found: {}. Use `runtimo list` to see available capabilities.",
+                    capability
+                )
+            })?;
+            let args_val: Value =
+                serde_json::from_str(&args).map_err(|e| format!("Invalid JSON args: {}", e))?;
             if let Err(e) = cap.validate(&args_val) {
                 eprintln!("Validation failed: {}", e);
                 std::process::exit(1);
@@ -981,15 +987,18 @@ fn main() -> Result<(), Box<dyn Error>> {
                     "Too many concurrent CLI runs (max {}). Try again later.",
                     MAX_CLI_CONCURRENT
                 );
+                std::process::exit(1);
             }
-            let resolved_timeout = timeout.unwrap_or_else(|| RuntimoConfig::get_capability_timeout(&capability, 30));
+            let resolved_timeout =
+                timeout.unwrap_or_else(|| RuntimoConfig::get_capability_timeout(&capability, 30));
             let result = execute_with_telemetry_and_session(
+                cap,
                 &args_val,
                 dry_run,
                 &wal_path(),
+                None,
+                None,
                 resolved_timeout,
-                None,
-                None,
             )
             .map_err(|e| format!("{}", e));
             release_cli_slot();
@@ -1002,15 +1011,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                 if fail_is_json {
                     println!(
                         "{}",
-                        serde_json::json!({
-                            "success": false,
-                            "capability": capability,
-                            "output": result.output
-                        })
+                        serde_json::json!({"success": false, "capability": capability, "output": result.output})
                     );
                 } else if !fail_is_quiet {
                     eprintln!("{}", result.output.output);
                 }
+                std::process::exit(1);
             }
             let output = result.output;
             // Resolve effective mode: subcommand --json/--quiet override global --output
@@ -1025,6 +1031,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 println!("{}", serde_json::to_string_pretty(&output)?);
             } else if mode.is_quiet() {
                 // silent — preserve --quiet contract
+            } else {
                 println!("{}", mode.render_text(&output.output));
                 if let Some(ref data) = output.data {
                     let text = if let Some(s) = data.as_str() {
@@ -1049,7 +1056,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         } => {
             if let Err(e) = ensure_daemon_running() {
                 eprintln!("Cannot dispatch: {}", e);
+                std::process::exit(1);
             }
+            let args = resolve_args(&args, args_file, args_stdin)?;
+            let args_val: Value =
+                serde_json::from_str(&args).map_err(|e| format!("Invalid JSON args: {}", e))?;
             // Pre-validate dangerous commands at dispatch time
             if capability == "ShellExec" {
                 if let Some(cmd) = args_val.get("cmd").and_then(|v| v.as_str()) {
@@ -1061,6 +1072,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         && runtimo_core::capabilities::is_network_command(cmd)
                     {
                         eprintln!("Dispatch rejected: network commands blocked — set RUNTIMO_ENABLE_NETWORK=1 to enable");
+                        std::process::exit(1);
                     }
                 }
             }
@@ -1086,6 +1098,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         msg.push_str("\nUse `runtimo list` to see available capabilities.");
                     }
                     eprintln!("{}", msg);
+                    std::process::exit(1);
                 }
             }
         }
@@ -1094,6 +1107,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             // Early validation: reject empty job_id
             if job_id.is_empty() {
                 eprintln!("Job ID cannot be empty");
+                std::process::exit(1);
             }
             // Pre-validate: check if job exists before entering poll loop
             // Try daemon RPC first
@@ -1126,7 +1140,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             if !job_exists {
                 eprintln!("Job not found: {}", job_id);
+                std::process::exit(1);
             }
+
             let start = std::time::Instant::now();
             loop {
                 let params = serde_json::json!({ "job_id": &job_id });
@@ -1134,6 +1150,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 // refactoring to if-let-else changes control flow here
                 match send_rpc("status", params) {
                     Ok(result) => {
+                        let status = result
+                            .get("status")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
                         match status {
                             "running" => {
                                 if timeout > 0 && start.elapsed().as_secs() >= timeout {
@@ -1158,9 +1178,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                             }
                             "failed" => {
                                 println!("Job {} failed", job_id);
+                                return Ok(());
                             }
                             _ => {
                                 println!("Job {} status: {}", job_id, status);
+                                return Ok(());
                             }
                         }
                     }
@@ -1169,16 +1191,23 @@ fn main() -> Result<(), Box<dyn Error>> {
                         if let Ok(reader) = WalReader::load_all(&wal_path()) {
                             let events = reader.events();
                             let has_completed = events.iter().any(|e| {
-                                matches!(e.event_type, runtimo_core::WalEventType::JobCompleted)
+                                e.job_id == job_id
+                                    && matches!(
+                                        e.event_type,
+                                        runtimo_core::WalEventType::JobCompleted
+                                    )
                             });
                             if has_completed {
                                 println!("Job {} completed (checked via WAL)", job_id);
+                                return Ok(());
                             }
                             let has_failed = events.iter().any(|e| {
-                                matches!(e.event_type, runtimo_core::WalEventType::JobFailed)
+                                e.job_id == job_id
+                                    && matches!(e.event_type, runtimo_core::WalEventType::JobFailed)
                             });
                             if has_failed {
                                 println!("Job {} failed (checked via WAL)", job_id);
+                                return Ok(());
                             }
                         }
                         std::thread::sleep(std::time::Duration::from_secs(2));
@@ -1192,29 +1221,37 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
 
         Commands::List { schemas, json } => {
+            let reg = make_registry().map_err(|e| format!("Registry init failed: {}", e))?;
             // Effective mode: global --output json or local --json forces json
-            let caps: Vec<Value> = reg
-                .list()
-                .iter()
-                .filter_map(|name| {
-                    reg.get(name).map(|cap| {
+            let mode = if json {
+                base_mode.with_format("json")
+            } else {
+                base_mode
+            };
+            if mode.is_json() {
+                let caps: Vec<Value> = reg
+                    .list()
+                    .iter()
+                    .filter_map(|name| {
+                        reg.get(name).map(|cap| {
                         serde_json::json!({
                             "name": name,
                             "description": cap.description(),
-                            "schema": if schemas { Some(cap.schema().to_string()) } else { None }
+                            "schema": if schemas { Some(cap.schema().to_string()) } else { None },
                         })
                     })
-                })
-                .collect();
-            if json {
+                    })
+                    .collect();
                 println!("{}", serde_json::to_string_pretty(&caps)?);
-            } else {
+            } else if mode.is_quiet() {
                 // silent
+            } else {
                 for name in reg.list() {
                     if let Some(cap) = reg.get(name) {
                         print!("  {:>12}  {}", name, cap.description());
                         if schemas {
                             println!("\n    schema: {}", cap.schema());
+                        } else {
                             println!();
                         }
                     }
@@ -1223,6 +1260,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
 
         Commands::Status { job_id, json } => {
+            let mode = if json {
+                base_mode.with_format("json")
+            } else {
+                base_mode
+            };
             if let Some(jid) = job_id {
                 // Try daemon RPC first
                 if let Ok(result) = send_rpc("status", serde_json::json!({ "job_id": &jid })) {
@@ -1230,6 +1272,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         println!("{}", serde_json::to_string_pretty(&result)?);
                     } else if mode.is_quiet() {
                         // silent
+                    } else {
                         let headers = ["JOB_ID", "STATUS", "CAPABILITY"];
                         let rows = vec![vec![
                             result
@@ -1250,15 +1293,20 @@ fn main() -> Result<(), Box<dyn Error>> {
                         ]];
                         println!("{}", mode.render_table(&headers, &rows));
                     }
+                    return Ok(());
                 }
+
                 // Fallback to WAL
                 if let Ok(reader) = WalReader::load_all(&wal_path()) {
                     let events = reader.events();
                     let by_job: Vec<_> = events.iter().filter(|e| e.job_id == jid).collect();
                     if by_job.is_empty() {
                         println!("Job not found: {}", jid);
+                    } else if mode.is_quiet() {
+                        // silent
                     } else if mode.is_json() {
                         println!("{}", serde_json::to_string_pretty(&by_job)?);
+                    } else {
                         let headers = if mode.timestamps {
                             vec!["EVENT", "CAPABILITY", "TS"]
                         } else {
@@ -1284,72 +1332,85 @@ fn main() -> Result<(), Box<dyn Error>> {
                         let hdr_refs: Vec<&str> = headers.clone();
                         println!("{}", mode.render_table(&hdr_refs, &rows));
                     }
+                } else {
+                    println!("Cannot read WAL");
                 }
+            } else {
                 // List all jobs via daemon
                 if let Ok(result) = send_rpc("jobs", serde_json::json!({ "limit": 50 })) {
-                    let jobs = result["jobs"].as_array().cloned().unwrap_or_default();
-                    if jobs.is_empty() {
-                        println!("No jobs found.");
-                        let headers = ["JOB_ID", "STATUS", "CAPABILITY"];
-                        let rows: Vec<Vec<String>> = jobs
-                            .iter()
-                            .map(|job| {
-                                let status = job["status"].as_str().unwrap_or("?");
-                                let icon = mode.status_icon(status);
-                                vec![
-                                    job["job_id"].as_str().unwrap_or("?").to_string(),
-                                    format!("{}{}", icon, status),
-                                    job["capability"].as_str().unwrap_or("?").to_string(),
-                                ]
-                            })
-                            .collect();
-                        println!("{}", mode.render_table(&headers, &rows));
-                    }
-                }
-                // Fallback to WAL
-                if let Ok(reader) = WalReader::load_all(&wal_path()) {
-                    let events = reader.events();
-                    let mut seen: std::collections::HashSet<&String> = std::collections::HashSet::new();
-                    let mut rows: Vec<Vec<String>> = Vec::new();
-                    for e in events.iter().rev() {
-                        if seen.contains(&e.job_id) {
-                            continue;
-                        }
-                        seen.insert(&e.job_id);
-                        rows.push(vec![
-                            e.job_id.clone(),
-                            e.event_type.as_str().to_string(),
-                            e.capability.as_deref().unwrap_or("-").to_string(),
-                        ];);
-                        if rows.len() >= 50 {
-                            break;
-                        }
-                    }
-                    if rows.is_empty() {
-                        println!("No jobs found.");
+                    if mode.is_json() {
+                        println!("{}", serde_json::to_string_pretty(&result)?);
                     } else if mode.is_quiet() {
                         // silent
-                    } else if mode.is_json() {
-                        println!("{}", serde_json::to_string_pretty(&rows)?);
-                        let headers = ["JOB_ID", "EVENT", "CAPABILITY"];
-                        if mode.timestamps {
-                            // include ts if timestamps enabled
-                            let rows_ts: Vec<Vec<String>> = rows
+                    } else {
+                        let jobs = result["jobs"].as_array().cloned().unwrap_or_default();
+                        if jobs.is_empty() {
+                            println!("No jobs found.");
+                        } else {
+                            let headers = ["JOB_ID", "STATUS", "CAPABILITY"];
+                            let rows: Vec<Vec<String>> = jobs
                                 .iter()
-                                .map(|r| {
-                                    // find ts for this job id
-                                    let ts = events
-                                        .iter()
-                                        .find(|ev| ev.job_id == r[0])
-                                        .map(|ev| ev.ts.to_string())
-                                        .unwrap_or_default();
-                                    vec![r[0].clone(), r[1].clone(), r[2].clone(), ts]
+                                .map(|job| {
+                                    let status = job["status"].as_str().unwrap_or("?");
+                                    let icon = mode.status_icon(status);
+                                    vec![
+                                        job["job_id"].as_str().unwrap_or("?").to_string(),
+                                        format!("{}{}", icon, status),
+                                        job["capability"].as_str().unwrap_or("?").to_string(),
+                                    ]
                                 })
                                 .collect();
-                            let hdr = ["JOB_ID", "EVENT", "CAPABILITY", "TS"];
-                            println!("{}", mode.render_table(&hdr, &rows_ts));
-                        } else {
                             println!("{}", mode.render_table(&headers, &rows));
+                        }
+                    }
+                } else {
+                    // Fallback to WAL
+                    if let Ok(reader) = WalReader::load_all(&wal_path()) {
+                        let events = reader.events();
+                        let mut seen: std::collections::HashSet<&String> =
+                            std::collections::HashSet::new();
+                        let mut rows: Vec<Vec<String>> = Vec::new();
+                        for e in events.iter().rev() {
+                            if seen.contains(&e.job_id) {
+                                continue;
+                            }
+                            seen.insert(&e.job_id);
+                            rows.push(vec![
+                                e.job_id.clone(),
+                                e.event_type.as_str().to_string(),
+                                e.capability.as_deref().unwrap_or("-").to_string(),
+                            ]);
+                            if rows.len() >= 50 {
+                                break;
+                            }
+                        }
+                        if rows.is_empty() {
+                            println!("No jobs found.");
+                        } else if mode.is_quiet() {
+                            // silent
+                        } else if mode.is_json() {
+                            println!("{}", serde_json::to_string_pretty(&rows)?);
+                        } else {
+                            let headers = ["JOB_ID", "EVENT", "CAPABILITY"];
+                            if mode.timestamps {
+                                // include ts if timestamps enabled
+                                let rows_ts: Vec<Vec<String>> = rows
+                                    .iter()
+                                    .map(|r| {
+                                        // find ts for this job id
+                                        let ts = events
+                                            .iter()
+                                            .find(|ev| ev.job_id == r[0])
+                                            .map(|ev| ev.ts.to_string())
+                                            .unwrap_or_default();
+                                        vec![r[0].clone(), r[1].clone(), r[2].clone(), ts]
+                                    })
+                                    .collect();
+                                let hdr = ["JOB_ID", "EVENT", "CAPABILITY", "TS"];
+                                println!("{}", mode.render_table(&hdr, &rows_ts));
+                            } else {
+                                println!("{}", mode.render_table(&headers, &rows));
+                            }
                         }
                     }
                 }
@@ -1357,11 +1418,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
 
         Commands::Jobs { limit, json } => {
+            let mode = if json {
+                base_mode.with_format("json")
+            } else {
+                base_mode
+            };
+            // Try daemon RPC first
             let result = send_rpc("jobs", serde_json::json!({ "limit": limit }));
             match result {
                 Ok(data) => {
-                    if json {
+                    if mode.is_json() {
                         println!("{}", serde_json::to_string_pretty(&data)?);
+                    } else if mode.is_quiet() {
+                        // silent
                     } else {
                         let jobs = data["jobs"].as_array().cloned().unwrap_or_default();
                         if jobs.is_empty() {
@@ -1370,12 +1439,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                             let headers = ["JOB_ID", "CAPABILITY", "STATUS"];
                             let rows: Vec<Vec<String>> = jobs
                                 .iter()
-                                .map(|job| {
-                                    let status = job["status"].as_str().unwrap_or("?");
+                                .map(|j| {
+                                    let status = j["status"].as_str().unwrap_or("?");
+                                    let icon = mode.status_icon(status);
                                     vec![
-                                        job["job_id"].as_str().unwrap_or("?").to_string(),
-                                        job["capability"].as_str().unwrap_or("?").to_string(),
-                                        format!("{}{}", mode.status_icon(status), status),
+                                        j["job_id"].as_str().unwrap_or("?").to_string(),
+                                        j["capability"].as_str().unwrap_or("?").to_string(),
+                                        format!("{}{}", icon, status),
                                     ]
                                 })
                                 .collect();
@@ -1384,13 +1454,20 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
                 Err(_) => {
-                    let mut jobs: Vec<Value> = Vec::new();
+                    // Fallback to WAL
                     if let Ok(reader) = WalReader::load_all(&wal_path()) {
                         let events = reader.events();
-                        for e in events.iter().rev().take(limit) {
+                        let mut jobs: Vec<Value> = Vec::new();
+                        let mut seen: std::collections::HashSet<&String> =
+                            std::collections::HashSet::new();
+                        for e in events.iter().rev() {
+                            if seen.contains(&e.job_id) {
+                                continue;
+                            }
                             if jobs.len() >= limit {
                                 break;
                             }
+                            seen.insert(&e.job_id);
                             let status = match e.event_type {
                                 runtimo_core::WalEventType::JobStarted => "started",
                                 runtimo_core::WalEventType::JobCompleted => "completed",
@@ -1404,7 +1481,28 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 "started_at": e.ts,
                             }));
                         }
-                        println!("{}", serde_json::to_string_pretty(&jobs)?);
+                        if jobs.is_empty() {
+                            println!("No jobs found.");
+                        } else if mode.is_json() {
+                            println!("{}", serde_json::to_string_pretty(&jobs)?);
+                        } else if mode.is_quiet() {
+                            // silent
+                        } else {
+                            let headers = ["JOB_ID", "CAPABILITY", "STATUS"];
+                            let rows: Vec<Vec<String>> = jobs
+                                .iter()
+                                .map(|j| {
+                                    let status = j["status"].as_str().unwrap_or("?");
+                                    let icon = mode.status_icon(status);
+                                    vec![
+                                        j["job_id"].as_str().unwrap_or("?").to_string(),
+                                        j["capability"].as_str().unwrap_or("?").to_string(),
+                                        format!("{}{}", icon, status),
+                                    ]
+                                })
+                                .collect();
+                            println!("{}", mode.render_table(&headers, &rows));
+                        }
                     } else {
                         eprintln!("Cannot read WAL. Is the daemon running?");
                     }
@@ -1412,7 +1510,17 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
-        Commands::Logs { job_id, limit, json } => {
+        Commands::Logs {
+            job_id,
+            limit,
+            json,
+        } => {
+            let mode = if json {
+                base_mode.with_format("json")
+            } else {
+                base_mode
+            };
+            // Try daemon RPC first
             let mut params = serde_json::json!({ "limit": limit });
             if let Some(ref jid) = job_id {
                 params["job_id"] = serde_json::json!(jid);
@@ -1422,6 +1530,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     println!("{}", serde_json::to_string_pretty(&result)?);
                 } else if mode.is_quiet() {
                     // silent
+                } else {
                     let events = result["events"].as_array().cloned().unwrap_or_default();
                     if events.is_empty() {
                         println!("No events found.");
@@ -1438,7 +1547,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 let et = e["event_type"].as_str().unwrap_or("?").to_string();
                                 let jid = e["job_id"].as_str().unwrap_or("?").to_string();
                                 let cap = e["capability"].as_str().unwrap_or("-").to_string();
-                                vec![ts, jid, et, cap]
+                                if mode.timestamps {
+                                    vec![ts, jid, et, cap]
+                                } else {
+                                    vec![jid, et, cap]
+                                }
                             })
                             .collect();
                         println!("{}", mode.render_table(&headers, &rows));
@@ -1452,8 +1565,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                     events.iter().collect()
                 };
                 let recent: Vec<_> = filtered.iter().rev().take(limit).rev().collect();
-                if json {
+                if mode.is_json() {
                     println!("{}", serde_json::to_string_pretty(&recent)?);
+                } else if mode.is_quiet() {
+                    // silent
                 } else if recent.is_empty() {
                     println!("No events found.");
                 } else {
@@ -1465,12 +1580,20 @@ fn main() -> Result<(), Box<dyn Error>> {
                     let rows: Vec<Vec<String>> = recent
                         .iter()
                         .map(|e| {
-                            vec![
-                                e.ts.to_string(),
-                                e.job_id.clone(),
-                                e.event_type.as_str().to_string(),
-                                e.capability.as_deref().unwrap_or("-").to_string(),
-                            ]
+                            if mode.timestamps {
+                                vec![
+                                    e.ts.to_string(),
+                                    e.job_id.clone(),
+                                    e.event_type.as_str().to_string(),
+                                    e.capability.as_deref().unwrap_or("-").to_string(),
+                                ]
+                            } else {
+                                vec![
+                                    e.job_id.clone(),
+                                    e.event_type.as_str().to_string(),
+                                    e.capability.as_deref().unwrap_or("-").to_string(),
+                                ]
+                            }
                         })
                         .collect();
                     println!("{}", mode.render_table(&headers, &rows));
@@ -1479,9 +1602,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
 
         Commands::Undo { job_id, dry_run } => {
+            let reg = make_registry().map_err(|e| format!("Registry init failed: {}", e))?;
             let cap = reg.get("Undo").ok_or("Undo capability not available")?;
             let args = serde_json::json!({ "job_id": job_id });
             let ctx = runtimo_core::Context {
+                dry_run,
                 job_id: runtimo_core::utils::generate_id(),
                 working_dir: std::env::current_dir().unwrap_or_default(),
             };
@@ -1490,69 +1615,80 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
 
         Commands::Telemetry { json, verbose } => {
+            let mode = if json {
+                base_mode.with_format("json")
+            } else {
+                base_mode
+            };
             // Telemetry gate (RC1): when disabled, skip capture entirely —
             // no /proc reads, no subprocess probes, no display emitters.
             if !resolved.telemetry_enabled {
-                if json {
-                    println!("{}", serde_json::json!({
-                        "telemetry_enabled": false,
-                        "telemetry": null
-                    }));
-                } else if !mode.is_quiet() {
-                    mode.render_text("Telemetry disabled (telemetry.enabled = false).");
-                }
-            } else {
-                let tel = Telemetry::capture();
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&tel)?);
-                } else if !mode.is_quiet() {
-                    // Listening ports: shown only with --verbose flag
-                    let ports_str = if verbose && !tel.network.listening_ports.is_empty() {
-                        format!(
-                            "\nListening ports: {}",
-                            tel.network
-                                .listening_ports
-                                .map(|p| p.to_string())
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        )
-                    } else {
-                        String::new()
-                    };
-                    let text = format!(
-                        "RUNTIMO TELEMETRY\n\nSystem\nCPU: {} ({} cores)\nRAM: {} total, {} free, {} available\nDisk: {} total, {} free ({}% used)\nUptime: {} ({}s)\nLoad: {} ({} cores)\n\nHardware\nAccelerators: {}\n\nNetwork\nPublic IP: {}\nTunnel: {}{}",
-                        tel.system.cpu_model,
-                        tel.system.cpu_count,
-                        tel.system.ram_total,
-                        tel.system.ram_free,
-                        tel.system.ram_available,
-                        tel.system.disk_total,
-                        tel.system.disk_free,
-                        tel.system.disk_used_percent,
-                        tel.system.uptime,
-                        tel.system.uptime_seconds,
-                        tel.system.load_average,
-                        tel.system.cpu_count,
-                        if tel.hardware.accelerators.is_empty() { "none" } else {
-                            tel.hardware.accelerators.iter().map(|a| format!("{}: {}x", a.kind, a.count)).collect::<Vec<_>>()
-                        },
-                        tel.network.public_ip,
-                        if tel.network.tunnel_running {
-                            format!("cloudflared (PID {})", tel.network.tunnel_pid.map_or_else(|| "?".to_string(), |p| p.to_string()))
-                        } else {
-                            "none".to_string()
-                        },
-                        ports_str,
+                if mode.is_json() {
+                    println!(
+                        "{}",
+                        serde_json::json!({"telemetry_enabled": false, "telemetry": null})
                     );
-                    mode.render_text(&text);
+                } else if !mode.is_quiet() {
+                    println!(
+                        "{}",
+                        mode.render_text("Telemetry disabled (telemetry.enabled = false).")
+                    );
                 }
+                return Ok(());
+            }
+            let tel = Telemetry::capture();
+            if mode.is_json() {
+                println!("{}", serde_json::to_string_pretty(&tel)?);
+            } else if mode.is_quiet() {
+                // silent
+            } else {
+                // Listening ports: shown only with --verbose flag
+                let ports_str = if verbose && !tel.network.listening_ports.is_empty() {
+                    format!(
+                        "\nListening ports: {}",
+                        tel.network
+                            .listening_ports
+                            .iter()
+                            .map(|p| p.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                } else {
+                    String::new()
+                };
+                let text = format!(
+                    "RUNTIMO TELEMETRY\n\nSystem\nCPU: {} ({} cores)\nRAM: {} total, {} free, {} available\nDisk: {} total, {} free ({}% used)\nUptime: {} ({}s)\nLoad: {} ({} cores)\n\nHardware\nAccelerators: {}\n\nNetwork\nPublic IP: {}\nTunnel: {}{}",
+                    tel.system.cpu_model, tel.system.cpu_count,
+                    tel.system.ram_total, tel.system.ram_free, tel.system.ram_available,
+                    tel.system.disk_total, tel.system.disk_free, tel.system.disk_used_percent,
+                    tel.system.uptime, tel.system.uptime_seconds,
+                    tel.system.load_average, tel.system.cpu_count,
+                    if tel.hardware.accelerators.is_empty() { "none".into() } else {
+                        tel.hardware.accelerators.iter().map(|a| format!("{}: {}x", a.kind, a.count)).collect::<Vec<_>>().join(", ")
+                    },
+                    tel.network.public_ip,
+                    if tel.network.tunnel_running {
+                        format!("cloudflared (PID {})", tel.network.tunnel_pid.map_or_else(|| "?".to_string(), |p| p.to_string()))
+                    } else {
+                        "none".to_string()
+                    },
+                    ports_str,
+                );
+                println!("{}", mode.render_text(&text));
             }
         }
 
         Commands::Processes { json } => {
+            let mode = if json {
+                base_mode.with_format("json")
+            } else {
+                base_mode
+            };
             let snap = ProcessSnapshot::capture();
-            if json {
+            if mode.is_json() {
                 println!("{}", serde_json::to_string_pretty(&snap)?);
+            } else if mode.is_quiet() {
+                // silent
             } else {
                 let zombie_lines = {
                     let zs = snap.zombies();
@@ -1574,33 +1710,37 @@ fn main() -> Result<(), Box<dyn Error>> {
                         format!("\n\nZombies ({})\n{}", zs.len(), lines.join("\n"))
                     }
                 };
-                println!(
-                    "PROCESS SNAPSHOT\n\nSummary\nTotal: {}\nCPU: {:.1}%\nMemory: {:.1}%\nZombies: {}{}{}",
+                let text = format!(
+                    "PROCESS SNAPSHOT\n\nSummary\nTotal: {}\nCPU: {:.1}%\nMemory: {:.1}%\nZombies: {}{}\n\nTop CPU\n{}\n\nTop Memory\n{}",
                     snap.summary.total_processes,
                     snap.summary.total_cpu_percent,
                     snap.summary.total_mem_percent,
                     snap.summary.zombie_count,
                     zombie_lines,
-                    snap.top_by_cpu(5).iter().map(|p| format!("- {} {} {} {}% CPU", p.pid, p.command.chars().take(40).collect::<String>(), p.stat, p.cpu_percent)).collect::<Vec<_>>()
-                        .join("\n"),
-                    snap.top_by_mem(5).iter().map(|p| format!("- {} {} {} {}% MEM", p.pid, p.command.chars().take(40).collect::<String>(), p.stat, p.mem_percent)).collect::<Vec<_>>()
-                        .join("\n"),
+                    snap.top_by_cpu(5).iter().map(|p| format!("- {} {} {} {}% CPU", p.pid, p.command.chars().take(40).collect::<String>(), p.stat, p.cpu_percent)).collect::<Vec<_>>().join("\n"),
+                    snap.top_by_mem(5).iter().map(|p| format!("- {} {} {} {}% MEM", p.pid, p.command.chars().take(40).collect::<String>(), p.stat, p.mem_percent)).collect::<Vec<_>>().join("\n"),
                 );
+                println!("{}", mode.render_text(&text));
             }
         }
 
         Commands::Zombies { reap } => {
+            let snap = ProcessSnapshot::capture();
             let zombies = snap.zombies();
             if zombies.is_empty() {
                 println!("No zombie processes.");
-            } else {
-                println!("{} zombie(s) found:\n", zombies.len());
-                for z in &zombies {
-                    println!(
-                        "  {:>8}  PPID:{:>8}  {:>6}  {}",
-                        z.pid, z.ppid, z.stat, z.command
-                    );
-                }
+                return Ok(());
+            }
+
+            println!("{} zombie(s) found:\n", zombies.len());
+            for z in &zombies {
+                println!(
+                    "  {:>8}  PPID:{:>8}  {:>6}  {}",
+                    z.pid, z.ppid, z.stat, z.command
+                );
+            }
+
+            if reap {
                 // Zombies can't be killed — they're already dead. We kill their
                 // parent instead, which causes the kernel to reap the zombie.
                 // Kill capability protects init (PID 1) and self.
@@ -1613,21 +1753,23 @@ fn main() -> Result<(), Box<dyn Error>> {
                     .collect();
                 // Never kill our own parent
                 unique_parents.remove(&std::process::id());
+
                 if unique_parents.is_empty() {
                     println!("\nNo reapable parents (all zombies are children of init or self).");
-                } else {
-                    println!("\nReaping via {} parent(s):", unique_parents.len());
-                    for ppid in &unique_parents {
-                        print!("  PID {} → ", ppid);
-                        let ctx = runtimo_core::Context {
-                            dry_run: false,
-                            job_id: format!("reap-{}", ppid),
-                            working_dir: std::env::current_dir().unwrap_or_default(),
-                        };
-                        match killer.execute(&serde_json::json!({ "pid": ppid, "signal": 15 }), &ctx) {
-                            Ok(o) => println!("{}", o.output),
-                            Err(e) => println!("blocked: {}", e),
-                        }
+                    return Ok(());
+                }
+
+                println!("\nReaping via {} parent(s):", unique_parents.len());
+                for ppid in &unique_parents {
+                    print!("  PID {} → ", ppid);
+                    let ctx = runtimo_core::Context {
+                        dry_run: false,
+                        job_id: format!("reap-{}", ppid),
+                        working_dir: std::env::current_dir().unwrap_or_default(),
+                    };
+                    match killer.execute(&serde_json::json!({"pid": ppid, "signal": 15}), &ctx) {
+                        Ok(o) => println!("{}", o.output),
+                        Err(e) => println!("blocked: {}", e),
                     }
                 }
                 // Re-check
@@ -1641,8 +1783,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                         "\n{} zombie(s) remain (may need SIGKILL or parent is protected).",
                         remaining
                     );
-                    println!("Use `runtimo zombies --reap` to kill zombie parents and clean them up.");
                 }
+            } else {
+                println!(
+                    "\nUse `runtimo zombies --reap` to kill zombie parents and clean them up."
+                );
             }
         }
 
@@ -1661,6 +1806,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                     AllowedPathsAction::Remove { paths } => {
                         config.allowed_paths.retain(|p| !paths.contains(p));
+                        config.save().map_err(|e| format!("Save failed: {}", e))?;
+                        println!("Prefixes updated: {:?}", config.allowed_paths);
                     }
                     AllowedPathsAction::List => {
                         let all = RuntimoConfig::get_allowed_prefixes();
@@ -1674,7 +1821,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             ConfigAction::Show => {
                 // Respect global --output json/quiet
                 if base_mode.is_quiet() {
-                } else if base_mode.is_json() {
+                    return Ok(());
+                }
+                if base_mode.is_json() {
                     let config_path = RuntimoConfig::config_path();
                     let config = RuntimoConfig::load();
                     let resolved = config.resolved();
@@ -1693,86 +1842,126 @@ fn main() -> Result<(), Box<dyn Error>> {
                         "telemetry_enabled": resolved.telemetry_enabled,
                     });
                     println!("{}", serde_json::to_string_pretty(&out)?);
-                } else {
-                    let config_path = RuntimoConfig::config_path();
-                    let config_exists = config_path.exists();
-                    let config = match RuntimoConfig::load_result() {
-                        Ok(c) => c,
-                        Err(e) => {
-                            eprintln!();
-                            eprintln!("[runtimo] Config parse error: {}", e);
-                            eprintln!(
-                                "[runtimo] Showing defaults — fix the config file to apply settings."
-                            );
-                            RuntimoConfig::default()
-                        }
-                    };
-                    println!("Configuration: {}", config_path.display());
-                    if !config_exists {
-                        println!("  (file does not exist — using defaults)");
-                    }
-                    // Profile line (Gate 1 seam)
-                    let profile_name = config
-                        .profile
-                        .clone()
-                        .unwrap_or_else(|| "minimal".to_string());
-                    println!("Profile: {}", profile_name);
-                    println!();
-                    println!("Allowed paths (config file): {:?}", config.allowed_paths);
-                    println!("DAL (config): {:?}", config.dal);
-                    println!("Blocklist overrides: {:?}", config.blocklist_overrides);
-                    if config.capability_timeouts.is_empty() {
-                        println!("Capability timeouts: (none configured, using defaults)");
-                        println!("Capability timeouts:");
-                        for (cap, timeout) in &config.capability_timeouts {
-                            println!("  {}: {}s", cap, timeout);
-                        }
-                    }
-                    if config.env.is_empty() {
-                        println!("Env [env]: (none configured)");
-                        println!("Env [env]:");
-                        for (key, value) in &config.env {
-                            println!("  {} = {}", key, value);
-                        }
-                    }
-                    // Show profile-derived tables if present
-                    if config.profile.is_some() {
-                        println!("Output: format={:?} renderer={:?}", config.output.format, config.output.renderer);
-                        println!("WAL: mode={:?} enabled={:?}", config.wal.mode, config.wal.enabled);
-                        println!("Backup: enabled={:?}", config.backup.enabled);
-                        println!("Guards: dal={:?} blocklist_enabled={:?}", config.guards.dal, config.guards.blocklist_enabled);
-                        println!("Session: max={:?} timeout={:?} on_limit={:?}", config.session.max_sessions, config.session.timeout_secs, config.session.on_limit);
-                        println!("Telemetry: enabled={:?}", config.telemetry.enabled);
-                    }
-                    println!("Effective settings (with env var + defaults):");
-                    let resolved = config.resolved();
-                    println!("  Profile: {}", resolved.profile);
-                    println!("  DAL: {}", resolved.dal);
-                    println!("  WAL mode: {}", resolved.wal_mode);
-                    println!("  Backup: {}", on_off(resolved.backup_enabled));
-                    println!("  Output: {}/{}", resolved.output_format, resolved.output_renderer);
-                    println!("  Session: {}/{}s {}", resolved.session_max, resolved.session_timeout, resolved.session_on_limit);
-                    println!("  DAL (legacy get_dal): {}", RuntimoConfig::get_dal());
-                    println!("  ShellExec blocklist: {}", on_off(resolved.blocklist_enabled));
-                    println!("  Critical-files denylist: {}", on_off(RuntimoConfig::critical_files_enabled()));
-                    println!("  Path whitelist: {}", on_off(RuntimoConfig::path_restriction_enabled()));
-                    println!("  PATH sanitization: {}", on_off(RuntimoConfig::path_sanitization_enabled()));
-                    let all_prefixes = RuntimoConfig::get_allowed_prefixes();
-                    println!("  Allowed paths ({} total):", all_prefixes.len());
-                    for p in &all_prefixes {
-                        println!("    {}", p);
-                    }
-                    // Guards off warning (Gate 1)
-                    if RuntimoConfig::guards_off_via_profile(&resolved)
-                        && resolved.profile == "ephemeral"
-                    {
+                    return Ok(());
+                }
+                let config_path = RuntimoConfig::config_path();
+                let config_exists = config_path.exists();
+                let config = match RuntimoConfig::load_result() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!();
+                        eprintln!("[runtimo] Config parse error: {}", e);
                         eprintln!(
-                            "[runtimo] WARNING: guards off via profile {} — not for service machines",
-                            resolved.profile
+                            "[runtimo] Showing defaults — fix the config file to apply settings."
                         );
+                        eprintln!();
+                        RuntimoConfig::default()
                     }
+                };
+                println!("Configuration: {}", config_path.display());
+                if !config_exists {
+                    println!("  (file does not exist — using defaults)");
+                }
+                // Profile line (Gate 1 seam)
+                let profile_name = config
+                    .profile
+                    .clone()
+                    .unwrap_or_else(|| "minimal".to_string());
+                println!("Profile: {}", profile_name);
+                println!();
+                println!("Allowed paths (config file): {:?}", config.allowed_paths);
+                println!("DAL (config): {:?}", config.dal);
+                println!("Blocklist overrides: {:?}", config.blocklist_overrides);
+                if config.capability_timeouts.is_empty() {
+                    println!("Capability timeouts: (none configured, using defaults)");
+                } else {
+                    println!("Capability timeouts:");
+                    for (cap, timeout) in &config.capability_timeouts {
+                        println!("  {}: {}s", cap, timeout);
+                    }
+                }
+                if config.env.is_empty() {
+                    println!("Env [env]: (none configured)");
+                } else {
+                    println!("Env [env]:");
+                    for (key, value) in &config.env {
+                        println!("  {} = {}", key, value);
+                    }
+                }
+                // Show profile-derived tables if present
+                if config.profile.is_some() {
+                    println!(
+                        "Output: format={:?} renderer={:?}",
+                        config.output.format, config.output.renderer
+                    );
+                    println!(
+                        "WAL: mode={:?} enabled={:?}",
+                        config.wal.mode, config.wal.enabled
+                    );
+                    println!("Backup: enabled={:?}", config.backup.enabled);
+                    println!(
+                        "Guards: dal={:?} blocklist_enabled={:?}",
+                        config.guards.dal, config.guards.blocklist_enabled
+                    );
+                    println!(
+                        "Session: max={:?} timeout={:?} on_limit={:?}",
+                        config.session.max_sessions,
+                        config.session.timeout_secs,
+                        config.session.on_limit
+                    );
+                    println!("Telemetry: enabled={:?}", config.telemetry.enabled);
+                }
+                println!();
+                println!("Effective settings (with env var + defaults):");
+                let resolved = config.resolved();
+                println!("  Profile: {}", resolved.profile);
+                println!("  DAL: {}", resolved.dal);
+                println!("  WAL mode: {}", resolved.wal_mode);
+                println!("  Backup: {}", on_off(resolved.backup_enabled));
+                println!(
+                    "  Output: {}/{}",
+                    resolved.output_format, resolved.output_renderer
+                );
+                println!(
+                    "  Session: {}/{}s {}",
+                    resolved.session_max, resolved.session_timeout, resolved.session_on_limit
+                );
+                println!("  DAL (legacy get_dal): {}", RuntimoConfig::get_dal());
+                println!(
+                    "  ShellExec blocklist: {}",
+                    on_off(resolved.blocklist_enabled)
+                );
+                println!(
+                    "  Critical-files denylist: {}",
+                    on_off(RuntimoConfig::critical_files_enabled())
+                );
+                println!(
+                    "  Path whitelist: {}",
+                    on_off(RuntimoConfig::path_restriction_enabled())
+                );
+                println!(
+                    "  PATH sanitization: {}",
+                    on_off(RuntimoConfig::path_sanitization_enabled())
+                );
+                let all_prefixes = RuntimoConfig::get_allowed_prefixes();
+                println!("  Allowed paths ({} total):", all_prefixes.len());
+                for p in &all_prefixes {
+                    println!("    {}", p);
+                }
+                // Guards off warning (Gate 1)
+                if RuntimoConfig::guards_off_via_profile(&resolved)
+                    && resolved.profile == "ephemeral"
+                {
+                    eprintln!(
+                        "[runtimo] WARNING: guards off via profile {} — not for service machines",
+                        resolved.profile
+                    );
+                }
+                if !config_exists {
+                    println!();
                     println!("No config file found. To customize, create one at:");
                     println!("  {}", config_path.display());
+                    println!();
                     println!("Supported fields:");
                     println!("  allowed_paths     — Extra path prefixes for FileRead/FileWrite (list of strings)");
                     println!("  dal               — Design Assurance Level A-E (string)");
@@ -1790,14 +1979,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                     println!("  [guards]          — dal, blocklist_enabled, etc.");
                     println!("  [session]         — max_sessions, timeout_secs, on_limit");
                     println!("  [telemetry]       — enabled");
+                    println!();
                     println!("Example:");
                     println!("  allowed_paths = [\"/srv\", \"/opt\"]");
                     println!("  dal = \"B\"");
                     println!("  blocklist_overrides = [\"curl\", \"wget\"]");
                     println!("  profile = \"ephemeral\"");
+                    println!();
                     println!("  [capability_timeouts]");
                     println!("  ShellExec = 120");
                     println!("  FileRead = 10");
+                    println!();
                     println!("  [env]");
                     println!("  RUNTIMO_ENABLE_INTERPRETERS = \"1\"");
                     println!("  RUNTIMO_ENABLE_NETWORK = \"1\"");
@@ -1807,25 +1999,38 @@ fn main() -> Result<(), Box<dyn Error>> {
                 if let Some(new_level) = level {
                     let upper = new_level.to_uppercase();
                     if !matches!(upper.as_str(), "A" | "B" | "C" | "D" | "E") {
-                        eprintln!("Invalid DAL level: {}. Must be A, B, C, D, or E.", new_level);
+                        eprintln!(
+                            "Invalid DAL level: {}. Must be A, B, C, D, or E.",
+                            new_level
+                        );
+                        std::process::exit(1);
                     }
-                }
-                let mut config = RuntimoConfig::load();
-                if let Some(new_level) = level {
+                    let mut config = RuntimoConfig::load();
                     config.dal = Some(upper.clone());
-                }
-                config.save().map_err(|e| format!("Save failed: {}", e))?;
-                println!("DAL set to {} in config file.", upper);
-                println!("Note: RUNTIMO_DAL env var (if set) still takes precedence.");
-                let current = RuntimoConfig::get_dal();
-                let source = if std::env::var("RUNTIMO_DAL").is_ok() {
-                    "env var (RUNTIMO_DAL)"
+                    config.save().map_err(|e| format!("Save failed: {}", e))?;
+                    println!("DAL set to {} in config file.", upper);
+                    println!("Note: RUNTIMO_DAL env var (if set) still takes precedence.");
                 } else {
-                    "default"
-                };
-                println!("Current DAL: {} (source: {})", current, source);
+                    let current = RuntimoConfig::get_dal();
+                    let source = if std::env::var("RUNTIMO_DAL").is_ok() {
+                        "env var (RUNTIMO_DAL)"
+                    } else {
+                        let config = RuntimoConfig::load();
+                        if config.dal.is_some() {
+                            "config file"
+                        } else {
+                            "default"
+                        }
+                    };
+                    println!("Current DAL: {} (source: {})", current, source);
+                }
             }
-            ConfigAction::Init { profile, minimal, path, force } => {
+            ConfigAction::Init {
+                profile,
+                force,
+                minimal,
+                path,
+            } => {
                 let effective_profile = if minimal {
                     Some("minimal".to_string())
                 } else {
@@ -1841,14 +2046,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                     Err(e) => {
                         if e.contains("already exists") {
                             eprintln!("{}", e);
-                            eprintln!("Config init failed: {}", e);
                         } else {
-                            eprintln!("{}", e);
+                            eprintln!("Config init failed: {}", e);
                         }
+                        std::process::exit(1);
                     }
                 }
             }
-        }
+        },
         Commands::Session { command } => match command {
             SessionCommand::Run {
                 prompt_file,
@@ -1856,8 +2061,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 max_steps,
                 max_seconds,
                 on_failure,
-                via_daemon,
                 dry_run,
+                via_daemon,
             } => {
                 // Inherit bounded policy from frozen ResolvedConfig.
                 let effective_max_steps = max_steps.unwrap_or(resolved.session_max);
@@ -1867,21 +2072,37 @@ fn main() -> Result<(), Box<dyn Error>> {
                     .unwrap_or(&resolved.session_on_limit)
                     .to_lowercase();
                 if effective_on_failure != "continue" && effective_on_failure != "stop" {
-                    eprintln!("Invalid --on-failure '{}': must be continue|stop", effective_on_failure);
+                    eprintln!(
+                        "Invalid --on-failure '{}': must be continue|stop",
+                        effective_on_failure
+                    );
+                    std::process::exit(1);
                 }
                 if effective_max_steps == 0 {
                     eprintln!("--max-steps must be >0");
+                    std::process::exit(1);
                 }
+
+                let reg = make_registry().map_err(|e| format!("Registry init failed: {}", e))?;
+
                 // Parse prompt file (validates size, steps>0, capability exists, traversal).
                 let steps = match session_parser::parse_prompt_file(&prompt_file, &reg) {
                     Ok(s) => s,
                     Err(e) => {
                         eprintln!("Prompt parse failed: {}", e);
+                        std::process::exit(1);
                     }
                 };
+
                 if u32::try_from(steps.len()).unwrap_or(u32::MAX) > effective_max_steps {
-                    eprintln!("Prompt has {} steps but --max-steps is {}", steps.len(), effective_max_steps);
+                    eprintln!(
+                        "Prompt has {} steps but --max-steps is {}",
+                        steps.len(),
+                        effective_max_steps
+                    );
+                    std::process::exit(1);
                 }
+
                 // --dry-run validates only.
                 if dry_run {
                     if base_mode.is_json() {
@@ -1905,11 +2126,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                             effective_on_failure
                         );
                     }
+                    return Ok(());
                 }
+
                 // Resolve sessions directory (honors RUNTIMO_SESSIONS_DIR).
                 let sdir = session_run::sessions_dir();
                 std::fs::create_dir_all(&sdir)
                     .map_err(|e| format!("create sessions dir: {}", e))?;
+
                 // Create or resume session by name/id.
                 let session_id = if let Some(ref name) = session {
                     if let Some(existing) = session_run::find_session_by_name_or_id(&sdir, name) {
@@ -1924,7 +2148,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                         s.id
                     }
                 } else {
-                    // Create new with this name.
                     let mut mgr = runtimo_core::session::SessionManager::new(sdir.clone())
                         .map_err(|e| format!("SessionManager: {}", e))?;
                     let s = mgr
@@ -1932,50 +2155,53 @@ fn main() -> Result<(), Box<dyn Error>> {
                         .map_err(|e| format!("create_session: {}", e))?;
                     s.id
                 };
+
                 // Load session for display (need its name/id).
                 let mgr_ro = runtimo_core::session::SessionManager::new(sdir.clone())
                     .map_err(|e| format!("SessionManager: {}", e))?;
                 let sess = mgr_ro
                     .load_session(&session_id)
                     .map_err(|e| format!("load_session: {}", e))?;
+
                 if !base_mode.is_quiet() {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
-                            "session_id": sess.id,
-                            "session_name": sess.name,
-                            "profile": resolved.profile,
-                            "wal_mode": resolved.wal_mode,
-                            "backup_enabled": resolved.backup_enabled,
-                            "steps": steps.len(),
-                        })).unwrap()
-                    );
-                    println!(
-                        "Session {} (name: {}) — profile={}, wal_mode={}, steps={}",
-                        sess.id,
-                        sess.name.as_deref().unwrap_or("-"),
-                        resolved.profile,
-                        resolved.wal_mode,
-                        steps.len()
-                    );
+                    if base_mode.is_json() {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "session_id": sess.id,
+                                "session_name": sess.name,
+                                "profile": resolved.profile,
+                                "wal_mode": resolved.wal_mode,
+                                "backup_enabled": resolved.backup_enabled,
+                                "steps": steps.len(),
+                            }))
+                            .unwrap()
+                        );
+                    } else {
+                        println!(
+                            "Session {} (name: {}) — profile={}, wal_mode={}, steps={}",
+                            sess.id,
+                            sess.name.as_deref().unwrap_or("-"),
+                            resolved.profile,
+                            resolved.wal_mode,
+                            steps.len()
+                        );
+                    }
                 }
+
                 let start = std::time::Instant::now();
                 let mut executed: usize = 0;
                 let mut had_failure = false;
                 let mut terminated = false;
+
                 for (idx, step) in steps.iter().enumerate() {
                     let step_no = idx + 1;
+
                     // Overall time guard (bounded).
                     if start.elapsed().as_secs() > effective_max_seconds {
                         emit_session_note(
                             &base_mode,
-                            serde_json::json!({
-                                "session_id": session_id,
-                                "step": step_no,
-                                "total": steps.len(),
-                                "error": "max-seconds exceeded",
-                                "terminated": true
-                            }),
+                            serde_json::json!({"session_id": session_id, "step": step_no, "total": steps.len(), "error": "max-seconds exceeded", "terminated": true}),
                             &format!(
                                 "Session {} exceeded --max-seconds {}s at step {}/{} — terminating",
                                 session_id,
@@ -1988,6 +2214,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         terminated = true;
                         break;
                     }
+
                     // Resource guard per step.
                     let guard = runtimo_core::LlmoSafeGuard::new();
                     if let Err(e) = guard.check() {
@@ -1999,20 +2226,18 @@ fn main() -> Result<(), Box<dyn Error>> {
                         );
                         emit_session_note(
                             &base_mode,
-                            serde_json::json!({
-                                "step": step_no,
-                                "total": steps.len(),
-                                "capability": step.capability,
-                                "error": msg
-                            }),
+                            serde_json::json!({"step": step_no, "total": steps.len(), "capability": step.capability, "error": msg}),
                             &msg,
                         );
+                        had_failure = true;
                         if effective_on_failure == "stop" {
                             terminated = true;
                             break;
+                        } else {
+                            continue;
                         }
-                        continue;
                     }
+
                     // Dangerous command + network gating per step (ShellExec).
                     if step.capability == "ShellExec" {
                         if let Some(cmd) = step.args.get("cmd").and_then(|v| v.as_str()) {
@@ -2025,18 +2250,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 );
                                 emit_session_note(
                                     &base_mode,
-                                    serde_json::json!({
-                                        "step": step_no,
-                                        "total": steps.len(),
-                                        "capability": step.capability,
-                                        "error": msg
-                                    }),
+                                    serde_json::json!({"step": step_no, "total": steps.len(), "capability": step.capability, "error": msg}),
                                     &msg,
                                 );
                                 had_failure = true;
                                 if effective_on_failure == "stop" {
                                     terminated = true;
                                     break;
+                                } else {
+                                    continue;
                                 }
                             }
                             if !network_enabled() && is_network_command(cmd) {
@@ -2048,31 +2270,25 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 );
                                 emit_session_note(
                                     &base_mode,
-                                    serde_json::json!({
-                                        "step": step_no,
-                                        "total": steps.len(),
-                                        "capability": step.capability,
-                                        "error": msg
-                                    }),
+                                    serde_json::json!({"step": step_no, "total": steps.len(), "capability": step.capability, "error": msg}),
                                     &msg,
                                 );
                                 had_failure = true;
                                 if effective_on_failure == "stop" {
                                     terminated = true;
                                     break;
+                                } else {
+                                    continue;
                                 }
                             }
                         }
                     }
+
                     // Acquire concurrency slot (reuse run's guard).
                     if !acquire_cli_slot() {
                         emit_session_note(
                             &base_mode,
-                            serde_json::json!({
-                                "step": step_no,
-                                "total": steps.len(),
-                                "error": "too many concurrent CLI runs"
-                            }),
+                            serde_json::json!({"step": step_no, "total": steps.len(), "error": "too many concurrent CLI runs"}),
                             &format!(
                                 "Too many concurrent CLI runs (max {}) at step {}/{}",
                                 MAX_CLI_CONCURRENT,
@@ -2080,101 +2296,146 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 steps.len()
                             ),
                         );
+                        had_failure = true;
+                        if effective_on_failure == "stop" {
+                            terminated = true;
+                            break;
+                        } else {
+                            continue;
+                        }
                     }
+
                     // Execute step: local or via-daemon stub.
-                    let result: Result<runtimo_core::executor::ExecutionResult, String> = if via_daemon {
-                        // Stub: dispatch via daemon RPC.
-                        if let Err(e) = ensure_daemon_running() {
-                            release_cli_slot();
-                            return Err(format!("failed to start daemon: {}", e));
-                        }
-                        let params = serde_json::json!({
-                            "capability": step.capability,
-                            "args": step.args,
-                            "dry_run": false,
-                            "working_dir": std::env::current_dir().unwrap_or_default().to_string_lossy(),
-                        });
-                        match send_rpc("dispatch", params) {
-                            Ok(v) => {
-                                // No forgery: poll the daemon for the real
-                                // terminal status instead of assuming success.
-                                // The WAL audit stays daemon-side; snapshots
-                                // below are local placeholders with cleared
-                                // caches so before/after always differ.
-                                let jid = v.get("job_id").and_then(|x| x.as_str()).unwrap_or("?");
-                                // Track job_id in session even when dispatched via daemon (stub).
-                                if let Ok(mut mgr) = runtimo_core::session::SessionManager::new(
-                                    session_run::sessions_dir(),
-                                ) {
-                                    let _ = mgr.add_job(&session_id, jid);
-                                }
-                                let remaining = effective_max_seconds
-                                    .saturating_sub(start.elapsed().as_secs());
-                                let (success, err_msg, wal_seq) = poll_dispatched_step(jid, remaining);
-                                let out = match err_msg {
-                                    None => runtimo_core::capability::Output::ok(format!(
-                                        "dispatched via daemon: {}",
-                                        jid
-                                    )),
-                                    Some(err) => runtimo_core::capability::Output::error(
-                                        format!("via-daemon step failed: {}", err),
-                                        err,
+                    let result: Result<runtimo_core::executor::ExecutionResult, String> =
+                        if via_daemon {
+                            // Stub: dispatch via daemon RPC.
+                            if let Err(e) = ensure_daemon_running() {
+                                release_cli_slot();
+                                emit_session_note(
+                                    &base_mode,
+                                    serde_json::json!({"step": step_no, "total": steps.len(), "error": format!("failed to start daemon: {}", e)}),
+                                    &format!(
+                                        "via-daemon step {}/{} failed to start daemon: {}",
+                                        step_no,
+                                        steps.len(),
+                                        e
                                     ),
-                                };
-                                runtimo_core::Telemetry::clear_cache();
-                                let tel_before = if resolved.telemetry_enabled {
-                                    runtimo_core::Telemetry::capture_lightweight()
+                                );
+                                had_failure = true;
+                                if effective_on_failure == "stop" {
+                                    terminated = true;
+                                    break;
                                 } else {
-                                    runtimo_core::Telemetry::empty()
-                                };
-                                runtimo_core::Telemetry::clear_lightweight_cache();
-                                runtimo_core::ProcessSnapshot::clear_cache();
-                                let tel_after = if resolved.telemetry_enabled {
-                                    runtimo_core::Telemetry::capture_lightweight()
-                                } else {
-                                    runtimo_core::Telemetry::empty()
-                                };
-                                let proc_before = runtimo_core::ProcessSnapshot::capture().summary;
-                                let proc_after = runtimo_core::ProcessSnapshot::capture().summary;
-                                Ok(runtimo_core::executor::ExecutionResult {
-                                    job_id: jid.to_string(),
-                                    capability: step.capability.clone(),
-                                    success,
-                                    output: out,
-                                    telemetry_before: tel_before,
-                                    telemetry_after: tel_after,
-                                    process_before: proc_before,
-                                    process_after: proc_after,
-                                    wal_seq,
-                                })
+                                    continue;
+                                }
                             }
-                            Err(e) => Err(format!("via-daemon dispatch failed: {}", e)),
-                        }
-                    } else {
-                        // Local deterministic execution with session binding.
-                        let Some(cap) = reg.get(&step.capability) else {
-                            // Unknown capability — treat as step failure per on_failure policy.
-                            let msg = format!("unknown capability '{}'", step.capability);
-                            return Err(format!("step {}/{} {}", step_no, steps.len(), msg));
+                            let params = serde_json::json!({
+                                "capability": step.capability,
+                                "args": step.args,
+                                "dry_run": false,
+                                "working_dir": std::env::current_dir().unwrap_or_default().to_string_lossy(),
+                            });
+                            match send_rpc("dispatch", params) {
+                                Ok(v) => {
+                                    // No forgery: poll the daemon for the real
+                                    // terminal status instead of assuming success.
+                                    // The WAL audit stays daemon-side; snapshots
+                                    // below are local placeholders with cleared
+                                    // caches so before/after always differ.
+                                    let jid =
+                                        v.get("job_id").and_then(|x| x.as_str()).unwrap_or("?");
+                                    // Track job_id in session even when dispatched via daemon (stub).
+                                    if let Ok(mut mgr) = runtimo_core::session::SessionManager::new(
+                                        session_run::sessions_dir(),
+                                    ) {
+                                        let _ = mgr.add_job(&session_id, jid);
+                                    }
+                                    let remaining = effective_max_seconds
+                                        .saturating_sub(start.elapsed().as_secs());
+                                    let (success, err_msg, wal_seq) =
+                                        poll_dispatched_step(jid, remaining);
+                                    let out = match err_msg {
+                                        None => runtimo_core::capability::Output::ok(format!(
+                                            "dispatched via daemon: {}",
+                                            jid
+                                        )),
+                                        Some(err) => runtimo_core::capability::Output::error(
+                                            format!("via-daemon step failed: {}", err),
+                                            err,
+                                        ),
+                                    };
+                                    runtimo_core::Telemetry::clear_cache();
+                                    let tel_before = if resolved.telemetry_enabled {
+                                        runtimo_core::Telemetry::capture_lightweight()
+                                    } else {
+                                        runtimo_core::Telemetry::empty()
+                                    };
+                                    runtimo_core::Telemetry::clear_lightweight_cache();
+                                    runtimo_core::ProcessSnapshot::clear_cache();
+                                    let tel_after = if resolved.telemetry_enabled {
+                                        runtimo_core::Telemetry::capture_lightweight()
+                                    } else {
+                                        runtimo_core::Telemetry::empty()
+                                    };
+                                    let proc_before =
+                                        runtimo_core::ProcessSnapshot::capture().summary;
+                                    runtimo_core::ProcessSnapshot::clear_cache();
+                                    let proc_after =
+                                        runtimo_core::ProcessSnapshot::capture().summary;
+                                    Ok(runtimo_core::executor::ExecutionResult {
+                                        job_id: jid.to_string(),
+                                        capability: step.capability.clone(),
+                                        success,
+                                        output: out,
+                                        telemetry_before: tel_before,
+                                        telemetry_after: tel_after,
+                                        process_before: proc_before,
+                                        process_after: proc_after,
+                                        wal_seq,
+                                    })
+                                }
+                                Err(e) => Err(format!("via-daemon dispatch failed: {}", e)),
+                            }
+                        } else {
+                            // Local deterministic execution with session binding.
+                            let Some(cap) = reg.get(&step.capability) else {
+                                // Unknown capability — treat as step failure per on_failure policy.
+                                let msg = format!("unknown capability '{}'", step.capability);
+                                emit_session_note(
+                                    &base_mode,
+                                    serde_json::json!({"step": step_no, "total": steps.len(), "capability": step.capability, "error": msg}),
+                                    &format!("step {}/{} {}", step_no, steps.len(), msg),
+                                );
+                                release_cli_slot();
+                                had_failure = true;
+                                if effective_on_failure == "stop" {
+                                    terminated = true;
+                                    break;
+                                }
+                                continue;
+                            };
+                            let timeout =
+                                RuntimoConfig::get_capability_timeout(&step.capability, 30);
+                            let res = execute_with_telemetry_and_session(
+                                cap,
+                                &step.args,
+                                false,
+                                &wal_path(),
+                                Some(&session_id),
+                                None,
+                                timeout,
+                            )
+                            .map_err(|e| format!("{}", e))?;
+                            Ok(res)
                         };
-                        let timeout = RuntimoConfig::get_capability_timeout(&step.capability, 30);
-                        let res = execute_with_telemetry_and_session(
-                            cap,
-                            &step.args,
-                            false,
-                            &wal_path(),
-                            Some(&session_id),
-                            None,
-                            timeout,
-                        )
-                        .map_err(|e| format!("{}", e))?;
-                        Ok(res)
-                    };
+
                     release_cli_slot();
+
                     match result {
                         Ok(exec) => {
                             executed += 1;
                             if !exec.success {
+                                had_failure = true;
                                 // Stream failure.
                                 if base_mode.is_json() {
                                     println!(
@@ -2186,7 +2447,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                                             "success": false,
                                             "output": exec.output,
                                             "job_id": exec.job_id,
-                                        })).unwrap()
+                                        }))
+                                        .unwrap()
                                     );
                                 } else if !base_mode.is_quiet() {
                                     eprintln!(
@@ -2197,17 +2459,29 @@ fn main() -> Result<(), Box<dyn Error>> {
                                         exec.output.output
                                     );
                                 }
+                                if effective_on_failure == "stop" {
+                                    terminated = true;
+                                    break;
+                                }
                             } else if base_mode.is_json() {
-                                println!(
-                                    "{}",
-                                    serde_json::to_string_pretty(&exec.output).unwrap()
-                                );
+                                println!("{}", serde_json::to_string_pretty(&exec.output).unwrap());
                             } else if !base_mode.is_quiet() {
                                 let rendered = base_mode.render_text(&exec.output.output);
                                 if rendered.trim().is_empty() {
-                                    println!("step {}/{} {}: ok", step_no, steps.len(), step.capability);
+                                    println!(
+                                        "step {}/{} {}: ok",
+                                        step_no,
+                                        steps.len(),
+                                        step.capability
+                                    );
                                 } else {
-                                    println!("step {}/{} {}: {}", step_no, steps.len(), step.capability, rendered);
+                                    println!(
+                                        "step {}/{} {}: {}",
+                                        step_no,
+                                        steps.len(),
+                                        step.capability,
+                                        rendered
+                                    );
                                 }
                                 if let Some(ref data) = exec.output.data {
                                     let text = if let Some(s) = data.as_str() {
@@ -2225,15 +2499,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                             }
                         }
                         Err(e) => {
+                            executed += 1;
                             had_failure = true;
                             emit_session_note(
                                 &base_mode,
-                                serde_json::json!({
-                                    "step": step_no,
-                                    "total": steps.len(),
-                                    "capability": step.capability,
-                                    "error": e
-                                }),
+                                serde_json::json!({"step": step_no, "total": steps.len(), "capability": step.capability, "error": e}),
                                 &format!(
                                     "step {}/{} {} error: {}",
                                     step_no,
@@ -2247,35 +2517,37 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 break;
                             }
                         }
-                    };
+                    }
                 }
+
                 // Mark terminal status deterministically.
-                let final_status = if terminated || (had_failure && effective_on_failure == "stop") {
+                let final_status = if terminated || (had_failure && effective_on_failure == "stop")
+                {
                     runtimo_core::session::SessionStatus::Terminated
                 } else if had_failure && effective_on_failure == "continue" {
                     // Completed even though some steps failed — the session itself completed.
                     runtimo_core::session::SessionStatus::Completed
                 } else {
-                    runtimo_core::session::SessionStatus::Running
+                    runtimo_core::session::SessionStatus::Completed
                 };
-                if let Err(e) = session_run::update_session_status(&sdir, &session_id, final_status) {
+                if let Err(e) = session_run::update_session_status(&sdir, &session_id, final_status)
+                {
                     emit_session_note(
                         &base_mode,
-                        serde_json::json!({
-                            "session_id": session_id,
-                            "error": format!("failed to update session status: {}", e)
-                        }),
+                        serde_json::json!({"session_id": session_id, "error": format!("failed to update session status: {}", e)}),
                         &format!("Failed to update session status: {}", e),
                     );
                 }
+
                 // Summary via OutputMode.
-                #[allow(clippy::redundant_clone)]
-                // sdir cloned for json branch so else-if can still move sdir; removing clone would move in one branch and break the other
-                let mgr = runtimo_core::session::SessionManager::new(sdir.clone());
-                let final_sess = mgr
-                    .load_session(&session_id)
-                    .map_err(|e| format!("{}", e))?;
                 if base_mode.is_json() {
+                    #[allow(clippy::redundant_clone)]
+                    // sdir cloned for json branch so else-if can still move sdir; removing clone would move in one branch and break the other
+                    let mgr = runtimo_core::session::SessionManager::new(sdir.clone())
+                        .map_err(|e| format!("SessionManager: {}", e))?;
+                    let final_sess = mgr
+                        .load_session(&session_id)
+                        .map_err(|e| format!("{}", e))?;
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({
@@ -2284,7 +2556,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                             "job_ids": final_sess.job_ids,
                             "executed": executed,
                             "total": steps.len(),
-                        })).unwrap()
+                        }))
+                        .unwrap()
                     );
                 } else if !base_mode.is_quiet() {
                     let mgr = runtimo_core::session::SessionManager::new(sdir).ok();
@@ -2295,8 +2568,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                             fs.id,
                             fs.status,
                             fs.job_ids.len(),
-                            fs.job_ids,
-                            final_sess.job_ids
+                            steps.len(),
+                            fs.job_ids
                         );
                     }
                 }
@@ -2307,10 +2580,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                 } else {
                     base_mode
                 };
-                let mgr = runtimo_core::session::SessionManager::new(sdir);
+                let sdir = session_run::sessions_dir();
+                let mgr = runtimo_core::session::SessionManager::new(sdir)
+                    .map_err(|e| format!("SessionManager: {}", e))?;
                 let sessions = mgr.list_sessions().map_err(|e| format!("{}", e))?;
-                if json {
+                if mode.is_json() {
                     println!("{}", serde_json::to_string_pretty(&sessions).unwrap());
+                } else if mode.is_quiet() {
+                    // silent
                 } else if sessions.is_empty() {
                     println!("No sessions found.");
                 } else {
@@ -2331,7 +2608,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
             SessionCommand::Show { session_id, json } => {
-                let mgr = runtimo_core::session::SessionManager::new(sdir);
+                let mode = if json {
+                    base_mode.with_format("json")
+                } else {
+                    base_mode
+                };
+                let sdir = session_run::sessions_dir();
+                let mgr = runtimo_core::session::SessionManager::new(sdir)
+                    .map_err(|e| format!("SessionManager: {}", e))?;
                 let sess = mgr
                     .load_session(&session_id)
                     .map_err(|e| format!("{}", e))?;
@@ -2340,21 +2624,24 @@ fn main() -> Result<(), Box<dyn Error>> {
                     let set: std::collections::HashSet<&String> = sess.job_ids.iter().collect();
                     reader
                         .events()
+                        .iter()
                         .filter(|e| set.contains(&e.job_id))
                         .map(|e| serde_json::to_value(e).unwrap_or(Value::Null))
                         .collect()
                 } else {
                     Vec::new()
                 };
-                let out = serde_json::json!({
-                    "session": sess,
-                    "wal_events": wal_events,
-                });
-                if json {
+                if mode.is_json() {
+                    let out = serde_json::json!({
+                        "session": sess,
+                        "wal_events": wal_events,
+                    });
                     println!("{}", serde_json::to_string_pretty(&out).unwrap());
+                } else if mode.is_quiet() {
+                    // silent
                 } else {
                     let info = format!(
-                        "Session {} (name: {})\\nStatus: {:?}\\nCreated: {}\\nUpdated: {}\\nJobs ({}): {}\\nWAL events: {}",
+                        "Session {} (name: {})\nStatus: {:?}\nCreated: {}\nUpdated: {}\nJobs ({}): {}\nWAL events: {}",
                         sess.id,
                         sess.name.as_deref().unwrap_or("-"),
                         sess.status,
@@ -2394,12 +2681,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
             }
-        }
+        },
         Commands::Observe {
-            sample_rate_hz,
             pid,
             cmd,
             out,
+            sample_rate_hz,
             burst,
             dal,
             suspend_ms,
@@ -2408,8 +2695,16 @@ fn main() -> Result<(), Box<dyn Error>> {
             properties,
             json,
         } => {
+            let mode = if json {
+                base_mode.with_format("json")
+            } else {
+                base_mode
+            };
             if pid.is_none() && cmd.is_none() && !self_test && verify.is_none() {
-                eprintln!("observe error: must specify one of --pid, --cmd, --self-test, or --verify");
+                eprintln!(
+                    "observe error: must specify one of --pid, --cmd, --self-test, or --verify"
+                );
+                std::process::exit(1);
             }
             if self_test {
                 let code = runtimo_core::observe::self_test::run();
@@ -2427,19 +2722,22 @@ fn main() -> Result<(), Box<dyn Error>> {
                     require_exists: true,
                     require_file: true,
                 };
-                let vstr = vpath.to_string_lossy().as_ref();
+                let vstr = vpath.to_string_lossy().to_string();
                 if let Err(e) = runtimo_core::validation::path::validate_path(&vstr, &ctx) {
                     eprintln!("verify: invalid bundle path: {e}");
+                    std::process::exit(1);
                 }
                 let res = runtimo_core::observe::verify_report(&vpath);
                 // Load events for oracle evaluation via the arm's existing loading path.
-                let wal_events: Vec<runtimo_core::wal::WalEvent> = if let Ok(reader) = WalReader::load_all(&vpath) {
-                    reader.events().to_vec()
-                } else {
-                    Vec::new()
-                };
+                let wal_events: Vec<runtimo_core::wal::WalEvent> =
+                    if let Ok(reader) = WalReader::load_all(&vpath) {
+                        reader.events().to_vec()
+                    } else {
+                        Vec::new()
+                    };
                 // Evaluate --properties spec if present; parse failure exits 1.
-                let property_verdicts: Vec<PropertyVerdict> = if let Some(ref spec_str) = properties {
+                let property_verdicts: Vec<PropertyVerdict> = if let Some(ref spec_str) = properties
+                {
                     let spec = match parse_spec(spec_str) {
                         Ok(s) => s,
                         Err(e) => {
@@ -2452,7 +2750,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         Err(_) => vec![],
                     }
                 } else {
-                    vec![]
+                    Vec::new()
                 };
                 // T6cli: consume honest watermark from VerifyReport.watermark (AP-5 field),
                 // never derive from truncated_gaps. Fallback only when no ObserveCompleted marker.
@@ -2463,35 +2761,64 @@ fn main() -> Result<(), Box<dyn Error>> {
                         "Complete".to_string()
                     }
                 });
-                let pv_array: Vec<serde_json::Value> = property_verdicts
-                    .iter()
-                    .map(|pv| {
-                        serde_json::json!({
-                            "name": pv.name,
-                            "verdict": format!("{:?}", pv.verdict),
-                            "detail": pv.detail,
+                if mode.is_json() {
+                    let pv_array: Vec<serde_json::Value> = property_verdicts
+                        .iter()
+                        .map(|pv| {
+                            serde_json::json!({
+                                "name": pv.name,
+                                "verdict": format!("{:?}", pv.verdict),
+                                "detail": pv.detail,
+                            })
                         })
-                    })
-                    .collect();
-                println!(
-                    "verify {}: structurally_parseable={} integrity_valid={} lifecycle_valid={} completeness_known={} admissible={} error={:?} watermark={:?}\ntrailer: bundle {} — hash chain {} — watermark {}",
-                    vpath.display(),
-                    res.structurally_parseable,
-                    res.integrity_valid,
-                    res.lifecycle_valid,
-                    res.completeness_known,
-                    res.admissible,
-                    res.error,
-                    res.watermark,
-                    vpath.display(),
-                    if res.integrity_valid { "ok" } else { "FAIL" },
-                    watermark_display
-                );
-                for pv in &property_verdicts {
-                    println!("property_verdicts: name={} verdict={:?} detail={}", pv.name, pv.verdict, pv.detail);
+                        .collect();
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "path": vpath.display().to_string(),
+                            "total": res.total,
+                            "truncated_gaps": res.truncated_gaps,
+                            "structurally_parseable": res.structurally_parseable,
+                            "integrity_valid": res.integrity_valid,
+                            "hash_ok": res.structurally_parseable && res.integrity_valid,
+                            "lifecycle_valid": res.lifecycle_valid,
+                            "completeness_known": res.completeness_known,
+                            "admissible": res.admissible,
+                            "error": res.error,
+                            "watermark": res.watermark,
+                            "property_verdicts": pv_array,
+                        }))
+                        .unwrap()
+                    );
+                } else {
+                    println!(
+                        "verify {}: structurally_parseable={} integrity_valid={} lifecycle_valid={} completeness_known={} admissible={} error={:?} watermark={:?}",
+                        vpath.display(),
+                        res.structurally_parseable,
+                        res.integrity_valid,
+                        res.lifecycle_valid,
+                        res.completeness_known,
+                        res.admissible,
+                        res.error,
+                        res.watermark
+                    );
+                    println!(
+                        "trailer: bundle {} — hash chain {} — watermark {}",
+                        vpath.display(),
+                        if res.integrity_valid { "ok" } else { "FAIL" },
+                        watermark_display
+                    );
+                    for pv in &property_verdicts {
+                        println!(
+                            "property_verdicts: name={} verdict={:?} detail={}",
+                            pv.name, pv.verdict, pv.detail
+                        );
+                    }
                 }
                 #[allow(clippy::bool_to_int_with_if)]
-                std::process::exit(if res.admissible { 0 } else { 1 });
+                {
+                    std::process::exit(if res.admissible { 0 } else { 1 });
+                }
             }
             // T10: burst is a dead contract — surface explicitly to stdout (not just daemon stderr)
             // and gate via RPC deferred error. The daemon's handle_observe_start returns
@@ -2505,9 +2832,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             // Resolve out path (validated, data_dir default)
             let run_id = runtimo_core::utils::generate_id();
             let bundle_path = if let Some(p) = out {
-                let s = p.to_string_lossy().as_ref();
+                let s = p.to_string_lossy().to_string();
+                let mut allowed = RuntimoConfig::get_allowed_prefixes();
+                allowed.push(
+                    runtimo_core::utils::data_dir()
+                        .to_string_lossy()
+                        .to_string(),
+                );
                 let ctx = runtimo_core::validation::path::PathContext {
-                    allowed_prefixes: RuntimoConfig::get_allowed_prefixes(),
+                    allowed_prefixes: allowed,
                     require_exists: false,
                     require_file: false,
                 };
@@ -2515,9 +2848,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                     Ok(valid) => valid,
                     Err(e) => {
                         eprintln!("--out invalid: {e}");
+                        std::process::exit(1);
                     }
-                };
-                runtimo_core::observe::bundle_path(&run_id)
+                }
             } else {
                 runtimo_core::observe::bundle_path(&run_id)
             };
@@ -2546,6 +2879,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     Ok(v) => {
                         if mode.is_json() {
                             println!("{}", serde_json::to_string_pretty(&v).unwrap());
+                        } else {
                             println!(
                                 "observe dispatched: run_id={} bundle={} hz={} dal={}",
                                 v["run_id"].as_str().unwrap_or("?"),
@@ -2554,107 +2888,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 dal_str
                             );
                             println!("bundle: {}", bundle_path.display());
-                        } else if !mode.is_quiet() {
-                            eprintln!("observe_start failed: {e}");
                         }
                     }
                     Err(e) => {
                         eprintln!("observe_start failed: {e}");
+                        std::process::exit(1);
                     }
                 }
-                // Local synchronous collection (sibling — caller is parent, collector + target share parent).
-                let target_pid = if let Some(p) = pid {
-                    p
-                } else if let Some(ref c) = cmd {
-                    match std::process::Command::new("sh").arg("-c").arg(c).spawn() {
-                        Ok(child) => child.id(),
-                        Err(e) => {
-                            eprintln!("failed to spawn --cmd: {e}");
-                        }
-                    }
-                } else {
-                    eprintln!("observe requires --pid or --cmd (or --self-test / --verify)");
-                    return;
-                };
-                let mut sup = match runtimo_core::observe::ObserveSupervisor::new_at_path(
-                    &run_id,
-                    &dal_str,
-                    Some(bundle_path.clone()),
-                    pressure_suspend_ms,
-                    None,
-                ) {
-                    Ok(sup) => sup,
-                    Err(e) => {
-                        eprintln!("supervisor create failed: {e}");
-                        return;
-                    }
-                };
-                let _ = sup.attach(target_pid, 0);
-                // Short burst collection (demo: 50 ticks or 2s).
-                let interval = sup.sampler_interval();
-                #[allow(clippy::arithmetic_side_effects)]
-                // Instant::now() + Duration; bounded by 2s
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-                let mut ticks = 0;
-                while std::time::Instant::now() < deadline && ticks < 50 {
-                    // 0 = unspecified: gated_tick falls back to the attach-captured process_start_time.
-                    let _ = sup.gated_tick(0);
-                    std::thread::sleep(interval.min(std::time::Duration::from_millis(20)));
-                    ticks += 1;
-                }
-                if let Err(e) = sup.finalize() {
-                    eprintln!("finalize failed: {e}");
-                }
-                let v = runtimo_core::observe::verify_report(&bundle_path);
-                println!(
-                    "observe complete: run_id={run_id} bundle={} ticks={ticks} hz={hz} dal={dal_str} watermark={:?}\nverify: total={} truncated_gaps={} structurally_parseable={} integrity_valid={} lifecycle_valid={} completeness_known={} admissible={} error={:?} watermark={:?}",
-                    bundle_path.display(),
-                    sup.watermark(),
-                    v.total,
-                    v.truncated_gaps,
-                    v.structurally_parseable,
-                    v.integrity_valid,
-                    v.lifecycle_valid,
-                    v.completeness_known,
-                    v.admissible,
-                    v.error,
-                    v.watermark
-                );
             } else {
-                let mut params = serde_json::json!({
-                    "run_id": run_id,
-                    "sample_rate_hz": hz,
-                    "dal": dal_str,
-                    "out": bundle_path.display().to_string(),
-                    "burst": burst,
-                    "pressure_suspend_ms": pressure_suspend_ms,
-                });
-                if let Some(p) = pid {
-                    params["pid"] = serde_json::json!(p);
-                }
-                if let Some(ref c) = cmd {
-                    params["cmd"] = serde_json::json!(c);
-                }
-                match send_rpc("observe_start", params) {
-                    Ok(v) => {
-                        if mode.is_json() {
-                            println!("{}", serde_json::to_string_pretty(&v).unwrap());
-                            println!(
-                                "observe dispatched: run_id={} bundle={} hz={} dal={}",
-                                v["run_id"].as_str().unwrap_or("?"),
-                                v["bundle"].as_str().unwrap_or("?"),
-                                hz,
-                                dal_str
-                            );
-                            println!("bundle: {}", bundle_path.display());
-                        } else if !mode.is_quiet() {
-                            eprintln!("observe_start failed: {e}");
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("observe_start failed: {e}");
-                    }
-                }
                 // Local synchronous collection (sibling — caller is parent, collector + target share parent).
                 let target_pid = if let Some(p) = pid {
                     p
@@ -2663,23 +2904,25 @@ fn main() -> Result<(), Box<dyn Error>> {
                         Ok(child) => child.id(),
                         Err(e) => {
                             eprintln!("failed to spawn --cmd: {e}");
+                            std::process::exit(1);
                         }
                     }
                 } else {
                     eprintln!("observe requires --pid or --cmd (or --self-test / --verify)");
-                    return;
+                    std::process::exit(1);
                 };
                 let mut sup = match runtimo_core::observe::ObserveSupervisor::new_at_path(
                     &run_id,
+                    hz,
                     &dal_str,
                     Some(bundle_path.clone()),
                     pressure_suspend_ms,
                     None,
                 ) {
-                    Ok(sup) => sup,
+                    Ok(s) => s,
                     Err(e) => {
                         eprintln!("supervisor create failed: {e}");
-                        return;
+                        std::process::exit(1);
                     }
                 };
                 let _ = sup.attach(target_pid, 0);
@@ -2697,22 +2940,43 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
                 if let Err(e) = sup.finalize() {
                     eprintln!("finalize failed: {e}");
+                    std::process::exit(1);
                 }
                 let v = runtimo_core::observe::verify_report(&bundle_path);
-                println!(
-                    "observe complete: run_id={run_id} bundle={} ticks={ticks} hz={hz} dal={dal_str} watermark={:?}\nverify: total={} truncated_gaps={} structurally_parseable={} integrity_valid={} lifecycle_valid={} completeness_known={} admissible={} error={:?} watermark={:?}",
-                    bundle_path.display(),
-                    sup.watermark(),
-                    v.total,
-                    v.truncated_gaps,
-                    v.structurally_parseable,
-                    v.integrity_valid,
-                    v.lifecycle_valid,
-                    v.completeness_known,
-                    v.admissible,
-                    v.error,
-                    v.watermark
-                );
+                if mode.is_json() {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "run_id": run_id,
+                            "bundle": bundle_path.display().to_string(),
+                            "ticks": ticks,
+                            "hz": hz,
+                            "dal": dal_str,
+                            "watermark": format!("{:?}", sup.watermark()),
+                            "verify": {
+                                "total": v.total,
+                                "truncated_gaps": v.truncated_gaps,
+                                "structurally_parseable": v.structurally_parseable,
+                                "integrity_valid": v.integrity_valid,
+                                "hash_ok": v.structurally_parseable && v.integrity_valid,
+                                "lifecycle_valid": v.lifecycle_valid,
+                                "completeness_known": v.completeness_known,
+                                "admissible": v.admissible,
+                                "error": v.error,
+                                "watermark": v.watermark,
+                            }
+                        }))
+                        .unwrap()
+                    );
+                } else {
+                    println!("observe complete: run_id={run_id} bundle={} ticks={ticks} hz={hz} dal={dal_str} watermark={:?}", bundle_path.display(), sup.watermark());
+                    println!(
+                        "verify: total={} truncated_gaps={} structurally_parseable={} integrity_valid={} lifecycle_valid={} completeness_known={} admissible={} error={:?} watermark={:?}",
+                        v.total, v.truncated_gaps,
+                        v.structurally_parseable, v.integrity_valid, v.lifecycle_valid,
+                        v.completeness_known, v.admissible, v.error, v.watermark
+                    );
+                }
             }
         }
         Commands::Oracle { command } => match command {
@@ -2729,7 +2993,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                         "eval_1k_ms": report.eval_1k_ms,
                         "eval_10k_ms": report.eval_10k_ms,
                         "eval_100k_ms": report.eval_100k_ms,
-                    })).unwrap_or_else(|_| "benchmark error".to_string())
+                    }))
+                    .unwrap_or_else(|_| "benchmark error".to_string())
                 );
             }
             OracleCommand::Evaluate {
@@ -2749,15 +3014,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                     json,
                 ));
             }
-        }
+        },
     }
 
     Ok(())
 }
 
-/// Oracle exit codes (§44): 0 Satisfied, 1 Violated, 2 property/eval error,"
-/// 3 evidence/infrastructure error. Violated is a successful evaluation with"
-/// a negative result — not a crash."
+/// Oracle exit codes (§44): 0 Satisfied, 1 Violated, 2 property/eval error,
+/// 3 evidence/infrastructure error. Violated is a successful evaluation with
+/// a negative result — not a crash.
 fn oracle_evaluate(
     wal: Option<PathBuf>,
     bundle: Option<PathBuf>,
@@ -2768,7 +3033,10 @@ fn oracle_evaluate(
 ) -> i32 {
     use runtimo_core::oracle::{evaluate, parse_spec};
     // Exactly one source.
-    let sources = [wal.is_some(), bundle.is_some(), facts.is_some()];
+    let sources = [wal.is_some(), bundle.is_some(), facts.is_some()]
+        .iter()
+        .filter(|&&b| b)
+        .count();
     if sources != 1 {
         eprintln!("oracle evaluate: exactly one of --wal, --bundle, --facts is required");
         return 3;
@@ -2782,10 +3050,9 @@ fn oracle_evaluate(
                 require_exists: true,
                 require_file: true,
             };
-            if let Err(e) = runtimo_core::validation::path::validate_path(
-                p.to_string_lossy().as_ref(),
-                &ctx,
-            ) {
+            if let Err(e) =
+                runtimo_core::validation::path::validate_path(p.to_string_lossy().as_ref(), &ctx)
+            {
                 eprintln!("oracle evaluate: invalid properties-file: {e}");
                 return 3;
             }
@@ -2797,6 +3064,7 @@ fn oracle_evaluate(
                 }
                 Err(e) => {
                     eprintln!("oracle evaluate: cannot read properties-file: {e}");
+                    return 3;
                 }
             }
         }
@@ -2812,14 +3080,19 @@ fn oracle_evaluate(
             return 2;
         }
     };
+
     if let Some(facts_path) = facts {
         return oracle_evaluate_facts(&facts_path, &spec, json);
     }
-    // WAL vs bundle (§42): distinct evidence types. Raw WAL never gets"
-    // Observe admissibility applied; bundles verify integrity separately"
+
+    // WAL vs bundle (§42): distinct evidence types. Raw WAL never gets
+    // Observe admissibility applied; bundles verify integrity separately
     // and report it alongside (not conflated with) the property verdict.
     let is_bundle = bundle.is_some();
-    let path = wal.or(bundle).unwrap();
+    let Some(path) = wal.or(bundle) else {
+        eprintln!("oracle evaluate: exactly one of --wal or --bundle required");
+        return 3;
+    };
     let source_kind = if is_bundle { "bundle" } else { "wal" };
     let reader = match WalReader::load_all(&path) {
         Ok(r) => r,
@@ -2852,7 +3125,8 @@ fn oracle_evaluate(
                 "selected_count": verdict.selected_count,
                 "evaluated_count": verdict.evaluated_count,
                 "matched_count": verdict.matched_count,
-            })).unwrap()
+            }))
+            .unwrap_or_default()
         );
     } else {
         println!(
@@ -2868,37 +3142,23 @@ fn oracle_evaluate(
     code
 }
 
-/// Facts source (§53-54): same selector/quantifier engine, separate field"
-/// resolver over `RuntimeFactV1`. Absent `ObservedExec` is NOT proof of"
-/// non-execution (`NOT OBSERVED != FALSE`)."
+/// Facts source (§53-54): same selector/quantifier engine, separate field
+/// resolver over `RuntimeFactV1`. Absent `ObservedExec` is NOT proof of
+/// non-execution (`NOT OBSERVED != FALSE`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::cast_precision_loss,
+    clippy::float_cmp
+)]
 fn oracle_evaluate_facts(
     facts_path: &std::path::Path,
     spec: &runtimo_core::oracle::PropertySpec,
     json: bool,
 ) -> i32 {
     use runtimo_core::oracle::{Op, Verdict};
-    let content = match std::fs::read_to_string(facts_path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("oracle evaluate: cannot read facts: {e}");
-            return 3;
-        }
-    };
-    let mut records: Vec<serde_json::Value> = Vec::new();
-    for (n, line) in content.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<serde_json::Value>(line) {
-            Ok(v) => records.push(v),
-            Err(e) => {
-                eprintln!("oracle evaluate: facts line {}: parse error: {e}", n + 1);
-            }
-        }
-    }
-    // Minimal fact-field resolver: family/run_id/provider/fidelity/"
-    // observations/first_seen/last_seen/revision/process.pid/"
+
+    // Minimal fact-field resolver: family/run_id/provider/fidelity/
+    // observations/first_seen/last_seen/revision/process.pid/
     // process.process_start_time/extra.<key>. Unknown field → Error.
     fn fact_field(rec: &serde_json::Value, field: &str) -> Option<serde_json::Value> {
         match field {
@@ -2937,12 +3197,37 @@ fn oracle_evaluate_facts(
                     _ => return None,
                 })
             }
-            // Contains | Regex (substring) + future ops fail closed to None.
-            match op {
-                Op::Contains | Op::Regex => {
-                    Some(field_val.as_str()?.contains(pred_val.as_str()?))
+            _ => {
+                // Contains | Regex (substring) + future ops fail closed to None.
+                match op {
+                    Op::Contains | Op::Regex => {
+                        Some(field_val.as_str()?.contains(pred_val.as_str()?))
+                    }
+                    _ => None,
                 }
-                _ => None,
+            }
+        }
+    }
+
+    let content = match std::fs::read_to_string(facts_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("oracle evaluate: cannot read facts: {e}");
+            return 3;
+        }
+    };
+    let mut records: Vec<serde_json::Value> = Vec::new();
+    for (n, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(v) => records.push(v),
+            Err(e) => {
+                let line_no = n + 1;
+                eprintln!("oracle evaluate: facts line {}: parse error: {e}", line_no);
+                return 3;
             }
         }
     }
@@ -2961,17 +3246,14 @@ fn oracle_evaluate_facts(
     for rec in &selected {
         let mut ok = true;
         for p in &spec.predicates {
-            match fact_field(rec, &p.field) {
-                Some(fv) => match cmp(&fv, &p.op, &p.value) {
-                    Some(true) => {}
-                    _ => {
-                        ok = false;
-                    }
-                },
-                None => {
-                    eprintln!("oracle evaluate: facts: unknown field '{}'", p.field);
-                    return 2;
+            if let Some(fv) = fact_field(rec, &p.field) {
+                if !matches!(cmp(&fv, &p.op, &p.value), Some(true)) {
+                    ok = false;
+                    break;
                 }
+            } else {
+                eprintln!("oracle evaluate: facts: unknown field '{}'", p.field);
+                return 2;
             }
         }
         if ok {
@@ -3000,27 +3282,29 @@ fn oracle_evaluate_facts(
                 Verdict::Violated
             }
         }
-        // Count (struct variant) — threshold check.
-        match &spec.quantifier {
-            runtimo_core::oracle::Quantifier::Count { op, threshold } => {
-                let a = matched as f64;
-                let b = *threshold as f64;
-                let ok = match op {
-                    Op::Gt => a > b,
-                    Op::Lt => a < b,
-                    Op::Gte => a >= b,
-                    Op::Lte => a <= b,
-                    Op::Eq => a == b,
-                    Op::Neq => a != b,
-                    _ => false,
-                };
-                if ok {
-                    Verdict::Satisfied
-                } else {
-                    Verdict::Violated
+        _ => {
+            // Count (struct variant) — threshold check.
+            match &spec.quantifier {
+                runtimo_core::oracle::Quantifier::Count { op, threshold } => {
+                    let a = matched as f64;
+                    let b = *threshold as f64;
+                    let ok = match op {
+                        Op::Gt => a > b,
+                        Op::Lt => a < b,
+                        Op::Gte => a >= b,
+                        Op::Lte => a <= b,
+                        Op::Eq => a == b,
+                        Op::Neq => a != b,
+                        _ => false,
+                    };
+                    if ok {
+                        Verdict::Satisfied
+                    } else {
+                        Verdict::Violated
+                    }
                 }
+                _ => Verdict::Error,
             }
-            _ => Verdict::Error,
         }
     };
     let code = match &verdict {
@@ -3037,7 +3321,8 @@ fn oracle_evaluate_facts(
                 "source_kind": "runtime_facts",
                 "selected_count": selected.len(),
                 "matched_count": matched,
-            })).unwrap()
+            }))
+            .unwrap_or_default()
         );
     } else {
         println!(
@@ -3051,7 +3336,7 @@ fn oracle_evaluate_facts(
     code
 }
 
-/// Print the truthful property-spec schema (§49: `Regex` is substring)."
+/// Print the truthful property-spec schema (§49: `Regex` is substring).
 fn print_oracle_schema() {
     println!(
         "{}",
@@ -3066,7 +3351,9 @@ fn print_oracle_schema() {
                 "select": "optional ANDed pre-filter (missing field => filtered out, never UnknownField)",
                 "quantifier": "all (default, legacy) | exists | none | {count: {op, threshold}}",
                 "version": "optional 1|2",
-                "counts": "selected_count/evaluated_count/matched_count always reported; zero matches never hidden",
+                "counts": "selected_count/evaluated_count/matched_count always reported; zero matches never hidden"
+            },
+            "fields": {
                 "event": ["event_type", "job_id", "seq", "capability", "error", "output.<key>", "watermark(bundle-metadata-only=>Error)"],
                 "safety": ["safety.semantic_policy", "safety.dal", "safety.llmosafe_status", "safety.runtimo_disposition", "safety.input_class", "safety.analysis_kind", "safety.provenance_consistent", "safety.no_evidence", "safety.stages_executed", "safety.oov_ratio", "safety.detection_flags", "safety.body_pressure", "safety.schema_version", "safety.field_id"],
                 "facts": ["family", "run_id", "provider", "fidelity", "observations", "first_seen", "last_seen", "revision", "process.pid", "process.process_start_time", "extra.<key>"]
@@ -3078,17 +3365,23 @@ fn print_oracle_schema() {
             },
             "exit_codes": {"0": "Satisfied", "1": "Violated", "2": "property/eval error", "3": "evidence/infrastructure error"},
             "sources": {"wal": "raw WAL, no admissibility", "bundle": "observe bundle, integrity reported separately", "facts": "runtime-facts-v1.jsonl; NOT OBSERVED != FALSE"}
-        })).unwrap()
+        }))
+        .unwrap_or_default()
     );
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
-    static CLI_SLOT_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Mutex to serialize tests that modify CLI_ACTIVE_JOBS counter.
+    /// Without this, concurrent tests fight over the process-global counter.
+    static CLI_SLOT_MUTEX: Mutex<()> = Mutex::new(());
 
     // ── CLI Argument Parsing (GAP 3) ─────────────────────────────────
+
     #[test]
     fn test_cli_parse_run_command() {
         let args = vec![
@@ -3104,6 +3397,7 @@ mod tests {
             Commands::Run {
                 capability,
                 args,
+                dry_run,
                 ..
             } => {
                 assert_eq!(capability, "FileRead");
@@ -3123,19 +3417,23 @@ mod tests {
             "ShellExec",
             "-a",
             "{\"cmd\":\"echo hello\"}",
+            "--dry-run",
             "--json",
+            "--timeout",
             "10",
         ];
         let cli = Cli::try_parse_from(args).unwrap();
         match cli.command {
             Commands::Run {
                 capability,
+                dry_run,
                 json,
                 quiet,
                 timeout,
                 ..
             } => {
                 assert_eq!(capability, "ShellExec");
+                assert!(dry_run);
                 assert!(json);
                 assert!(!quiet);
                 assert_eq!(timeout, Some(10));
@@ -3159,9 +3457,12 @@ mod tests {
             Commands::Dispatch {
                 capability,
                 args,
-                ..
+                args_file: _,
+                args_stdin: _,
+                dry_run,
             } => {
                 assert_eq!(capability, "FileWrite");
+                assert!(!dry_run);
                 // Verify args was captured (not empty)
                 assert!(!args.is_empty(), "Dispatch args should not be empty");
                 // Verify args contains the expected content field
@@ -3188,6 +3489,7 @@ mod tests {
         let cli = Cli::try_parse_from(args).unwrap();
         match cli.command {
             Commands::Telemetry { json, verbose } => {
+                assert!(json);
                 assert!(!verbose);
             }
             _ => panic!("Expected Telemetry command"),
@@ -3223,50 +3525,77 @@ mod tests {
     }
 
     // ── MAX_CLI_CONCURRENT Slot Enforcement (GAP 3) ──────────────────
+
     #[test]
     fn test_acquire_cli_slot_under_limit() {
         let _guard = CLI_SLOT_MUTEX.lock().unwrap();
         // Reset counter for test isolation
         CLI_ACTIVE_JOBS.store(0, Ordering::Relaxed);
+
         let mut successes = 0;
         for _ in 0..MAX_CLI_CONCURRENT {
             if acquire_cli_slot() {
                 successes += 1;
             }
         }
-        assert_eq!(successes, MAX_CLI_CONCURRENT, "Should acquire all {} slots", MAX_CLI_CONCURRENT);
+        assert_eq!(
+            successes, MAX_CLI_CONCURRENT,
+            "Should acquire all {} slots",
+            MAX_CLI_CONCURRENT
+        );
+
+        // Release all
+        for _ in 0..MAX_CLI_CONCURRENT {
+            release_cli_slot();
+        }
     }
 
     #[test]
     fn test_acquire_cli_slot_over_limit() {
+        let _guard = CLI_SLOT_MUTEX.lock().unwrap();
         // Reset counter
         CLI_ACTIVE_JOBS.store(0, Ordering::Relaxed);
+
         // Acquire all slots
         for _ in 0..MAX_CLI_CONCURRENT {
             assert!(acquire_cli_slot(), "Should acquire slot");
         }
+
         // Next acquisition should fail
         assert!(!acquire_cli_slot(), "Should reject when at limit");
+
+        // Release all
+        for _ in 0..MAX_CLI_CONCURRENT {
+            release_cli_slot();
+        }
     }
 
     #[test]
     fn test_release_cli_slot_after_acquire() {
+        let _guard = CLI_SLOT_MUTEX.lock().unwrap();
+        CLI_ACTIVE_JOBS.store(0, Ordering::Relaxed);
+
         assert!(acquire_cli_slot());
         assert_eq!(CLI_ACTIVE_JOBS.load(Ordering::Relaxed), 1);
+
         release_cli_slot();
         assert_eq!(CLI_ACTIVE_JOBS.load(Ordering::Relaxed), 0);
+
         // Should be able to acquire again
         assert!(acquire_cli_slot());
+        release_cli_slot();
     }
 
     // ── Flock Coordination (GAP 3) ───────────────────────────────────
+
     #[test]
     fn test_acquire_daemon_lock_creates_file() {
         let _guard = CLI_SLOT_MUTEX.lock().unwrap(); // serialize env var access
-        // Override XDG_DATA_HOME to use temp dir
+                                                     // Override XDG_DATA_HOME to use temp dir
         let tmp = std::env::temp_dir().join("runtimo_cli_lock_test");
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::set_var("XDG_DATA_HOME", &tmp);
+
         let result = acquire_daemon_lock();
         // Should succeed since no other process holds the lock (NB mode)
         assert!(
@@ -3274,19 +3603,24 @@ mod tests {
             "acquire_daemon_lock failed: {:?}",
             result.err()
         );
+
         let lock_path = daemon_lock_path();
         assert!(
             lock_path.exists(),
             "Lock file should exist at {}",
             lock_path.display()
         );
+
         // Drop the lock to release it
         drop(result.unwrap());
+
+        let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("XDG_DATA_HOME");
     }
 
     #[test]
     fn test_daemon_lock_path_format() {
+        let lock_path = daemon_lock_path();
         // Should end with daemon.lock
         let path_str = lock_path.to_string_lossy();
         assert!(
@@ -3313,6 +3647,7 @@ mod tests {
     }
 
     // ── Properties Flag Tests ──────────────────────────
+
     #[test]
     fn test_properties_flag_present() {
         let args = vec![
@@ -3335,12 +3670,7 @@ mod tests {
 
     #[test]
     fn test_properties_flag_absent() {
-        let args = vec![
-            "runtimo",
-            "observe",
-            "--verify",
-            "/tmp/test.jsonl",
-        ];
+        let args = vec!["runtimo", "observe", "--verify", "/tmp/test.jsonl"];
         let cli = Cli::try_parse_from(args).unwrap();
         match cli.command {
             Commands::Observe { properties, .. } => {
@@ -3362,7 +3692,7 @@ mod tests {
 
     #[test]
     fn test_parse_spec_malformed() {
-        let result = parse_spec(r#"{"name":"bad","predicates":[}]"#);
+        let result = parse_spec(r#"{"name":"bad","predicates":[}"#);
         assert!(result.is_err());
     }
 
@@ -3370,6 +3700,7 @@ mod tests {
     fn test_evaluate_satisfied() {
         use runtimo_core::oracle::Verdict;
         use runtimo_core::wal::WalEvent;
+
         let event = WalEvent {
             event_type: runtimo_core::WalEventType::JobStarted,
             job_id: "test-job-42".to_string(),
@@ -3387,8 +3718,9 @@ mod tests {
     fn test_evaluate_violated() {
         use runtimo_core::oracle::Verdict;
         use runtimo_core::wal::WalEvent;
+
         let event = WalEvent {
-            event_type: runtimo_core::WalEventType::JobCompleted,
+            event_type: runtimo_core::WalEventType::JobStarted,
             job_id: "test-job-42".to_string(),
             ..WalEvent::default()
         };
@@ -3404,8 +3736,9 @@ mod tests {
     fn test_exit_independence_violated() {
         use runtimo_core::oracle::Verdict;
         use runtimo_core::wal::WalEvent;
+
         let event = WalEvent {
-            event_type: runtimo_core::WalEventType::JobCompleted,
+            event_type: runtimo_core::WalEventType::JobStarted,
             job_id: "test-job-42".to_string(),
             ..WalEvent::default()
         };

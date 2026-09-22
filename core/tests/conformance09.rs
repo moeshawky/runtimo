@@ -278,6 +278,66 @@ fn resource_exhaustion_deterministic() {
     }
 }
 
+// --- §68: mid-pressure characterization -----------------------------------
+// Characterization only — not a defect, not forcing symmetry. Records that
+// semantic-eligible inputs go through decide_with_pressure() while
+// resource-only inputs see only the initial resource gate.
+
+#[test]
+fn mid_pressure_semantic_vs_resource_only_characterization() {
+    // DAL-A, mid-pressure (60). Characterizes current authority model:
+    // semantic path is pressure-sensitive; resource-only is not.
+    let _g = lock_env();
+    std::env::set_var("RUNTIMO_TEST_PRESSURE", "60");
+
+    let guard = LlmoSafeGuard::new()
+        .with_dal(DAL::A)
+        .with_semantic_policy(SemanticPolicy::Corroborate);
+
+    // Semantic-eligible: short prose at mid-pressure → Escalate (single-root).
+    // At low pressure (10) this also Escalates; pressure does not change
+    // the verdict here but the semantic path still consumes it.
+    let semantic = guard
+        .assess("Hello world", "content", InputClass::PayloadProse)
+        .unwrap();
+    assert_eq!(
+        semantic.runtimo_disposition,
+        RuntimoDisposition::EscalationRequired,
+        "mid-pressure semantic: short prose still Escalates"
+    );
+    assert_eq!(
+        semantic.analysis_kind,
+        AnalysisKind::SemanticOneShot,
+        "semantic input must take the one-shot path"
+    );
+
+    // Resource-only: filesystem locator sees only the resource gate.
+    // No semantic assessment runs; no pressure consumption in the decision.
+    // Disposition is Allow regardless of pressure level.
+    // Use resource_only_assessment directly — guard.assess() always runs
+    // the sifter (input class eligibility is checked in the executor's
+    // field classification, not in assess()).
+    let resource_only = runtimo_core::safety::resource_only_assessment(
+        InputClass::FilesystemLocator,
+        "path",
+        SemanticPolicy::Corroborate,
+        DAL::A,
+        Some(60),
+    );
+    assert_eq!(
+        resource_only.runtimo_disposition,
+        RuntimoDisposition::Allow,
+        "resource-only input always Allow (no semantic assessment)"
+    );
+    assert_eq!(
+        resource_only.analysis_kind,
+        AnalysisKind::ResourceOnly,
+        "resource-only input must take the resource path"
+    );
+
+    clear_env();
+}
+
 // --- §22 ShellExec conformance experiment ---------------------------------
 
 #[test]
@@ -294,10 +354,14 @@ fn shellexec_benign_commands_observe_vs_enforce() {
         // ShellExec path is ResourceOnly by table — assess() is NOT called
         // for cmd; instead assert the table classification directly.
         let fields = runtimo_core::safety::fields_for("ShellExec");
-        assert_eq!(fields.len(), 1);
-        let first = fields.first().expect("fields non-empty (len asserted)");
-        assert_eq!(first.class, InputClass::CommandControl);
-        assert!(!first.sifter_eligible);
+        // ShellExec now has 3 classified fields: cmd, cwd, stdin.
+        assert_eq!(fields.len(), 3);
+        let cmd_field = fields
+            .iter()
+            .find(|f| f.field == "cmd")
+            .expect("cmd field must be classified");
+        assert_eq!(cmd_field.class, InputClass::CommandControl);
+        assert!(!cmd_field.sifter_eligible);
         let _ = (guard, cmd);
     }
     // Dangerous: deterministic blocklist (capability-owned) rejects.

@@ -289,12 +289,16 @@ impl LlmoSafeGuard {
     }
 
     /// Legacy shim: sifter-only `PipelineResult` for callers not yet on
-    /// [`Self::assess`]. Delegates to the real one-shot path where possible;
-    /// maps `AssessmentError` to a fail-closed `Halt` decision instead of
-    /// fabricating stages. Prefer `assess()`.
+    /// [`Self::assess`]. Runs only the SIFT stage; remaining `PipelineResult`
+    /// fields are synthetic placeholders (stable monitor state, zero steps,
+    /// 0.0 classifier score, generic provenance).
+    ///
+    /// Prefer [`Self::assess`] for typed, truthful one-shot assessment.
     ///
     /// # Errors
-    /// Never returns `Err` — analysis failure becomes a fail-closed Halt.
+    /// Returns `Err(String)` when the sifter fails (`SiftError`). Analysis
+    /// failure is propagated, never coerced to `Proceed`.
+    #[deprecated(note = "use LlmoSafeGuard::assess() for typed SafetyAssessmentV1")]
     pub fn check_cognitive_pipeline(
         &self,
         _objective: &str,
@@ -412,6 +416,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // Tests the deprecated shim itself
     fn dal_regression_single_application() {
         // DAL must be applied exactly once (inside the crate).
         // If Runtimo ever re-applies DAL, Corroborate+DAL-B downgrade
@@ -470,6 +475,39 @@ mod tests {
                 assert_eq!(a.input_len, big.len());
             }
             Err(AssessmentError::WorkBudgetExhausted | AssessmentError::AnalysisFailed(_)) => {}
+        }
+    }
+
+    /// check_cognitive_pipeline can return Err (the "never returns Err" lie is gone).
+    /// The docs are now truthful: sifter failure propagates as Err(String).
+    #[test]
+    #[allow(deprecated)] // Tests the deprecated shim itself
+    fn check_cognitive_pipeline_can_return_err() {
+        let guard = LlmoSafeGuard::new();
+        // Benign input → Ok.
+        let res = guard
+            .check_cognitive_pipeline(
+                "obj",
+                "a completely ordinary sentence about everyday topics",
+            )
+            .unwrap();
+        // Verify the decision is not Proceed for a short sentence.
+        assert!(!matches!(res.decision, SafetyDecision::Proceed));
+
+        // Oversized input may exhaust the work budget → Err.
+        let big = "x ".repeat(500_000);
+        let res_big = guard.check_cognitive_pipeline("obj", &big);
+        // Either Ok (upstream didn't exhaust) or Err (exhausted). Both are valid.
+        // The contract is: Err is possible, never silently coerced to Proceed.
+        match res_big {
+            Ok(r) => {
+                // If Ok, it must not be a fabricated Proceed.
+                assert!(!matches!(r.decision, SafetyDecision::Proceed));
+            }
+            Err(e) => {
+                // Err is the truthful outcome for sifter failure.
+                assert!(e.contains("sifter"), "error must mention sifter");
+            }
         }
     }
 }

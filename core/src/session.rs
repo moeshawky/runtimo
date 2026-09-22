@@ -87,7 +87,7 @@ pub struct SessionManager {
     sessions_dir: PathBuf,
 }
 
-/// File lock for session operations, reusing the `flock` pattern from [`WalWriter`].
+/// File lock for session operations, reusing the `flock` pattern from [`crate::WalWriter`].
 ///
 /// On unix, acquires `LOCK_EX` via `libc::flock`. On non-unix, this is a no-op.
 /// The lock is released when the `FileLock` is dropped.

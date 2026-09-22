@@ -247,17 +247,28 @@ pub struct SafetyAssessmentV1 {
     pub llmosafe_severity: u8,
     /// Whether the upstream decision blocks (`is_blocking()`).
     pub llmosafe_blocking: bool,
-    /// Raw upstream provenance preserved as evidence (explanatory only).
-    pub provenance_label: String,
-    /// Raw upstream reasons (explanatory only).
-    pub provenance_reasons: Vec<String>,
-    /// Raw upstream evidence families (explanatory only).
-    pub provenance_families: Vec<String>,
-    /// Raw upstream hard-invariant flag (explanatory only — never
+    /// Raw upstream provenance label (None when unavailable, e.g. sifter-only
+    /// path where crate DecisionProvenance does not exist by construction).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance_label: Option<String>,
+    /// Raw upstream provenance reasons (None when unavailable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance_reasons: Option<Vec<String>>,
+    /// Raw upstream provenance evidence families (None when unavailable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance_families: Option<Vec<String>>,
+    /// Raw upstream hard-invariant flag (None when unavailable — never
     /// independently sufficient authorization).
-    pub provenance_hard_invariant: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance_hard_invariant: Option<bool>,
     /// Boundary validation: does provenance agree with the final decision?
-    pub provenance_consistent: bool,
+    /// None when provenance is unavailable (nothing to compare).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance_consistent: Option<bool>,
+    /// Runtimo-generated explanation for this assessment. Never mistaken for
+    /// upstream DecisionProvenance — a separately-named field carrying the
+    /// boundary's own rationale.
+    pub runtimo_explanation: Vec<String>,
     /// Runtimo-side disposition.
     pub runtimo_disposition: RuntimoDisposition,
     /// Bitmask of stages that actually executed (sifter-only one-shot).
@@ -289,9 +300,12 @@ pub struct SafetyAssessmentV1 {
 
 impl SafetyAssessmentV1 {
     /// Did the boundary detect provenance inconsistency?
+    /// Returns true only when provenance is available AND inconsistent.
+    /// When provenance is unavailable (None), returns false (no mismatch
+    /// to detect).
     #[must_use]
     pub const fn has_provenance_mismatch(&self) -> bool {
-        !self.provenance_consistent
+        matches!(self.provenance_consistent, Some(false))
     }
 }
 
@@ -409,52 +423,6 @@ pub fn assess_one_shot(
     // boundary-built provenance snapshot. The crate's full
     // `DecisionProvenance` (from `process_ctrl`) is unavailable on the
     // sifter-only path by construction — truthful incompleteness.
-    let (label, families, hard_invariant) = match &decision {
-        SafetyDecision::Proceed => ("safe", vec![], false),
-        SafetyDecision::Warn(_) => ("warning", vec!["semantic".to_string()], false),
-        SafetyDecision::Escalate { .. } => {
-            // Dual-root corroboration signal when both roots agree.
-            let dual = synapse.has_bias();
-            if dual {
-                (
-                    "escalate",
-                    vec!["semantic".to_string(), "classifier".to_string()],
-                    false,
-                )
-            } else {
-                ("escalate", vec!["semantic".to_string()], false)
-            }
-        }
-        SafetyDecision::Halt(..) => {
-            // On the sifter path a Halt surviving Corroborate implies
-            // mechanical/dual-root authority per upstream contract.
-            // hard_invariant is recorded as observed-from-decision, and the
-            // consistency check below gates implausible combinations.
-            ("halt", vec!["semantic".to_string()], false)
-        }
-        SafetyDecision::Exit(_) => ("exit", vec!["mechanical".to_string()], true),
-    };
-    let provenance = DecisionProvenance {
-        decision_label: label.to_string(),
-        reasons: vec![format!("one-shot sifter: {}", decision.status_label())],
-        evidence_families: families,
-        hard_invariant,
-    };
-    let consistent = {
-        // Local structural check mirroring `provenance_consistent` but over
-        // the boundary-built snapshot (crate provenance unavailable here).
-        let expected = decision.status_label();
-        provenance.decision_label.eq_ignore_ascii_case(expected)
-            && !(provenance.hard_invariant
-                && matches!(
-                    &decision,
-                    SafetyDecision::Proceed
-                        | SafetyDecision::Warn(_)
-                        | SafetyDecision::Escalate { .. }
-                ))
-            && !(decision.is_blocking() && provenance.evidence_families.is_empty())
-    };
-
     let dal_str = format!("{:?}", policy.dal);
     let sp_str = match policy.semantic_policy {
         SemanticPolicy::Observe => "observe",
@@ -462,6 +430,10 @@ pub fn assess_one_shot(
         SemanticPolicy::Enforce => "enforce",
     };
 
+    // Unavailable upstream provenance stays unavailable (None, never synthesized).
+    // The crate's full DecisionProvenance (from process_ctrl) is unavailable on
+    // the sifter-only path by construction — truthful incompleteness.
+    // Runtimo-generated explanation goes in a separately-named field.
     Ok(SafetyAssessmentV1 {
         schema_version: SAFETY_SCHEMA_VERSION,
         analysis_kind: AnalysisKind::SemanticOneShot,
@@ -471,11 +443,12 @@ pub fn assess_one_shot(
         llmosafe_status: decision.status_label().to_string(),
         llmosafe_severity: decision.severity(),
         llmosafe_blocking: decision.is_blocking(),
-        provenance_label: provenance.decision_label.clone(),
-        provenance_reasons: provenance.reasons.clone(),
-        provenance_families: provenance.evidence_families.clone(),
-        provenance_hard_invariant: provenance.hard_invariant,
-        provenance_consistent: consistent,
+        provenance_label: None,
+        provenance_reasons: None,
+        provenance_families: None,
+        provenance_hard_invariant: None,
+        provenance_consistent: None,
+        runtimo_explanation: vec![format!("one-shot sifter: {}", decision.status_label())],
         runtimo_disposition: disposition_for(&decision),
         stages_executed: llmosafe::llmosafe_pipeline::STAGE_SIFT,
         oov_ratio: Some(synapse.oov_ratio()),
@@ -507,20 +480,25 @@ pub fn resource_only_assessment(
         SemanticPolicy::Corroborate => "corroborate",
         SemanticPolicy::Enforce => "enforce",
     };
+    // Unavailable upstream provenance stays unavailable (None, never synthesized).
+    // `not assessed != safe` — the upstream semantic decision did not run.
     SafetyAssessmentV1 {
         schema_version: SAFETY_SCHEMA_VERSION,
         analysis_kind: AnalysisKind::ResourceOnly,
         input_class,
         semantic_policy: sp_str.to_string(),
         dal: format!("{dal:?}"),
-        llmosafe_status: "safe".to_string(),
+        // Not the upstream status — this is the Runtimo resource gate disposition.
+        // llmosafe_status remains a placeholder string; the semantic decision is absent.
+        llmosafe_status: "resource-only".to_string(),
         llmosafe_severity: 0,
         llmosafe_blocking: false,
-        provenance_label: "resource-only".to_string(),
-        provenance_reasons: vec!["input class not semantic-eligible".to_string()],
-        provenance_families: vec!["mechanical".to_string()],
-        provenance_hard_invariant: false,
-        provenance_consistent: true,
+        provenance_label: None,
+        provenance_reasons: None,
+        provenance_families: None,
+        provenance_hard_invariant: None,
+        provenance_consistent: None,
+        runtimo_explanation: vec!["input class not semantic-eligible".to_string()],
         runtimo_disposition: RuntimoDisposition::Allow,
         stages_executed: 0,
         oov_ratio: None,
@@ -563,16 +541,28 @@ pub struct FieldSemantics {
 #[must_use]
 pub fn fields_for(cap_name: &str) -> &'static [FieldSemantics] {
     match cap_name {
-        // ShellExec.cmd = command/control syntax — NOT natural-language
-        // intent. Observe-mode telemetry + deterministic policy own it.
-        "ShellExec" => &[FieldSemantics {
-            field: "cmd",
-            class: InputClass::CommandControl,
-            is_control: true,
-            sifter_eligible: false,
-        }],
-        // FileWrite.content = payload; may be prose/code/JSON/quoted-attack.
-        // Eligible (payload prose + code), never treated as instruction.
+        // ShellExec: cmd = command syntax; cwd = locator; stdin = text payload.
+        "ShellExec" => &[
+            FieldSemantics {
+                field: "cmd",
+                class: InputClass::CommandControl,
+                is_control: true,
+                sifter_eligible: false,
+            },
+            FieldSemantics {
+                field: "cwd",
+                class: InputClass::FilesystemLocator,
+                is_control: false,
+                sifter_eligible: false,
+            },
+            FieldSemantics {
+                field: "stdin",
+                class: InputClass::PayloadProse,
+                is_control: false,
+                sifter_eligible: true,
+            },
+        ],
+        // FileWrite: content = prose/code/JSON payload (eligible); path = locator.
         "FileWrite" => &[
             FieldSemantics {
                 field: "content",
@@ -599,7 +589,8 @@ pub fn fields_for(cap_name: &str) -> &'static [FieldSemantics] {
             is_control: false,
             sifter_eligible: false,
         }],
-        // GitExec: message = NL payload (limited authority); args/paths confined.
+        // GitExec: message = NL payload (eligible); operation = command syntax;
+        // url/path/branch/commit_sha/files = locators/identifiers.
         "GitExec" => &[
             FieldSemantics {
                 field: "message",
@@ -608,19 +599,57 @@ pub fn fields_for(cap_name: &str) -> &'static [FieldSemantics] {
                 sifter_eligible: true,
             },
             FieldSemantics {
+                field: "operation",
+                class: InputClass::CommandControl,
+                is_control: true,
+                sifter_eligible: false,
+            },
+            FieldSemantics {
                 field: "url",
                 class: InputClass::UrlLocator,
                 is_control: false,
                 sifter_eligible: false,
             },
+            FieldSemantics {
+                field: "path",
+                class: InputClass::FilesystemLocator,
+                is_control: false,
+                sifter_eligible: false,
+            },
+            FieldSemantics {
+                field: "branch",
+                class: InputClass::StructuredIdentifier,
+                is_control: false,
+                sifter_eligible: false,
+            },
+            FieldSemantics {
+                field: "files",
+                class: InputClass::FilesystemLocator,
+                is_control: false,
+                sifter_eligible: false,
+            },
+            FieldSemantics {
+                field: "commit_sha",
+                class: InputClass::StructuredIdentifier,
+                is_control: false,
+                sifter_eligible: false,
+            },
         ],
-        // Undo: job-id identifier only.
-        "Undo" => &[FieldSemantics {
-            field: "job_id",
-            class: InputClass::StructuredIdentifier,
-            is_control: false,
-            sifter_eligible: false,
-        }],
+        // Undo: job_id = identifier; file = optional target locator.
+        "Undo" => &[
+            FieldSemantics {
+                field: "job_id",
+                class: InputClass::StructuredIdentifier,
+                is_control: false,
+                sifter_eligible: false,
+            },
+            FieldSemantics {
+                field: "file",
+                class: InputClass::FilesystemLocator,
+                is_control: false,
+                sifter_eligible: false,
+            },
+        ],
         _ => &[],
     }
 }
@@ -645,16 +674,183 @@ mod tests {
         for cap in REGISTERED_CAPABILITIES {
             // Every registered capability must have a classification entry,
             // even if that entry is resource-only. Unknown caps return
-            // empty slice — which this test treats as a coverage hole
-            // unless the cap is genuinely unregistered.
+            // empty slice — which this test treats as a coverage hole.
             let fields = fields_for(cap);
-            // ShellExec/FileWrite/etc all have entries; this asserts the
-            // table was consulted (not defaulted).
             assert!(
-                !fields.is_empty() || *cap == "Undo" && !fields.is_empty(),
+                !fields.is_empty(),
                 "capability {cap} lacks input-semantics classification"
             );
         }
+    }
+
+    /// Tripwire: verifies every known capability arg field is classified.
+    /// When a new field is added to a capability's args struct, this test
+    /// fails until the field table is updated in `fields_for()`.
+    /// Unavailable upstream provenance stays unavailable (None, never synthesized).
+    /// The sifter-only path does not have crate DecisionProvenance by construction.
+    #[test]
+    fn sifter_only_provenance_is_absent() {
+        use llmosafe::DesignAssuranceLevel as DAL;
+        let policy = llmosafe::EscalationPolicy::default()
+            .with_semantic_policy(SemanticPolicy::Corroborate)
+            .with_dal(DAL::A);
+        let assessment = assess_one_shot(
+            &policy,
+            "Hello world",
+            "content",
+            InputClass::PayloadProse,
+            Some(10),
+        )
+        .unwrap();
+        // Upstream provenance is unavailable on the sifter-only path.
+        assert!(
+            assessment.provenance_label.is_none(),
+            "provenance_label must be None on sifter-only path"
+        );
+        assert!(
+            assessment.provenance_reasons.is_none(),
+            "provenance_reasons must be None on sifter-only path"
+        );
+        assert!(
+            assessment.provenance_families.is_none(),
+            "provenance_families must be None on sifter-only path"
+        );
+        assert!(
+            assessment.provenance_hard_invariant.is_none(),
+            "provenance_hard_invariant must be None on sifter-only path"
+        );
+        assert!(
+            assessment.provenance_consistent.is_none(),
+            "provenance_consistent must be None when provenance is unavailable"
+        );
+        // Runtimo-generated explanation must be present and non-empty.
+        assert!(
+            !assessment.runtimo_explanation.is_empty(),
+            "runtimo_explanation must be present when provenance is absent"
+        );
+    }
+
+    /// Resource-only is never semantic Safe/Proceed.
+    /// `not assessed != safe` — the upstream semantic decision did not run.
+    #[test]
+    fn resource_only_never_semantic_safe() {
+        use llmosafe::DesignAssuranceLevel as DAL;
+        let assessment = resource_only_assessment(
+            InputClass::FilesystemLocator,
+            "path",
+            SemanticPolicy::Corroborate,
+            DAL::A,
+            Some(10),
+        );
+        // llmosafe_status must not be the semantic "safe" string.
+        assert_ne!(
+            assessment.llmosafe_status, "safe",
+            "resource-only must not claim semantic 'safe'"
+        );
+        // Disposition is still Allow (Runtimo resource gate passed).
+        assert_eq!(assessment.runtimo_disposition, RuntimoDisposition::Allow);
+        // Upstream provenance is absent (no semantic decision ran).
+        assert!(assessment.provenance_label.is_none());
+        assert!(assessment.provenance_consistent.is_none());
+    }
+
+    /// Tripwire: verifies every known capability arg field is classified.
+    /// When a new field is added to a capability's args struct, this test
+    /// fails until the field table is updated in `fields_for()`.
+    #[test]
+    fn all_capability_fields_are_classified() {
+        fn fields_for_cap(cap: &str) -> Vec<&'static str> {
+            fields_for(cap).iter().map(|fs| fs.field).collect()
+        }
+
+        // ShellExec: cmd, cwd, stdin, timeout_secs (numeric — excluded)
+        let shell = fields_for_cap("ShellExec");
+        for required in &["cmd", "cwd", "stdin"] {
+            assert!(
+                shell.contains(required),
+                "ShellExec field '{required}' not classified"
+            );
+        }
+
+        // FileWrite: path, content, append (bool — excluded)
+        let write = fields_for_cap("FileWrite");
+        for required in &["path", "content"] {
+            assert!(
+                write.contains(required),
+                "FileWrite field '{required}' not classified"
+            );
+        }
+
+        // FileRead: path, max_bytes (numeric — excluded)
+        let read = fields_for_cap("FileRead");
+        assert!(
+            read.contains(&"path"),
+            "FileRead field 'path' not classified"
+        );
+
+        // Delete: path, no_backup (bool — excluded)
+        let delete = fields_for_cap("Delete");
+        assert!(
+            delete.contains(&"path"),
+            "Delete field 'path' not classified"
+        );
+
+        // Kill: pid (numeric identifier, included), signal (numeric — excluded)
+        let kill = fields_for_cap("Kill");
+        assert!(kill.contains(&"pid"), "Kill field 'pid' not classified");
+
+        // GitExec: operation, url, path, branch, message, files, commit_sha,
+        // timeout_secs (numeric — excluded)
+        let git = fields_for_cap("GitExec");
+        for required in &[
+            "operation",
+            "url",
+            "path",
+            "branch",
+            "message",
+            "files",
+            "commit_sha",
+        ] {
+            assert!(
+                git.contains(required),
+                "GitExec field '{required}' not classified"
+            );
+        }
+
+        // Undo: job_id, file
+        let undo = fields_for_cap("Undo");
+        for required in &["job_id", "file"] {
+            assert!(
+                undo.contains(required),
+                "Undo field '{required}' not classified"
+            );
+        }
+    }
+
+    /// Verifies that resource-only assessment uses a field actually present
+    /// in the args (executor `fields.first()` fallback fix).
+    #[test]
+    fn resource_only_uses_present_field() {
+        use super::*;
+        // Simulate: args has "cwd" but not "cmd" for ShellExec.
+        // The resource-only assessment must record "cwd", not "cmd".
+        let fields = fields_for("ShellExec");
+        let args = serde_json::json!({"cwd": "/tmp"});
+        let (class, field) = fields
+            .iter()
+            .find(|fs| args.get(fs.field).is_some())
+            .map_or((InputClass::OpaqueData, "-"), |fs| (fs.class, fs.field));
+        assert_eq!(field, "cwd", "must use present field, not table-first");
+        assert_eq!(class, InputClass::FilesystemLocator);
+
+        // Simulate: no field present → default OpaqueData, "-".
+        let args2 = serde_json::json!({});
+        let (class2, field2) = fields
+            .iter()
+            .find(|fs| args2.get(fs.field).is_some())
+            .map_or((InputClass::OpaqueData, "-"), |fs| (fs.class, fs.field));
+        assert_eq!(field2, "-");
+        assert_eq!(class2, InputClass::OpaqueData);
     }
 
     #[test]

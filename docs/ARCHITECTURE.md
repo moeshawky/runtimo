@@ -144,6 +144,20 @@ reconcile (daemon restart): JobFailed preserves original capability + output {"r
 | 5 | Kill PID → process | Protected PID list + PID reuse detection |
 | 6 | GitExec → network | URL validation (http/https/SSH) + SSRF blocking |
 | 7 | Undo → filesystem | Restore target re-validated against allowed prefixes |
-| 8 | Resource pressure → execution | `LlmoSafeGuard.check()` — 80% ceiling, rolling average |
+| 8 | Resource pressure → execution | `LlmoSafeGuard.check()` — 80% ceiling, single fresh upstream observation per call (no rolling average, no cooldown cache) |
 | 9 | 1 MB args → memory | Executor pre-check rejects oversized args |
 | 10 | Zombie count → execution | Executor rejects if zombie_count > 10 |
+
+## Safety Architecture Invariants
+
+### Provenance Ordering (ii)
+
+Upstream `DecisionProvenance` is `Option`-typed and `None` on sifter-only and resource-only paths — never synthesized (`core/src/safety.rs:446-450,483`). The final typed `SafetyDecision` is canonical; `provenance.decision_label` is never the authority. `has_bias` (OR) is never dual-root (AND) evidence.
+
+### `SafetyEvaluated` Durability (iii)
+
+`SafetyEvaluated` WAL persistence is REQUIRED before the governed side effect (`core/src/executor.rs:508-541`). Append failure returns `Err(Error::WalError(...))` and blocks execution — WAL failure implies no side effect. Ordering: `JobStarted` → gates → `SafetyEvaluated` → `capability.execute()` → `JobCompleted/Failed`.
+
+### Oracle Evaluator Shape (v)
+
+`WalSource` and `RuntimeFactSource` share one narrow generic select-then-quantify evaluator (`core/src/oracle/generic_eval.rs`) over separate native typed field resolvers. No fake `WalEvent` adaptation of `RuntimeFactV1`. Selector field absence filters items out (never `Error`); predicate field absence or type mismatch yields `Verdict::Error`.

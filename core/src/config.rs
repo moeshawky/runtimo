@@ -28,7 +28,7 @@ pub struct OutputConfig {
 
 /// WAL configuration.
 ///
-/// `mode` is resolved by [`Self::resolved`] (file `wal.mode` > profile > builtin).
+/// `mode` is resolved by [`RuntimoConfig::resolved`] (file `wal.mode` > profile > builtin).
 /// `enabled` is a dead config field — it is never read by `resolved()` or any
 /// other code path; the WAL is always active. Kept for backward-compatible
 /// parsing of existing config files. Documented here as reporting-only;

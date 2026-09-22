@@ -355,7 +355,7 @@ fn validate_op_type(field: &str, op: &Op, value: &Value) -> Result<(), ParseSpec
 ///
 /// # Field Resolution
 ///
-/// - `"event_type"` → the event type as a string (via [`WalEventType::as_str`])
+/// - `"event_type"` → the event type as a string (via [`crate::wal::WalEventType::as_str`])
 /// - `"job_id"` → the job ID string
 /// - `"seq"` → the sequence number as a number
 /// - `"capability"` → capability name (absent → `None`, not empty string)
@@ -400,7 +400,7 @@ pub fn extract_field(event: &WalEvent, field: &str) -> Option<Value> {
         "safety.provenance_consistent" => event
             .safety
             .as_ref()
-            .map(|s| Value::Bool(s.provenance_consistent)),
+            .and_then(|s| s.provenance_consistent.map(Value::Bool)),
         "safety.no_evidence" => event
             .safety
             .as_ref()

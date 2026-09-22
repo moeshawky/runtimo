@@ -605,6 +605,34 @@ pub enum JobState {
 }
 ```
 
+## Safety Assessment Contracts
+
+These six typed contracts are load-bearing for Oracle, audit, and crash recovery. All are verified against `core/src/safety.rs`, `core/src/executor.rs`, `core/src/llmosafe.rs`, and `core/src/oracle/generic_eval.rs`.
+
+### 1. Resource-Only Assessment Writes `"resource-only"`, Never `"safe"`
+
+`resource_only_assessment()` (`core/src/safety.rs:471`) sets `llmosafe_status = "resource-only"` and `llmosafe_severity = 0`, with `llmosafe_blocking: false`. The upstream semantic decision did not run — `not assessed != safe`. Callers and Oracle must never equate `llmosafe_status == "resource-only"` with a safe semantic disposition; the Runtimo disposition (separate field) governs execution.
+
+### 2. Upstream `DecisionProvenance` Is `Option`-Typed and Absent on Sifter-Only/Resource-Only Paths
+
+On the sifter-only and resource-only paths, the five `provenance_*` fields in `SafetyAssessmentV1` (`provenance_label`, `provenance_reasons`, `provenance_families`, `provenance_hard_invariant`, `provenance_consistent`) are `None` — never synthesized to a fake value (`core/src/safety.rs:446-450`, `483`). The crate's full `DecisionProvenance` (from `process_ctrl`) is unavailable on these paths by construction. Runtimo-generated explanations live in the separate `runtimo_explanation: Vec<String>` field, not in the provenance fields. The final typed `SafetyDecision` is canonical; `provenance.decision_label` is never the authority. `has_bias` (OR of multiple detectors) is never dual-root (AND) evidence.
+
+### 3. `SafetyEvaluated` WAL Persistence Is REQUIRED Before the Governed Side Effect
+
+`execute_with_telemetry_and_session()` (`core/src/executor.rs:508-541`) appends the `SafetyEvaluated` WAL event and flushes before the capability side effect runs. An append failure returns `Err(Error::WalError(...))` and blocks execution — WAL failure implies no side effect. The ordering is: `JobStarted` → resource/safety checks → `SafetyEvaluated` → `capability.execute()` → `JobCompleted`/`JobFailed`. Oracle and crash recovery depend on `SafetyEvaluated` preceding the side effect in the WAL.
+
+### 4. `check_cognitive_pipeline` Is Deprecated Compatibility; Can Return `Err`
+
+`LlmoSafeGuard::check_cognitive_pipeline()` (`core/src/llmosafe.rs:302`) is a legacy shim that runs only the SIFT stage. It returns `Err(String)` when the sifter fails (`SiftError` is propagated, never coerced to `Proceed`). The synthetic `PipelineResult` fields (`monitor_state: Stable`, `step_count: 0`, `classifier_score: 0.0`) are documented placeholders. New code should use `LlmoSafeGuard::assess()` for the typed `SafetyAssessmentV1`.
+
+### 5. Oracle WAL and RuntimeFact Sources Share One Narrow Generic Evaluator
+
+`core/src/oracle/generic_eval.rs` provides a single generic select-then-quantify evaluator over a typed field resolver closure. WAL (`WalEvent`) and RuntimeFact (`serde_json::Value`) sources each provide their own native typed field resolver — no fake `WalEvent` adaptation of RuntimeFacts or vice versa. The evaluator owns only comparator/selector/quantifier semantics; unknown fields in selectors filter items out (never `Error`), unknown fields in predicates yield `Verdict::Error`.
+
+### 6. Expanded Input Taxonomy — Only Args Actually Present Are Recorded
+
+`safety::fields_for(cap_name)` (`core/src/safety.rs:542`) declares per-capability field semantics: `ShellExec` (cmd, cwd, stdin), `GitExec` (message, operation, url, path, branch, files, commit_sha), `Undo` (job_id, file). The executor picks the first field in the table that's actually present in the args (`core/src/executor.rs:493-504`); an absent field must never become the recorded assessed field. Each field has an `InputClass` (8 variants), `is_control` flag, and `sifter_eligible` flag.
+
 ## Error Handling
 
 ### Error Enum
@@ -615,11 +643,17 @@ pub enum Error {
     SchemaValidationFailed(String),
     CapabilityNotFound(String),
     ExecutionFailed(String),
+    CapabilityExecutionFailed { msg: String, variant: &'static str, code: i32 },
     WalError(String),
     BackupError(String),
     SessionError(String),
     ResourceLimitExceeded(String),
     TelemetryError(String),
+    CognitiveSafetyViolation(String),  // legacy generic channel
+    SafetyEscalationRequired(String),  // semantic Escalate (do not execute now)
+    SafetyRejected(String),            // hard Halt
+    SafetyFatal(String),               // upstream Exit (no daemon kill)
+    SafetyAnalysisFailed(String),      // SiftError (never coerced to allow)
 }
 ```
 
@@ -785,7 +819,11 @@ On daemon restart, in-flight jobs are reconciled to `JobFailed` with the origina
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `RUNTIMO_WAL_PATH` | `/tmp/runtimo/wal.jsonl` | WAL file path |
+| `RUNTIMO_WAL_PATH` | `data_dir()/wal.jsonl` (XDG data dir, e.g. `~/.local/share/runtimo/wal.jsonl`; `/tmp/runtimo/wal.jsonl` only as last resort) | WAL file path |
+| `RUNTIMO_DAL` | Profile-dependent: `service` → `A`, all other profiles (`bare`/`minimal`/`ephemeral`) → `E`. Env var overrides file, file overrides `[guards].dal`, which overrides profile. Unknown values fail closed to `A`. | Design Assurance Level |
+| `RUNTIMO_SEMANTIC_POLICY` | `corroborate` | Semantic authority mode (`observe`/`corroborate`/`enforce`) |
+| `RUNTIMO_TEST_PRESSURE` | Unset (live measurement) | Deterministic test seam: pin pressure 0-100 |
+| `RUNTIMO_MEMORY_CEILING_BYTES` | Auto-detected (80% of RAM) | Explicit memory ceiling for deterministic tests |
 
 ## Examples
 
@@ -804,7 +842,7 @@ cargo test -- --nocapture
 
 ## Version
 
-0.9.0
+0.10.0
 
 ## License
 

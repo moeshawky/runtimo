@@ -22,10 +22,12 @@ use thiserror::Error;
 
 pub mod benchmark;
 pub mod eval;
+pub mod generic_eval;
 pub mod spec;
 
 pub use benchmark::{run_benchmarks, BenchmarkReport};
 pub use eval::{evaluate, evaluate_v2, PropertyVerdict, Verdict};
+pub use generic_eval::{evaluate_items, GenericVerdict};
 pub use spec::{parse_spec, Op, Predicate, PropertySpec, Quantifier};
 
 /// Errors that can occur in the oracle module.

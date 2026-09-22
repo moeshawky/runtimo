@@ -10,13 +10,13 @@
 //!
 //! Capabilities run under a post-hoc timeout: the per-capability value is
 //! resolved via [`RuntimoConfig::get_capability_timeout`] (default
-//! [`CAPABILITY_TIMEOUT_SECS`] = 30s) and injected into the args so
+//! `CAPABILITY_TIMEOUT_SECS` = 30s) and injected into the args so
 //! subprocess-based capabilities (ShellExec, GitExec) enforce it internally.
 //! Pure-Rust capabilities run to completion and the elapsed time is checked
 //! after the fact — they cannot be interrupted without subprocess isolation.
 //!
 //! WAL path: the caller (the CLI) passes [`crate::utils::wal_path()`] —
-//! [`RUNTIMO_WAL_PATH`] if set, otherwise `data_dir()/wal.jsonl` (the XDG
+//! `RUNTIMO_WAL_PATH` if set, otherwise `data_dir()/wal.jsonl` (the XDG
 //! data dir, e.g. `~/.local/share/runtimo/wal.jsonl`). `/tmp/runtimo` is
 //! only the last-resort fallback when neither `XDG_DATA_HOME` nor `HOME` is
 //! set. Override with the `RUNTIMO_WAL_PATH` env var.
@@ -151,10 +151,10 @@ pub struct ExecutionResult {
 /// # Timeout
 ///
 /// The per-capability timeout is resolved here via
-/// [`RuntimoConfig::get_capability_timeout`] (default [`CAPABILITY_TIMEOUT_SECS`])
+/// [`RuntimoConfig::get_capability_timeout`] (default 30s)
 /// and injected into the args for subprocess-based capabilities, which enforce
 /// it internally. Pure-Rust capabilities cannot be interrupted; the timeout is
-/// checked after completion (see [`execute_with_timeout_check`]).
+/// checked after completion (see `execute_with_timeout_check`).
 pub fn execute_with_telemetry(
     capability: &dyn Capability,
     args: &Value,
@@ -488,9 +488,13 @@ pub fn execute_with_telemetry_and_session(
             }
         }
         // No eligible semantic field → resource-only (truthful, not skipped).
+        // Pick the first field in the table that's actually present in the
+        // args — an absent field must never become the recorded assessed field.
         winning.or_else(|| {
-            let class = fields.first().map_or(InputClass::OpaqueData, |f| f.class);
-            let field = fields.first().map_or("-", |f| f.field);
+            let (class, field) = fields
+                .iter()
+                .find(|fs| args.get(fs.field).is_some())
+                .map_or((InputClass::OpaqueData, "-"), |fs| (fs.class, fs.field));
             Some(safety::resource_only_assessment(
                 class,
                 field,
@@ -501,9 +505,9 @@ pub fn execute_with_telemetry_and_session(
         })
     };
 
-    // SafetyEvaluated BEFORE the governed side effect (§37). Best-effort
-    // like other audits: WAL failure must not mask the safety decision,
-    // but the side effect below still follows the disposition.
+    // SafetyEvaluated BEFORE the governed side effect (§37). Persistence
+    // MUST succeed before the governed side effect runs — load-bearing
+    // authority-chain evidence for Oracle. WAL failure implies no side effect.
     if let Some(ref assessment) = safety_assessment {
         let seq = wal.seq();
         if let Err(e) = wal.append(WalEvent {
@@ -531,7 +535,9 @@ pub fn execute_with_telemetry_and_session(
             wall_ns: None,
             safety: Some(assessment.clone()),
         }) {
-            log::warn!("WAL SafetyEvaluated append failed for job {job_id_str}: {e}");
+            return Err(Error::WalError(format!(
+                "SafetyEvaluated append failed for job {job_id_str}: {e}"
+            )));
         }
 
         // Explicit actuation (§29-30): Escalate stays EscalationRequired
