@@ -406,8 +406,6 @@ mod tests {
         ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-
-
     #[test]
     fn guard_reports_system_memory() {
         let guard = LlmoSafeGuard::new();
@@ -439,7 +437,10 @@ mod tests {
         // suite running under an outer RUNTIMO_TEST_PRESSURE override is
         // not left with the var deleted for later tests in the same process.
         let prior = std::env::var("RUNTIMO_TEST_PRESSURE").ok();
-        std::env::set_var("RUNTIMO_TEST_PRESSURE", "10");
+        // Pin 90 (Emergency) → upstream Halt(ResourceExhaustion) unconditionally
+        // (llmosafe_integration.rs:660-667). DAL B downgrades Halt→Escalate exactly
+        // once (llmosafe_integration.rs:760-769), never Proceed. Ambient-proof.
+        std::env::set_var("RUNTIMO_TEST_PRESSURE", "90");
         let guard = LlmoSafeGuard::new()
             .with_dal(DesignAssuranceLevel::B)
             .with_semantic_policy(SemanticPolicy::Enforce);
@@ -501,10 +502,12 @@ mod tests {
 
     /// check_cognitive_pipeline can return Err (the "never returns Err" lie is gone).
     /// The docs are now truthful: sifter failure propagates as Err(String).
-    /// Pin RUNTIMO_TEST_PRESSURE=10 for determinism: the shim's verdict flows
-    /// through the pressure-sensitive decide_with_pressure layer, so ambient
-    /// pressure would flip this benign short sentence between Proceed (idle)
-    /// and Escalate/Warn (loaded). Low pressure guarantees non-Proceed.
+    /// Pin RUNTIMO_TEST_PRESSURE=90 (Emergency) for determinism: with
+    /// PressureLevel::Emergency, upstream decide_with_pressure returns
+    /// Halt(ResourceExhaustion) unconditionally (checked before any
+    /// entropy/surprise/bias evaluation), so ambient pressure or sifter
+    /// variance cannot flip this to Proceed. Verified in llmosafe-0.9.0
+    /// llmosafe_integration.rs:660-667 (Emergency arm) and :227 (76-100→Emergency).
     #[test]
     #[allow(deprecated)] // Tests the deprecated shim itself
     fn check_cognitive_pipeline_can_return_err() {
@@ -513,7 +516,7 @@ mod tests {
         // suite running under an outer RUNTIMO_TEST_PRESSURE override is
         // not left with the var deleted for later tests in the same process.
         let prior = std::env::var("RUNTIMO_TEST_PRESSURE").ok();
-        std::env::set_var("RUNTIMO_TEST_PRESSURE", "10");
+        std::env::set_var("RUNTIMO_TEST_PRESSURE", "90");
         let guard = LlmoSafeGuard::new();
         // Benign input → Ok.
         let res = guard
