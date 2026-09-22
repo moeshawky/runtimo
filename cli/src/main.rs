@@ -361,6 +361,18 @@ Rate from --sample-rate-hz or RUNTIMO_OBSERVE_SAMPLE_HZ or config observe.sample
         #[arg(long, short = 'j', default_value = "false")]
         json: bool,
     },
+    /// Oracle — evaluate properties over recorded evidence (read-only).
+    ///
+    /// The oracle never reruns LLMOSafe, reclassifies input, mutates WAL,
+    /// or executes capabilities. It evaluates recorded evidence so
+    /// historical results reproduce even if future LLMOSafe versions change.
+    /// Exit codes: 0 Satisfied, 1 Violated, 2 property/eval error,
+    /// 3 evidence/infrastructure error.
+    #[command(about = "Oracle — evaluate properties over recorded evidence")]
+    Oracle {
+        #[command(subcommand)]
+        command: OracleCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -447,6 +459,43 @@ enum AllowedPathsAction {
     Add { paths: Vec<String> },
     Remove { paths: Vec<String> },
     List,
+}
+
+/// Oracle subcommands (first-class namespace, §41).
+#[derive(Subcommand)]
+enum OracleCommand {
+    /// Evaluate a property file (or inline JSON) over an evidence source.
+    ///
+    /// Sources (exactly one required): `--wal`, `--bundle`, `--facts`.
+    /// Raw WAL is queryable directly — Observe admissibility is NOT applied
+    /// to raw WAL (§42). Bundles verify integrity separately.
+    #[command(about = "Evaluate properties over WAL / bundle / facts")]
+    Evaluate {
+        /// Raw WAL path (`wal.jsonl`).
+        #[arg(long)]
+        wal: Option<PathBuf>,
+        /// Observe bundle path (`observe-run.jsonl`, hash-chained).
+        #[arg(long)]
+        bundle: Option<PathBuf>,
+        /// Runtime facts path (`runtime-facts-v1.jsonl`).
+        #[arg(long)]
+        facts: Option<PathBuf>,
+        /// Property spec as inline JSON.
+        #[arg(long, conflicts_with = "properties_file")]
+        properties: Option<String>,
+        /// Property spec file (bounded, regular-file validated).
+        #[arg(long, conflicts_with = "properties")]
+        properties_file: Option<PathBuf>,
+        /// Output as JSON.
+        #[arg(long, short = 'j', default_value = "false")]
+        json: bool,
+    },
+    /// Print the property-spec schema (truthful operator list, §49).
+    #[command(about = "Print Oracle property-spec schema")]
+    Schema,
+    /// Run Oracle micro-benchmarks (evaluator throughput).
+    #[command(about = "Run Oracle benchmarks")]
+    Benchmark,
 }
 
 /// Returns the WAL file path (env-overridable via `RUNTIMO_WAL_PATH`).
@@ -2930,9 +2979,378 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
         }
+        Commands::Oracle { command } => match command {
+            OracleCommand::Schema => {
+                print_oracle_schema();
+            }
+            OracleCommand::Benchmark => {
+                let report = runtimo_core::oracle::run_benchmarks();
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                    "parse_ms": report.parse_ms,
+                    "eval_ms_per_1k": report.eval_ms_per_1k,
+                    "eval_1k_ms": report.eval_1k_ms,
+                    "eval_10k_ms": report.eval_10k_ms,
+                    "eval_100k_ms": report.eval_100k_ms,
+                })).unwrap_or_else(|_| "benchmark error".to_string()));
+            }
+            OracleCommand::Evaluate {
+                wal,
+                bundle,
+                facts,
+                properties,
+                properties_file,
+                json,
+            } => {
+                std::process::exit(oracle_evaluate(wal, bundle, facts, properties, properties_file, json));
+            }
+        },
     }
 
     Ok(())
+}
+
+/// Oracle exit codes (§44): 0 Satisfied, 1 Violated, 2 property/eval error,
+/// 3 evidence/infrastructure error. Violated is a successful evaluation with
+/// a negative result — not a crash.
+fn oracle_evaluate(
+    wal: Option<PathBuf>,
+    bundle: Option<PathBuf>,
+    facts: Option<PathBuf>,
+    properties: Option<String>,
+    properties_file: Option<PathBuf>,
+    json: bool,
+) -> i32 {
+    use runtimo_core::oracle::{evaluate, parse_spec};
+    // Exactly one source.
+    let sources = [wal.is_some(), bundle.is_some(), facts.is_some()]
+        .iter()
+        .filter(|&&b| b)
+        .count();
+    if sources != 1 {
+        eprintln!("oracle evaluate: exactly one of --wal, --bundle, --facts is required");
+        return 3;
+    }
+    // Property inline XOR file (§43: bounded, regular-file validated, same parser).
+    let spec_str = match (properties, properties_file) {
+        (Some(s), None) => s,
+        (None, Some(p)) => {
+            let ctx = runtimo_core::validation::path::PathContext {
+                allowed_prefixes: RuntimoConfig::get_allowed_prefixes(),
+                require_exists: true,
+                require_file: true,
+            };
+            if let Err(e) = runtimo_core::validation::path::validate_path(
+                &p.to_string_lossy().to_string(),
+                &ctx,
+            ) {
+                eprintln!("oracle evaluate: invalid properties-file: {e}");
+                return 3;
+            }
+            match std::fs::read_to_string(&p) {
+                Ok(s) if s.len() <= 1_048_576 => s,
+                Ok(_) => {
+                    eprintln!("oracle evaluate: properties-file exceeds 1MB bound");
+                    return 3;
+                }
+                Err(e) => {
+                    eprintln!("oracle evaluate: cannot read properties-file: {e}");
+                    return 3;
+                }
+            }
+        }
+        _ => {
+            eprintln!("oracle evaluate: one of --properties or --properties-file is required");
+            return 2;
+        }
+    };
+    let spec = match parse_spec(&spec_str) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("oracle evaluate: property spec parse error: {e}");
+            return 2;
+        }
+    };
+
+    if let Some(facts_path) = facts {
+        return oracle_evaluate_facts(&facts_path, &spec, json);
+    }
+
+    // WAL vs bundle (§42): distinct evidence types. Raw WAL never gets
+    // Observe admissibility applied; bundles verify integrity separately
+    // and report it alongside (not conflated with) the property verdict.
+    let is_bundle = bundle.is_some();
+    let path = wal.or(bundle).unwrap();
+    let source_kind = if is_bundle { "bundle" } else { "wal" };
+    let reader = match WalReader::load_all(&path) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("oracle evaluate: cannot load {source_kind}: {e}");
+            return 3;
+        }
+    };
+    let events = reader.events();
+    let verdict = match evaluate(events, &spec) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("oracle evaluate: evaluation error: {e}");
+            return 2;
+        }
+    };
+    let code = match &verdict.verdict {
+        runtimo_core::oracle::Verdict::Satisfied => 0,
+        runtimo_core::oracle::Verdict::Violated => 1,
+        _ => 2,
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "property": verdict.name,
+                "verdict": format!("{:?}", verdict.verdict),
+                "detail": verdict.detail,
+                "source_kind": if is_bundle { "observe_bundle" } else { "wal" },
+                "selected_count": verdict.selected_count,
+                "evaluated_count": verdict.evaluated_count,
+                "matched_count": verdict.matched_count,
+            }))
+            .unwrap()
+        );
+    } else {
+        println!(
+            "oracle {}: {:?} — {} (selected={}, evaluated={}, matched={})",
+            verdict.name,
+            verdict.verdict,
+            verdict.detail,
+            verdict.selected_count,
+            verdict.evaluated_count,
+            verdict.matched_count
+        );
+    }
+    code
+}
+
+/// Facts source (§53-54): same selector/quantifier engine, separate field
+/// resolver over `RuntimeFactV1`. Absent `ObservedExec` is NOT proof of
+/// non-execution (`NOT OBSERVED != FALSE`).
+fn oracle_evaluate_facts(
+    facts_path: &std::path::Path,
+    spec: &runtimo_core::oracle::PropertySpec,
+    json: bool,
+) -> i32 {
+    use runtimo_core::oracle::{Op, Verdict};
+    let content = match std::fs::read_to_string(facts_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("oracle evaluate: cannot read facts: {e}");
+            return 3;
+        }
+    };
+    let mut records: Vec<serde_json::Value> = Vec::new();
+    for (n, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(v) => records.push(v),
+            Err(e) => {
+                eprintln!("oracle evaluate: facts line {}: parse error: {e}", n + 1);
+                return 3;
+            }
+        }
+    }
+    // Minimal fact-field resolver: family/run_id/provider/fidelity/
+    // observations/first_seen/last_seen/revision/process.pid/
+    // process.process_start_time/extra.<key>. Unknown field → Error.
+    fn fact_field(rec: &serde_json::Value, field: &str) -> Option<serde_json::Value> {
+        match field {
+            "family" => rec.get("family").cloned(),
+            "run_id" => rec.get("run_id").cloned(),
+            "provider" => rec.get("provider").cloned(),
+            "fidelity" => rec.get("fidelity").cloned(),
+            "observations" => rec.get("observations").cloned(),
+            "first_seen" => rec.get("first_seen").cloned(),
+            "last_seen" => rec.get("last_seen").cloned(),
+            "revision" => rec.get("revision").cloned(),
+            "process.pid" => rec.get("process_key").and_then(|k| k.get("pid")).cloned(),
+            "process.process_start_time" => rec
+                .get("process_key")
+                .and_then(|k| k.get("process_start_time"))
+                .cloned(),
+            _ if field.starts_with("extra.") => {
+                let key = &field["extra.".len()..];
+                rec.get("extra").and_then(|e| e.get(key)).cloned()
+            }
+            _ => None,
+        }
+    }
+    fn cmp(field_val: &serde_json::Value, op: &Op, pred_val: &serde_json::Value) -> Option<bool> {
+        match op {
+            Op::Eq => Some(field_val == pred_val),
+            Op::Neq => Some(field_val != pred_val),
+            Op::Gt | Op::Lt | Op::Gte | Op::Lte => {
+                let a = field_val.as_f64()?;
+                let b = pred_val.as_f64()?;
+                Some(match op {
+                    Op::Gt => a > b,
+                    Op::Lt => a < b,
+                    Op::Gte => a >= b,
+                    Op::Lte => a <= b,
+                    _ => return None,
+                })
+            }
+            _ => {
+                // Contains | Regex (substring) + future ops fail closed to None.
+                match op {
+                    Op::Contains | Op::Regex => {
+                        Some(field_val.as_str()?.contains(pred_val.as_str()?))
+                    }
+                    _ => None,
+                }
+            }
+        }
+    }
+    // Select (missing → filtered out), then quantifier.
+    let selected: Vec<&serde_json::Value> = records
+        .iter()
+        .filter(|r| {
+            spec.select.iter().all(|p| {
+                fact_field(r, &p.field)
+                    .and_then(|fv| cmp(&fv, &p.op, &p.value))
+                    .unwrap_or(false)
+            })
+        })
+        .collect();
+    let mut matched = 0usize;
+    for rec in &selected {
+        let mut ok = true;
+        for p in &spec.predicates {
+            match fact_field(rec, &p.field) {
+                Some(fv) => match cmp(&fv, &p.op, &p.value) {
+                    Some(true) => {}
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                },
+                None => {
+                    eprintln!("oracle evaluate: facts: unknown field '{}'", p.field);
+                    return 2;
+                }
+            }
+        }
+        if ok {
+            matched += 1;
+        }
+    }
+    let verdict = match &spec.quantifier {
+        runtimo_core::oracle::Quantifier::All => {
+            if matched == selected.len() {
+                Verdict::Satisfied
+            } else {
+                Verdict::Violated
+            }
+        }
+        runtimo_core::oracle::Quantifier::Exists => {
+            if matched >= 1 {
+                Verdict::Satisfied
+            } else {
+                Verdict::Violated
+            }
+        }
+        runtimo_core::oracle::Quantifier::None => {
+            if matched == 0 {
+                Verdict::Satisfied
+            } else {
+                Verdict::Violated
+            }
+        }
+        _ => {
+            // Count (struct variant) — threshold check.
+            match &spec.quantifier {
+                runtimo_core::oracle::Quantifier::Count { op, threshold } => {
+                    let a = matched as f64;
+                    let b = *threshold as f64;
+                    let ok = match op {
+                        Op::Gt => a > b,
+                        Op::Lt => a < b,
+                        Op::Gte => a >= b,
+                        Op::Lte => a <= b,
+                        Op::Eq => a == b,
+                        Op::Neq => a != b,
+                        _ => false,
+                    };
+                    if ok {
+                        Verdict::Satisfied
+                    } else {
+                        Verdict::Violated
+                    }
+                }
+                _ => Verdict::Error,
+            }
+        }
+    };
+    let code = match &verdict {
+        Verdict::Satisfied => 0,
+        Verdict::Violated => 1,
+        _ => 2,
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "property": spec.name,
+                "verdict": format!("{verdict:?}"),
+                "source_kind": "runtime_facts",
+                "selected_count": selected.len(),
+                "matched_count": matched,
+            }))
+            .unwrap()
+        );
+    } else {
+        println!(
+            "oracle {}: {:?} (facts selected={}, matched={})",
+            spec.name,
+            verdict,
+            selected.len(),
+            matched
+        );
+    }
+    code
+}
+
+/// Print the truthful property-spec schema (§49: `Regex` is substring).
+fn print_oracle_schema() {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "version": 2,
+            "legacy": {
+                "name": "string",
+                "predicates": [{"field": "string", "op": "Eq|Neq|Gt|Lt|Gte|Lte|Contains|Regex", "value": "json"}],
+                "semantics": "ALL events satisfy ALL predicates; empty predicates => Satisfied; empty events + non-empty predicates => vacuously Satisfied (legacy)"
+            },
+            "v2_additive": {
+                "select": "optional ANDed pre-filter (missing field => filtered out, never UnknownField)",
+                "quantifier": "all (default, legacy) | exists | none | {count: {op, threshold}}",
+                "version": "optional 1|2",
+                "counts": "selected_count/evaluated_count/matched_count always reported; zero matches never hidden"
+            },
+            "fields": {
+                "event": ["event_type", "job_id", "seq", "capability", "error", "output.<key>", "watermark(bundle-metadata-only=>Error)"],
+                "safety": ["safety.semantic_policy", "safety.dal", "safety.llmosafe_status", "safety.runtimo_disposition", "safety.input_class", "safety.analysis_kind", "safety.provenance_consistent", "safety.no_evidence", "safety.stages_executed", "safety.oov_ratio", "safety.detection_flags", "safety.body_pressure", "safety.schema_version", "safety.field_id"],
+                "facts": ["family", "run_id", "provider", "fidelity", "observations", "first_seen", "last_seen", "revision", "process.pid", "process.process_start_time", "extra.<key>"]
+            },
+            "operators": {
+                "Regex": "SUBSTRING match (std only, no regex crate) — legacy semantics preserved; use a distinct operator + dependency for true regex",
+                "Contains": "substring",
+                "note": "Count op must be numeric (Gt/Lt/Gte/Lte/Eq/Neq)"
+            },
+            "exit_codes": {"0": "Satisfied", "1": "Violated", "2": "property/eval error", "3": "evidence/infrastructure error"},
+            "sources": {"wal": "raw WAL, no admissibility", "bundle": "observe bundle, integrity reported separately", "facts": "runtime-facts-v1.jsonl; NOT OBSERVED != FALSE"}
+        }))
+        .unwrap()
+    );
 }
 
 #[cfg(test)]
