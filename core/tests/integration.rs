@@ -1319,17 +1319,25 @@ fn test_dal_e_permissive_mode() {
 }
 
 #[test]
-fn test_dal_a_shell_exec_cognitive_safety() {
+fn test_dal_a_shell_exec_safety_path() {
+    // Path-sensitive replacement for the old false-positive
+    // `test_dal_a_shell_exec_cognitive_safety` (§23): the old test claimed
+    // "ShellExec now goes through cognitive pipeline" while
+    // `skip_cognitive = cap_name == "ShellExec"` bypassed it, passing on
+    // bare `echo succeeds + JobCompleted`.
+    //
+    // Truthful contract (§22, decided from conformance): ShellExec.cmd is
+    // CommandControl / sifter-ineligible → ResourceOnly assessment +
+    // deterministic blocklist enforcement (Observe-equivalent). This test
+    // proves the PATH, not just the end state.
     let _guard = ENV_GUARD.lock().unwrap();
     let dir = setup();
     let wp = wal_path(&dir);
 
-    // Set env var RUNTIMO_DAL=A (aggressive mode)
     std::env::set_var("RUNTIMO_DAL", "A");
+    std::env::set_var("RUNTIMO_SEMANTIC_POLICY", "corroborate");
+    std::env::set_var("RUNTIMO_MEMORY_CEILING_BYTES", "34000000000");
 
-    // ShellExec now goes through cognitive pipeline (COGNITIVE_SAFETY_SKIP
-    // was removed). The sifter + detectors run against the cmd input.
-    // A benign echo command should pass even under DAL=A.
     let result = execute_with_telemetry(
         &ShellExec,
         &json!({ "cmd": "echo 'hello world'" }),
@@ -1338,28 +1346,43 @@ fn test_dal_a_shell_exec_cognitive_safety() {
     );
 
     std::env::remove_var("RUNTIMO_DAL");
+    std::env::remove_var("RUNTIMO_SEMANTIC_POLICY");
+    std::env::remove_var("RUNTIMO_MEMORY_CEILING_BYTES");
 
-    // Should pass — cognitive pipeline detects manipulation patterns,
-    // not harmless echo commands.
-    assert!(
-        result.is_ok(),
-        "ShellExec cognitive safety failed: {:?}",
-        result.err()
-    );
+    assert!(result.is_ok(), "ShellExec failed: {:?}", result.err());
     let exec_res = result.unwrap();
     assert!(exec_res.success, "ShellExec should execute successfully");
 
-    // Verify WAL has JobCompleted event (not JobFailed)
     let reader = WalReader::load(&wp).expect("read");
     let events = reader.events();
 
-    let has_completed = events
+    // 1. SafetyEvaluated exists for this job.
+    let safety_ev: Vec<_> = events
         .iter()
-        .any(|e| matches!(e.event_type, WalEventType::JobCompleted));
-    assert!(
-        has_completed,
-        "Should have JobCompleted event for ShellExec"
+        .filter(|e| matches!(e.event_type, WalEventType::SafetyEvaluated))
+        .collect();
+    assert_eq!(safety_ev.len(), 1, "exactly one SafetyEvaluated, got {}", safety_ev.len());
+    let assessment = safety_ev[0].safety.as_ref().expect("SafetyEvaluated carries record");
+
+    // 2. Analysis mode is resource-only (ShellExec command path).
+    assert_eq!(assessment.analysis_kind, runtimo_core::AnalysisKind::ResourceOnly);
+    // 3. Input class is command_control, not natural language.
+    assert_eq!(assessment.input_class, runtimo_core::InputClass::CommandControl);
+    // 4. Disposition is allow (deterministic policy owns enforcement).
+    assert_eq!(
+        assessment.runtimo_disposition,
+        runtimo_core::RuntimoDisposition::Allow
     );
+    // 5. Stages executed is empty (no sifter run claimed).
+    assert_eq!(assessment.stages_executed, 0);
+
+    // 6. Only then JobStarted → JobCompleted ordering.
+    let started = events.iter().position(|e| matches!(e.event_type, WalEventType::JobStarted));
+    let completed = events.iter().position(|e| matches!(e.event_type, WalEventType::JobCompleted));
+    assert!(started.is_some() && completed.is_some());
+    assert!(started.unwrap() < completed.unwrap());
+    let safety_pos = events.iter().position(|e| matches!(e.event_type, WalEventType::SafetyEvaluated)).unwrap();
+    assert!(started.unwrap() < safety_pos && safety_pos < completed.unwrap(), "SafetyEvaluated before side-effect completion");
 
     cleanup(&dir);
 }

@@ -63,6 +63,21 @@ fn semantic_policy_from_str(s: &str) -> SemanticPolicy {
     }
 }
 
+/// Narrow deterministic-test seam (§68): `RUNTIMO_TEST_PRESSURE`.
+///
+/// When set to `0`-`100`, `check()` and `assess()` use it instead of a live
+/// measurement. Production never sets it (unset → single live upstream
+/// observation per call). Lets tests pin Nominal (e.g. `10`) or denial
+/// (e.g. `90`) without a DI framework and without the upstream `testing`
+/// feature (which would leak test constructors into the production build).
+/// Out-of-range/unparseable values are ignored (live measurement used).
+fn test_pressure_override() -> Option<u8> {
+    std::env::var("RUNTIMO_TEST_PRESSURE")
+        .ok()
+        .and_then(|v| v.parse::<u8>().ok())
+        .filter(|&p| p <= 100)
+}
+
 /// Wraps [`llmosafe::ResourceGuard`] with an [`EscalationPolicy`].
 ///
 /// `check()` performs exactly one upstream observation per call
@@ -126,10 +141,20 @@ impl LlmoSafeGuard {
     /// measurement, and a pass never reflects a persisted cooldown
     /// without data (vacuous-restore eliminated by construction).
     ///
+    /// When `RUNTIMO_TEST_PRESSURE` is set, it replaces the live reading
+    /// (both the `>80` gate and the guard decision are derived from it:
+    /// `>80` denies, otherwise passes without a live `/proc` read).
+    ///
     /// # Errors
     /// Returns a message when instantaneous pressure exceeds 80% or the
     /// upstream guard reports exhaustion.
     pub fn check(&self) -> Result<(), String> {
+        if let Some(p) = test_pressure_override() {
+            if p > 80 {
+                return Err(format!("Resource pressure at {p}% (ceiling: 80%, test override)"));
+            }
+            return Ok(());
+        }
         let pressure = self.guard.pressure();
         if pressure > 80 {
             return Err(format!("Resource pressure at {pressure}% (ceiling: 80%)"));
@@ -195,6 +220,14 @@ impl LlmoSafeGuard {
         self.guard.pressure()
     }
 
+    /// Effective pressure: test override when set, else live reading.
+    /// `pub(crate)` — executor + tests use this so deterministic suites
+    /// pin Nominal without touching production live path (unset → live).
+    #[must_use]
+    pub(crate) fn effective_pressure(&self) -> u8 {
+        test_pressure_override().unwrap_or_else(|| self.guard.pressure())
+    }
+
     /// Creates a safety context for tracking decisions across an execution.
     #[must_use]
     pub fn safety_context(&self) -> SafetyContext {
@@ -243,7 +276,7 @@ impl LlmoSafeGuard {
         field_id: &str,
         input_class: InputClass,
     ) -> Result<SafetyAssessmentV1, AssessmentError> {
-        let pressure = self.guard.pressure();
+        let pressure = test_pressure_override().unwrap_or_else(|| self.guard.pressure());
         safety::assess_one_shot(&self.policy, observation, field_id, input_class, Some(pressure))
     }
 

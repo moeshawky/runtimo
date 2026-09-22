@@ -496,7 +496,7 @@ pub fn execute_with_telemetry_and_session(
                 field,
                 guard.semantic_policy(),
                 guard.dal(),
-                Some(guard.pressure()),
+                Some(guard.effective_pressure()),
             ))
         })
     };
