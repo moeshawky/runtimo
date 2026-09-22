@@ -99,44 +99,32 @@ pub enum SymbolUidResolution {
 ///
 /// # No Codegraph Import
 ///
-/// This function does **not** import Codegraph. When Codegraph is not
-/// available (the default for export without Codegraph integration),
-/// the resolution returns [`SymbolUidResolution::Unresolved`].
+/// This function does **not** import Codegraph and never fabricates a
+/// `SymbolUID`. Both branches return [`SymbolUidResolution::Unresolved`]:
+/// a real resolver would return `Resolved(real SymbolUID)`; with no real
+/// resolver wired, the truthful result is `Unresolved` with a reason.
+/// Fabricating a deterministic `file:line:kind` identity from locator data
+/// (the old `codegraph_available=true` path) violated evidence custody
+/// (§56) and has been removed.
 ///
 /// # Arguments
 /// * `locator` — The runtime locator to resolve.
-/// * `codegraph_available` — Whether Codegraph is available for resolution.
+/// * `codegraph_available` — Reserved for a future real resolver wiring.
+///   Currently ignored (both values yield `Unresolved`); kept for
+///   backwards-compatible call sites.
 ///
 /// # Returns
-/// * `SymbolUidResolution::Resolved` if Codegraph is available and the
-///   locator resolves to a symbol.
-/// * `SymbolUidResolution::Unresolved` if Codegraph is unavailable or
-///   the locator cannot be resolved.
+/// * `SymbolUidResolution::Unresolved` always (until a real resolver lands).
 #[must_use]
 pub fn resolve_locator(locator: &RuntimeLocator, codegraph_available: bool) -> SymbolUidResolution {
-    if codegraph_available {
-        // Codegraph is available — resolve the locator.
-        // In a real integration, this would call into Codegraph's
-        // symbol resolution API. Here we produce a deterministic
-        // SymbolUID from the locator's file and line.
-        let file = locator.file().unwrap_or("unknown").to_string();
-        let line = locator.line().unwrap_or(0);
-        let kind = match locator {
-            RuntimeLocator::Python { .. }
-            | RuntimeLocator::Jvm { .. }
-            | RuntimeLocator::DotNet { .. } => "method",
-            RuntimeLocator::Native { .. } | RuntimeLocator::JsTs { .. } => "function",
-        };
-        let uid = format!("{}:{}:{}", file, line, kind);
-        SymbolUidResolution::Resolved {
-            symbol_uid: SymbolUID::new(uid, kind.to_string(), file, line),
-        }
+    let reason = if codegraph_available {
+        "Codegraph resolver not wired — no real SymbolUID available; refusing to fabricate identity (§56)"
     } else {
-        // Codegraph unavailable — return Unresolved with documented reason.
-        SymbolUidResolution::Unresolved {
-            locator: locator.clone(),
-            reason: "Codegraph unavailable — export works without Codegraph; locator documented but not resolved".to_string(),
-        }
+        "Codegraph unavailable — export works without Codegraph; locator documented but not resolved"
+    };
+    SymbolUidResolution::Unresolved {
+        locator: locator.clone(),
+        reason: reason.to_string(),
     }
 }
 
@@ -405,18 +393,22 @@ mod tests {
     }
 
     #[test]
-    fn resolve_locator_returns_resolved_with_codegraph() {
+    fn resolve_locator_never_fabricates() {
+        // §56: no real resolver wired → Unresolved even when the flag is true.
+        // Fabricating `file:line:kind` identity is banned evidence custody.
         let locator = RuntimeLocator::Python {
             module: "runtimo".to_string(),
             qualname: "run".to_string(),
             file: "/src/runtimo.py".to_string(),
             line: 10,
         };
-        let resolution = resolve_locator(&locator, true);
-        assert!(
-            matches!(resolution, SymbolUidResolution::Resolved { .. }),
-            "Should be Resolved when Codegraph is available"
-        );
+        for flag in [true, false] {
+            let resolution = resolve_locator(&locator, flag);
+            assert!(
+                matches!(resolution, SymbolUidResolution::Unresolved { .. }),
+                "must be Unresolved (no real resolver), flag={flag}"
+            );
+        }
     }
 
     #[test]
