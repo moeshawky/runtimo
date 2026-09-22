@@ -137,11 +137,13 @@ runtimo processes
 │ 2. ProcessSnapshot::capture()   — process list with PPIDs      │
 │ 3. LlmoSafeGuard::check()       — resource guard (80% ceiling) │
 │ 4. WalWriter::append(Started)   — WAL event (fsync)            │
-│ 5. capability.validate()        — schema + path checks         │
-│ 6. capability.execute()         — run the capability           │
-│ 7. Telemetry::capture()         — after snapshot               │
-│ 8. ProcessSnapshot::capture()   — after snapshot               │
-│ 9. WalWriter::append(Completed) — WAL event (fsync)            │
+│ 5. Safety assessment            — LLMOSafe 0.9 boundary        │
+│ 6. WalWriter::append(SafetyEval) — typed safety evidence       │
+│ 7. capability.validate()        — schema + path checks         │
+│ 8. capability.execute()         — run the capability           │
+│ 9. Telemetry::capture()         — after snapshot               │
+│ 10. ProcessSnapshot::capture()  — after snapshot               │
+│ 11. WalWriter::append(Completed) — WAL event (fsync)           │
 │                                                                │
 │ Returns: ExecutionResult with before/after telemetry           │
 └────────────────────────────────────────────────────────────────┘
@@ -298,7 +300,7 @@ runtimo run -c GitExec -a '{"operation":"clone","url":"https://github.com/user/r
 |-------|-----------|--------------|
 | **Path validation** | `validate_path()` | Rejects traversal (`..`), null bytes, non-ASCII, symlink escapes. Enforces allowed prefix whitelist (`/tmp`, `/var/tmp` + config). |
 | **Critical file deny** | `is_critical_file()` | Blocks `.bashrc`, `.ssh/authorized_keys`, `.gitconfig`, `.netrc`, etc. |
-| **Resource guard** | `LlmoSafeGuard` | Reads `/proc/stat` + `/proc/self/status`. Rejects execution when pressure > 80%. Rolling average over 30s. Cooldown persists across restarts. |
+| **Resource guard** | `LlmoSafeGuard` | Single fresh upstream resource observation per call. Rejects execution when pressure > 80%. |
 | **Zombie guard** | Executor pre-check | Rejects execution if zombie count > 10. |
 | **Args size guard** | Executor pre-check | Rejects capability arguments > 1 MB. |
 | **Disk space check** | `check_disk_space()` | Runs `df -B1`, parses header-aware "Available" column. Requires 10 MB free. |
@@ -336,7 +338,8 @@ All events written to append-only JSONL with fsync:
 
 | Event Type | When |
 |------------|------|
-| `job_started` | Before validation |
+| `job_started` | Before all execution gates |
+| `safety_evaluated` | After safety assessment, before governed side effect |
 | `job_completed` | After successful execution |
 | `job_failed` | On validation or execution failure |
 | `command_executed` | (Debug builds only) Shell command with stdout/stderr/exit code |
@@ -618,7 +621,10 @@ cargo clippy --all-targets          # zero warnings required
 | `XDG_DATA_HOME` | `~/.local/share` | Default WAL/backup/session root |
 | `RUNTIMO_ENABLE_PUBLIC_IP` | (unset) | Set to `1` to enable public IP discovery in telemetry |
 | `RUNTIMO_ENABLE_NETWORK` | (unset) | Set to `1` to allow outbound network tools (curl, wget, ssh, etc.) in ShellExec |
-| `RUNTIMO_DAL` | (unset = A) | Design Assurance Level for cognitive safety pipeline (A-E). A=strict, E=permissive. Also configurable via `runtimo config dal` or config file `dal` field. |
+| `RUNTIMO_DAL` | (unset = A) | Design Assurance Level for safety assessment (A-E). A=strict, E=permissive. Also configurable via `runtimo config dal` or config file `dal` field. |
+| `RUNTIMO_SEMANTIC_POLICY` | (unset = corroborate) | Semantic authority mode: `observe`, `corroborate`, or `enforce`. Orthogonal to DAL. |
+| `RUNTIMO_TEST_PRESSURE` | (unset = live) | Deterministic test seam: pin pressure 0-100 (e.g. `10`=nominal, `90`=denial). Production never sets. |
+| `RUNTIMO_MEMORY_CEILING_BYTES` | (unset = auto) | Deterministic test seam: explicit memory ceiling in bytes, replaces auto-detected ceiling. |
 | `RUNTIMO_OBSERVE_SAMPLE_HZ` | `50` | Observe samples per second; precedence CLI `--sample-rate-hz` > env > `observe.sample_rate_hz` file > 50 (`core/src/config.rs`). Malformed env falls through to file. |
 | `RUNTIMO_STATE_DIR` | `$XDG_DATA_HOME/runtimo` | Override state directory for WAL/backups/sessions |
 

@@ -18,14 +18,19 @@ use llmosafe::{EscalationPolicy, SafetyDecision, SemanticPolicy};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
+use std::fmt::Write;
 
 // ---------------------------------------------------------------------------
 // Input semantics (§16-17): control plane vs payload plane
 // ---------------------------------------------------------------------------
 
 /// Semantic class of a single capability field.
+///
+/// Closed set: adding variants requires updating field tables, eval logic,
+/// and serialization tests across the workspace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(clippy::exhaustive_enums)]
 pub enum InputClass {
     /// Natural-language instruction with execution authority
     /// (agent objective / instruction, if present at this boundary).
@@ -78,8 +83,12 @@ impl InputClass {
 }
 
 /// What kind of analysis produced an assessment.
+///
+/// Closed set: both variants are handled exhaustively by the evaluation
+/// and reporting paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(clippy::exhaustive_enums)]
 pub enum AnalysisKind {
     /// One-shot sifter assessment (no durable pipeline state).
     /// Truthful: `stages_executed` = sifter only.
@@ -108,8 +117,12 @@ impl AnalysisKind {
 /// Separate from [`SafetyDecision`]: LLMOSafe produces evidence + decision,
 /// Runtimo maps it to a side-effect permission. `Escalate` never silently
 /// becomes `Allow` or `Halt`.
+///
+/// Closed set: all variants are handled by `permits_execution`, `as_str`,
+/// and the disposition mapping functions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(clippy::exhaustive_enums)]
 pub enum RuntimoDisposition {
     /// Execute now.
     Allow,
@@ -175,7 +188,10 @@ pub const fn disposition_for(decision: &SafetyDecision) -> RuntimoDisposition {
 // ---------------------------------------------------------------------------
 
 /// Why a semantic assessment could not complete.
+///
+/// Closed set: sifter errors map to one of these two outcomes.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::exhaustive_enums)]
 pub enum AssessmentError {
     /// Upstream work budget exhausted (`SiftError::ResourceExhaustion`).
     /// Never maps to `Proceed`.
@@ -206,7 +222,12 @@ pub const SAFETY_SCHEMA_VERSION: u32 = 1;
 ///
 /// Only fields with consumers. No raw prompt/command/content —
 /// correlation uses `input_hash` + `field_id` + `input_len` + `input_class`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+///
+/// Multiple bool fields are intentional: each represents a distinct piece
+/// of provenance or evidence that consumers inspect independently.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[allow(clippy::exhaustive_structs)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct SafetyAssessmentV1 {
     /// Schema version (`SAFETY_SCHEMA_VERSION`).
     pub schema_version: u32,
@@ -269,7 +290,7 @@ pub struct SafetyAssessmentV1 {
 impl SafetyAssessmentV1 {
     /// Did the boundary detect provenance inconsistency?
     #[must_use]
-    pub const fn has_provenance_mismatch(self: &Self) -> bool {
+    pub const fn has_provenance_mismatch(&self) -> bool {
         !self.provenance_consistent
     }
 }
@@ -278,7 +299,12 @@ impl SafetyAssessmentV1 {
 #[must_use]
 pub fn hash_input(input: &str) -> String {
     let digest = Sha256::digest(input.as_bytes());
-    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    // Safe: digest is fixed-size 32 bytes, capacity = 64 chars, no overflow possible.
+    #[allow(clippy::arithmetic_side_effects)]
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for b in &digest {
+        let _ = write!(hex, "{b:02x}");
+    }
     hex[..16].to_string()
 }
 
@@ -290,12 +316,12 @@ pub fn hash_input(input: &str) -> String {
 /// Never rewrites upstream evidence — returns `false` on mismatch and
 /// the caller records/reports it while enforcing from the canonical path.
 #[must_use]
-pub fn provenance_consistent(
-    decision: &SafetyDecision,
-    provenance: &DecisionProvenance,
-) -> bool {
+pub fn provenance_consistent(decision: &SafetyDecision, provenance: &DecisionProvenance) -> bool {
     let expected_label = decision.status_label();
-    if !provenance.decision_label.eq_ignore_ascii_case(expected_label) {
+    if !provenance
+        .decision_label
+        .eq_ignore_ascii_case(expected_label)
+    {
         return false;
     }
     // Hard-invariant must only accompany Halt/Exit-class outcomes.
@@ -304,9 +330,7 @@ pub fn provenance_consistent(
     if provenance.hard_invariant
         && matches!(
             decision,
-            SafetyDecision::Proceed
-                | SafetyDecision::Warn(_)
-                | SafetyDecision::Escalate { .. }
+            SafetyDecision::Proceed | SafetyDecision::Warn(_) | SafetyDecision::Escalate { .. }
         )
     {
         return false;
@@ -338,6 +362,12 @@ pub fn provenance_consistent(
 ///   from the crate (`decide_with_pressure`), never reconstructed.
 /// - Provenance is preserved + consistency-validated; enforcement uses
 ///   only the canonical `SafetyDecision`.
+///
+/// # Errors
+///
+/// Returns [`AssessmentError::WorkBudgetExhausted`] if the sifter exceeds
+/// its work budget, or [`AssessmentError::AnalysisFailed`] for any other
+/// sifter failure. Never returns `Ok(Proceed)` on error.
 #[allow(clippy::too_many_arguments)]
 pub fn assess_one_shot(
     policy: &EscalationPolicy,
@@ -510,7 +540,11 @@ pub fn resource_only_assessment(
 
 /// A single assessable field: its key, semantic class, and whether the
 /// sifter should see it.
+///
+/// Closed set of fields per capability: adding variants requires updating
+/// the per-capability field tables and coverage tests.
 #[derive(Debug, Clone, Copy)]
+#[allow(clippy::exhaustive_structs)]
 pub struct FieldSemantics {
     /// JSON arg key (e.g. `"content"`).
     pub field: &'static str,
@@ -526,6 +560,7 @@ pub struct FieldSemantics {
 ///
 /// Exhaustive over registered capabilities. Tests fail when a new
 /// capability lacks classification (`capability_coverage` test).
+#[must_use]
 pub fn fields_for(cap_name: &str) -> &'static [FieldSemantics] {
     match cap_name {
         // ShellExec.cmd = command/control syntax — NOT natural-language
@@ -552,13 +587,7 @@ pub fn fields_for(cap_name: &str) -> &'static [FieldSemantics] {
                 sifter_eligible: false,
             },
         ],
-        "FileRead" => &[FieldSemantics {
-            field: "path",
-            class: InputClass::FilesystemLocator,
-            is_control: false,
-            sifter_eligible: false,
-        }],
-        "Delete" => &[FieldSemantics {
+        "FileRead" | "Delete" => &[FieldSemantics {
             field: "path",
             class: InputClass::FilesystemLocator,
             is_control: false,

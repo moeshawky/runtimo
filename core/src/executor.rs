@@ -465,7 +465,10 @@ pub fn execute_with_telemetry_and_session(
                 }
                 Err(e) => {
                     // Fail closed (§20): analysis inability never Proceeds.
-                    let msg = format!("Safety analysis failed for '{field}': {e}", field = fs.field);
+                    let msg = format!(
+                        "Safety analysis failed for '{field}': {e}",
+                        field = fs.field
+                    );
                     let telemetry_after = fresh_telemetry_after(telemetry_on);
                     let process_after = fresh_process_after();
                     let _ = log_job_failed_with_snapshots(
@@ -486,11 +489,8 @@ pub fn execute_with_telemetry_and_session(
         }
         // No eligible semantic field → resource-only (truthful, not skipped).
         winning.or_else(|| {
-            let class = fields
-                .first()
-                .map(|f| f.class)
-                .unwrap_or(InputClass::OpaqueData);
-            let field = fields.first().map(|f| f.field).unwrap_or("-");
+            let class = fields.first().map_or(InputClass::OpaqueData, |f| f.class);
+            let field = fields.first().map_or("-", |f| f.field);
             Some(safety::resource_only_assessment(
                 class,
                 field,

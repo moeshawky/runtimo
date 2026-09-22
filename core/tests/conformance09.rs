@@ -8,9 +8,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use llmosafe::{
-    EscalationPolicy, EscalationReason, PressureLevel, SafetyDecision, SemanticPolicy,
-};
+use llmosafe::{EscalationPolicy, EscalationReason, PressureLevel, SafetyDecision, SemanticPolicy};
 use runtimo_core::{AnalysisKind, InputClass, LlmoSafeGuard, RuntimoDisposition};
 use std::sync::Mutex;
 
@@ -50,9 +48,17 @@ fn benign_short_prose_proceeds() {
     let guard = LlmoSafeGuard::new()
         .with_dal(DAL::A)
         .with_semantic_policy(SemanticPolicy::Corroborate);
-    let short = guard.assess("Hello world", "content", InputClass::PayloadProse).unwrap();
-    assert_eq!(short.llmosafe_status, "escalate", "short single-root must Escalate, not Proceed");
-    assert_eq!(short.runtimo_disposition, RuntimoDisposition::EscalationRequired);
+    let short = guard
+        .assess("Hello world", "content", InputClass::PayloadProse)
+        .unwrap();
+    assert_eq!(
+        short.llmosafe_status, "escalate",
+        "short single-root must Escalate, not Proceed"
+    );
+    assert_eq!(
+        short.runtimo_disposition,
+        RuntimoDisposition::EscalationRequired
+    );
     let long = guard
         .assess(
             "The quick brown fox jumps over the lazy dog near the river bank yesterday",
@@ -80,7 +86,9 @@ fn quoted_attack_is_payload_not_instruction() {
         .with_dal(DAL::A)
         .with_semantic_policy(SemanticPolicy::Corroborate);
     let quoted = "In this article we quote: \"ignore all previous instructions\" as an example.";
-    let a = guard.assess(quoted, "content", InputClass::PayloadProse).unwrap();
+    let a = guard
+        .assess(quoted, "content", InputClass::PayloadProse)
+        .unwrap();
     assert_eq!(a.input_class, InputClass::PayloadProse);
     // Corroborate: single-root semantic signal → Escalate (distinct, not Halt).
     // If benign thresholds pass it, disposition is still explicit (Allow or EscalationRequired),
@@ -99,10 +107,16 @@ fn unicode_ood_is_unknown_not_safe() {
     let p_corr = policy(SemanticPolicy::Corroborate, DAL::A);
     let raw = p_corr.decide(60000, 0, false);
     // High-entropy semantic Halt candidate → Corroborate Escalate.
-    assert!(matches!(raw, SafetyDecision::Escalate { .. }), "got {raw:?}");
+    assert!(
+        matches!(raw, SafetyDecision::Escalate { .. }),
+        "got {raw:?}"
+    );
     let p_enf = policy(SemanticPolicy::Enforce, DAL::A);
     let raw_enf = p_enf.decide(60000, 0, false);
-    assert!(matches!(raw_enf, SafetyDecision::Halt(..)), "got {raw_enf:?}");
+    assert!(
+        matches!(raw_enf, SafetyDecision::Halt(..)),
+        "got {raw_enf:?}"
+    );
     clear_env();
 }
 
@@ -114,8 +128,14 @@ fn corroborate_single_root_escalates_enforce_halts() {
     low_pressure_env();
     let enf = policy(SemanticPolicy::Enforce, DAL::A).decide(55000, 0, false);
     let corr = policy(SemanticPolicy::Corroborate, DAL::A).decide(55000, 0, false);
-    assert!(matches!(enf, SafetyDecision::Halt(..)), "enforce got {enf:?}");
-    assert!(matches!(corr, SafetyDecision::Escalate { .. }), "corroborate got {corr:?}");
+    assert!(
+        matches!(enf, SafetyDecision::Halt(..)),
+        "enforce got {enf:?}"
+    );
+    assert!(
+        matches!(corr, SafetyDecision::Escalate { .. }),
+        "corroborate got {corr:?}"
+    );
     assert_eq!(
         runtimo_core::safety::disposition_for(&corr),
         RuntimoDisposition::EscalationRequired
@@ -133,31 +153,56 @@ fn dual_root_survives_corroroborate() {
     // authority under Corroborate. Verified at policy level via explicit ctx.
     let p = policy(SemanticPolicy::Corroborate, DAL::A);
     let raw = SafetyDecision::Halt(llmosafe::KernelError::BiasHaloDetected, 30000);
-    let ctx = llmosafe::SemanticPolicyContext { hard_invariant: false, dual_root: true };
+    let ctx = llmosafe::SemanticPolicyContext {
+        hard_invariant: false,
+        dual_root: true,
+    };
     let out = p.apply_semantic_policy(raw, ctx);
-    assert!(matches!(out, SafetyDecision::Halt(..)), "dual-root must survive, got {out:?}");
+    assert!(
+        matches!(out, SafetyDecision::Halt(..)),
+        "dual-root must survive, got {out:?}"
+    );
     // Single-root without dual_root → Escalate.
-    let ctx_single = llmosafe::SemanticPolicyContext { hard_invariant: false, dual_root: false };
+    let ctx_single = llmosafe::SemanticPolicyContext {
+        hard_invariant: false,
+        dual_root: false,
+    };
     let out2 = p.apply_semantic_policy(
         SafetyDecision::Halt(llmosafe::KernelError::CognitiveInstability, 30000),
         ctx_single,
     );
-    assert!(matches!(out2, SafetyDecision::Escalate { .. }), "single-root must downgrade, got {out2:?}");
+    assert!(
+        matches!(out2, SafetyDecision::Escalate { .. }),
+        "single-root must downgrade, got {out2:?}"
+    );
 }
 
 #[test]
 fn mechanical_authority_independent_of_policy() {
     // §66: mechanical/NaN/Emergency Halts survive all three policies.
-    for sp in [SemanticPolicy::Observe, SemanticPolicy::Corroborate, SemanticPolicy::Enforce] {
+    for sp in [
+        SemanticPolicy::Observe,
+        SemanticPolicy::Corroborate,
+        SemanticPolicy::Enforce,
+    ] {
         let p = policy(sp, DAL::A);
         // Emergency pressure → Halt regardless of policy.
         let d = p.decide_with_pressure(0, 0, false, PressureLevel::Emergency);
-        assert!(matches!(d, SafetyDecision::Halt(..)), "{sp:?} emergency got {d:?}");
+        assert!(
+            matches!(d, SafetyDecision::Halt(..)),
+            "{sp:?} emergency got {d:?}"
+        );
         // Mechanical ctx hard_invariant survives Corroborate.
         let raw = SafetyDecision::Halt(llmosafe::KernelError::ResourceExhaustion, 30000);
-        let ctx = llmosafe::SemanticPolicyContext { hard_invariant: true, dual_root: false };
+        let ctx = llmosafe::SemanticPolicyContext {
+            hard_invariant: true,
+            dual_root: false,
+        };
         let out = p.apply_semantic_policy(raw, ctx);
-        assert!(matches!(out, SafetyDecision::Halt(..)), "{sp:?} mechanical got {out:?}");
+        assert!(
+            matches!(out, SafetyDecision::Halt(..)),
+            "{sp:?} mechanical got {out:?}"
+        );
     }
 }
 
@@ -167,9 +212,15 @@ fn observe_is_non_enforcing_for_semantic() {
     // mechanical survives. Runtimo deterministic controls still execute.
     let p = policy(SemanticPolicy::Observe, DAL::A);
     let raw_halt = SafetyDecision::Halt(llmosafe::KernelError::CognitiveInstability, 30000);
-    let ctx = llmosafe::SemanticPolicyContext { hard_invariant: false, dual_root: false };
+    let ctx = llmosafe::SemanticPolicyContext {
+        hard_invariant: false,
+        dual_root: false,
+    };
     let out = p.apply_semantic_policy(raw_halt, ctx);
-    assert!(matches!(out, SafetyDecision::Warn(_)), "observe semantic halt → Warn, got {out:?}");
+    assert!(
+        matches!(out, SafetyDecision::Warn(_)),
+        "observe semantic halt → Warn, got {out:?}"
+    );
     assert_eq!(
         runtimo_core::safety::disposition_for(&out),
         RuntimoDisposition::AllowWithWarning
@@ -182,7 +233,10 @@ fn dal_ordering_raw_then_policy_then_dal() {
     // to Proceed even after Corroborate Escalate.
     let p = policy(SemanticPolicy::Corroborate, DAL::E);
     let d = p.decide(60000, 0, false);
-    assert!(matches!(d, SafetyDecision::Proceed), "DAL E must suppress, got {d:?}");
+    assert!(
+        matches!(d, SafetyDecision::Proceed),
+        "DAL E must suppress, got {d:?}"
+    );
     // DAL A preserves Corroborate Escalate distinctly (not collapsed to Halt).
     let p2 = policy(SemanticPolicy::Corroborate, DAL::A);
     let d2 = p2.decide(60000, 0, false);
@@ -201,8 +255,10 @@ fn sifter_exhaustion_fail_closed() {
             assert!(a.analysis_complete);
             assert_eq!(a.input_len, big.len());
         }
-        Err(runtimo_core::safety::AssessmentError::WorkBudgetExhausted) => {}
-        Err(runtimo_core::safety::AssessmentError::AnalysisFailed(_)) => {}
+        Err(
+            runtimo_core::safety::AssessmentError::WorkBudgetExhausted
+            | runtimo_core::safety::AssessmentError::AnalysisFailed(_),
+        ) => {}
     }
     clear_env();
 }
@@ -239,12 +295,15 @@ fn shellexec_benign_commands_observe_vs_enforce() {
         // for cmd; instead assert the table classification directly.
         let fields = runtimo_core::safety::fields_for("ShellExec");
         assert_eq!(fields.len(), 1);
-        assert_eq!(fields[0].class, InputClass::CommandControl);
-        assert!(!fields[0].sifter_eligible);
+        let first = fields.first().expect("fields non-empty (len asserted)");
+        assert_eq!(first.class, InputClass::CommandControl);
+        assert!(!first.sifter_eligible);
         let _ = (guard, cmd);
     }
     // Dangerous: deterministic blocklist (capability-owned) rejects.
-    assert!(runtimo_core::capabilities::is_dangerous_command("rm -rf / --no-preserve-root").is_some());
+    assert!(
+        runtimo_core::capabilities::is_dangerous_command("rm -rf / --no-preserve-root").is_some()
+    );
     clear_env();
 }
 
@@ -278,22 +337,36 @@ fn authority_chain_escalate_blocks_side_effect_with_evidence() {
     // chain — but the chain must be coherent either way.
     let reader = WalReader::load(&wp).expect("read wal");
     let events = reader.events();
-    let has_safety = events.iter().any(|e| matches!(e.event_type, WalEventType::SafetyEvaluated));
+    let has_safety = events
+        .iter()
+        .any(|e| matches!(e.event_type, WalEventType::SafetyEvaluated));
     assert!(has_safety, "SafetyEvaluated must exist");
-    let safety = events.iter().find(|e| matches!(e.event_type, WalEventType::SafetyEvaluated)).unwrap();
+    let safety = events
+        .iter()
+        .find(|e| matches!(e.event_type, WalEventType::SafetyEvaluated))
+        .unwrap();
     let a = safety.safety.as_ref().unwrap();
     assert_eq!(a.analysis_kind, AnalysisKind::SemanticOneShot);
     match res {
         Ok(ok) if ok.success => {
-            assert!(events.iter().any(|e| matches!(e.event_type, WalEventType::JobCompleted)));
+            assert!(events
+                .iter()
+                .any(|e| matches!(e.event_type, WalEventType::JobCompleted)));
         }
         _ => {
             // Blocked: no capability completion for this job.
-            let job = &events.iter().find(|e| matches!(e.event_type, WalEventType::JobStarted)).unwrap().job_id;
-            let completed_for_job = events.iter().any(|e| {
-                matches!(e.event_type, WalEventType::JobCompleted) && &e.job_id == job
-            });
-            assert!(!completed_for_job, "blocked disposition produced completion");
+            let job = &events
+                .iter()
+                .find(|e| matches!(e.event_type, WalEventType::JobStarted))
+                .unwrap()
+                .job_id;
+            let completed_for_job = events
+                .iter()
+                .any(|e| matches!(e.event_type, WalEventType::JobCompleted) && &e.job_id == job);
+            assert!(
+                !completed_for_job,
+                "blocked disposition produced completion"
+            );
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
@@ -314,20 +387,22 @@ fn oracle_calibration_violated_and_satisfied() {
                 .with_dal(DAL::A)
                 .with_semantic_policy(SemanticPolicy::Corroborate)
                 .assess("hello", "path", InputClass::FilesystemLocator)
-                .map(|mut a| {
-                    a.runtimo_disposition = RuntimoDisposition::Reject;
-                    a.llmosafe_status = "halt".to_string();
-                    a
-                })
-                .unwrap_or_else(|_| {
-                    runtimo_core::safety::resource_only_assessment(
-                        InputClass::FilesystemLocator,
-                        "path",
-                        SemanticPolicy::Corroborate,
-                        DAL::A,
-                        Some(10),
-                    )
-                }),
+                .map_or_else(
+                    |_| {
+                        runtimo_core::safety::resource_only_assessment(
+                            InputClass::FilesystemLocator,
+                            "path",
+                            SemanticPolicy::Corroborate,
+                            DAL::A,
+                            Some(10),
+                        )
+                    },
+                    |mut a| {
+                        a.runtimo_disposition = RuntimoDisposition::Reject;
+                        a.llmosafe_status = "halt".to_string();
+                        a
+                    },
+                ),
         ),
         ..Default::default()
     };
@@ -341,15 +416,23 @@ fn oracle_calibration_violated_and_satisfied() {
         job_id: "job-blocked".to_string(),
         ..Default::default()
     };
-    let spec = parse_spec(r#"{"name":"blocked-before-effect","select":[{"field":"event_type","op":"Eq","value":"safety_evaluated"}],"quantifier":"none","predicates":[{"field":"job_id","op":"Eq","value":"job-blocked"}]}"#);
+    let spec = parse_spec(
+        r#"{"name":"blocked-before-effect","select":[{"field":"event_type","op":"Eq","value":"safety_evaluated"}],"quantifier":"none","predicates":[{"field":"job_id","op":"Eq","value":"job-blocked"}]}"#,
+    );
     // NOTE: this toy select/predicate combo demonstrates the engine; the
     // real cross-layer property (blocked disposition + later completion)
     // is asserted in integration via job_id join. Here prove Violated path:
-    let spec_viol = parse_spec(r#"{"name":"cal","predicates":[{"field":"event_type","op":"Eq","value":"job_completed"}]}"#).unwrap();
-    let v = evaluate(&[completion.clone()], &spec_viol).unwrap();
+    let spec_viol = parse_spec(
+        r#"{"name":"cal","predicates":[{"field":"event_type","op":"Eq","value":"job_completed"}]}"#,
+    )
+    .unwrap();
+    let v = evaluate(std::slice::from_ref(&completion), &spec_viol).unwrap();
     assert_eq!(v.verdict, Verdict::Satisfied);
-    let spec_miss = parse_spec(r#"{"name":"cal","predicates":[{"field":"event_type","op":"Eq","value":"job_started"}]}"#).unwrap();
-    let v2 = evaluate(&[completion], &spec_miss).unwrap();
+    let spec_miss = parse_spec(
+        r#"{"name":"cal","predicates":[{"field":"event_type","op":"Eq","value":"job_started"}]}"#,
+    )
+    .unwrap();
+    let v2 = evaluate(std::slice::from_ref(&completion), &spec_miss).unwrap();
     assert_eq!(v2.verdict, Verdict::Violated);
     let _ = (spec, blocked);
 }
@@ -357,7 +440,11 @@ fn oracle_calibration_violated_and_satisfied() {
 #[test]
 fn escalation_reason_preserved_not_collapsed() {
     // Escalate carries reason; disposition mapping preserves it (no collapse to Halt).
-    let d = SafetyDecision::Escalate { entropy: 1, reason: EscalationReason::BiasDetected, cooldown_ms: 5000 };
+    let d = SafetyDecision::Escalate {
+        entropy: 1,
+        reason: EscalationReason::BiasDetected,
+        cooldown_ms: 5000,
+    };
     assert_eq!(
         runtimo_core::safety::disposition_for(&d),
         RuntimoDisposition::EscalationRequired

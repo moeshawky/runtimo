@@ -917,8 +917,6 @@ mod tests {
 
         // Representative decisions retained for documentation; gating is
         // crate-owned via EscalationPolicy below.
-        let _proceed_decision = SafetyDecision::Proceed;
-        let _warn_decision = SafetyDecision::Warn("test warning");
 
         // For each DAL level, apply both functions and verify strictness ordering.
         // dal_decision_for maps DAL → DalDecision (Halt/Degraded/Proceed).
@@ -993,7 +991,10 @@ mod tests {
         let b_policy = EscalationPolicy::default().with_dal(DesignAssuranceLevel::B);
         let b_result = b_policy.decide(35000, 0, false);
         assert!(
-            matches!(b_result, SafetyDecision::Warn(_) | SafetyDecision::Escalate { .. }),
+            matches!(
+                b_result,
+                SafetyDecision::Warn(_) | SafetyDecision::Escalate { .. }
+            ),
             "DAL B must preserve/escalate mid-range input, got {b_result:?}"
         );
 

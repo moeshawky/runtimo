@@ -1,7 +1,7 @@
 # Getting Started with Runtimo
 
-**Version:** 0.9.0
-**Last Updated:** 2026-09-08
+**Version:** 0.10.0
+**Last Updated:** 2026-09-22
 
 This guide walks you through using Runtimo for the first time. By the end, you'll have executed capabilities with full telemetry, process tracking, and crash recovery.
 
@@ -29,7 +29,7 @@ and find the binary at `./target/release/runtimo`.
 ```bash
 # Add to your Cargo.toml
 [dependencies]
-runtimo-core = "0.7"
+runtimo-core = "0.10"
 ```
 
 ## Quick Start (5 Minutes)

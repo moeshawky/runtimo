@@ -116,7 +116,10 @@ enum PredicateOutcome {
 pub fn evaluate(events: &[WalEvent], spec: &PropertySpec) -> Result<PropertyVerdict, OracleError> {
     use super::spec::Quantifier;
     // v2 path when select/quantifier/version present.
-    if !spec.select.is_empty() || !matches!(spec.quantifier, Quantifier::All) || spec.version.is_some() {
+    if !spec.select.is_empty()
+        || !matches!(spec.quantifier, Quantifier::All)
+        || spec.version.is_some()
+    {
         return evaluate_v2(events, spec);
     }
     // Empty predicate set → total-function satisfied (load-bearing behavior)
@@ -203,10 +206,19 @@ pub fn evaluate(events: &[WalEvent], spec: &PropertySpec) -> Result<PropertyVerd
 /// 2. `predicates` ANDed within each selected candidate (missing field or
 ///    type mismatch → Error verdict, like legacy).
 /// 3. `quantifier` decides Satisfied/Violated over matched counts.
-/// Empty selection: `All` is vacuously Satisfied (legacy spirit) with
-/// `selected_count: 0` visible; `Exists`/`Count≥1` Violated; `None`
-/// Satisfied. Never hidden.
-pub fn evaluate_v2(events: &[WalEvent], spec: &PropertySpec) -> Result<PropertyVerdict, OracleError> {
+///    Empty selection: `All` is vacuously Satisfied (legacy spirit) with
+///    `selected_count: 0` visible; `Exists`/`Count≥1` Violated; `None`
+///    Satisfied. Never hidden.
+///
+/// # Errors
+///
+/// Returns [`OracleError::FieldNotFound`] if a predicate references a field
+/// not present in the event schema, or [`OracleError::FieldParseError`] if
+/// a field value cannot be parsed.
+pub fn evaluate_v2(
+    events: &[WalEvent],
+    spec: &PropertySpec,
+) -> Result<PropertyVerdict, OracleError> {
     use super::spec::Quantifier;
     // 1. Select.
     let selected: Vec<&WalEvent> = events
@@ -231,7 +243,11 @@ pub fn evaluate_v2(events: &[WalEvent], spec: &PropertySpec) -> Result<PropertyV
                 format!("Empty predicates over {selected_count} selected: satisfied"),
             ),
             Quantifier::Exists => (
-                if selected_count > 0 { Verdict::Satisfied } else { Verdict::Violated },
+                if selected_count > 0 {
+                    Verdict::Satisfied
+                } else {
+                    Verdict::Violated
+                },
                 format!("Empty predicates Exists over {selected_count} selected"),
             ),
             Quantifier::Count { op, threshold } => {
@@ -242,7 +258,11 @@ pub fn evaluate_v2(events: &[WalEvent], spec: &PropertySpec) -> Result<PropertyV
                 )
                 .unwrap_or(false);
                 (
-                    if ok { Verdict::Satisfied } else { Verdict::Violated },
+                    if ok {
+                        Verdict::Satisfied
+                    } else {
+                        Verdict::Violated
+                    },
                     format!("Count {selected_count} {op:?} {threshold} (empty predicates)"),
                 )
             }
@@ -284,7 +304,8 @@ pub fn evaluate_v2(events: &[WalEvent], spec: &PropertySpec) -> Result<PropertyV
             }
         }
         if all_hold {
-            matched += 1;
+            // Safe: matched is a counter bounded by selected_count (events.len()).
+            matched = matched.wrapping_add(1);
         }
     }
 
@@ -292,23 +313,41 @@ pub fn evaluate_v2(events: &[WalEvent], spec: &PropertySpec) -> Result<PropertyV
     let (verdict, detail) = match &spec.quantifier {
         Quantifier::All => {
             if matched == selected_count {
-                (Verdict::Satisfied, format!("ALL: {matched}/{selected_count} satisfy"))
+                (
+                    Verdict::Satisfied,
+                    format!("ALL: {matched}/{selected_count} satisfy"),
+                )
             } else {
-                (Verdict::Violated, format!("ALL violated: {matched}/{selected_count} satisfy"))
+                (
+                    Verdict::Violated,
+                    format!("ALL violated: {matched}/{selected_count} satisfy"),
+                )
             }
         }
         Quantifier::Exists => {
             if matched >= 1 {
-                (Verdict::Satisfied, format!("EXISTS: {matched}/{selected_count} satisfy"))
+                (
+                    Verdict::Satisfied,
+                    format!("EXISTS: {matched}/{selected_count} satisfy"),
+                )
             } else {
-                (Verdict::Violated, format!("EXISTS violated: 0/{selected_count} satisfy"))
+                (
+                    Verdict::Violated,
+                    format!("EXISTS violated: 0/{selected_count} satisfy"),
+                )
             }
         }
         Quantifier::None => {
             if matched == 0 {
-                (Verdict::Satisfied, format!("NONE: 0/{selected_count} satisfy"))
+                (
+                    Verdict::Satisfied,
+                    format!("NONE: 0/{selected_count} satisfy"),
+                )
             } else {
-                (Verdict::Violated, format!("NONE violated: {matched}/{selected_count} satisfy"))
+                (
+                    Verdict::Violated,
+                    format!("NONE violated: {matched}/{selected_count} satisfy"),
+                )
             }
         }
         Quantifier::Count { op, threshold } => {
@@ -319,9 +358,15 @@ pub fn evaluate_v2(events: &[WalEvent], spec: &PropertySpec) -> Result<PropertyV
             )
             .unwrap_or(false);
             if ok {
-                (Verdict::Satisfied, format!("COUNT: {matched} {op:?} {threshold}"))
+                (
+                    Verdict::Satisfied,
+                    format!("COUNT: {matched} {op:?} {threshold}"),
+                )
             } else {
-                (Verdict::Violated, format!("COUNT violated: {matched} {op:?} {threshold}"))
+                (
+                    Verdict::Violated,
+                    format!("COUNT violated: {matched} {op:?} {threshold}"),
+                )
             }
         }
     };
@@ -431,7 +476,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    use crate::oracle::spec;
+    use crate::oracle::spec::{self, Quantifier};
     use crate::wal::WalEventType;
 
     fn sample_event() -> WalEvent {
@@ -462,7 +507,7 @@ mod tests {
             name: "empty-prop".to_string(),
             predicates: vec![],
             select: vec![],
-            quantifier: Default::default(),
+            quantifier: Quantifier::default(),
             version: None,
         };
         let events = vec![sample_event()];
@@ -481,7 +526,7 @@ mod tests {
                 value: Value::String("job_started".to_string()),
             }],
             select: vec![],
-            quantifier: Default::default(),
+            quantifier: Quantifier::default(),
             version: None,
         };
         let events = vec![sample_event()];
@@ -499,7 +544,7 @@ mod tests {
                 value: Value::String("job_completed".to_string()),
             }],
             select: vec![],
-            quantifier: Default::default(),
+            quantifier: Quantifier::default(),
             version: None,
         };
         let events = vec![sample_event()];
@@ -517,7 +562,7 @@ mod tests {
                 value: Value::String("test".to_string()),
             }],
             select: vec![],
-            quantifier: Default::default(),
+            quantifier: Quantifier::default(),
             version: None,
         };
         let events = vec![sample_event()];
@@ -535,7 +580,7 @@ mod tests {
                 value: Value::String("test".to_string()),
             }],
             select: vec![],
-            quantifier: Default::default(),
+            quantifier: Quantifier::default(),
             version: None,
         };
         let events = vec![sample_event()];
@@ -553,7 +598,7 @@ mod tests {
                 value: Value::String("test".to_string()),
             }],
             select: vec![],
-            quantifier: Default::default(),
+            quantifier: Quantifier::default(),
             version: None,
         };
         let events = vec![sample_event()];
@@ -571,7 +616,7 @@ mod tests {
                 value: Value::String("test".to_string()),
             }],
             select: vec![],
-            quantifier: Default::default(),
+            quantifier: Quantifier::default(),
             version: None,
         };
         let events = vec![sample_event()];
@@ -589,7 +634,7 @@ mod tests {
                 value: Value::from(0u64),
             }],
             select: vec![],
-            quantifier: Default::default(),
+            quantifier: Quantifier::default(),
             version: None,
         };
         let events = vec![sample_event()];
@@ -614,7 +659,7 @@ mod tests {
                 },
             ],
             select: vec![],
-            quantifier: Default::default(),
+            quantifier: Quantifier::default(),
             version: None,
         };
         let events = vec![sample_event()];
@@ -639,7 +684,7 @@ mod tests {
                 },
             ],
             select: vec![],
-            quantifier: Default::default(),
+            quantifier: Quantifier::default(),
             version: None,
         };
         let events = vec![sample_event()];
@@ -662,7 +707,7 @@ mod tests {
                 value: Value::from(0u64),
             }],
             select: vec![],
-            quantifier: Default::default(),
+            quantifier: Quantifier::default(),
             version: None,
         };
 
@@ -697,7 +742,7 @@ mod tests {
                 value: Value::String("job_started".to_string()),
             }],
             select: vec![],
-            quantifier: Default::default(),
+            quantifier: Quantifier::default(),
             version: None,
         };
 
@@ -717,7 +762,7 @@ mod tests {
                 value: Value::from(5u64),
             }],
             select: vec![],
-            quantifier: Default::default(),
+            quantifier: Quantifier::default(),
             version: None,
         };
         let events = vec![sample_event()];
@@ -735,7 +780,7 @@ mod tests {
                 value: Value::String("job_started".to_string()),
             }],
             select: vec![],
-            quantifier: Default::default(),
+            quantifier: Quantifier::default(),
             version: None,
         };
         let events = vec![sample_event()];

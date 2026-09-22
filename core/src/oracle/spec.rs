@@ -115,7 +115,7 @@ pub struct Predicate {
 ///
 /// Legacy specs (no `quantifier`) mean `All` (every event satisfies all
 /// predicates — the v1 universal semantics, preserved).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Quantifier {
@@ -123,6 +123,7 @@ pub enum Quantifier {
     /// vacuously `Satisfied` (legacy spirit) but reported via
     /// `selected_count: 0` — zero matches are never hidden.
     #[serde(alias = "ALL")]
+    #[default]
     All,
     /// At least one selected record satisfies all predicates.
     #[serde(alias = "EXISTS")]
@@ -138,12 +139,6 @@ pub enum Quantifier {
         /// Threshold count.
         threshold: u64,
     },
-}
-
-impl Default for Quantifier {
-    fn default() -> Self {
-        Self::All
-    }
 }
 
 /// A property specification consisting of a name and a set of predicates.
@@ -284,12 +279,26 @@ pub fn parse_spec(input: &str) -> Result<PropertySpec, ParseSpecError> {
 fn validate_field_path(field: &str) -> Result<(), ParseSpecError> {
     // Check exact matches first
     match field {
-        "event_type" | "job_id" | "seq" | "capability" | "error" | "watermark" => return Ok(()),
-        "safety.semantic_policy" | "safety.dal" | "safety.llmosafe_status"
-        | "safety.runtimo_disposition" | "safety.input_class" | "safety.analysis_kind"
-        | "safety.provenance_consistent" | "safety.no_evidence" | "safety.stages_executed"
-        | "safety.oov_ratio" | "safety.detection_flags" | "safety.body_pressure"
-        | "safety.schema_version" | "safety.field_id" => return Ok(()),
+        "event_type"
+        | "job_id"
+        | "seq"
+        | "capability"
+        | "error"
+        | "watermark"
+        | "safety.semantic_policy"
+        | "safety.dal"
+        | "safety.llmosafe_status"
+        | "safety.runtimo_disposition"
+        | "safety.input_class"
+        | "safety.analysis_kind"
+        | "safety.provenance_consistent"
+        | "safety.no_evidence"
+        | "safety.stages_executed"
+        | "safety.oov_ratio"
+        | "safety.detection_flags"
+        | "safety.body_pressure"
+        | "safety.schema_version"
+        | "safety.field_id" => return Ok(()),
         _ => {}
     }
     // Check output.<key> pattern
@@ -367,20 +376,56 @@ pub fn extract_field(event: &WalEvent, field: &str) -> Option<Value> {
         "capability" => event.capability.clone().map(Value::String),
         "error" => event.error.clone().map(Value::String),
         "watermark" => None,
-        "safety.semantic_policy" => event.safety.as_ref().map(|s| Value::String(s.semantic_policy.clone())),
+        "safety.semantic_policy" => event
+            .safety
+            .as_ref()
+            .map(|s| Value::String(s.semantic_policy.clone())),
         "safety.dal" => event.safety.as_ref().map(|s| Value::String(s.dal.clone())),
-        "safety.llmosafe_status" => event.safety.as_ref().map(|s| Value::String(s.llmosafe_status.clone())),
-        "safety.runtimo_disposition" => event.safety.as_ref().map(|s| Value::String(s.runtimo_disposition.as_str().to_string())),
-        "safety.input_class" => event.safety.as_ref().map(|s| Value::String(s.input_class.as_str().to_string())),
-        "safety.analysis_kind" => event.safety.as_ref().map(|s| Value::String(s.analysis_kind.as_str().to_string())),
-        "safety.provenance_consistent" => event.safety.as_ref().map(|s| Value::Bool(s.provenance_consistent)),
-        "safety.no_evidence" => event.safety.as_ref().and_then(|s| s.no_evidence.map(Value::Bool)),
-        "safety.stages_executed" => event.safety.as_ref().map(|s| Value::from(s.stages_executed)),
-        "safety.oov_ratio" => event.safety.as_ref().and_then(|s| s.oov_ratio.map(Value::from)),
-        "safety.detection_flags" => event.safety.as_ref().and_then(|s| s.detection_flags.map(Value::from)),
-        "safety.body_pressure" => event.safety.as_ref().and_then(|s| s.body_pressure.map(Value::from)),
+        "safety.llmosafe_status" => event
+            .safety
+            .as_ref()
+            .map(|s| Value::String(s.llmosafe_status.clone())),
+        "safety.runtimo_disposition" => event
+            .safety
+            .as_ref()
+            .map(|s| Value::String(s.runtimo_disposition.as_str().to_string())),
+        "safety.input_class" => event
+            .safety
+            .as_ref()
+            .map(|s| Value::String(s.input_class.as_str().to_string())),
+        "safety.analysis_kind" => event
+            .safety
+            .as_ref()
+            .map(|s| Value::String(s.analysis_kind.as_str().to_string())),
+        "safety.provenance_consistent" => event
+            .safety
+            .as_ref()
+            .map(|s| Value::Bool(s.provenance_consistent)),
+        "safety.no_evidence" => event
+            .safety
+            .as_ref()
+            .and_then(|s| s.no_evidence.map(Value::Bool)),
+        "safety.stages_executed" => event
+            .safety
+            .as_ref()
+            .map(|s| Value::from(s.stages_executed)),
+        "safety.oov_ratio" => event
+            .safety
+            .as_ref()
+            .and_then(|s| s.oov_ratio.map(Value::from)),
+        "safety.detection_flags" => event
+            .safety
+            .as_ref()
+            .and_then(|s| s.detection_flags.map(Value::from)),
+        "safety.body_pressure" => event
+            .safety
+            .as_ref()
+            .and_then(|s| s.body_pressure.map(Value::from)),
         "safety.schema_version" => event.safety.as_ref().map(|s| Value::from(s.schema_version)),
-        "safety.field_id" => event.safety.as_ref().map(|s| Value::String(s.field_id.clone())),
+        "safety.field_id" => event
+            .safety
+            .as_ref()
+            .map(|s| Value::String(s.field_id.clone())),
         _ if field.starts_with("output.") => {
             let path = &field["output.".len()..];
             event.output.as_ref().and_then(|o| {

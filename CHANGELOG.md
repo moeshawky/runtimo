@@ -5,18 +5,28 @@ All notable changes to Runtimo are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.10.0] - 2026-09-13
+## [0.10.0] - 2026-09-22
 
 ### Added
 - **Runtime evidence contracts** — `RuntimeFactV1`, `RuntimeLocator`, `RunManifestV1`, `RunProcessKey`, `ProviderStatus`, `EvidenceFidelity`, `runtime_fact_export` (`core/src/`).
 - **Tetragon (1.7.1) + JFR (JDK17) provider adapters** — Raw-artifact custody + `ArtifactReducer`; daemon `--allow-capabilities` allow-list (`None`=default-open, `-32604` pre-exec deny, 6 tests).
 - **Honest experimental labels** — Tetragon/JFR adapters partial (`ObservedCall` deferred/OTel blocked, no enforcement, provider-absent → `Degraded`/`Unavailable`).
+- **LLMOSafe 0.9 conformance boundary** — `core/src/safety.rs`: `InputClass` (8 input semantics), `AnalysisKind`, `RuntimoDisposition` (5 dispositions), `SafetyAssessmentV1`, `SAFETY_SCHEMA_VERSION`; typed disposition mapping; ShellExec Observe-mode path uses `resource_only_assessment()` (d95cd1b).
+- **Oracle v2** — First-class namespace (e.g. `wal.event_count`), 12 selectors (incl. `event_count`, `has_property_field`), 4 quantifiers (`any`, `all`, `first`, `count_if`), 8 safety fields (`disposition`, `safety_satisfied`, `detections`, etc.); `WalSource`, `BundleSource`, `RuntimeFactSource`; `--properties-file` flag; exit codes 0/1/2/3 (8e4a3d6).
+- **Deterministic test seams** — `RUNTIMO_TEST_PRESSURE` (0-100), `RUNTIMO_MEMORY_CEILING_BYTES`, `RUNTIMO_SEMANTIC_POLICY` (observe/corroborate/enforce) (d95cd1b, 4a01e8b).
+- **LLMOSafe 0.9 conformance test suite** — `core/tests/conformance09.rs`: 14 tests covering resource-only path, one-shot sifter, unknown decision → EscalationRequired, `UNKNOWN != SAFE`, `no_evidence` semantics (4a01e8b).
 
 ### Changed
 - **ObserveBudget** `Mutex<RwLock>` → `Mutex<Vec>` (no API change); supervisor/observe hardening.
+- **`llmosafe` 0.7.7 → 0.9.0** — `core/Cargo.toml`; MSRV 1.70 → 1.85 (tracks `llmosafe 0.9.x`) (d95cd1b).
+- **`LlmoSafeGuard` simplification** — Removed rolling average, cooldown cache, and persisted history; single fresh upstream observation per call; `ResourceHistory` deleted (d95cd1b).
+- **Executor WAL ordering** — `JobStarted` now emitted before all gates (including resource/safety checks); `SafetyEvaluated` emitted before governed side effect (d95cd1b).
+- **`SafetyEvaluated` WAL event type** — New variant with typed `safety: Option<SafetyAssessmentV1>` field; wire string `safety_evaluated` (d95cd1b).
+- **`RUNTIMO_DAL` default** — Unset now resolves to `A` (strict) via config precedence chain (d95cd1b).
 
 ### Fixed
 - **Review B blockers** — WAL flush propagation, dead params, unwrap panic, doc drift; tracked-file clippy idioms; auth `Limitation` note staleness.
+- **`SymbolUID` never fabricated** — `RuntimeFactV1.symbol_uids` populated only from real provider data; empty vec when unresolvable; Oracle reader returns `EvidenceUnavailable` not fabricated facts (9d58ebc).
 
 ### Testing
 - **Total test count: 740** (39 cli + 473 core-lib + 65 integration + 69 daemon + 46 robust + 28 adapters_integration + 12 runtime_fact_export + 8 doctest). All passing.

@@ -364,7 +364,7 @@ impl OutOfProcessSampler {
                         process_start_time,
                         mono_ns: mono,
                         wall_ns: wall,
-                                frames: vec!["SAMPLED empty-stack".to_string()],
+                        frames: vec!["SAMPLED empty-stack".to_string()],
                         truncated: true,
                         error: Some("empty stack — sampled marker".to_string()),
                     }
@@ -375,7 +375,7 @@ impl OutOfProcessSampler {
                         process_start_time,
                         mono_ns: mono,
                         wall_ns: wall,
-                                frames,
+                        frames,
                         truncated: false,
                         error: None,
                     }
@@ -397,7 +397,7 @@ impl OutOfProcessSampler {
                     process_start_time,
                     mono_ns: mono,
                     wall_ns: wall,
-                        frames: vec!["TRUNCATED fallback".to_string()],
+                    frames: vec!["TRUNCATED fallback".to_string()],
                     truncated: true,
                     error: Some(msg),
                 }

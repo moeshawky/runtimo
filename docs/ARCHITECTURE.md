@@ -1,13 +1,13 @@
 # Runtimo Architecture
 
-**Version:** 0.9.0
-**Last Updated:** 2026-09-08
+**Version:** 0.10.0
+**Last Updated:** 2026-09-22
 
 ---
 
 ## Execution Pipeline
 
-Every capability execution follows a 10-step pipeline:
+Every capability execution follows a 13-step pipeline:
 
 ```rust
 // core/src/executor.rs — execute_with_telemetry_and_session()
@@ -19,11 +19,13 @@ Every capability execution follows a 10-step pipeline:
 4. args size check                    // reject > 1 MB
 5. zombie check                       // reject if > 10 zombies
 6. WalWriter::append(JobStarted)      // fsync'd JSONL (one fsync per batch + watermark on bundle finalize; see core/src/observe/bundle.rs)
-7. capability.validate()              // schema + path + semantic checks
-8. capability.execute()               // runs the capability; Err-path still emits BackupCreated before JobFailed covering path/repo_path/dir (core/src/executor.rs)
-9. Telemetry::capture()               // after snapshot
-10. ProcessSnapshot::capture()        // after snapshot
-11. WalWriter::append(JobCompleted)   // fsync'd, with output + telemetry; watermark fsync guarantees durability on bundle close
+7. Safety assessment (if applicable)  // LLMOSafe 0.9 boundary: one-shot sifter or resource-only
+8. WalWriter::append(SafetyEvaluated) // typed assessment evidence, before governed side effect
+9. capability.validate()              // schema + path + semantic checks
+10. capability.execute()               // runs the capability; Err-path still emits BackupCreated before JobFailed covering path/repo_path/dir (core/src/executor.rs)
+11. Telemetry::capture()               // after snapshot
+12. ProcessSnapshot::capture()        // after snapshot
+13. WalWriter::append(JobCompleted)   // fsync'd, with output + telemetry; watermark fsync guarantees durability on bundle close
 ```
 
 ## Module Map
@@ -50,8 +52,10 @@ Capability (core/src/capability.rs)
   │     backup-before-mutate, integrity verify, restore with pre-restore backup
   ├── WAL (core/src/wal.rs)
   │     append-only JSONL, fsync, flock, rotation, cleanup, tail-read seq recovery
-  ├── LlmoSafeGuard (core/src/llmosafe.rs)
-  │     rolling average, cooldown, persisted to disk across restarts
+   ├── LlmoSafeGuard (core/src/llmosafe.rs)
+   │     single fresh upstream observation per call, no cache/cooldown
+   ├── Safety boundary (core/src/safety.rs)
+   │     LLMOSafe 0.9 conformance: InputClass, AnalysisKind, RuntimoDisposition, SafetyAssessmentV1
   ├── Telemetry (core/src/telemetry.rs)
   │     discovery-based: accelerators, services, system, network
   ├── Process Snapshot (core/src/processes.rs)

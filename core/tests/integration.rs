@@ -1361,13 +1361,27 @@ fn test_dal_a_shell_exec_safety_path() {
         .iter()
         .filter(|e| matches!(e.event_type, WalEventType::SafetyEvaluated))
         .collect();
-    assert_eq!(safety_ev.len(), 1, "exactly one SafetyEvaluated, got {}", safety_ev.len());
-    let assessment = safety_ev[0].safety.as_ref().expect("SafetyEvaluated carries record");
+    assert_eq!(
+        safety_ev.len(),
+        1,
+        "exactly one SafetyEvaluated, got {}",
+        safety_ev.len()
+    );
+    let assessment = safety_ev[0]
+        .safety
+        .as_ref()
+        .expect("SafetyEvaluated carries record");
 
     // 2. Analysis mode is resource-only (ShellExec command path).
-    assert_eq!(assessment.analysis_kind, runtimo_core::AnalysisKind::ResourceOnly);
+    assert_eq!(
+        assessment.analysis_kind,
+        runtimo_core::AnalysisKind::ResourceOnly
+    );
     // 3. Input class is command_control, not natural language.
-    assert_eq!(assessment.input_class, runtimo_core::InputClass::CommandControl);
+    assert_eq!(
+        assessment.input_class,
+        runtimo_core::InputClass::CommandControl
+    );
     // 4. Disposition is allow (deterministic policy owns enforcement).
     assert_eq!(
         assessment.runtimo_disposition,
@@ -1377,12 +1391,22 @@ fn test_dal_a_shell_exec_safety_path() {
     assert_eq!(assessment.stages_executed, 0);
 
     // 6. Only then JobStarted → JobCompleted ordering.
-    let started = events.iter().position(|e| matches!(e.event_type, WalEventType::JobStarted));
-    let completed = events.iter().position(|e| matches!(e.event_type, WalEventType::JobCompleted));
+    let started = events
+        .iter()
+        .position(|e| matches!(e.event_type, WalEventType::JobStarted));
+    let completed = events
+        .iter()
+        .position(|e| matches!(e.event_type, WalEventType::JobCompleted));
     assert!(started.is_some() && completed.is_some());
     assert!(started.unwrap() < completed.unwrap());
-    let safety_pos = events.iter().position(|e| matches!(e.event_type, WalEventType::SafetyEvaluated)).unwrap();
-    assert!(started.unwrap() < safety_pos && safety_pos < completed.unwrap(), "SafetyEvaluated before side-effect completion");
+    let safety_pos = events
+        .iter()
+        .position(|e| matches!(e.event_type, WalEventType::SafetyEvaluated))
+        .unwrap();
+    assert!(
+        started.unwrap() < safety_pos && safety_pos < completed.unwrap(),
+        "SafetyEvaluated before side-effect completion"
+    );
 
     cleanup(&dir);
 }

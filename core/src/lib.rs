@@ -89,8 +89,6 @@ pub mod executor;
 pub mod job;
 /// LLM safety guard — CPU/RAM circuit breakers and entropy source.
 pub mod llmosafe;
-/// Thin LLMOSafe 0.9 conformance boundary: assessment, disposition, input semantics.
-pub mod safety;
 /// Health monitoring with alerting.
 pub mod monitor;
 /// Observe subsystem — sampling, bundling, budgeting, auditing.
@@ -99,6 +97,8 @@ pub mod observe;
 pub mod oracle;
 /// Process snapshot, zombie detection, and top-N queries.
 pub mod processes;
+/// Thin LLMOSafe 0.9 conformance boundary: assessment, disposition, input semantics.
+pub mod safety;
 /// Session tracking for reliable SSH.
 pub mod session;
 /// System telemetry capture and reporting.
@@ -108,7 +108,10 @@ pub mod validation;
 /// Write-ahead log for crash recovery.
 pub mod wal;
 
-pub use oracle::{evaluate, evaluate_v2, Op, OracleError, Predicate, PropertySpec, PropertyVerdict, Quantifier, Verdict};
+pub use oracle::{
+    evaluate, evaluate_v2, Op, OracleError, Predicate, PropertySpec, PropertyVerdict, Quantifier,
+    Verdict,
+};
 
 pub use adapters::{ArtifactReducer, JfrAdapter, JfrConfig, TetragonAdapter, TetragonConfig};
 pub use backup::BackupManager;
@@ -120,15 +123,15 @@ pub use config::RuntimoConfig;
 pub use executor::{execute_with_telemetry, execute_with_telemetry_and_session};
 pub use job::{Job, JobId, JobState};
 pub use llmosafe::LlmoSafeGuard;
-pub use safety::{
-    AnalysisKind, AssessmentError, FieldSemantics, InputClass, RuntimoDisposition,
-    SafetyAssessmentV1, SAFETY_SCHEMA_VERSION,
-};
 pub use monitor::HealthMonitor;
 pub use processes::ProcessSnapshot;
 pub use runtime::{
     resolve_locator, EvidenceFidelity, ProviderStatus, RunManifestV1, RunProcessKey,
     RuntimeFactExport, RuntimeFactV1, RuntimeLocator, SymbolUID, SymbolUidResolution,
+};
+pub use safety::{
+    AnalysisKind, AssessmentError, FieldSemantics, InputClass, RuntimoDisposition,
+    SafetyAssessmentV1, SAFETY_SCHEMA_VERSION,
 };
 pub use telemetry::Telemetry;
 pub use validation::{validate_path, PathContext};
