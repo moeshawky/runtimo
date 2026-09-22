@@ -305,7 +305,8 @@ impl LlmoSafeGuard {
         observation: &str,
     ) -> Result<llmosafe::llmosafe_pipeline::PipelineResult, String> {
         use llmosafe::llmosafe_pipeline::STAGE_SIFT;
-        let pressure = self.guard.pressure();
+        // Mirror assess(): honor RUNTIMO_TEST_PRESSURE override for deterministic tests.
+        let pressure = test_pressure_override().unwrap_or_else(|| self.guard.pressure());
         let pressure_level = PressureLevel::from_percentage(pressure);
         match llmosafe::sift_text(observation) {
             Ok((sifted, _proof)) => {
@@ -396,6 +397,16 @@ impl Default for LlmoSafeGuard {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // Serialize env var mutations across tests (process-global state).
+    static ENV_GUARD: Mutex<()> = Mutex::new(());
+
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+
 
     #[test]
     fn guard_reports_system_memory() {
@@ -423,6 +434,12 @@ mod tests {
         // chains would double-downgrade. This test pins the crate's
         // single-application contract via a semantic Halt candidate:
         // under DAL B a Halt becomes Escalate exactly once.
+        let _g = lock_env();
+        // Save-and-restore: capture prior presence AND value so that a
+        // suite running under an outer RUNTIMO_TEST_PRESSURE override is
+        // not left with the var deleted for later tests in the same process.
+        let prior = std::env::var("RUNTIMO_TEST_PRESSURE").ok();
+        std::env::set_var("RUNTIMO_TEST_PRESSURE", "10");
         let guard = LlmoSafeGuard::new()
             .with_dal(DesignAssuranceLevel::B)
             .with_semantic_policy(SemanticPolicy::Enforce);
@@ -434,6 +451,10 @@ mod tests {
         // double-downgrade to E-like allow. The key pin: decision came
         // from the crate alone (no local second pass).
         assert!(!matches!(res.decision, SafetyDecision::Proceed));
+        match prior {
+            Some(v) => std::env::set_var("RUNTIMO_TEST_PRESSURE", v),
+            None => std::env::remove_var("RUNTIMO_TEST_PRESSURE"),
+        }
     }
 
     #[test]
@@ -480,9 +501,19 @@ mod tests {
 
     /// check_cognitive_pipeline can return Err (the "never returns Err" lie is gone).
     /// The docs are now truthful: sifter failure propagates as Err(String).
+    /// Pin RUNTIMO_TEST_PRESSURE=10 for determinism: the shim's verdict flows
+    /// through the pressure-sensitive decide_with_pressure layer, so ambient
+    /// pressure would flip this benign short sentence between Proceed (idle)
+    /// and Escalate/Warn (loaded). Low pressure guarantees non-Proceed.
     #[test]
     #[allow(deprecated)] // Tests the deprecated shim itself
     fn check_cognitive_pipeline_can_return_err() {
+        let _g = lock_env();
+        // Save-and-restore: capture prior presence AND value so that a
+        // suite running under an outer RUNTIMO_TEST_PRESSURE override is
+        // not left with the var deleted for later tests in the same process.
+        let prior = std::env::var("RUNTIMO_TEST_PRESSURE").ok();
+        std::env::set_var("RUNTIMO_TEST_PRESSURE", "10");
         let guard = LlmoSafeGuard::new();
         // Benign input → Ok.
         let res = guard
@@ -508,6 +539,10 @@ mod tests {
                 // Err is the truthful outcome for sifter failure.
                 assert!(e.contains("sifter"), "error must mention sifter");
             }
+        }
+        match prior {
+            Some(v) => std::env::set_var("RUNTIMO_TEST_PRESSURE", v),
+            None => std::env::remove_var("RUNTIMO_TEST_PRESSURE"),
         }
     }
 }
