@@ -44,7 +44,8 @@ pub enum Verdict {
 ///
 /// The `detail` field is **always populated** with a human-readable
 /// description of the outcome, including which predicate failed or
-/// why the evaluation produced an error.
+/// why the evaluation produced an error. Count fields are always
+/// populated (v2 self-explanation, §48) — legacy callers ignore them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PropertyVerdict {
@@ -54,6 +55,12 @@ pub struct PropertyVerdict {
     pub verdict: Verdict,
     /// A detailed description of the outcome. Always populated.
     pub detail: String,
+    /// Records remaining after `select` filtering (pre-predicate).
+    pub selected_count: usize,
+    /// Records actually evaluated (selected minus filter errors).
+    pub evaluated_count: usize,
+    /// Selected records satisfying ALL predicates.
+    pub matched_count: usize,
 }
 
 /// The outcome of evaluating a single predicate against one event.
@@ -107,12 +114,20 @@ enum PredicateOutcome {
 /// - Uses shared borrows only (`&[WalEvent]`, `&PropertySpec`).
 /// - AND semantics: all predicates must hold for `Satisfied`.
 pub fn evaluate(events: &[WalEvent], spec: &PropertySpec) -> Result<PropertyVerdict, OracleError> {
+    use super::spec::Quantifier;
+    // v2 path when select/quantifier/version present.
+    if !spec.select.is_empty() || !matches!(spec.quantifier, Quantifier::All) || spec.version.is_some() {
+        return evaluate_v2(events, spec);
+    }
     // Empty predicate set → total-function satisfied (load-bearing behavior)
     if spec.predicates.is_empty() {
         return Ok(PropertyVerdict {
             name: spec.name.clone(),
             verdict: Verdict::Satisfied,
             detail: "Empty predicate set: total-function satisfied by definition".to_string(),
+            selected_count: events.len(),
+            evaluated_count: events.len(),
+            matched_count: events.len(),
         });
     }
 
@@ -152,6 +167,9 @@ pub fn evaluate(events: &[WalEvent], spec: &PropertySpec) -> Result<PropertyVerd
                 "Evaluation error on field(s): {}; predicate could not be evaluated",
                 error_fields.join(", ")
             ),
+            selected_count: events.len(),
+            evaluated_count: events.len(),
+            matched_count: 0,
         });
     }
 
@@ -163,6 +181,9 @@ pub fn evaluate(events: &[WalEvent], spec: &PropertySpec) -> Result<PropertyVerd
                 "Predicate(s) violated on field(s): {}; expected all predicates to hold",
                 violated_fields.join(", ")
             ),
+            selected_count: events.len(),
+            evaluated_count: events.len(),
+            matched_count: 0,
         });
     }
 
@@ -170,6 +191,147 @@ pub fn evaluate(events: &[WalEvent], spec: &PropertySpec) -> Result<PropertyVerd
         name: spec.name.clone(),
         verdict: Verdict::Satisfied,
         detail: format!("All {} predicate(s) satisfied", spec.predicates.len()),
+        selected_count: events.len(),
+        evaluated_count: events.len(),
+        matched_count: events.len(),
+    })
+}
+
+/// v2 evaluation: select-then-quantify (§46-47).
+///
+/// 1. `select` filters (ANDed, missing field → filtered out, never Error).
+/// 2. `predicates` ANDed within each selected candidate (missing field or
+///    type mismatch → Error verdict, like legacy).
+/// 3. `quantifier` decides Satisfied/Violated over matched counts.
+/// Empty selection: `All` is vacuously Satisfied (legacy spirit) with
+/// `selected_count: 0` visible; `Exists`/`Count≥1` Violated; `None`
+/// Satisfied. Never hidden.
+pub fn evaluate_v2(events: &[WalEvent], spec: &PropertySpec) -> Result<PropertyVerdict, OracleError> {
+    use super::spec::Quantifier;
+    // 1. Select.
+    let selected: Vec<&WalEvent> = events
+        .iter()
+        .filter(|e| {
+            spec.select.iter().all(|p| {
+                let Some(fv) = super::spec::extract_field(e, &p.field) else {
+                    return false;
+                };
+                compare_values(&fv, &p.op, &p.value).unwrap_or(false)
+            })
+        })
+        .collect();
+    let selected_count = selected.len();
+
+    // Empty predicates + quantifier: All/None over empty → Satisfied;
+    // Exists → Violated; Count → threshold check over 0.
+    if spec.predicates.is_empty() {
+        let (verdict, detail) = match &spec.quantifier {
+            Quantifier::All | Quantifier::None => (
+                Verdict::Satisfied,
+                format!("Empty predicates over {selected_count} selected: satisfied"),
+            ),
+            Quantifier::Exists => (
+                if selected_count > 0 { Verdict::Satisfied } else { Verdict::Violated },
+                format!("Empty predicates Exists over {selected_count} selected"),
+            ),
+            Quantifier::Count { op, threshold } => {
+                let ok = compare_values(
+                    &serde_json::Value::from(selected_count as u64),
+                    op,
+                    &serde_json::Value::from(*threshold),
+                )
+                .unwrap_or(false);
+                (
+                    if ok { Verdict::Satisfied } else { Verdict::Violated },
+                    format!("Count {selected_count} {op:?} {threshold} (empty predicates)"),
+                )
+            }
+        };
+        return Ok(PropertyVerdict {
+            name: spec.name.clone(),
+            verdict,
+            detail,
+            selected_count,
+            evaluated_count: selected_count,
+            matched_count: selected_count,
+        });
+    }
+
+    // 2. Predicates per candidate.
+    let mut matched = 0usize;
+    for event in &selected {
+        let mut all_hold = true;
+        for pred in &spec.predicates {
+            match evaluate_predicate(event, pred) {
+                PredicateOutcome::Satisfied => {}
+                PredicateOutcome::Violated => {
+                    all_hold = false;
+                    break;
+                }
+                PredicateOutcome::UnknownField | PredicateOutcome::TypeMismatch => {
+                    return Ok(PropertyVerdict {
+                        name: spec.name.clone(),
+                        verdict: Verdict::Error,
+                        detail: format!(
+                            "Evaluation error on field '{}'; selector should have removed unrelated events (§47)",
+                            pred.field
+                        ),
+                        selected_count,
+                        evaluated_count: selected_count,
+                        matched_count: matched,
+                    });
+                }
+            }
+        }
+        if all_hold {
+            matched += 1;
+        }
+    }
+
+    // 3. Quantify.
+    let (verdict, detail) = match &spec.quantifier {
+        Quantifier::All => {
+            if matched == selected_count {
+                (Verdict::Satisfied, format!("ALL: {matched}/{selected_count} satisfy"))
+            } else {
+                (Verdict::Violated, format!("ALL violated: {matched}/{selected_count} satisfy"))
+            }
+        }
+        Quantifier::Exists => {
+            if matched >= 1 {
+                (Verdict::Satisfied, format!("EXISTS: {matched}/{selected_count} satisfy"))
+            } else {
+                (Verdict::Violated, format!("EXISTS violated: 0/{selected_count} satisfy"))
+            }
+        }
+        Quantifier::None => {
+            if matched == 0 {
+                (Verdict::Satisfied, format!("NONE: 0/{selected_count} satisfy"))
+            } else {
+                (Verdict::Violated, format!("NONE violated: {matched}/{selected_count} satisfy"))
+            }
+        }
+        Quantifier::Count { op, threshold } => {
+            let ok = compare_values(
+                &serde_json::Value::from(matched as u64),
+                op,
+                &serde_json::Value::from(*threshold),
+            )
+            .unwrap_or(false);
+            if ok {
+                (Verdict::Satisfied, format!("COUNT: {matched} {op:?} {threshold}"))
+            } else {
+                (Verdict::Violated, format!("COUNT violated: {matched} {op:?} {threshold}"))
+            }
+        }
+    };
+    Ok(PropertyVerdict {
+        name: spec.name.clone(),
+        verdict,
+        detail,
+        selected_count,
+        evaluated_count: selected_count,
+        matched_count: matched,
     })
 }
 
@@ -299,6 +461,9 @@ mod tests {
         let spec = spec::PropertySpec {
             name: "empty-prop".to_string(),
             predicates: vec![],
+            select: vec![],
+            quantifier: Default::default(),
+            version: None,
         };
         let events = vec![sample_event()];
         let result = evaluate(&events, &spec).unwrap();
@@ -315,6 +480,9 @@ mod tests {
                 op: Op::Eq,
                 value: Value::String("job_started".to_string()),
             }],
+            select: vec![],
+            quantifier: Default::default(),
+            version: None,
         };
         let events = vec![sample_event()];
         let result = evaluate(&events, &spec).unwrap();
@@ -330,6 +498,9 @@ mod tests {
                 op: Op::Eq,
                 value: Value::String("job_completed".to_string()),
             }],
+            select: vec![],
+            quantifier: Default::default(),
+            version: None,
         };
         let events = vec![sample_event()];
         let result = evaluate(&events, &spec).unwrap();
@@ -345,6 +516,9 @@ mod tests {
                 op: Op::Eq,
                 value: Value::String("test".to_string()),
             }],
+            select: vec![],
+            quantifier: Default::default(),
+            version: None,
         };
         let events = vec![sample_event()];
         let result = evaluate(&events, &spec).unwrap();
@@ -360,6 +534,9 @@ mod tests {
                 op: Op::Eq,
                 value: Value::String("test".to_string()),
             }],
+            select: vec![],
+            quantifier: Default::default(),
+            version: None,
         };
         let events = vec![sample_event()];
         let result = evaluate(&events, &spec).unwrap();
@@ -375,6 +552,9 @@ mod tests {
                 op: Op::Contains,
                 value: Value::String("test".to_string()),
             }],
+            select: vec![],
+            quantifier: Default::default(),
+            version: None,
         };
         let events = vec![sample_event()];
         let result = evaluate(&events, &spec).unwrap();
@@ -390,6 +570,9 @@ mod tests {
                 op: Op::Regex,
                 value: Value::String("test".to_string()),
             }],
+            select: vec![],
+            quantifier: Default::default(),
+            version: None,
         };
         let events = vec![sample_event()];
         let result = evaluate(&events, &spec).unwrap();
@@ -405,6 +588,9 @@ mod tests {
                 op: Op::Gt,
                 value: Value::from(0u64),
             }],
+            select: vec![],
+            quantifier: Default::default(),
+            version: None,
         };
         let events = vec![sample_event()];
         let result = evaluate(&events, &spec).unwrap();
@@ -427,6 +613,9 @@ mod tests {
                     value: Value::String("test".to_string()),
                 },
             ],
+            select: vec![],
+            quantifier: Default::default(),
+            version: None,
         };
         let events = vec![sample_event()];
         let result = evaluate(&events, &spec).unwrap();
@@ -449,6 +638,9 @@ mod tests {
                     value: Value::String("job_completed".to_string()),
                 },
             ],
+            select: vec![],
+            quantifier: Default::default(),
+            version: None,
         };
         let events = vec![sample_event()];
         let result = evaluate(&events, &spec).unwrap();
@@ -469,6 +661,9 @@ mod tests {
                 op: Op::Gt,
                 value: Value::from(0u64),
             }],
+            select: vec![],
+            quantifier: Default::default(),
+            version: None,
         };
 
         let result1 = evaluate(&events, &spec).unwrap();
@@ -501,6 +696,9 @@ mod tests {
                 op: Op::Eq,
                 value: Value::String("job_started".to_string()),
             }],
+            select: vec![],
+            quantifier: Default::default(),
+            version: None,
         };
 
         let result = evaluate(&events, &spec).unwrap();
@@ -518,6 +716,9 @@ mod tests {
                 op: Op::Gt,
                 value: Value::from(5u64),
             }],
+            select: vec![],
+            quantifier: Default::default(),
+            version: None,
         };
         let events = vec![sample_event()];
         let result = evaluate(&events, &spec).unwrap();
@@ -533,6 +734,9 @@ mod tests {
                 op: Op::Eq,
                 value: Value::String("job_started".to_string()),
             }],
+            select: vec![],
+            quantifier: Default::default(),
+            version: None,
         };
         let events = vec![sample_event()];
         let result = evaluate(&events, &spec).unwrap();

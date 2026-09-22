@@ -176,6 +176,14 @@ pub struct WalEvent {
     /// Wall-clock timestamp in nanoseconds since UNIX epoch (observe dual-clock).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wall_ns: Option<u64>,
+    /// Typed pre-execution safety evidence (only on `SafetyEvaluated`).
+    ///
+    /// Versioned (`SafetyAssessmentV1.schema_version`). `None` for legacy
+    /// events; old WAL lines deserialize via `#[serde(default)]`.
+    /// Contains no raw prompt/command/content — correlation via
+    /// `input_hash` + `field_id` + `input_len` + `input_class`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safety: Option<crate::safety::SafetyAssessmentV1>,
 }
 
 /// Types of WAL events, corresponding to job lifecycle stages
@@ -217,6 +225,16 @@ pub enum WalEventType {
     ObserveSuspended,
     /// Observe session completed — bundle finalized with watermark fsync.
     ObserveCompleted,
+    /// Safety assessment recorded before the governed side effect.
+    ///
+    /// Emitted after `JobStarted` and before capability execution for every
+    /// admission that reaches the safety gate (semantic or resource-only).
+    /// Carries the typed [`crate::safety::SafetyAssessmentV1`] in the
+    /// `safety` field. A blocked disposition (`escalation_required`,
+    /// `reject`, `fatal`, analysis failure) never has a subsequent
+    /// capability completion for the same `job_id` — the cross-layer
+    /// `blocked before effect` invariant Oracle asserts.
+    SafetyEvaluated,
     /// Writer initialized — marker event written on WAL creation.
     ///
     /// Emitted by [`WalWriter::create`] as the first event in a new or
@@ -251,6 +269,7 @@ impl WalEventType {
             Self::ObserveTruncated => "observe_truncated",
             Self::ObserveSuspended => "observe_suspended",
             Self::ObserveCompleted => "observe_completed",
+            Self::SafetyEvaluated => "safety_evaluated",
             Self::WriterInitialized => "writer_initialized",
         }
     }

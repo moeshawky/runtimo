@@ -7,7 +7,7 @@ This guide walks you through using Runtimo for the first time. By the end, you'l
 
 ## Prerequisites
 
-- Rust 1.70+ (for edition 2021)
+- Rust 1.85+ (MSRV, tracks `llmosafe 0.9.x`; edition 2021)
 - Linux or macOS (for `/proc` telemetry)
 - `cargo` installed
 

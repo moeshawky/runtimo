@@ -61,6 +61,10 @@ pub struct GuardsConfig {
     /// Design Assurance Level for this profile.
     #[serde(default)]
     pub dal: Option<String>,
+    /// Semantic authority mode (`observe`|`corroborate`|`enforce`).
+    /// Separate axis from DAL. Unknown values fail closed to `enforce`.
+    #[serde(default)]
+    pub semantic_policy: Option<String>,
     /// Whether blocklist is enabled.
     #[serde(default)]
     pub blocklist_enabled: Option<bool>,
@@ -134,6 +138,9 @@ pub struct ResolvedConfig {
     pub profile: String,
     /// Effective DAL (A-E).
     pub dal: String,
+    /// Effective semantic policy (`observe`|`corroborate`|`enforce`).
+    /// Orthogonal to DAL. Default `corroborate` (tracks upstream).
+    pub semantic_policy: String,
     /// Effective WAL mode.
     pub wal_mode: String,
     /// Whether backup is enabled.
@@ -187,6 +194,16 @@ pub struct RuntimoConfig {
     /// - E: All decisions → Proceed (permissive)
     #[serde(default)]
     pub dal: Option<String>,
+
+    /// Semantic authority mode for LLMOSafe 0.9 (`observe`|`corroborate`|`enforce`).
+    ///
+    /// Orthogonal to DAL. Precedence mirrors DAL: `RUNTIMO_SEMANTIC_POLICY`
+    /// env > top-level `semantic_policy` > `[guards].semantic_policy` >
+    /// builtin `corroborate` (tracks upstream default). Case-insensitive.
+    /// Unknown values fail closed to `enforce` (strictest) — a typo must
+    /// never silently become `observe`.
+    #[serde(default)]
+    pub semantic_policy: Option<String>,
 
     /// Additional dangerous command patterns for ShellExec blocklist.
     ///
@@ -584,6 +601,27 @@ profile = "minimal"
             "E".to_string()
         };
 
+        // SemanticPolicy: env > file > guards > builtin(corroborate).
+        // Lowercased; validation happens at parse (unknown → enforce).
+        let semantic_policy = if let Ok(v) = std::env::var("RUNTIMO_SEMANTIC_POLICY") {
+            v.to_lowercase()
+        } else if let Some(s) = &self.semantic_policy {
+            s.to_lowercase()
+        } else if let Some(s) = &self.guards.semantic_policy {
+            s.to_lowercase()
+        } else {
+            "corroborate".to_string()
+        };
+        let semantic_policy = match semantic_policy.as_str() {
+            "observe" | "corroborate" | "enforce" => semantic_policy,
+            _ => {
+                log::warn!(
+                    "unknown semantic_policy '{semantic_policy}', failing closed to 'enforce'"
+                );
+                "enforce".to_string()
+            }
+        };
+
         // WAL mode: file wal.mode > profile > builtin
         let wal_mode = if let Some(m) = &self.wal.mode {
             m.clone()
@@ -697,6 +735,7 @@ profile = "minimal"
         ResolvedConfig {
             profile,
             dal,
+            semantic_policy,
             wal_mode,
             backup_enabled,
             output_format,
@@ -964,6 +1003,34 @@ profile = "minimal"
             "A".to_string()
         } else {
             "E".to_string()
+        }
+    }
+
+    /// Returns the resolved semantic policy (`observe`|`corroborate`|`enforce`).
+    ///
+    /// Priority: `RUNTIMO_SEMANTIC_POLICY` env > top-level `semantic_policy` >
+    /// `[guards].semantic_policy` > builtin `corroborate`. Lowercased.
+    /// Unknown values fail closed to `enforce` (never silently `observe`).
+    #[must_use]
+    pub fn get_semantic_policy() -> String {
+        let raw = if let Ok(v) = std::env::var("RUNTIMO_SEMANTIC_POLICY") {
+            v.to_lowercase()
+        } else {
+            let config = Self::load();
+            if let Some(s) = config.semantic_policy {
+                s.to_lowercase()
+            } else if let Some(s) = config.guards.semantic_policy {
+                s.to_lowercase()
+            } else {
+                "corroborate".to_string()
+            }
+        };
+        match raw.as_str() {
+            "observe" | "corroborate" | "enforce" => raw,
+            _ => {
+                log::warn!("unknown semantic_policy '{raw}', failing closed to 'enforce'");
+                "enforce".to_string()
+            }
         }
     }
 

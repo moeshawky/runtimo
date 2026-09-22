@@ -8,7 +8,7 @@
 
 ## Development Standards
 
-- **Rust Edition 2021**, MSRV **1.70.0**
+- **Rust Edition 2021**, MSRV **1.85.0** (tracks `llmosafe 0.9.x` contract)
 - `cargo fmt --check` must be clean before commits
 - `cargo clippy --all-targets` must have zero new warnings
 - `cargo test --workspace` must be green

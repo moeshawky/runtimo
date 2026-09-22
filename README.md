@@ -5,7 +5,7 @@
 [![Crates.io](https://img.shields.io/crates/v/runtimo-core.svg)](https://crates.io/crates/runtimo-core)
 [![Documentation](https://docs.rs/runtimo-core/badge.svg)](https://docs.rs/runtimo-core)
 [![CI](https://github.com/moeshawky/runtimo/actions/workflows/ci.yml/badge.svg)](https://github.com/moeshawky/runtimo/actions/workflows/ci.yml)
-[![MSRV](https://img.shields.io/badge/MSRV-1.70-blue.svg)](rust-toolchain.toml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.85-blue.svg)](rust-toolchain.toml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 - [x] Project name + one-line description
@@ -16,7 +16,7 @@
 - [x] [CHANGELOG](CHANGELOG.md)
 - [x] [License](LICENSE)
 - [x] [Contributing](CONTRIBUTING.md)
-- [x] MSRV badge (1.70.0)
+- [x] MSRV badge (1.85.0, tracks `llmosafe 0.9.x`)
 
 > **One program, one version.** `runtimo-core`, `runtimo-daemon`, and `runtimo-cli` are a single program at a single workspace version. Never version, bump, or release one crate independently. `cargo install runtimo-cli` installs **both** `runtimo` (CLI) and `runtimo-daemon` binaries. The `runtimo-daemon` package is the daemon *library*; the `runtimo-daemon` *binary* is bundled inside the `runtimo-cli` package. Never `cargo install runtimo-daemon` or `cargo install runtimo-core` alone for deployment.
 

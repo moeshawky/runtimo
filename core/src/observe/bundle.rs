@@ -326,6 +326,7 @@ impl BundleWriter {
                         .duration_since(std::time::UNIX_EPOCH)
                         .map_or(0, |d| d.as_nanos() as u64),
                 ),
+                safety: None,
                 ..Default::default()
             };
             self.next_seq += 1;
@@ -850,6 +851,7 @@ mod tests {
             ),
             mono_ns: Some(15672),
             wall_ns: Some(1788865740613426198),
+            safety: None,
             ..Default::default()
         };
         let mut s = String::new();

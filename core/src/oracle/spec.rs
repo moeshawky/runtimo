@@ -111,24 +111,51 @@ pub struct Predicate {
     pub value: Value,
 }
 
+/// Quantifier over the selected record set (§45-46).
+///
+/// Legacy specs (no `quantifier`) mean `All` (every event satisfies all
+/// predicates — the v1 universal semantics, preserved).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Quantifier {
+    /// Every selected record satisfies all predicates. Empty selection is
+    /// vacuously `Satisfied` (legacy spirit) but reported via
+    /// `selected_count: 0` — zero matches are never hidden.
+    #[serde(alias = "ALL")]
+    All,
+    /// At least one selected record satisfies all predicates.
+    #[serde(alias = "EXISTS")]
+    Exists,
+    /// No selected record satisfies all predicates.
+    #[serde(alias = "NONE")]
+    None,
+    /// The number of satisfying records compared against `threshold`
+    /// via `op` (numeric ops only: `Gte`/`Gt`/`Eq`/`Lte`/`Lt`).
+    Count {
+        /// Numeric comparison operator.
+        op: Op,
+        /// Threshold count.
+        threshold: u64,
+    },
+}
+
+impl Default for Quantifier {
+    fn default() -> Self {
+        Self::All
+    }
+}
+
 /// A property specification consisting of a name and a set of predicates.
 ///
-/// Predicates are combined with **AND semantics**: all predicates must
-/// hold for the property to be satisfied. An **empty predicate set**
-/// means the property is **always satisfied** (total-function behavior),
-/// which is load-bearing and must not be "fixed" to return `Violated`.
+/// Predicates are combined with **AND semantics** within each candidate
+/// record. An **empty predicate set** means **always satisfied**
+/// (total-function behavior, load-bearing).
 ///
-/// # Example
-///
-/// ```rust,ignore
-/// let spec = PropertySpec {
-///     name: "job-completed".to_string(),
-///     predicates: vec![
-///         Predicate { field: "event_type".to_string(), op: Op::Eq, value: json!("job_completed") },
-///         Predicate { field: "job_id".to_string(), op: Op::Contains, value: json!("batch") },
-///     ],
-/// };
-/// ```
+/// v2 (additive, back-compatible): optional `select` (pre-filter, ANDed),
+/// optional `quantifier` (`all`|`exists`|`none`|`count`), optional
+/// `version`. Legacy JSON without these fields parses as
+/// `select: []`, `quantifier: All` — identical legacy meaning.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[non_exhaustive]
 pub struct PropertySpec {
@@ -139,7 +166,20 @@ pub struct PropertySpec {
     /// **Invariant**: An empty vector means the property is satisfied
     /// for all inputs (total-function behavior). This is intentional
     /// and load-bearing — do not change it to return `Violated`.
+    #[serde(default)]
     pub predicates: Vec<Predicate>,
+    /// Pre-filter: only records satisfying ALL select predicates are
+    /// evaluated. Unrelated events (e.g. `JobStarted` lacking `safety.*`)
+    /// are removed before predicate evaluation — never `UnknownField`.
+    #[serde(default)]
+    pub select: Vec<Predicate>,
+    /// Quantifier over the selected set. Default `All` (legacy).
+    #[serde(default)]
+    pub quantifier: Quantifier,
+    /// Explicit spec version (`1` legacy, `2` select/quantifier).
+    /// `None` = legacy v1 shape.
+    #[serde(default)]
+    pub version: Option<u32>,
 }
 
 /// Errors that can occur during specification parsing.
@@ -161,7 +201,14 @@ pub enum ParseSpecError {
 #[derive(serde::Deserialize)]
 struct SpecWrapper {
     name: String,
+    #[serde(default)]
     predicates: Vec<Predicate>,
+    #[serde(default)]
+    select: Vec<Predicate>,
+    #[serde(default)]
+    quantifier: Option<Quantifier>,
+    #[serde(default)]
+    version: Option<u32>,
 }
 
 /// Parse a specification string into a [`PropertySpec`].
@@ -200,27 +247,49 @@ struct SpecWrapper {
 /// ```
 pub fn parse_spec(input: &str) -> Result<PropertySpec, ParseSpecError> {
     let wrapper: SpecWrapper = serde_json::from_str(input)
-        .map_err(|e| ParseSpecError::InvalidFormat(format!("JSON parse error: {}", e)))?;
+        .map_err(|e| ParseSpecError::InvalidFormat(format!("JSON parse error: {e}")))?;
 
-    for pred in &wrapper.predicates {
+    for pred in wrapper.predicates.iter().chain(wrapper.select.iter()) {
         validate_field_path(&pred.field)?;
         validate_op_type(&pred.field, &pred.op, &pred.value)?;
+    }
+    if let Some(Quantifier::Count { op, .. }) = &wrapper.quantifier {
+        match op {
+            Op::Gt | Op::Lt | Op::Gte | Op::Lte | Op::Eq | Op::Neq => {}
+            Op::Contains | Op::Regex => {
+                return Err(ParseSpecError::OpTypeMismatch {
+                    field: "quantifier.count.op".to_string(),
+                    message: "Count op must be numeric (Gt/Lt/Gte/Lte/Eq/Neq)".to_string(),
+                });
+            }
+        }
     }
 
     Ok(PropertySpec {
         name: wrapper.name,
         predicates: wrapper.predicates,
+        select: wrapper.select,
+        quantifier: wrapper.quantifier.unwrap_or_default(),
+        version: wrapper.version,
     })
 }
 
 /// Validate that a field path follows a known pattern.
 ///
-/// Supported patterns: `"event_type"`, `"job_id"`, `"seq"`,
-/// `"output.<key>"` (where `<key>` is any string), `"watermark"`.
+/// Supported: `"event_type"`, `"job_id"`, `"seq"`, `"capability"`,
+/// `"error"`, `"output.<key>"`, `"watermark"`, and `safety.*`
+/// (`safety.semantic_policy|dal|llmosafe_status|runtimo_disposition|
+/// input_class|analysis_kind|provenance_consistent|no_evidence|
+/// stages_executed|oov_ratio|detection_flags|body_pressure|schema_version`).
 fn validate_field_path(field: &str) -> Result<(), ParseSpecError> {
     // Check exact matches first
     match field {
-        "event_type" | "job_id" | "seq" | "watermark" => return Ok(()),
+        "event_type" | "job_id" | "seq" | "capability" | "error" | "watermark" => return Ok(()),
+        "safety.semantic_policy" | "safety.dal" | "safety.llmosafe_status"
+        | "safety.runtimo_disposition" | "safety.input_class" | "safety.analysis_kind"
+        | "safety.provenance_consistent" | "safety.no_evidence" | "safety.stages_executed"
+        | "safety.oov_ratio" | "safety.detection_flags" | "safety.body_pressure"
+        | "safety.schema_version" | "safety.field_id" => return Ok(()),
         _ => {}
     }
     // Check output.<key> pattern
@@ -229,12 +298,12 @@ fn validate_field_path(field: &str) -> Result<(), ParseSpecError> {
             return Ok(());
         }
     }
+    // Check safety.extra.<key>? Not in v1 — reject to avoid silent scope creep.
     Err(ParseSpecError::InvalidFieldPath {
         field: field.to_string(),
         message: format!(
-            "Field path '{}' is not a recognized path. \
-             Supported: event_type, job_id, seq, output.<key>, watermark",
-            field
+            "Field path '{field}' is not a recognized path. \
+             Supported: event_type, job_id, seq, capability, error, output.<key>, watermark, safety.*"
         ),
     })
 }
@@ -280,8 +349,14 @@ fn validate_op_type(field: &str, op: &Op, value: &Value) -> Result<(), ParseSpec
 /// - `"event_type"` → the event type as a string (via [`WalEventType::as_str`])
 /// - `"job_id"` → the job ID string
 /// - `"seq"` → the sequence number as a number
+/// - `"capability"` → capability name (absent → `None`, not empty string)
+/// - `"error"` → error string (absent → `None`)
 /// - `"output.<key>"` → the nested key from the output JSON value
-/// - `"watermark"` → always `None` (not a WalEvent field; eval returns Error)
+/// - `"watermark"` → always `None` (bundle metadata, not a record field;
+///   eval returns Error — §50 conflation fix)
+/// - `"safety.*"` → typed safety record fields when `event.safety` is
+///   present; `None` when the event has no safety record (selector
+///   filtering removes these before predicate eval — §47)
 /// - `"bundle_hash"` → **never accessed** (integrity invariant)
 #[must_use]
 pub fn extract_field(event: &WalEvent, field: &str) -> Option<Value> {
@@ -289,7 +364,23 @@ pub fn extract_field(event: &WalEvent, field: &str) -> Option<Value> {
         "event_type" => Some(Value::String(event.event_type.as_str().to_string())),
         "job_id" => Some(Value::String(event.job_id.clone())),
         "seq" => Some(Value::from(event.seq)),
+        "capability" => event.capability.clone().map(Value::String),
+        "error" => event.error.clone().map(Value::String),
         "watermark" => None,
+        "safety.semantic_policy" => event.safety.as_ref().map(|s| Value::String(s.semantic_policy.clone())),
+        "safety.dal" => event.safety.as_ref().map(|s| Value::String(s.dal.clone())),
+        "safety.llmosafe_status" => event.safety.as_ref().map(|s| Value::String(s.llmosafe_status.clone())),
+        "safety.runtimo_disposition" => event.safety.as_ref().map(|s| Value::String(s.runtimo_disposition.as_str().to_string())),
+        "safety.input_class" => event.safety.as_ref().map(|s| Value::String(s.input_class.as_str().to_string())),
+        "safety.analysis_kind" => event.safety.as_ref().map(|s| Value::String(s.analysis_kind.as_str().to_string())),
+        "safety.provenance_consistent" => event.safety.as_ref().map(|s| Value::Bool(s.provenance_consistent)),
+        "safety.no_evidence" => event.safety.as_ref().and_then(|s| s.no_evidence.map(Value::Bool)),
+        "safety.stages_executed" => event.safety.as_ref().map(|s| Value::from(s.stages_executed)),
+        "safety.oov_ratio" => event.safety.as_ref().and_then(|s| s.oov_ratio.map(Value::from)),
+        "safety.detection_flags" => event.safety.as_ref().and_then(|s| s.detection_flags.map(Value::from)),
+        "safety.body_pressure" => event.safety.as_ref().and_then(|s| s.body_pressure.map(Value::from)),
+        "safety.schema_version" => event.safety.as_ref().map(|s| Value::from(s.schema_version)),
+        "safety.field_id" => event.safety.as_ref().map(|s| Value::String(s.field_id.clone())),
         _ if field.starts_with("output.") => {
             let path = &field["output.".len()..];
             event.output.as_ref().and_then(|o| {

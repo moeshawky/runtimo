@@ -25,8 +25,8 @@ pub mod eval;
 pub mod spec;
 
 pub use benchmark::{run_benchmarks, BenchmarkReport};
-pub use eval::{evaluate, PropertyVerdict, Verdict};
-pub use spec::{parse_spec, Op, Predicate, PropertySpec};
+pub use eval::{evaluate, evaluate_v2, PropertyVerdict, Verdict};
+pub use spec::{parse_spec, Op, Predicate, PropertySpec, Quantifier};
 
 /// Errors that can occur in the oracle module.
 ///

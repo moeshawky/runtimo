@@ -64,6 +64,7 @@ use crate::capability::{Capability, Context, Output};
 use crate::config::RuntimoConfig;
 use crate::job::JobId;
 use crate::processes::{ProcessSnapshot, ProcessSummary};
+use crate::safety::{self, InputClass, RuntimoDisposition, SafetyAssessmentV1};
 use crate::session::SessionManager;
 use crate::telemetry::Telemetry;
 use crate::wal::{WalEvent, WalEventType, WalWriter};
@@ -298,7 +299,38 @@ pub fn execute_with_telemetry_and_session(
     // audited with a JobFailed event (no silent early-Err gap).
     let mut wal = WalWriter::create(wal_path)?;
 
-    // LlmoSafeGuard is the circuit breaker — reads /proc/stat with delta measurement
+    // JobStarted = "executor accepted the attempt" (contract A, §37).
+    // Emitted before all gates so every JobFailed has a preceding JobStarted
+    // for the same job_id. Oracle `blocked before effect` relies on this.
+    let start_seq = wal.seq();
+    wal.append(WalEvent {
+        seq: start_seq,
+        ts: telemetry_before.timestamp,
+        event_type: WalEventType::JobStarted,
+        job_id: job_id_str.clone(),
+        capability: Some(cap_name.clone()),
+        output: None,
+        error: None,
+        telemetry_before: telemetry_opt(telemetry_on, &telemetry_before),
+        telemetry_after: None,
+        process_before: Some(process_before.summary.clone()),
+        process_after: None,
+        cmd: None,
+        cmd_stdout: None,
+        cmd_stderr: None,
+        cmd_exit_code: None,
+        cmd_corrected: None,
+        oov_ratio: None,
+        detection_flags: None,
+        backup_path: None,
+        bundle_hash: None,
+        mono_ns: None,
+        wall_ns: None,
+        safety: None,
+    })?;
+
+    // LlmoSafeGuard is the circuit breaker — one upstream observation per
+    // admission, no cooldown cache (vacuous-restore eliminated).
     let guard = LlmoSafeGuard::new();
     if let Err(e) = guard.check() {
         let msg = e;
@@ -393,76 +425,195 @@ pub fn execute_with_telemetry_and_session(
         }),
     );
 
-    let start_seq = wal.seq();
-    wal.append(WalEvent {
-        seq: start_seq,
-        ts: telemetry_before.timestamp,
-        event_type: WalEventType::JobStarted,
-        job_id: job_id_str.clone(),
-        capability: Some(cap_name.clone()),
-        output: None,
-        error: None,
-        telemetry_before: telemetry_opt(telemetry_on, &telemetry_before),
-        telemetry_after: None,
-        process_before: Some(process_before.summary.clone()),
-        process_after: None,
-        cmd: None,
-        cmd_stdout: None,
-        cmd_stderr: None,
-        cmd_exit_code: None,
-        cmd_corrected: None,
-        oov_ratio: None,
-        detection_flags: None,
-        backup_path: None,
-        bundle_hash: None,
-        mono_ns: None,
-        wall_ns: None,
-    })?;
-
-    // Cognitive safety check — runs llmosafe's CognitivePipeline
-    // (sifter + bias detection + surprise gating + detectors) against
-    // user-authored natural language content (commands, file content,
-    // URLs, commit messages). Structured inputs (paths, PIDs, job IDs)
-    // are skipped — the TF-IDF classifier was trained on manipulation
-    // text and produces false positives on structured data.
+    // Safety gate (§14 Path B, §16-18): declarative input semantics over the
+    // COMPLETE eligible input. No first-field-wins, no 8192-byte blind tail
+    // (upstream MAX_WORK_TOKENS + SiftError is the bounded-work contract),
+    // no ShellExec string-match skip.
     //
-    // ShellExec is excluded: its blocklist already validates dangerous
-    // commands, and the NLP sifter produces false positives on shell
-    // command syntax (e.g. `ls -la` flagged as CognitiveInstability).
-    let skip_cognitive = cap_name == "ShellExec";
-    if !skip_cognitive && has_natural_content(args) {
-        let pipeline_result = guard
-            .check_cognitive_pipeline(
-                capability.description(),
-                &sift_observation(capability.description(), args),
-            )
-            .map_err(|e| Error::ExecutionFailed(format!("Cognitive safety check failed: {}", e)))?;
-
-        if !pipeline_result.decision.can_proceed() {
-            let telemetry_after = fresh_telemetry_after(telemetry_on);
-            let process_after = fresh_process_after();
-            let err_msg = format!(
-                "Cognitive safety violation: decision {:?}",
-                pipeline_result.decision
-            );
-            // Best-effort audit (matches the pre-execution rejection sites):
-            // a WAL write failure must not mask the cognitive violation.
-            // The failure is logged so dropped audits stay visible.
-            if let Err(e) = log_job_failed_with_snapshots(
-                &mut wal,
-                &job_id_str,
-                &cap_name,
-                &err_msg,
-                telemetry_opt(telemetry_on, &telemetry_before).as_ref(),
-                telemetry_opt(telemetry_on, &telemetry_after).as_ref(),
-                &process_before.summary,
-                &process_after.summary,
-                Some(pipeline_result.oov_ratio),
-                Some(pipeline_result.detection_flags),
-            ) {
-                log::warn!("WAL audit append failed for job {}: {}", job_id_str, e);
+    // Composition: when several control-plane observations are eligible,
+    // all are evaluated and the most severe disposition wins
+    // (Fatal > Reject > EscalationRequired > AllowWithWarning > Allow).
+    // ShellExec.cmd is CommandControl / sifter-ineligible by table, so it
+    // yields ResourceOnly + deterministic blocklist enforcement in the
+    // capability (Observe-equivalent: telemetry without semantic authority).
+    let safety_assessment: Option<SafetyAssessmentV1> = {
+        let fields = safety::fields_for(&cap_name);
+        let mut winning: Option<SafetyAssessmentV1> = None;
+        let mut winning_rank: u8 = 0;
+        let rank = |d: RuntimoDisposition| match d {
+            RuntimoDisposition::Allow => 0,
+            RuntimoDisposition::AllowWithWarning => 1,
+            RuntimoDisposition::EscalationRequired => 2,
+            RuntimoDisposition::Reject => 3,
+            RuntimoDisposition::Fatal => 4,
+        };
+        for fs in fields {
+            let Some(text) = args.get(fs.field).and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if !fs.sifter_eligible {
+                continue;
             }
-            return Err(Error::CognitiveSafetyViolation(err_msg));
+            // Full input, no truncation (§19). analysis_complete stays true.
+            match guard.assess(text, fs.field, fs.class) {
+                Ok(a) => {
+                    let r = rank(a.runtimo_disposition);
+                    if winning.is_none() || r > winning_rank {
+                        winning_rank = r;
+                        winning = Some(a);
+                    }
+                }
+                Err(e) => {
+                    // Fail closed (§20): analysis inability never Proceeds.
+                    let msg = format!("Safety analysis failed for '{field}': {e}", field = fs.field);
+                    let telemetry_after = fresh_telemetry_after(telemetry_on);
+                    let process_after = fresh_process_after();
+                    let _ = log_job_failed_with_snapshots(
+                        &mut wal,
+                        &job_id_str,
+                        &cap_name,
+                        &msg,
+                        telemetry_opt(telemetry_on, &telemetry_before).as_ref(),
+                        telemetry_opt(telemetry_on, &telemetry_after).as_ref(),
+                        &process_before.summary,
+                        &process_after.summary,
+                        None,
+                        None,
+                    );
+                    return Err(Error::SafetyAnalysisFailed(msg));
+                }
+            }
+        }
+        // No eligible semantic field → resource-only (truthful, not skipped).
+        winning.or_else(|| {
+            let class = fields
+                .first()
+                .map(|f| f.class)
+                .unwrap_or(InputClass::OpaqueData);
+            let field = fields.first().map(|f| f.field).unwrap_or("-");
+            Some(safety::resource_only_assessment(
+                class,
+                field,
+                guard.semantic_policy(),
+                guard.dal(),
+                Some(guard.pressure()),
+            ))
+        })
+    };
+
+    // SafetyEvaluated BEFORE the governed side effect (§37). Best-effort
+    // like other audits: WAL failure must not mask the safety decision,
+    // but the side effect below still follows the disposition.
+    if let Some(ref assessment) = safety_assessment {
+        let seq = wal.seq();
+        if let Err(e) = wal.append(WalEvent {
+            seq,
+            ts: telemetry_before.timestamp,
+            event_type: WalEventType::SafetyEvaluated,
+            job_id: job_id_str.clone(),
+            capability: Some(cap_name.clone()),
+            output: None,
+            error: None,
+            telemetry_before: None,
+            telemetry_after: None,
+            process_before: None,
+            process_after: None,
+            cmd: None,
+            cmd_stdout: None,
+            cmd_stderr: None,
+            cmd_exit_code: None,
+            cmd_corrected: None,
+            oov_ratio: assessment.oov_ratio,
+            detection_flags: assessment.detection_flags,
+            backup_path: None,
+            bundle_hash: None,
+            mono_ns: None,
+            wall_ns: None,
+            safety: Some(assessment.clone()),
+        }) {
+            log::warn!("WAL SafetyEvaluated append failed for job {job_id_str}: {e}");
+        }
+
+        // Explicit actuation (§29-30): Escalate stays EscalationRequired
+        // (never silent Allow, never generic Halt); Halt → Reject;
+        // Exit → Fatal (no daemon kill); Warn → allow + audit (below).
+        match assessment.runtimo_disposition {
+            RuntimoDisposition::Allow | RuntimoDisposition::AllowWithWarning => {}
+            RuntimoDisposition::EscalationRequired => {
+                let telemetry_after = fresh_telemetry_after(telemetry_on);
+                let process_after = fresh_process_after();
+                let err_msg = format!(
+                    "Safety escalation required: {} {} (llmosafe {})",
+                    assessment.input_class.as_str(),
+                    assessment.field_id,
+                    assessment.llmosafe_status
+                );
+                if let Err(e) = log_job_failed_with_snapshots(
+                    &mut wal,
+                    &job_id_str,
+                    &cap_name,
+                    &err_msg,
+                    telemetry_opt(telemetry_on, &telemetry_before).as_ref(),
+                    telemetry_opt(telemetry_on, &telemetry_after).as_ref(),
+                    &process_before.summary,
+                    &process_after.summary,
+                    assessment.oov_ratio,
+                    assessment.detection_flags,
+                ) {
+                    log::warn!("WAL audit append failed for job {job_id_str}: {e}");
+                }
+                return Err(Error::SafetyEscalationRequired(err_msg));
+            }
+            RuntimoDisposition::Reject => {
+                let telemetry_after = fresh_telemetry_after(telemetry_on);
+                let process_after = fresh_process_after();
+                let err_msg = format!(
+                    "Safety rejected: {} {} (llmosafe {})",
+                    assessment.input_class.as_str(),
+                    assessment.field_id,
+                    assessment.llmosafe_status
+                );
+                if let Err(e) = log_job_failed_with_snapshots(
+                    &mut wal,
+                    &job_id_str,
+                    &cap_name,
+                    &err_msg,
+                    telemetry_opt(telemetry_on, &telemetry_before).as_ref(),
+                    telemetry_opt(telemetry_on, &telemetry_after).as_ref(),
+                    &process_before.summary,
+                    &process_after.summary,
+                    assessment.oov_ratio,
+                    assessment.detection_flags,
+                ) {
+                    log::warn!("WAL audit append failed for job {job_id_str}: {e}");
+                }
+                return Err(Error::SafetyRejected(err_msg));
+            }
+            RuntimoDisposition::Fatal => {
+                let telemetry_after = fresh_telemetry_after(telemetry_on);
+                let process_after = fresh_process_after();
+                let err_msg = format!(
+                    "Safety fatal: {} {} (llmosafe {})",
+                    assessment.input_class.as_str(),
+                    assessment.field_id,
+                    assessment.llmosafe_status
+                );
+                if let Err(e) = log_job_failed_with_snapshots(
+                    &mut wal,
+                    &job_id_str,
+                    &cap_name,
+                    &err_msg,
+                    telemetry_opt(telemetry_on, &telemetry_before).as_ref(),
+                    telemetry_opt(telemetry_on, &telemetry_after).as_ref(),
+                    &process_before.summary,
+                    &process_after.summary,
+                    assessment.oov_ratio,
+                    assessment.detection_flags,
+                ) {
+                    log::warn!("WAL audit append failed for job {job_id_str}: {e}");
+                }
+                return Err(Error::SafetyFatal(err_msg));
+            }
         }
     }
 
@@ -533,6 +684,7 @@ pub fn execute_with_telemetry_and_session(
                             bundle_hash: None,
                             mono_ns: None,
                             wall_ns: None,
+                            safety: None,
                         }) {
                             log::error!(
                                 "WAL BackupCreated append failed for job {}: {}",
@@ -624,6 +776,7 @@ pub fn execute_with_telemetry_and_session(
                     bundle_hash: None,
                     mono_ns: None,
                     wall_ns: None,
+                    safety: None,
                 })?;
             }
         }
@@ -673,6 +826,7 @@ pub fn execute_with_telemetry_and_session(
         bundle_hash: None,
         mono_ns: None,
         wall_ns: None,
+        safety: None,
     })?;
 
     // Dev-only: log shell command executions separately for error absorption analysis.
@@ -736,6 +890,7 @@ pub fn execute_with_telemetry_and_session(
             bundle_hash: None,
             mono_ns: None,
             wall_ns: None,
+            safety: None,
         }) {
             log::error!("WAL CommandExecuted append failed: {}", e);
         }
@@ -851,6 +1006,7 @@ fn log_job_failed_with_snapshots(
         bundle_hash: None,
         mono_ns: None,
         wall_ns: None,
+        safety: None,
     })
 }
 
@@ -984,67 +1140,11 @@ fn execute_with_timeout_check(
     output
 }
 
-/// Returns whether `args` carries a user-authored natural-language
-/// field that should pass through the cognitive safety pipeline.
-///
-/// True when any of `cmd`, `content`, `url`, or `message` is a JSON
-/// string. These are the fields whose text is manipulation-prone;
-/// structured-only args (paths, PIDs, job IDs) have none of these
-/// fields and return false, skipping the TF-IDF check. This tests
-/// field presence only — it does not inspect the text's keywords
-/// (that happens downstream in the sifter).
-fn has_natural_content(args: &Value) -> bool {
-    args.get("cmd").and_then(|v| v.as_str()).is_some()
-        || args.get("content").and_then(|v| v.as_str()).is_some()
-        || args.get("url").and_then(|v| v.as_str()).is_some()
-        || args.get("message").and_then(|v| v.as_str()).is_some()
-}
-
-/// Selects the natural-language field to run through the cognitive
-/// sifter.
-///
-/// Returns the first present string among `cmd`, `content`, `url`,
-/// `message` (in that order). `cmd`, `content`, and `message` are
-/// passed through [`truncate_for_sift`]; `url` is returned whole.
-/// When none of those fields is a string, falls back to the
-/// capability description.
-fn sift_observation(description: &str, args: &Value) -> String {
-    if let Some(cmd) = args.get("cmd").and_then(|v| v.as_str()) {
-        return truncate_for_sift(cmd);
-    }
-    if let Some(content) = args.get("content").and_then(|v| v.as_str()) {
-        return truncate_for_sift(content);
-    }
-    if let Some(url) = args.get("url").and_then(|v| v.as_str()) {
-        return url.to_string();
-    }
-    if let Some(message) = args.get("message").and_then(|v| v.as_str()) {
-        return truncate_for_sift(message);
-    }
-    description.to_string()
-}
-
-/// Truncates a string to at most `SIFT_MAX_CHARS` (8192) bytes of
-/// original content for the cognitive sifter.
-///
-/// When the string is longer, backs off from 8192 to the nearest
-/// UTF-8 char boundary so the cut never splits a multi-byte
-/// character, then appends `... [truncated N bytes]` (N = bytes
-/// dropped) — so the returned [`String`] can exceed 8192 bytes by
-/// the length of that marker.
-fn truncate_for_sift(s: &str) -> String {
-    const SIFT_MAX_CHARS: usize = 8192;
-    if s.len() <= SIFT_MAX_CHARS {
-        s.to_string()
-    } else {
-        let mut end = SIFT_MAX_CHARS;
-        while !s.is_char_boundary(end) {
-            end = end.saturating_sub(1);
-        }
-        let remaining = s.len().saturating_sub(end);
-        format!("{}... [truncated {} bytes]", &s[..end], remaining)
-    }
-}
+// Deleted (§16-19): `has_natural_content` (crude key-presence heuristic),
+// `sift_observation` (first-field-wins evidence hiding), and
+// `truncate_for_sift` (8192-byte blind tail narrated as full inspection).
+// Replaced by declarative `safety::fields_for` + full-input `assess()` with
+// most-severe-wins composition in the admission path above.
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::unused_result_ok)]

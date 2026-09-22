@@ -254,6 +254,7 @@ mod tests {
         ResolvedConfig {
             profile: "minimal".to_string(),
             dal: "E".to_string(),
+            semantic_policy: "corroborate".to_string(),
             wal_mode: "always".to_string(),
             backup_enabled: true,
             output_format: "human".to_string(),

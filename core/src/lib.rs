@@ -89,6 +89,8 @@ pub mod executor;
 pub mod job;
 /// LLM safety guard — CPU/RAM circuit breakers and entropy source.
 pub mod llmosafe;
+/// Thin LLMOSafe 0.9 conformance boundary: assessment, disposition, input semantics.
+pub mod safety;
 /// Health monitoring with alerting.
 pub mod monitor;
 /// Observe subsystem — sampling, bundling, budgeting, auditing.
@@ -106,7 +108,7 @@ pub mod validation;
 /// Write-ahead log for crash recovery.
 pub mod wal;
 
-pub use oracle::{evaluate, Op, OracleError, Predicate, PropertySpec, PropertyVerdict, Verdict};
+pub use oracle::{evaluate, evaluate_v2, Op, OracleError, Predicate, PropertySpec, PropertyVerdict, Quantifier, Verdict};
 
 pub use adapters::{ArtifactReducer, JfrAdapter, JfrConfig, TetragonAdapter, TetragonConfig};
 pub use backup::BackupManager;
@@ -118,6 +120,10 @@ pub use config::RuntimoConfig;
 pub use executor::{execute_with_telemetry, execute_with_telemetry_and_session};
 pub use job::{Job, JobId, JobState};
 pub use llmosafe::LlmoSafeGuard;
+pub use safety::{
+    AnalysisKind, AssessmentError, FieldSemantics, InputClass, RuntimoDisposition,
+    SafetyAssessmentV1, SAFETY_SCHEMA_VERSION,
+};
 pub use monitor::HealthMonitor;
 pub use processes::ProcessSnapshot;
 pub use runtime::{
@@ -205,8 +211,32 @@ pub enum Error {
     TelemetryError(String),
 
     /// Cognitive safety violation detected by LLMOSafe.
+    ///
+    /// Legacy generic channel — preserved for backwards compatibility.
+    /// New code emits the typed variants below (`SafetyEscalationRequired`,
+    /// `SafetyRejected`, `SafetyFatal`, `SafetyAnalysisFailed`) so callers
+    /// can distinguish escalation from hard rejection without string parsing.
     #[error("Cognitive safety violation: {0}")]
     CognitiveSafetyViolation(String),
+
+    /// Semantic Escalate: do not execute now; higher-level handler required.
+    /// Distinct from hard Halt — preserved through audit + Oracle.
+    #[error("Safety escalation required: {0}")]
+    SafetyEscalationRequired(String),
+
+    /// Hard safety rejection (upstream Halt).
+    #[error("Safety rejected: {0}")]
+    SafetyRejected(String),
+
+    /// Fatal-class upstream safety result (upstream Exit).
+    /// Does NOT terminate the daemon/process by itself.
+    #[error("Safety fatal: {0}")]
+    SafetyFatal(String),
+
+    /// Upstream analysis could not complete (`SiftError`).
+    /// Never coerced to allow.
+    #[error("Safety analysis failed: {0}")]
+    SafetyAnalysisFailed(String),
 }
 
 /// Result alias for runtimo-core operations.

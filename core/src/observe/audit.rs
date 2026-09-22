@@ -159,6 +159,7 @@ impl AuditEvent {
             })),
             mono_ns: Some(self.ts_ns),
             wall_ns: Some(self.ts_ns),
+            safety: None,
             ..Default::default()
         }
     }
