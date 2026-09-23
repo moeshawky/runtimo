@@ -208,8 +208,11 @@ fn mock_resolver_proves_unresolved() {
 }
 
 #[test]
-fn mock_resolver_proves_resolved_with_codegraph() {
-    // With Codegraph available, resolution should be Resolved.
+fn resolver_refuses_fabrication_when_codegraph_flag_true() {
+    // Per core/src/runtime/runtime_fact_export.rs:119-129, resolve_locator
+    // always returns Unresolved — even when codegraph_available=true —
+    // because no real resolver is wired. Fabricating a SymbolUID is
+    // banned evidence custody (§56).
     let locator = RuntimeLocator::Python {
         module: "runtimo".to_string(),
         qualname: "run".to_string(),
@@ -219,10 +222,21 @@ fn mock_resolver_proves_resolved_with_codegraph() {
 
     let resolution = RuntimeFactExport::resolve_locator_for_test(&locator, true);
 
+    // Prove codegraph_available=true was passed, result is Unresolved,
+    // no fabricated UID exists.
     assert!(
-        matches!(resolution, SymbolUidResolution::Resolved { .. }),
-        "With Codegraph, resolution must be Resolved"
+        matches!(resolution, SymbolUidResolution::Unresolved { .. }),
+        "codegraph_available=true must still yield Unresolved (no real resolver wired)"
     );
+    if let SymbolUidResolution::Unresolved { reason, .. } = &resolution {
+        assert!(
+            reason.contains("refusing to fabricate") || reason.contains("not wired"),
+            "Reason must document refusal to fabricate, got: {}",
+            reason
+        );
+    } else {
+        panic!("Expected Unresolved resolution; no fabricated SymbolUID permitted");
+    }
 }
 
 // ── No Codegraph Import ──────────────────────────────────────────

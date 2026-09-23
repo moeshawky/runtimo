@@ -29,7 +29,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`SymbolUID` never fabricated** — `RuntimeFactV1.symbol_uids` populated only from real provider data; empty vec when unresolvable; Oracle reader returns `EvidenceUnavailable` not fabricated facts (9d58ebc).
 
 ### Testing
-- **Test count:** 758 passed / 5 failed (4 sampler-environment + 1 external-service-dependent) / 27 ignored. Failing: (a) `observe::supervisor::tests::supervisor_pressure_routing` (lib), (b) `observe::self_test::tests::self_test_fixtures_pass_on_healthy` (lib), (c) `observe_fixture_b_integration` (integration), (d) `observe_self_test_run_exits_zero` (integration) — all four reproduced byte-identical on pre-change baseline; the sampler yields 0 samples at 50Hz in this container and no observe files were touched; (e) `mock_resolver_proves_resolved_with_codegraph` (runtime_fact_export_test) — requires external Codegraph service. Run `RUNTIMO_TEST_PRESSURE=10 cargo test --workspace --no-fail-fast` for current counts.
+- **Test count:** 758 passed / 5 failed (4 sampler-environment + 1 external-service-dependent) / 27 ignored. Failing: (a) `observe::supervisor::tests::supervisor_pressure_routing` (lib), (b) `observe::self_test::tests::self_test_fixtures_pass_on_healthy` (lib), (c) `observe_fixture_b_integration` (integration), (d) `observe_self_test_run_exits_zero` (integration) — all four reproduced byte-identical on pre-change baseline; the sampler yields 0 samples at 50Hz in this container and no observe files were touched; (e) `resolver_refuses_fabrication_when_codegraph_flag_true` (runtime_fact_export_test) — requires external Codegraph service. Run `RUNTIMO_TEST_PRESSURE=10 cargo test --workspace --no-fail-fast` for current counts.
+
+## [0.10.1] - 2026-09-23
+
+### Added
+- **LLMOSafe 0.9 conformance boundary** — New `core/src/safety.rs` (921 lines): `InputClass` (8 input semantics), `AnalysisKind`, `RuntimoDisposition` (5 dispositions), `SafetyAssessmentV1`, `SAFETY_SCHEMA_VERSION`; typed disposition mapping; `resource_only_assessment()` path; invariants: `UNKNOWN != SAFE`, `no_evidence` never safe, `SiftError` is a real safety outcome (d95cd1b).
+- **Oracle v2** — New `core/src/oracle/generic_eval.rs` (211 lines): `Quantifier` enum (`All`, `Exists`, `None`, `Count`), `evaluate_v2` path, `GenericVerdict` with `selected_count`/`evaluated_count`/`matched_count`; `PropertyVerdict` gains count fields; `WalSource`, `BundleSource`, `RuntimeFactSource` selectors expanded (8e4a3d6).
+- **Conformance firewall** — New `core/tests/conformance09.rs` (498 lines): §11/§59 conformance tests, §62-66 authority-chain tests; `EnvGuard` RAII for process-global env isolation; `RUNTIMO_MEMORY_CEILING_BYTES` set to `usize::MAX` for deterministic low-pressure seams.
+- **EnvGuard RAII isolation** — New `core/src/lib.rs::test_isolation` module: `EnvGuard` struct with `Drop` impl that restores `RUNTIMO_TEST_PRESSURE`, `RUNTIMO_MEMORY_CEILING_BYTES`, `RUNTIMO_SEMANTIC_POLICY` on drop (including panic); serializes via shared `ENV_GUARD` inside `crate::lock_env()`.
+
+### Changed
+- **RuntimeFact no-fabrication** — `resolve_locator()` (`core/src/runtime/runtime_fact_export.rs`) now returns `SymbolUidResolution::Unresolved` always, even when `codegraph_available=true`; the old `codegraph_available=true` path that fabricated deterministic `file:line:kind` identity violated §56 evidence custody and has been removed. Test renamed from `resolve_locator_returns_resolved_with_codegraph` to `resolve_locator_never_fabricates`.
+- **Test correction** — `mock_resolver_proves_resolved_with_codegraph` corrected to `resolver_refuses_fabrication_when_codegraph_flag_true`; the test asserts `Unresolved` with reason `"Codegraph resolver not wired — no real SymbolUID available; refusing to fabricate identity (§56)"` even when the flag is true.
+- **WAL/safety evidence** — `WalEvent` gains `safety: Option<SafetyAssessmentV1>` field (serde default, versioned); new `WalEventType::SafetyEvaluated` variant with wire string `safety_evaluated`; executor emits `SafetyEvaluated` AFTER `JobStarted` and BEFORE the governed side effect — WAL append failure blocks execution (`core/src/wal.rs`, `core/src/executor.rs`).
+- **ShellExec containment** — Blocklist documentation clarified: `blocklist_enabled = false` opts out entirely (operator decision, not a security failure); `is_dangerous_command` docs updated to reflect blocklist-ON-by-default semantics; `SafetyEvaluated` event integrated into the execution pipeline diagram.
+- **Sampler determinism** — `core/src/observe/sampler.rs`: `SampleEvent` default gains `safety: None`; `core/src/observe/self_test.rs`: `self_test_fixtures_pass_on_healthy` now uses `EnvGuard::new()` and sets `RUNTIMO_MEMORY_CEILING_BYTES` to `usize::MAX` for deterministic seams; `RUNTIMO_TEST_PRESSURE` removed to ensure `test_pressure_override()` returns `None`.
+- **Version retarget 0.10.0→0.10.1** — `README.md` version updated to 0.10.1; MSRV 1.70→1.85 (tracks `llmosafe 0.9.x`); `llmosafe` 0.7.7→0.9.0 in `core/Cargo.toml`; `Cargo.lock` updated; `CONTRIBUTING.md` MSRV updated; CI toolchain updated to 1.85.0.
+
+### Testing
+- **OBSERVED final (precision run):** lib 489/0, integration 69/2 same-known (`observe_fixture_b_integration` + `observe_self_test_run_exits_zero`), sampler 0 samples at 50Hz container, robust 46/0, conformance09 15/0, runtime_fact_export 12/0, cli 39/0, daemon 69/0, doc 28/0; total ~767 passed / 2 failed same-known. State fmt/check/clippy/deny/machete/MSRV exit 0.
+- **Known failures (same-known, reproduced on pre-change baseline):** `observe_fixture_b_integration` + `observe_self_test_run_exits_zero` — sampler yields 0 samples at 50Hz in this container.
 
 ## [0.9.1] - 2026-09-12
 

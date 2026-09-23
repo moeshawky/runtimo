@@ -3,7 +3,7 @@
 **Last Updated:** 2026-09-12
 **Build:** `cargo clippy --all-targets` — clean, 0 warnings
 **Tests:** 740 (39 cli + 473 core-lib + 65 integration + 69 daemon + 46 robust + 28 adapters_integration + 12 runtime_fact_export + 8 doctest)
-**Version:** 0.10.0 (pending) — crate deps pinned ^0.10 (verified: daemon/Cargo.toml:18, cli/Cargo.toml:23-24)
+**Version:** 0.10.1 (pending) — crate deps pinned ^0.10 (verified: daemon/Cargo.toml:18, cli/Cargo.toml:23-24)
 
 ---
 

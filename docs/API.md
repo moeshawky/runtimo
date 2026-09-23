@@ -1,8 +1,8 @@
 # Runtimo Core API Reference
 
-**Version:** 0.10.0
+**Version:** 0.10.1
 **Updated:** 2026-09-22
-**Documentation:** [docs.rs/runtimo-core](https://docs.rs/runtimo-core/0.10.0)
+**Documentation:** [docs.rs/runtimo-core](https://docs.rs/runtimo-core/0.10.1)
 
 ## Quick Links
 
@@ -842,7 +842,7 @@ cargo test -- --nocapture
 
 ## Version
 
-0.10.0
+0.10.1
 
 ## License
 
