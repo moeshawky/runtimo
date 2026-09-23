@@ -30,7 +30,7 @@ Runtimo is a Rust workspace providing a **capability execution engine**. Every c
 - **Backup/undo** — Files backed up before mutation, rollback by job ID
 - **Input validation** — Capabilities validate arguments including path traversal, symlink, and null byte protection
 
-**Version:** 0.10.1 | **Rust Edition:** 2021 | **Tests:** 758 passed / 5 failed (4 sampler-environment + 1 external-service-dependent) / 27 ignored. Failing: (a) `observe::supervisor::tests::supervisor_pressure_routing` (lib), (b) `observe::self_test::tests::self_test_fixtures_pass_on_healthy` (lib), (c) `observe_fixture_b_integration` (integration), (d) `observe_self_test_run_exits_zero` (integration) — all four reproduced byte-identical on pre-change baseline; the sampler yields 0 samples at 50Hz in this container and no observe files were touched; (e) `resolver_refuses_fabrication_when_codegraph_flag_true` (runtime_fact_export_test) — requires external Codegraph service. Run `RUNTIMO_TEST_PRESSURE=10 cargo test --workspace --no-fail-fast` for current counts.
+**Version:** 0.10.1 | **Rust Edition:** 2021 | **Tests:** ~767 passed / 2 failed same-known (observe_fixture_b_integration, observe_self_test_run_exits_zero sampler 0@50Hz container) / runtime_fact_export 12/12 including resolver_refuses_fabrication_when_codegraph_flag_true PASS / lib 489/0 / conformance09 15/0 / fmt/check/clippy/deny/machete/MSRV exit 0.
 
 See [CHANGELOG.md](CHANGELOG.md) for full release history.
 
