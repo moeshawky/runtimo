@@ -397,13 +397,13 @@ impl Default for LlmoSafeGuard {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     // Serialize env var mutations across tests (process-global state).
-    static ENV_GUARD: Mutex<()> = Mutex::new(());
-
-    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
-        ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner())
+    // Uses the shared ENV_GUARD from runtimo_core to coordinate
+    // with other test modules (e.g., observe::supervisor::tests).
+    // RAII EnvGuard restores unset-vs-set on drop, including on panic.
+    fn lock_env() -> crate::test_isolation::EnvGuard {
+        crate::test_isolation::EnvGuard::new()
     }
 
     #[test]
@@ -432,11 +432,9 @@ mod tests {
         // chains would double-downgrade. This test pins the crate's
         // single-application contract via a semantic Halt candidate:
         // under DAL B a Halt becomes Escalate exactly once.
-        let _g = lock_env();
-        // Save-and-restore: capture prior presence AND value so that a
-        // suite running under an outer RUNTIMO_TEST_PRESSURE override is
-        // not left with the var deleted for later tests in the same process.
-        let prior = std::env::var("RUNTIMO_TEST_PRESSURE").ok();
+        // RAII guard captures the four RUNTIMO_* vars and restores
+        // them on drop (including on panic).
+        let _guard = lock_env();
         // Pin 90 (Emergency) → upstream Halt(ResourceExhaustion) unconditionally
         // (llmosafe_integration.rs:660-667). DAL B downgrades Halt→Escalate exactly
         // once (llmosafe_integration.rs:760-769), never Proceed. Ambient-proof.
@@ -452,10 +450,7 @@ mod tests {
         // double-downgrade to E-like allow. The key pin: decision came
         // from the crate alone (no local second pass).
         assert!(!matches!(res.decision, SafetyDecision::Proceed));
-        match prior {
-            Some(v) => std::env::set_var("RUNTIMO_TEST_PRESSURE", v),
-            None => std::env::remove_var("RUNTIMO_TEST_PRESSURE"),
-        }
+        // EnvGuard::drop restores unset-vs-set automatically.
     }
 
     #[test]
@@ -502,50 +497,25 @@ mod tests {
 
     /// check_cognitive_pipeline can return Err (the "never returns Err" lie is gone).
     /// The docs are now truthful: sifter failure propagates as Err(String).
-    /// Pin RUNTIMO_TEST_PRESSURE=90 (Emergency) for determinism: with
-    /// PressureLevel::Emergency, upstream decide_with_pressure returns
-    /// Halt(ResourceExhaustion) unconditionally (checked before any
-    /// entropy/surprise/bias evaluation), so ambient pressure or sifter
-    /// variance cannot flip this to Proceed. Verified in llmosafe-0.9.0
-    /// llmosafe_integration.rs:660-667 (Emergency arm) and :227 (76-100→Emergency).
+    /// Oversized input exceeding MAX_WORK_TOKENS triggers `SiftError::ResourceExhaustion`
+    /// from the upstream sifter, which this shim propagates as `Err(String)`.
+    /// Verified in llmosafe-0.9.0 llmosafe_sifter.rs:629-630.
+    /// RAII guard captures the four RUNTIMO_* vars and restores
+    /// them on drop (including on panic).
     #[test]
     #[allow(deprecated)] // Tests the deprecated shim itself
     fn check_cognitive_pipeline_can_return_err() {
-        let _g = lock_env();
-        // Save-and-restore: capture prior presence AND value so that a
-        // suite running under an outer RUNTIMO_TEST_PRESSURE override is
-        // not left with the var deleted for later tests in the same process.
-        let prior = std::env::var("RUNTIMO_TEST_PRESSURE").ok();
-        std::env::set_var("RUNTIMO_TEST_PRESSURE", "90");
+        // RAII guard ensures clean env and restores unset-vs-set.
+        let _guard = lock_env();
         let guard = LlmoSafeGuard::new();
-        // Benign input → Ok.
-        let res = guard
-            .check_cognitive_pipeline(
-                "obj",
-                "a completely ordinary sentence about everyday topics",
-            )
-            .unwrap();
-        // Verify the decision is not Proceed for a short sentence.
-        assert!(!matches!(res.decision, SafetyDecision::Proceed));
-
-        // Oversized input may exhaust the work budget → Err.
         let big = "x ".repeat(500_000);
-        let res_big = guard.check_cognitive_pipeline("obj", &big);
-        // Either Ok (upstream didn't exhaust) or Err (exhausted). Both are valid.
-        // The contract is: Err is possible, never silently coerced to Proceed.
-        match res_big {
-            Ok(r) => {
-                // If Ok, it must not be a fabricated Proceed.
-                assert!(!matches!(r.decision, SafetyDecision::Proceed));
-            }
-            Err(e) => {
-                // Err is the truthful outcome for sifter failure.
-                assert!(e.contains("sifter"), "error must mention sifter");
-            }
-        }
-        match prior {
-            Some(v) => std::env::set_var("RUNTIMO_TEST_PRESSURE", v),
-            None => std::env::remove_var("RUNTIMO_TEST_PRESSURE"),
-        }
+        let res = guard.check_cognitive_pipeline("obj", &big);
+        assert!(res.is_err(), "oversized input must produce Err");
+        let Err(err_str) = res else { unreachable!() };
+        assert!(
+            err_str.contains("sifter") && err_str.contains("Exhaustion"),
+            "error must identify sifter failure: {err_str}"
+        );
+        // EnvGuard::drop restores unset-vs-set automatically.
     }
 }

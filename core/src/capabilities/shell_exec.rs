@@ -10,7 +10,7 @@
 //! **Threat model:** Agents making mistakes, not attackers.
 //! The blocklist catches obvious agent hallucinations/bugs.
 //!
-//! **What's blocked:**
+//! **Blocked when blocklist is ON (default):**
 //! - Filesystem destruction: `rm` (all forms), `rm -rf /`, `rm --recursive`, `rm --no-preserve-root`
 //! - Secure deletion: `shred` (use FileWrite/Undo instead)
 //! - Fork bombs: `:(){ :|:& };:` and variants (self-referencing function definitions)
@@ -28,13 +28,17 @@
 //! - Outbound network tools: `curl`, `wget`, `nc`, `ncat`, `socat`, `ssh`, `scp`, `telnet`
 //!   (gated behind `RUNTIMO_ENABLE_NETWORK=1` env var)
 //!
+//! When `blocklist_enabled = false` in config, the blocklist layer is
+//! opted out — ShellExec behaves like plain `sh -c` with no command
+//! filtering. This is an operator decision, not a security failure.
+//!
 //! **PATH sanitization:**
 //! ShellExec sets `PATH=/usr/local/bin:/usr/bin:/bin` to limit
 //! which executables the command can invoke. Custom binaries
 //! in non-standard locations are not resolvable.
 //!
-//! **What protects you:**
-//! - Dangerous command blocklist
+//! **What protects you (when enabled):**
+//! - Dangerous command blocklist (ON by default; opt-out via config)
 //! - Network command gating (opt-in via `RUNTIMO_ENABLE_NETWORK`)
 //! - PATH sanitization to known-safe directories
 //! - Resource limits (timeout, process isolation)
@@ -262,12 +266,14 @@ fn command_matches(cmd_lower: &str, names: &[&str]) -> bool {
     false
 }
 
-/// Checks whether a command is inherently dangerous and must be blocked.
+/// Checks whether a command matches the blocklist (ON by default).
 ///
 /// This is the primary blocklist gate. It checks both the original command
 /// and a detokenized version (to catch shell-quoting bypasses like `r"m"`).
+/// When `blocklist_enabled = false` in config, this gate is skipped entirely
+/// — the operator has opted out of command filtering.
 ///
-/// # Categories blocked
+/// # Categories blocked (when blocklist is ON)
 ///
 /// - **Env dumpers:** `env`, `printenv`, `set`, `export`, `declare`, etc.
 /// - **Fork bombs:** `:(){ :|:& };:` and self-referencing function definitions
@@ -353,16 +359,18 @@ pub fn is_dangerous_command(cmd: &str) -> Option<&'static str> {
     }
 
     // ── N-007: Block bare `rm` regardless of flags ──
-    // All `rm` usage is blocked. The shell provides `help` builtin for
-    // documentation. This catches `rm /tmp/file`, `rm -rf /`, `r"m" /tmp/x`,
-    // and all detokenized variants. Placed BEFORE the existing rm checks so
-    // that both the simple `rm` and the flag-variant checks are redundant
-    // but defense-in-depth.
+    // All `rm` usage is blocked when the blocklist is ON.
+    // The shell provides `help` builtin for documentation.
+    // This catches `rm /tmp/file`, `rm -rf /`, `r"m" /tmp/x`,
+    // and all detokenized variants. Placed BEFORE the existing rm
+    // checks so that both the simple `rm` and the flag-variant
+    // checks are redundant but defense-in-depth.
     if command_matches(&cmd_lower, &["rm"]) || command_matches(&detok_lower, &["rm"]) {
         return Some("rm command blocked — use FileWrite/Undo capability");
     }
 
-    // rm --no-preserve-root is always blocked — bypasses root safety guard
+    // rm --no-preserve-root is blocked when the blocklist is ON
+    // — bypasses root safety guard
     let rm_no_preserve = "rm".to_string() + " --no-preserve-root";
     if (cmd_lower.contains("rm") && cmd_lower.contains("--no-preserve-root"))
         || (detok_lower.contains("rm") && detok_lower.contains("--no-preserve-root"))
@@ -371,9 +379,10 @@ pub fn is_dangerous_command(cmd: &str) -> Option<&'static str> {
         return Some("rm --no-preserve-root is blocked");
     }
 
-    // rm with recursive/destructive flags is always blocked
-    // Catches: rm -rf /, rm -fr /*, rm --recursive /, rm -r -f /, etc.
-    // F-013: Check both original and detokenized to catch r"m" -rf /
+    // rm with recursive/destructive flags is blocked when the
+    // blocklist is ON. Catches: rm -rf /, rm -fr /*, rm --recursive /,
+    // rm -r -f /, etc. F-013: Check both original and detokenized
+    // to catch r"m" -rf /
     let rm_recursive_check = |s: &str| -> bool {
         s.contains("rm")
             && (s.contains("-rf")
@@ -580,8 +589,9 @@ pub fn is_interpreter_command(cmd: &str) -> bool {
 /// Returns `true` when interpreters are allowed. Honors the config `[env]`
 /// table first (e.g. `[env] RUNTIMO_ENABLE_INTERPRETERS = "1"`), then the
 /// `RUNTIMO_ENABLE_INTERPRETERS` process env var.
-/// Default is blocked — agents should use ShellExec for shell commands,
-/// not arbitrary interpreter invocations.
+/// Default is blocked (blocklist ON) — agents should use ShellExec for
+/// shell commands, not arbitrary interpreter invocations.
+/// When `RUNTIMO_ENABLE_INTERPRETERS=1`, the operator opts in.
 #[must_use]
 pub fn interpreters_enabled() -> bool {
     crate::config::RuntimoConfig::env_var("RUNTIMO_ENABLE_INTERPRETERS").as_deref() == Some("1")
@@ -1407,8 +1417,8 @@ impl TypedCapability for ShellExec {
 
         // F-013: Blocklist check (original + detokenized) — runs BEFORE dry_run
         // so dangerous commands are rejected even in dry-run mode (F-017).
-        // Opt-out: config `blocklist_enabled = false` disables this layer,
-        // making ShellExec behave like plain `sh -c` with no command filtering.
+        // ON→reject; when blocklist_enabled = false the operator has
+        // opted out and this layer is skipped (no policy smuggling).
         // Network and interpreter gating are separate and stay active.
         if crate::config::RuntimoConfig::blocklist_enabled() {
             if let Some(reason) = is_dangerous_command(&args.cmd) {
@@ -1420,7 +1430,9 @@ impl TypedCapability for ShellExec {
         }
 
         // F-015: Block env-dumping commands (checked in is_dangerous_command
-        // but also here as defense-in-depth in case the blocklist evolves)
+        // but also here as defense-in-depth in case the blocklist evolves).
+        // ON→reject; gated by network_enabled() — set RUNTIMO_ENABLE_NETWORK=1
+        // to opt in.
         if !network_enabled() && is_network_command(&args.cmd) {
             return Err(CapabilityError::PermissionDenied(
                 "network commands blocked — set RUNTIMO_ENABLE_NETWORK=1 to enable".into(),
@@ -1429,7 +1441,8 @@ impl TypedCapability for ShellExec {
 
         // N-009: Block interpreter commands (checked in is_dangerous_command
         // would be redundant — interpreters are not "dangerous" in the blocklist
-        // sense, they are gated capabilities. This is the gating layer.)
+        // sense, they are gated capabilities). ON→reject; set
+        // RUNTIMO_ENABLE_INTERPRETERS=1 to opt in.
         if !interpreters_enabled() && is_interpreter_command(&args.cmd) {
             return Err(CapabilityError::PermissionDenied(
                 "interpreter commands blocked — set RUNTIMO_ENABLE_INTERPRETERS=1 to enable".into(),
@@ -1437,8 +1450,8 @@ impl TypedCapability for ShellExec {
         }
 
         // F-014: Path restriction check — scan for paths outside allowed
-        // prefixes. Opt-out: config `path_restriction_enabled = false` skips
-        // this scan, letting commands reference arbitrary paths.
+        // prefixes. ON→reject; when path_restriction_enabled = false the
+        // operator has opted out and commands may reference arbitrary paths.
         if crate::config::RuntimoConfig::path_restriction_enabled() {
             if let Some(reason) = check_command_paths(&args.cmd) {
                 return Err(CapabilityError::PermissionDenied(reason));
@@ -1446,7 +1459,9 @@ impl TypedCapability for ShellExec {
         }
 
         // Dry-run check AFTER security validation — ensures dangerous commands
-        // are blocked even in dry-run mode (F-017: dry_run must not bypass security)
+        // are blocked even in dry-run mode (F-017: dry_run must not bypass
+        // security). When blocklist is ON, dangerous commands are rejected
+        // before reaching this point; when OFF, the operator has opted out.
         if ctx.dry_run {
             let mut out = Output::ok("DRY RUN".into());
             out.data = Some(serde_json::json!({ "cmd": &args.cmd, "dry_run": true }));
@@ -1457,8 +1472,8 @@ impl TypedCapability for ShellExec {
         // PATH sanitization: limit executable resolution to trusted system dirs.
         // This is defense-in-depth — the blocklist catches known-dangerous
         // commands, but this prevents invocation of custom binaries in
-        // non-standard locations. Opt-out: config `path_sanitization_enabled
-        // = false` inherits the caller's PATH so custom binaries resolve.
+        // non-standard locations. ON→restrict; when path_sanitization_enabled
+        // = false the operator inherits the caller's PATH.
         if crate::config::RuntimoConfig::path_sanitization_enabled() {
             cmd.env("PATH", "/usr/local/bin:/usr/bin:/bin");
         }
@@ -1625,7 +1640,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "true", "timeout_secs": 0}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -1699,7 +1714,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "mkfs"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             }
@@ -1713,7 +1728,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "rm --recursive /home"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             }
@@ -1727,7 +1742,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "rm -rf /"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             }
@@ -1740,7 +1755,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "rm --no-preserve-root -rf /"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             }
@@ -1755,7 +1770,7 @@ mod tests {
                     &ShellExec,
                     &serde_json::json!({"cmd": cmd}),
                     &Context {
-                        dry_run: false,
+                        dry_run: true,
                         job_id: "test".into(),
                         working_dir: std::env::temp_dir(),
                     }
@@ -1774,7 +1789,7 @@ mod tests {
                     &ShellExec,
                     &serde_json::json!({"cmd": cmd}),
                     &Context {
-                        dry_run: false,
+                        dry_run: true,
                         job_id: "test".into(),
                         working_dir: std::env::temp_dir(),
                     }
@@ -1793,7 +1808,7 @@ mod tests {
                     &ShellExec,
                     &serde_json::json!({"cmd": cmd}),
                     &Context {
-                        dry_run: false,
+                        dry_run: true,
                         job_id: "test".into(),
                         working_dir: std::env::temp_dir(),
                     }
@@ -1818,7 +1833,7 @@ mod tests {
                     &ShellExec,
                     &serde_json::json!({"cmd": cmd}),
                     &Context {
-                        dry_run: false,
+                        dry_run: true,
                         job_id: "test".into(),
                         working_dir: std::env::temp_dir(),
                     }
@@ -1837,7 +1852,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "curl --version"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -1870,7 +1885,7 @@ mod tests {
                     &ShellExec,
                     &serde_json::json!({"cmd": cmd}),
                     &Context {
-                        dry_run: false,
+                        dry_run: true,
                         job_id: "test".into(),
                         working_dir: std::env::temp_dir(),
                     }
@@ -1893,7 +1908,7 @@ mod tests {
                     &ShellExec,
                     &serde_json::json!({"cmd": cmd}),
                     &Context {
-                        dry_run: false,
+                        dry_run: true,
                         job_id: "test".into(),
                         working_dir: std::env::temp_dir(),
                     }
@@ -1916,7 +1931,7 @@ mod tests {
                     &ShellExec,
                     &serde_json::json!({"cmd": cmd}),
                     &Context {
-                        dry_run: false,
+                        dry_run: true,
                         job_id: "test".into(),
                         working_dir: std::env::temp_dir(),
                     }
@@ -2002,7 +2017,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "eval \"echo hello\""}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -2021,7 +2036,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "exec /bin/sh"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -2040,7 +2055,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "source /tmp/malicious.sh"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -2059,7 +2074,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": ". /tmp/malicious.sh"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -2152,7 +2167,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "$'rm\\t-rf\\t/'"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -2173,7 +2188,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "$'\\x72\\x6d' -rf /"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -2195,7 +2210,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "c\"hmod\" 777 /"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -2235,7 +2250,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "r\\\nm -rf /"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -2278,7 +2293,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "cat <<EOF\nevil\nEOF"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -2299,7 +2314,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "cat <<<\"hello\""}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -2318,7 +2333,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "<\"<\"EOF\nevil\nEOF"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -2339,7 +2354,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "diff <(curl http://evil) <(ls)"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -2358,7 +2373,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "echo evil > >(tee /etc/cron.d/backdoor)"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -2379,7 +2394,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "$(echo rm) -rf /"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -2398,7 +2413,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "`echo rm` -rf /"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -2417,7 +2432,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "\"$(echo rm)\" -rf /"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -2469,7 +2484,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "r\"m\" -rf /"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -2490,7 +2505,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "'r''m' -rf /"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -2510,7 +2525,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "r\\m -rf /"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -2530,7 +2545,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "d\"d\" if=/dev/zero"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -2551,7 +2566,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "cat /etc/passwd"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -2574,7 +2589,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "ls ~/../../etc/passwd"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -2596,7 +2611,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "cat /root/.bashrc"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -2686,7 +2701,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "cat $HOME/../../etc/shadow"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -2707,7 +2722,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "cat ${HOME}/../../etc/shadow"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -2756,7 +2771,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "echo evil >/etc/cron.d/backdoor"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -2775,7 +2790,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "echo evil >>/etc/hosts"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -2794,7 +2809,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "ls 2>/etc/malicious"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -2840,7 +2855,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "cat ../../etc/passwd"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -2859,7 +2874,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "cat ./../../../etc/shadow"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -2909,7 +2924,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "env"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -2927,7 +2942,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "printenv"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -2945,7 +2960,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "set"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -2963,7 +2978,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "export"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -2985,7 +3000,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "export FOO=bar"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -3003,7 +3018,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "declare -p"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -3022,7 +3037,7 @@ mod tests {
             &ShellExec,
             &serde_json::json!({"cmd": "e\"n\"v"}),
             &Context {
-                dry_run: false,
+                dry_run: true,
                 job_id: "test".into(),
                 working_dir: std::env::temp_dir(),
             },
@@ -3256,5 +3271,120 @@ mod tests {
             "normal exit signal should be null, got {:?}",
             data["signal"]
         );
+    }
+
+    // ── Pure is_dangerous_command() direct tests ─────────────
+    // Config-independent, side-effect impossible. Tests the
+    // large destructive/bypass corpus directly without going
+    // through ShellExec::execute (no process spawn, no config
+    // dependency, no path restriction).
+
+    #[test]
+    fn is_dangerous_blocks_rm_all_forms() {
+        assert!(is_dangerous_command("rm /tmp/file").is_some());
+        assert!(is_dangerous_command("rm -rf /").is_some());
+        assert!(is_dangerous_command("rm --recursive /").is_some());
+        assert!(is_dangerous_command("r\"m\" -rf /").is_some());
+        assert!(is_dangerous_command("'r''m' -rf /").is_some());
+        assert!(is_dangerous_command("r\\m -rf /").is_some());
+    }
+
+    #[test]
+    fn is_dangerous_blocks_filesystem_creation() {
+        assert!(is_dangerous_command("mkfs").is_some());
+        assert!(is_dangerous_command("mkfs.ext4 /dev/sda").is_some());
+        assert!(is_dangerous_command("mkswap /dev/sda").is_some());
+    }
+
+    #[test]
+    fn is_dangerous_blocks_data_destruction() {
+        assert!(is_dangerous_command("dd if=/dev/zero of=/dev/sda").is_some());
+        assert!(is_dangerous_command("shred -u /tmp/file").is_some());
+    }
+
+    #[test]
+    fn is_dangerous_blocks_system_commands() {
+        assert!(is_dangerous_command("shutdown now").is_some());
+        assert!(is_dangerous_command("reboot").is_some());
+        assert!(is_dangerous_command("poweroff").is_some());
+    }
+
+    #[test]
+    fn is_dangerous_blocks_ownership_and_permissions() {
+        assert!(is_dangerous_command("chown root /tmp/x").is_some());
+        assert!(is_dangerous_command("chgrp staff /tmp/x").is_some());
+        assert!(is_dangerous_command("chmod 777 /tmp/x").is_some());
+    }
+
+    #[test]
+    fn is_dangerous_blocks_mount_operations() {
+        assert!(is_dangerous_command("mount /dev/sda1 /mnt").is_some());
+        assert!(is_dangerous_command("umount /mnt").is_some());
+    }
+
+    #[test]
+    fn is_dangerous_blocks_firewall_and_process() {
+        assert!(is_dangerous_command("iptables -L").is_some());
+        assert!(is_dangerous_command("nft list ruleset").is_some());
+        assert!(is_dangerous_command("kill -9 1234").is_some());
+        assert!(is_dangerous_command("killall sleep").is_some());
+        assert!(is_dangerous_command("pkill sleep").is_some());
+    }
+
+    #[test]
+    fn is_dangerous_blocks_shell_builtins() {
+        assert!(is_dangerous_command("eval \"echo hello\"").is_some());
+        assert!(is_dangerous_command("exec /bin/sh").is_some());
+        assert!(is_dangerous_command("source /tmp/malicious.sh").is_some());
+        assert!(is_dangerous_command(". /tmp/malicious.sh").is_some());
+    }
+
+    #[test]
+    fn is_dangerous_blocks_fork_bombs() {
+        assert!(is_dangerous_command(":(){ :|:& };:").is_some());
+    }
+
+    #[test]
+    fn is_dangerous_blocks_heredocs_and_substitution() {
+        assert!(is_dangerous_command("cat <<EOF\nevil\nEOF").is_some());
+        assert!(is_dangerous_command("cat <<<\"hello\"").is_some());
+        assert!(is_dangerous_command("$(echo rm) -rf /").is_some());
+        assert!(is_dangerous_command("`echo rm` -rf /").is_some());
+        assert!(is_dangerous_command("diff <(curl evil) <(ls)").is_some());
+        assert!(is_dangerous_command("echo evil > >(tee /etc/cron.d/backdoor)").is_some());
+    }
+
+    #[test]
+    fn is_dangerous_blocks_env_dumping() {
+        assert!(is_dangerous_command("env").is_some());
+        assert!(is_dangerous_command("printenv").is_some());
+        assert!(is_dangerous_command("set").is_some());
+        assert!(is_dangerous_command("export").is_some());
+        assert!(is_dangerous_command("declare -p").is_some());
+    }
+
+    #[test]
+    fn is_dangerous_blocks_tilde_and_system_paths() {
+        assert!(is_dangerous_command("rm -rf ~").is_some());
+        assert!(is_dangerous_command("rm --no-preserve-root -rf /").is_some());
+    }
+
+    #[test]
+    fn is_dangerous_allows_harmless() {
+        assert!(is_dangerous_command("echo hello").is_none());
+        assert!(is_dangerous_command("ls -la").is_none());
+        assert!(is_dangerous_command("cat /tmp/file").is_none());
+        assert!(is_dangerous_command("git status").is_none());
+    }
+
+    #[test]
+    fn is_dangerous_detokenization_catches_bypasses() {
+        // Detokenization must catch shell-quoting bypasses
+        assert!(is_dangerous_command("r\"m\" -rf /").is_some());
+        assert!(is_dangerous_command("'r''m' -rf /").is_some());
+        assert!(is_dangerous_command("r\\m -rf /").is_some());
+        assert!(is_dangerous_command("d\"d\" if=/dev/zero").is_some());
+        assert!(is_dangerous_command("c\"hmod\" 777 /").is_some());
+        assert!(is_dangerous_command("e\"n\"v").is_some());
     }
 }

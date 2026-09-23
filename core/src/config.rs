@@ -238,11 +238,12 @@ pub struct RuntimoConfig {
 
     /// Enable the ShellExec dangerous-command blocklist (default: enabled).
     ///
-    /// When `false`, `is_dangerous_command()` always returns `None` — ShellExec
-    /// behaves like a plain `sh -c` with no command filtering. The blocklist
-    /// catches `rm`, `shred`, `mkfs`, fork bombs, env dumpers, etc.; disabling
-    /// it surrenders that defense deliberately. Network and interpreter
-    /// gating are separate and unaffected by this flag.
+    /// When `false`, the blocklist gate in ShellExec::execute() is skipped,
+    /// so `is_dangerous_command()` is never invoked and ShellExec behaves
+    /// like plain `sh -c`. The blocklist catches `rm`, `shred`, `mkfs`,
+    /// fork bombs, env dumpers, etc.; disabling it surrenders that
+    /// defense deliberately. Network and interpreter gating are separate
+    /// and unaffected by this flag.
     #[serde(default)]
     pub blocklist_enabled: Option<bool>,
 

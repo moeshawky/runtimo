@@ -431,6 +431,18 @@ mod tests {
 
     #[test]
     fn self_test_fixtures_pass_on_healthy() {
+        // RAII guard captures the four RUNTIMO_* vars and restores
+        // them on drop (including on panic), ensuring no leakage
+        // into sibling tests. The guard also serializes via the
+        // shared ENV_GUARD inside crate::lock_env().
+        let _guard = crate::test_isolation::EnvGuard::new();
+        // Deterministic seam: unset RUNTIMO_TEST_PRESSURE
+        // so test_pressure_override() returns None, and set
+        // RUNTIMO_MEMORY_CEILING_BYTES to a very high value so
+        // the sampler guard never suspends regardless of ambient
+        // system load.
+        std::env::remove_var("RUNTIMO_TEST_PRESSURE");
+        std::env::set_var("RUNTIMO_MEMORY_CEILING_BYTES", usize::MAX.to_string());
         let cs = checks();
         for c in &cs {
             assert!(
@@ -440,6 +452,7 @@ mod tests {
             );
         }
         assert_eq!(run(), 0, "run() should exit 0 on healthy");
+        // EnvGuard::drop restores unset-vs-set automatically.
     }
 
     #[test]

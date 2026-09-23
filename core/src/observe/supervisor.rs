@@ -1019,8 +1019,20 @@ mod tests {
     /// Bounded soak test: pressure-routing metamorphic — low pressure
     /// lets samples flow (no Suspended), high pressure (budget suspend
     /// via inject_drop_next) triggers suspension + ObserveSuspended marker.
+    /// Uses RUNTIMO_TEST_PRESSURE=0 as deterministic seam for the low-pressure
+    /// phase, ensuring ambient load cannot violate the guard's pressure gate.
     #[test]
     fn supervisor_pressure_routing() {
+        // RAII guard captures the four RUNTIMO_* vars and restores
+        // them on drop (including on panic), ensuring no leakage
+        // into sibling tests.
+        let _guard = crate::test_isolation::EnvGuard::new();
+        // Deterministic low-pressure seam: unset RUNTIMO_TEST_PRESSURE
+        // so test_pressure_override() returns None, and set
+        // RUNTIMO_MEMORY_CEILING_BYTES to a very high value so the
+        // guard's pressure reading is always well below 80%.
+        std::env::remove_var("RUNTIMO_TEST_PRESSURE");
+        std::env::set_var("RUNTIMO_MEMORY_CEILING_BYTES", usize::MAX.to_string());
         // --- Low pressure: samples flow, no ObserveSuspended ---
         let path_low = tmp_bundle("pressure_low");
         let _ = std::fs::remove_file(&path_low);
@@ -1062,6 +1074,10 @@ mod tests {
         );
         let _ = std::fs::remove_file(&path_low);
         let _ = std::fs::remove_file(PathBuf::from(format!("{}.checkpoint", path_low.display())));
+
+        // EnvGuard::drop restores unset-vs-set automatically
+        // before the high-pressure phase, so inject_drop_next
+        // remains the sole pressure mechanism.
 
         // --- High pressure (budget suspend): suspension + ObserveSuspended ---
         let path_high = tmp_bundle("pressure_high");

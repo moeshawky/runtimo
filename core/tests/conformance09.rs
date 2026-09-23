@@ -4,28 +4,21 @@
 //! actuation; it never reconstructs dual-root logic or DAL.
 //!
 //! Determinism: `RUNTIMO_MEMORY_CEILING_BYTES` huge for low pressure;
-//! env vars serialized via `ENV_GUARD` (process-global).
+//! env vars serialized via `EnvGuard` (RAII, process-global).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use llmosafe::{EscalationPolicy, EscalationReason, PressureLevel, SafetyDecision, SemanticPolicy};
-use runtimo_core::{AnalysisKind, InputClass, LlmoSafeGuard, RuntimoDisposition};
-use std::sync::Mutex;
+use runtimo_core::{
+    test_isolation::EnvGuard, AnalysisKind, InputClass, LlmoSafeGuard, RuntimoDisposition,
+};
 
-static ENV_GUARD: Mutex<()> = Mutex::new(());
-
-fn lock_env() -> std::sync::MutexGuard<'static, ()> {
-    ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner())
+fn lock_env() -> EnvGuard {
+    EnvGuard::new()
 }
 
 fn low_pressure_env() {
     std::env::set_var("RUNTIMO_TEST_PRESSURE", "10");
-}
-fn clear_env() {
-    std::env::remove_var("RUNTIMO_TEST_PRESSURE");
-    std::env::remove_var("RUNTIMO_MEMORY_CEILING_BYTES");
-    std::env::remove_var("RUNTIMO_DAL");
-    std::env::remove_var("RUNTIMO_SEMANTIC_POLICY");
 }
 
 fn policy(sp: SemanticPolicy, dal: llmosafe::DesignAssuranceLevel) -> EscalationPolicy {
@@ -72,7 +65,6 @@ fn benign_short_prose_proceeds() {
     // No raw secrets in serialized record.
     let s = serde_json::to_string(&long).unwrap();
     assert!(!s.contains("quick brown fox"));
-    clear_env();
 }
 
 #[test]
@@ -95,7 +87,6 @@ fn quoted_attack_is_payload_not_instruction() {
     // never silent coercion — the key pin is the record exists with full input length.
     assert_eq!(a.input_len, quoted.len());
     assert!(a.analysis_complete);
-    clear_env();
 }
 
 #[test]
@@ -117,7 +108,6 @@ fn unicode_ood_is_unknown_not_safe() {
         matches!(raw_enf, SafetyDecision::Halt(..)),
         "got {raw_enf:?}"
     );
-    clear_env();
 }
 
 #[test]
@@ -144,7 +134,6 @@ fn corroborate_single_root_escalates_enforce_halts() {
         runtimo_core::safety::disposition_for(&enf),
         RuntimoDisposition::Reject
     );
-    clear_env();
 }
 
 #[test]
@@ -260,7 +249,6 @@ fn sifter_exhaustion_fail_closed() {
             | runtimo_core::safety::AssessmentError::AnalysisFailed(_),
         ) => {}
     }
-    clear_env();
 }
 
 #[test]
@@ -334,8 +322,6 @@ fn mid_pressure_semantic_vs_resource_only_characterization() {
         AnalysisKind::ResourceOnly,
         "resource-only input must take the resource path"
     );
-
-    clear_env();
 }
 
 // --- §22 ShellExec conformance experiment ---------------------------------
@@ -368,7 +354,6 @@ fn shellexec_benign_commands_observe_vs_enforce() {
     assert!(
         runtimo_core::capabilities::is_dangerous_command("rm -rf / --no-preserve-root").is_some()
     );
-    clear_env();
 }
 
 // --- §62 authority chain ----------------------------------------------------
@@ -393,9 +378,6 @@ fn authority_chain_escalate_blocks_side_effect_with_evidence() {
         false,
         &wp,
     );
-    std::env::remove_var("RUNTIMO_DAL");
-    std::env::remove_var("RUNTIMO_SEMANTIC_POLICY");
-    clear_env();
     // Either blocked (EscalationRequired/Reject/Fatal/AnalysisFailed) with
     // SafetyEvaluated + JobFailed and NO JobCompleted, or allowed with full
     // chain — but the chain must be coherent either way.

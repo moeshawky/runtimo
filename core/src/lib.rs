@@ -320,3 +320,138 @@ pub mod utils {
         }
     }
 }
+
+/// Shared environment guard for serializing `RUNTIMO_TEST_PRESSURE`
+/// mutations across test modules.
+#[allow(dead_code)]
+pub(crate) static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquire the environment guard lock, serializing `RUNTIMO_TEST_PRESSURE`
+/// mutations across all test modules.
+#[allow(dead_code)]
+pub(crate) fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+    ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// RAII guard that captures four `RUNTIMO_*` env vars on construction
+/// and restores them on drop (unset-vs-set semantics).
+///
+/// Captures: `RUNTIMO_TEST_PRESSURE`, `RUNTIMO_MEMORY_CEILING_BYTES`,
+/// `RUNTIMO_DAL`, `RUNTIMO_SEMANTIC_POLICY`.
+///
+/// On construction, acquires `ENV_GUARD` and holds it for the
+/// guard's entire lifetime — closing the mutation window for the
+/// duration of the test. On drop: if a var was `None` (absent) at
+/// construction time, it is removed; if it was `Some(v)`, it is
+/// restored to `v`. This ensures test mutations never leak into
+/// sibling tests, even when a panic occurs during the test body.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let _guard = crate::test_isolation::EnvGuard::new();
+/// std::env::set_var("RUNTIMO_TEST_PRESSURE", "90");
+/// // ... test code ...
+/// // Drop restores the original state automatically.
+/// ```
+pub mod test_isolation {
+    use std::env;
+
+    /// Captures four `RUNTIMO_*` env vars and holds the global lock
+    /// for the guard's entire lifetime.
+    ///
+    /// The lock serializes env-var mutations across test modules.
+    /// Each captured value is stored as `Some(v)` if present,
+    /// or `None` if the var was absent. The mutex is held until
+    /// `Drop` restores the vars, closing the mutation window.
+    #[derive(Debug)]
+    pub struct EnvGuard {
+        #[allow(dead_code)]
+        guard: std::sync::MutexGuard<'static, ()>,
+        pressure: Option<String>,
+        ceiling: Option<String>,
+        dal: Option<String>,
+        semantic_policy: Option<String>,
+    }
+
+    impl Default for EnvGuard {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl EnvGuard {
+        /// Capture the four env vars and acquire the global lock,
+        /// holding it for the entire lifetime of this guard.
+        ///
+        /// The lock serializes env-var mutations across test modules.
+        /// Each captured value is stored as `Some(v)` if present,
+        /// or `None` if the var was absent. The mutex is held until
+        /// `Drop` restores the vars, closing the mutation window.
+        #[must_use]
+        pub fn new() -> Self {
+            let guard = crate::lock_env();
+            let pressure = env::var("RUNTIMO_TEST_PRESSURE").ok();
+            let ceiling = env::var("RUNTIMO_MEMORY_CEILING_BYTES").ok();
+            let dal = env::var("RUNTIMO_DAL").ok();
+            let semantic_policy = env::var("RUNTIMO_SEMANTIC_POLICY").ok();
+            // Hold the guard for the lifetime of EnvGuard — this
+            // closes the mutation window for the entire test body.
+            Self {
+                guard,
+                pressure,
+                ceiling,
+                dal,
+                semantic_policy,
+            }
+        }
+
+        /// Returns the captured `RUNTIMO_TEST_PRESSURE` value, if any.
+        #[must_use]
+        pub fn pressure(&self) -> Option<&str> {
+            self.pressure.as_deref()
+        }
+
+        /// Returns the captured `RUNTIMO_MEMORY_CEILING_BYTES` value, if any.
+        #[must_use]
+        pub fn ceiling(&self) -> Option<&str> {
+            self.ceiling.as_deref()
+        }
+
+        /// Returns the captured `RUNTIMO_DAL` value, if any.
+        #[must_use]
+        pub fn dal(&self) -> Option<&str> {
+            self.dal.as_deref()
+        }
+
+        /// Returns the captured `RUNTIMO_SEMANTIC_POLICY` value, if any.
+        #[must_use]
+        pub fn semantic_policy(&self) -> Option<&str> {
+            self.semantic_policy.as_deref()
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // The mutex is already held by `self.guard`; no
+            // re-acquisition needed (would deadlock). Drop the
+            // guard after restoring vars to release the lock.
+            match &self.pressure {
+                Some(v) => env::set_var("RUNTIMO_TEST_PRESSURE", v),
+                None => env::remove_var("RUNTIMO_TEST_PRESSURE"),
+            }
+            match &self.ceiling {
+                Some(v) => env::set_var("RUNTIMO_MEMORY_CEILING_BYTES", v),
+                None => env::remove_var("RUNTIMO_MEMORY_CEILING_BYTES"),
+            }
+            match &self.dal {
+                Some(v) => env::set_var("RUNTIMO_DAL", v),
+                None => env::remove_var("RUNTIMO_DAL"),
+            }
+            match &self.semantic_policy {
+                Some(v) => env::set_var("RUNTIMO_SEMANTIC_POLICY", v),
+                None => env::remove_var("RUNTIMO_SEMANTIC_POLICY"),
+            }
+        }
+    }
+}
