@@ -78,4 +78,4 @@ cargo test -p runtimo-core --lib -- telemetry
 # 8 tests: capture, cache, back-compat, empty state, serialization, old WAL deser
 ```
 
-**Last Verified:** 2026-09-08 (617 total: 39 cli + 397 core-lib + 65 integration + 46 robust + 63 daemon + 7 doctest, 0 failed, clippy clean)
+**Last Verified:** 2026-09-23 (~767 total: 39 cli + 489 core-lib + 69 integration + 46 robust + 15 conformance09 + 12 runtime_fact_export + 8 doctest; 2 same-known failures: observe_fixture_b_integration, observe_self_test_run_exits_zero; sampler 0 samples at 50Hz container; fmt/check/clippy/deny/machete/MSRV exit 0)

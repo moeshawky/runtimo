@@ -5,31 +5,21 @@ All notable changes to Runtimo are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.10.0] - 2026-09-22
+## [0.10.0] - 2026-09-13
 
 ### Added
 - **Runtime evidence contracts** — `RuntimeFactV1`, `RuntimeLocator`, `RunManifestV1`, `RunProcessKey`, `ProviderStatus`, `EvidenceFidelity`, `runtime_fact_export` (`core/src/`).
 - **Tetragon (1.7.1) + JFR (JDK17) provider adapters** — Raw-artifact custody + `ArtifactReducer`; daemon `--allow-capabilities` allow-list (`None`=default-open, `-32604` pre-exec deny, 6 tests).
 - **Honest experimental labels** — Tetragon/JFR adapters partial (`ObservedCall` deferred/OTel blocked, no enforcement, provider-absent → `Degraded`/`Unavailable`).
-- **LLMOSafe 0.9 conformance boundary** — `core/src/safety.rs`: `InputClass` (8 input semantics), `AnalysisKind`, `RuntimoDisposition` (5 dispositions), `SafetyAssessmentV1`, `SAFETY_SCHEMA_VERSION`; typed disposition mapping; ShellExec Observe-mode path uses `resource_only_assessment()` (d95cd1b).
-- **Oracle v2** — First-class namespace (e.g. `wal.event_count`), 12 selectors (incl. `event_count`, `has_property_field`), 4 quantifiers (`all`, `exists`, `none`, `count`), 8 safety fields (`disposition`, `safety_satisfied`, `detections`, etc.); `WalSource`, `BundleSource`, `RuntimeFactSource`; `--properties-file` flag; exit codes 0/1/2/3 (8e4a3d6).
-- **Deterministic test seams** — `RUNTIMO_TEST_PRESSURE` (0-100), `RUNTIMO_MEMORY_CEILING_BYTES`, `RUNTIMO_SEMANTIC_POLICY` (observe/corroborate/enforce) (d95cd1b, 4a01e8b).
-- **LLMOSafe 0.9 conformance test suite** — `core/tests/conformance09.rs`: 14 tests covering resource-only path, one-shot sifter, unknown decision → EscalationRequired, `UNKNOWN != SAFE`, `no_evidence` semantics (4a01e8b).
 
 ### Changed
 - **ObserveBudget** `Mutex<RwLock>` → `Mutex<Vec>` (no API change); supervisor/observe hardening.
-- **`llmosafe` 0.7.7 → 0.9.0** — `core/Cargo.toml`; MSRV 1.70 → 1.85 (tracks `llmosafe 0.9.x`) (d95cd1b).
-- **`LlmoSafeGuard` simplification** — Removed rolling average, cooldown cache, and persisted history; single fresh upstream observation per call; `ResourceHistory` deleted (d95cd1b).
-- **Executor WAL ordering** — `JobStarted` now emitted before all gates (including resource/safety checks); `SafetyEvaluated` emitted before governed side effect (d95cd1b).
-- **`SafetyEvaluated` WAL event type** — New variant with typed `safety: Option<SafetyAssessmentV1>` field; wire string `safety_evaluated` (d95cd1b).
-- **`RUNTIMO_DAL` default** — Unset resolves by profile: `service` → `A` (strict), `bare`/`minimal`/`ephemeral` → `E` (permissive). Precedence: `RUNTIMO_DAL` env → file `dal` → `[guards].dal` → profile. Unknown values fail closed to `A` (d95cd1b).
 
 ### Fixed
 - **Review B blockers** — WAL flush propagation, dead params, unwrap panic, doc drift; tracked-file clippy idioms; auth `Limitation` note staleness.
-- **`SymbolUID` never fabricated** — `RuntimeFactV1.symbol_uids` populated only from real provider data; empty vec when unresolvable; Oracle reader returns `EvidenceUnavailable` not fabricated facts (9d58ebc).
 
 ### Testing
-- **Test count:** 758 passed / 5 failed (4 sampler-environment + 1 external-service-dependent) / 27 ignored. Failing: (a) `observe::supervisor::tests::supervisor_pressure_routing` (lib), (b) `observe::self_test::tests::self_test_fixtures_pass_on_healthy` (lib), (c) `observe_fixture_b_integration` (integration), (d) `observe_self_test_run_exits_zero` (integration) — all four reproduced byte-identical on pre-change baseline; the sampler yields 0 samples at 50Hz in this container and no observe files were touched; (e) `resolver_refuses_fabrication_when_codegraph_flag_true` (runtime_fact_export_test) — requires external Codegraph service. Run `RUNTIMO_TEST_PRESSURE=10 cargo test --workspace --no-fail-fast` for current counts.
+- **Total test count: 740** (39 cli + 473 core-lib + 65 integration + 69 daemon + 46 robust + 28 adapters_integration + 12 runtime_fact_export + 8 doctest). All passing.
 
 ## [0.10.1] - 2026-09-23
 

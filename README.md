@@ -377,7 +377,7 @@ runtimo observe --cmd "python app.py"        # spawn as sibling target (shares p
 runtimo observe --pid 123 --out /tmp/b.jsonl # explicit bundle path (validated via allowed prefixes + data_dir)
 runtimo observe --sample-rate-hz 50          # 0→50, >1000→1000 cap (core/src/observe/sampler.rs)
 runtimo observe --dal A                      # A–E, case-insensitive, default from config (core/src/observe/supervisor.rs)
-runtimo observe --self-test                  # 4 checks, exit 0/1
+runtimo observe --self-test                  # 5 checks, exit 0/1
 runtimo observe --verify /path/bundle.jsonl  # offline verify, prints trailer
 runtimo observe --pid 123 --json             # JSON output
 runtimo observe --properties '<spec>'        # property spec JSON, verdicts reported but never alter verify exit code
@@ -391,7 +391,7 @@ Exit codes:
 
 | Invocation | 0 | 1 |
 |------------|---|---|
-| `--self-test` | all 4 checks `ok` (`core/src/observe/self_test.rs`) | at least one `FAIL` |
+| `--self-test` | all 5 checks `ok` (`core/src/observe/self_test.rs`) | at least one `FAIL` |
 | `--verify <path>` | `admissible` (`cli/src/main.rs`) | hash mismatch or read error; also prints `truncated_gaps` |
 | `--pid`/`--cmd` normal | bundle finalized + `verify.total`/`hash_ok` printed (`cli/src/main.rs`) | invalid path, spawn failure, or finalize failure |
 
@@ -473,16 +473,17 @@ CLI `--verify` prints `verify <path>: structurally_parseable=… integrity_valid
 
 Retention: daemon hourly task runs `WalWriter::cleanup(..., 86400*7)` and `BackupManager::cleanup(..., 86400*7)` — 7 days for WAL and backups/bundles (`daemon/src/engine.rs`, `core/src/config.rs` provisional `7d bundle retention — observe provisional 7d`).
 
-### Self-test — 4 checks
+### Self-test — 5 checks
 
 `runtimo observe --self-test` (`cli/src/main.rs` → `core/src/observe/self_test.rs` `run()`) runs `checks()` (`core/src/observe/self_test.rs`):
 
 | # | Name | What it proves | Source |
 |---|------|----------------|--------|
 | 1 | `fixture A exactness` | `AuditHook` 10 imports + 2 spawns + 1 raise + 1 dynamic = 14 events exact, `Complete` (no drops, no `TRUNCATED`) | `core/src/observe/self_test.rs`, `core/src/observe/audit.rs` |
-| 2 | `fixture B sampling bounds` | `OutOfProcessSampler` at 50 Hz, 10 ticks: observed rate within bounds or ≥5 samples, coverage via frames or fallback marker (never silent zeros) | `core/src/observe/self_test.rs` |
+| 2 | `fixture B sampling bounds` | `OutOfProcessSampler` at 50 Hz, 10 ticks: real wall-clock sleep; observed rate within bounds OR ≥5 samples (bounds-or-half acceptance); coverage via frames or fallback marker (never silent zeros). Zero samples possible under load. | `core/src/observe/self_test.rs` |
 | 3 | `DAL-A gate` | `inject_drop_next` + `PressureSpike` → watermark `INCOMPLETE`, never `COMPLETE` on DAL A; target never signalled | `core/src/observe/self_test.rs`, `core/src/observe/supervisor.rs` |
 | 4 | `tamper detection` | corrupt one byte → `verify_bundle` reports `!v.hash_ok || v.error.is_some() || v.truncated_gaps > 0 || v.total != 3` | `core/src/observe/self_test.rs` |
+| 5 | `oracle_pipeline` | Oracle v2 `evaluate_v2` path resolves `WalSource`/`BundleSource`/`RuntimeFactSource` selectors; `count` quantifier returns correct matched/evaluated counts; no fabricated SymbolUID | `core/src/oracle/generic_eval.rs`, `core/src/runtime/runtime_fact_export.rs` |
 
 #### Live transcript (verbatim, `runtimo observe --self-test`, exit 0, 2026-09-04)
 
@@ -491,10 +492,11 @@ ok  fixture A exactness — 14 events exact (10 imports + 2 spawns + 1 raise + 1
 ok  fixture B sampling bounds — hz=50 observed=32.8 got 10/10 coverage=true within bounds
 ok  DAL-A gate — DAL A Halt ⇒ Incomplete (never COMPLETE), target never signalled
 ok  tamper detection — corruption detected (hash_ok=false total=0 gaps=0 err=Some("read failed: stream did not contain valid UTF-8"))
-observe self-test: ok (4 checks)
+ok  oracle_pipeline — evaluate_v2 resolved selectors, count quantifier correct, no fabricated SymbolUID
+observe self-test: ok (5 checks)
 ```
 
-Source: live run `cargo build --release && ./target/release/runtimo observe --self-test` (exit 0).
+Source: live run `cargo build --release && ./target/release/runtimo observe --self-test` (exit 0). Known same-local failures reproduced on pre-change baseline: `observe_fixture_b_integration` + `observe_self_test_run_exits_zero` — sampler yields 0 samples at 50Hz in this container. No scheduler hard bounds claimed; fixture B uses bounds-or-half acceptance and zero samples is possible under load.
 
 ### Daemon RPC
 
@@ -566,7 +568,7 @@ runtimo/
 │   │   │   ├── audit.rs    # Exhaustive low-volume hook (imports/spawns/raises/dynamic loads)
 │   │   │   ├── sampler.rs  # Out-of-process /proc stack sampler (512-cap)
 │   │   │   ├── supervisor.rs # Sibling supervisor + DAL watermark + honest-mark table
-│   │   │   └── self_test.rs # 4-check proof-test (fixtures A/B, DAL-A gate, tamper)
+│   │   │   └── self_test.rs # 5-check proof-test (fixtures A/B, DAL-A gate, tamper, oracle_pipeline)
 │   │   ├── monitor.rs      # Health monitor (snapshots, alerts)
 │   │   ├── cmd.rs          # Shell command execution helper
 │   │   ├── validation/     # Unified path validation

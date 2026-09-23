@@ -88,7 +88,7 @@ Raw artifacts are never deleted by the adapter. They remain in the artifact dire
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `RUNTIMO_WAL_PATH` | WAL file path | `data_dir()/wal.jsonl` |
-| `RUNTIMO_DAL` | Design Assurance Level | `A` |
+| `RUNTIMO_DAL` | Design Assurance Level | Profile-dependent: `service` → `A`, `bare`/`minimal`/`ephemeral` → `E`. Precedence: env → file `dal` → `[guards].dal` → profile. Unknown → `A` |
 | `RUNTIMO_STATE_DIR` | State directory | `~/.local/share/runtimo` |
 
 ### Adapter Configuration

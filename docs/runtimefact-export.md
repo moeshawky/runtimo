@@ -34,8 +34,8 @@ Each `RuntimeLocator` can be resolved to a `SymbolUID` via [`resolve_locator`].
 
 | Outcome | Meaning | When |
 |---------|---------|------|
-| `Resolved(SymbolUID)` | Codegraph resolved the locator to a unique symbol ID | Codegraph available |
-| `Unresolved(String)` | Codegraph unavailable; locator documented but not resolved | Default (no Codegraph) |
+| `Unresolved(String)` | No real resolver wired; locator documented but not resolved | Default (no Codegraph resolver) |
+| `Unresolved(String)` | Codegraph available but resolver not wired; `codegraph_available=true` does NOT fabricate | Even when `codegraph_available=true` |
 
 ### No Codegraph Import
 
@@ -52,6 +52,10 @@ when Codegraph is available.
 **`SymbolUID` never appears inside raw adapters.** This is enforced by:
 - The adapter invariant: "No SymbolUID inside raw adapters"
 - A grep test verifying no `SymbolUID` in `core/src/adapters/`
+
+### Resolution Truth
+
+`resolve_locator()` returns `SymbolUidResolution::Unresolved` always, even when `codegraph_available=true`. The old `codegraph_available=true` path that fabricated deterministic `file:line:kind` identity violated §56 evidence custody and has been removed. The only change when `codegraph_available=true` is the reason string. Fabrication is forbidden; `Resolved` only when a real resolver is wired.
 
 ## Observed* Distinct Calls
 
