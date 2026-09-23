@@ -75,10 +75,10 @@ cat TODO.md
    - Check system RAM% before running
 
 ### Awaiting Operator Decision
-- **moegraph + runtimo integration strategy** (see TODO.md "In Progress")
-  - Option A: Complete fusion
-  - Option B: Partial dependence (recommended)
-  - Option C: Orthogonal
+- **Future code-aware capability integration strategy** (see TODO.md "In Progress")
+   - Option A: Complete fusion
+   - Option B: Partial dependence (recommended)
+   - Option C: Orthogonal
 
 ---
 

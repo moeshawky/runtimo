@@ -110,36 +110,30 @@ loop {
 
 ---
 
-## Relationship to moegraph + llmosafe
+## Relationship to llmosafe + telemetry
 
 **llmosafe** = Resource limits (CPU time, memory, disk I/O, timeout)  
-**moegraph** = Code intelligence (graph analysis, vector search)  
 **telemetry** = Environment awareness (what's available, what's running)
 
 ### How They Work Together
 
 1. **llmosafe** enforces limits ("don't use more than 2GB RAM")
 2. **telemetry** reports current state ("13Gi RAM free")
-3. **moegraph** analyzes code ("this function has 100 callers")
-
-runtimo uses all three:
-- Check telemetry → Is GPU available?
-- Check llmosafe → Am I within RAM limits?
-- (Optional) Use moegraph → Will this break callers?
+3. (Optional) Future code-aware capabilities → Will this break callers?
 
 ---
 
-## Options for moegraph + runtimo Integration
+## Options for Future Code-Aware Capability Integration
 
 As discussed earlier, three options remain:
 
 **Option A: Complete Fusion**  
-Merge moegraph + runtimo into one repo.  
-→ Best if runtimo is moegraph-specific runtime.
+Merge code-aware capabilities + runtimo into one repo.  
+→ Best if runtimo is code-aware-capability-specific runtime.
 
 **Option B: Partial Dependence** (Recommended)  
-runtimo has `features = ["moegraph-integration"]` (optional).  
-→ Best if runtimo capabilities need graph analysis.
+runtimo has `features = ["code-aware-integration"]` (optional).  
+→ Best if runtimo capabilities need code analysis.
 
 **Option C: Orthogonal + Shared Safety**  
 No direct dependency, both use llmosafe.  
@@ -154,7 +148,7 @@ No direct dependency, both use llmosafe.
 1. **Integrate telemetry into WAL** (every event includes telemetry snapshot)
 2. **Add telemetry guards to capabilities** (check resources before execution)
 3. **Implement health monitoring** (alert on thresholds)
-4. **Operator decision on moegraph integration** (fusion vs dependence vs orthogonal)
+4. **Operator decision on code-aware capability integration** (fusion vs dependence vs orthogonal)
 
 ---
 

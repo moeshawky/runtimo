@@ -149,19 +149,19 @@ All verified ✅
 ---
 
 ##
-## Next: moegraph + runtimo Integration
+## Next: Future Code-Aware Capabilities
 
 The original question remains: **fusion or partial dependence?**
 
 Now with telemetry, runtimo can:
-- Check environment before running moegraph capabilities
-- Log moegraph usage in telemetry (which graph algorithms ran)
-- Monitor moegraph service health (is the graph DB running?)
+- Check environment before running future code-aware capabilities
+- Log code-aware capability usage in telemetry
+- Monitor code-aware service health
 
 **Recommendation unchanged:** Option B (optional dependency)
-- runtimo has `features = ["moegraph-integration"]`
-- Default: pure runtime (no moegraph)
-- With feature: code-aware capabilities (UpdateFunction, Refactor)
+- runtimo has `features = ["code-aware-integration"]`
+- Default: pure runtime (no code-aware capabilities)
+- With feature: future code-aware capabilities (not yet wired)
 
 **Your move, operator.** Telemetry is done. What's next?
 

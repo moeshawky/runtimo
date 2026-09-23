@@ -136,7 +136,7 @@ Run FileRead on /tmp/test.txt
 | Version | Date | Change |
 |---------|------|--------|
 | 1.0 | 2026-05-16 | Initial prompt (telemetry + process tracking) |
-| — | — | Next: Add moegraph integration decision |
+| — | — | Next: Add code-aware capability integration decision |
 
 ---
 

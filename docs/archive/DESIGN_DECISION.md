@@ -181,32 +181,31 @@ fn kill_job(job_id: &str) {
 
 ---
 
-## Relationship to moegraph + llmosafe
+## Relationship to llmosafe + telemetry
 
 | System | Purpose | Persistent Machine Role |
 |--------|---------|------------------------|
 | **llmosafe** | Resource limits (CPU time, memory, timeout) | Enforces hard limits |
-| **moegraph** | Code intelligence (graph analysis) | Optional code-aware capabilities |
-| **runtimo telemetry** | Hardware awareness | Know what exists |
+| **telemetry** | Environment awareness | Know what exists |
 | **runtimo processes** ⭐ | Process awareness | Know what's running, what to kill |
 
-**Integration:** runtimo uses llmosafe for hard limits, telemetry for environment awareness, processes for execution tracking, and optionally moegraph for code-aware capabilities.
+**Integration:** runtimo uses llmosafe for hard limits, telemetry for environment awareness, processes for execution tracking, and optionally future code-aware capabilities for code-aware features.
 
 ---
 
-## Operator Decision: moegraph + runtimo
+## Operator Decision: Future Code-Aware Capabilities
 
 The original question remains: **fusion, partial dependence, or orthogonal?**
 
 With process tracking, runtimo can:
-- Track which moegraph processes are running
-- Detect if moegraph graph DB is consuming too much RAM
-- Kill runaway moegraph queries
+- Track which code-aware processes are running
+- Detect if code-aware services are consuming too much RAM
+- Kill runaway code-aware queries
 
 **Recommendation unchanged:** Option B (optional dependency)
-- runtimo has `features = ["moegraph-integration"]`
-- Default: pure runtime (no moegraph)
-- With feature: code-aware capabilities + process tracking
+- runtimo has `features = ["code-aware-integration"]`
+- Default: pure runtime (no code-aware capabilities)
+- With feature: future code-aware capabilities (not yet wired) + process tracking
 
 ---
 

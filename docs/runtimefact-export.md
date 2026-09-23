@@ -1,7 +1,7 @@
 # Runtime Fact Export — `runtime-facts-v1.jsonl` + `run-manifest-v1.json`
 
 > Bridge module for versioned forward-compat export of runtime facts and run manifests.
-> Activation: 009. No Codegraph import. RuntimeLocator→SymbolUID|unresolved.
+> Activation: 009. No authoritative symbol resolver wired. RuntimeLocator→SymbolUID|unresolved.
 
 ## Overview
 
@@ -34,18 +34,16 @@ Each `RuntimeLocator` can be resolved to a `SymbolUID` via [`resolve_locator`].
 
 | Outcome | Meaning | When |
 |---------|---------|------|
-| `Unresolved(String)` | No real resolver wired; locator documented but not resolved | Default (no Codegraph resolver) |
-| `Unresolved(String)` | Codegraph available but resolver not wired; `codegraph_available=true` does NOT fabricate | Even when `codegraph_available=true` |
+| `Unresolved(String)` | No real resolver wired; locator documented but not resolved | Default (no authoritative resolver) |
+| `Unresolved(String)` | Resolver not wired; `resolve_locator` does not fabricate identity | Even when a resolver flag is true |
 
-### No Codegraph Import
+### No Authoritative Resolver
 
-The export works **without** Codegraph. When `codegraph_available` is `false` (the default),
-`resolve_locator` returns `SymbolUidResolution::Unresolved` with a documented reason:
+The export works **without** a wired resolver. When no authoritative resolver is available (the default), `resolve_locator` returns `SymbolUidResolution::Unresolved` with a documented reason:
 
-> "Codegraph unavailable — export works without Codegraph; locator documented but not resolved"
+> "No real symbol resolver is currently wired; unresolved locators remain explicitly Unresolved"
 
-This ensures the export is useful without Codegraph while preserving the ability to resolve
-when Codegraph is available.
+This ensures the export is useful without a resolver while preserving the ability to resolve when one is wired.
 
 ### SymbolUID in Adapters
 
@@ -55,7 +53,7 @@ when Codegraph is available.
 
 ### Resolution Truth
 
-`resolve_locator()` returns `SymbolUidResolution::Unresolved` always, even when `codegraph_available=true`. The old `codegraph_available=true` path that fabricated deterministic `file:line:kind` identity violated §56 evidence custody and has been removed. The only change when `codegraph_available=true` is the reason string. Fabrication is forbidden; `Resolved` only when a real resolver is wired.
+`resolve_locator()` returns `SymbolUidResolution::Unresolved` always when no authoritative resolver is wired. The old path that fabricated deterministic `file:line:kind` identity violated §56 evidence custody and has been removed. `Resolved(SymbolUID)` is valid only when a real authoritative resolver supplies identity. Runtimo never fabricates one.
 
 ## Observed* Distinct Calls
 
@@ -69,18 +67,15 @@ when Codegraph is available.
 | `ObservedException` | JFR | `ExactRuntime` | IMPORT |
 | `ObservedCall` | sema | `Sampled` | DEFERRED (OTel blocked) |
 
-Each `ObservedCall` fact is stored as a distinct entry. The `facts_are_distinct()` method
-verifies no collapsing has occurred.
+Each `ObservedCall` fact is stored as a distinct entry. The `facts_are_distinct()` method verifies no collapsing has occurred.
 
 ## Forward-Compat
 
-All JSON/JSONL exports tolerate unknown fields during deserialization. This is achieved
-through serde's default behavior (ignore unknown fields) and explicit test cases.
+All JSON/JSONL exports tolerate unknown fields during deserialization. This is achieved through serde's default behavior (ignore unknown fields) and explicit test cases.
 
 ## Manifest No Secrets
 
-`RunManifestV1` contains no raw environment variables or secrets. Environmental identity
-is hashed or whitelisted. The manifest includes:
+`RunManifestV1` contains no raw environment variables or secrets. Environmental identity is hashed or whitelisted. The manifest includes:
 
 - `schema_version: "1"`
 - `run_id`
@@ -124,7 +119,7 @@ export.add_fact(RuntimeFactV1::new(
     "abc123".to_string(),
 ));
 
-// Resolve a locator (returns Unresolved without Codegraph)
+// Resolve a locator (returns Unresolved without authoritative resolver)
 let locator = RuntimeLocator::Python {
     module: "runtimo".to_string(),
     qualname: "run".to_string(),

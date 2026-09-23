@@ -30,7 +30,6 @@
 - `hash_ok` retained as deprecated alias = `structurally_parseable && integrity_valid`
 - Per-guard `llmosafe` history: single fresh upstream observation per call; `ResourceHistory` deleted (d95cd1b)
 - Burst deferred contract: `observe_burst` RPC → `-32601 observe_burst deferred`; CLI prints `burst_deferred:true` note
-- `max_bundle_bytes` vaporware removed from config resolution (field still present in `ObserveConfig`/`ResolvedConfig` — not wired to rotation; CHANGELOG notes removal, code cleanup pending Unit B)
 
 ### Capabilities
 - **FileRead** — traversal protection, O_NOFOLLOW, binary detection, UTF-8 safe truncation, JSON auto-parse, max_bytes support
@@ -73,7 +72,7 @@
 - [ ] HTTP request capability (via reqwest)
 - [ ] Concurrent job execution with worker pool
 - [ ] Backup cleanup policy (TTL-based deletion)
-- [ ] `max_bundle_bytes` code cleanup — field still in `ObserveConfig`/`ResolvedConfig`/`output.rs`; removal from structs pending (CHANGELOG notes removal, wiring not yet observed)
+- [ ] `max_bundle_bytes` residual — field still in `ObserveConfig`/`ResolvedConfig`/`output.rs`; removal from structs pending; enumerate occurrences; consumer analysis before remove; compile/tests prove no phantom usage
 
 ### P3: Daemon
 - [ ] Process isolation (subprocess with cgroups/namespaces)
@@ -86,5 +85,3 @@
 ### P5: Documentation
 - [ ] "How to add a new capability" runbook
 - [ ] "How to recover from runaway jobs" runbook
-- [x] Version bump consistency: workspace 0.9.1 with daemon/cli deps pinned ^0.9 (verified) — superseded by 0.10.1 release; no action needed
-- [x] Test count accuracy: README / TODO / CHANGELOG reconciled to ~767 passed / 2 failed same-known / runtime_fact_export 12/12 (39 cli + 489 core-lib + 69 integration + 46 robust + 15 conformance09 + 12 runtime_fact_export + 8 doctest)

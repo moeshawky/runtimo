@@ -30,8 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **EnvGuard RAII isolation** — New `core/src/lib.rs::test_isolation` module: `EnvGuard` struct with `Drop` impl that restores `RUNTIMO_TEST_PRESSURE`, `RUNTIMO_MEMORY_CEILING_BYTES`, `RUNTIMO_SEMANTIC_POLICY` on drop (including panic); serializes via shared `ENV_GUARD` inside `crate::lock_env()`.
 
 ### Changed
-- **RuntimeFact no-fabrication** — `resolve_locator()` (`core/src/runtime/runtime_fact_export.rs`) now returns `SymbolUidResolution::Unresolved` always, even when `codegraph_available=true`; the old `codegraph_available=true` path that fabricated deterministic `file:line:kind` identity violated §56 evidence custody and has been removed. Test renamed from `resolve_locator_returns_resolved_with_codegraph` to `resolve_locator_never_fabricates`.
-- **Test correction** — `mock_resolver_proves_resolved_with_codegraph` corrected to `resolver_refuses_fabrication_when_codegraph_flag_true`; the test asserts `Unresolved` with reason `"Codegraph resolver not wired — no real SymbolUID available; refusing to fabricate identity (§56)"` even when the flag is true.
+- **RuntimeFact no-fabrication** — `resolve_locator()` (`core/src/runtime/runtime_fact_export.rs`) now returns `SymbolUidResolution::Unresolved` always when no authoritative resolver is wired; the old path that fabricated deterministic `file:line:kind` identity violated §56 evidence custody and has been removed. Test renamed from `resolve_locator_returns_resolved_with_resolver` to `resolve_locator_never_fabricates`.
+- **Test correction** — `mock_resolver_proves_resolved_with_resolver` corrected to `resolver_refuses_fabrication_when_resolver_flag_true`; the test asserts `Unresolved` with reason `"No real symbol resolver is currently wired; refusing to fabricate identity (§56)"` even when the flag is true.
 - **WAL/safety evidence** — `WalEvent` gains `safety: Option<SafetyAssessmentV1>` field (serde default, versioned); new `WalEventType::SafetyEvaluated` variant with wire string `safety_evaluated`; executor emits `SafetyEvaluated` AFTER `JobStarted` and BEFORE the governed side effect — WAL append failure blocks execution (`core/src/wal.rs`, `core/src/executor.rs`).
 - **ShellExec containment** — Blocklist documentation clarified: `blocklist_enabled = false` opts out entirely (operator decision, not a security failure); `is_dangerous_command` docs updated to reflect blocklist-ON-by-default semantics; `SafetyEvaluated` event integrated into the execution pipeline diagram.
 - **Sampler determinism** — `core/src/observe/sampler.rs`: `SampleEvent` default gains `safety: None`; `core/src/observe/self_test.rs`: `self_test_fixtures_pass_on_healthy` now uses `EnvGuard::new()` and sets `RUNTIMO_MEMORY_CEILING_BYTES` to `usize::MAX` for deterministic seams; `RUNTIMO_TEST_PRESSURE` removed to ensure `test_pressure_override()` returns `None`.
@@ -51,7 +51,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **`FileLock` in session management** — `core/src/session.rs` introduces `FileLock` struct with `lock()`, `unlock()`, and `Drop` impl for session file locking. Lock is released on drop; supports concurrent access detection via `flock`. (`core/src/session.rs`)
 - **`WalEventType::WriterInitialized` marker** — New WAL event variant `WriterInitialized` written on WAL writer initialization. Used as a sentinel in bundle verification to skip the initial marker event (`core/src/wal.rs`, `core/src/observe/bundle.rs`).
-- **Watch index scope + debounce (b225b8a)** — Added `.ixd.toml` to exclude metadata dirs (`.annotations`, `.opencode`, `.ix`, `.codegraph`, `.git`, `node_modules`, `target`, `telebox`) from trigram index churn; 2000ms debounce for agent-driven write bursts. Takes effect on daemon reload. (`.ixd.toml`)
+- **Watch index scope + debounce (b225b8a)** — Added `.ixd.toml` to exclude metadata dirs (`.annotations`, `.opencode`, `.ix`, `[private tooling dir]`, `.git`, `node_modules`, `target`, `telebox`) from trigram index churn; 2000ms debounce for agent-driven write bursts. Takes effect on daemon reload. (`.ixd.toml`)
 
 ### Fixed
 - **Guard accessors → resolved (RC1)** — `blocklist_enabled()`, `critical_files_enabled()`, `path_restriction_enabled()`, `path_sanitization_enabled()` now delegate to `RuntimoConfig::load().resolved()` (precedence: top-level > `[guards]` > profile > builtin `true`; `ephemeral` resolves to `false`). Fixes divergence where `[guards]` table was ignored. (`core/src/config.rs`)
@@ -466,7 +466,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **MSRV declared correctly** — `rust-version` changed from `1.85.0` to `1.70.0`, matching the CI-tested MSRV in `ci.yml`. (`Cargo.toml`)
 - **GitClone optimization** — Changed `HashSet<String>` to `HashSet<&String>` in `cli/src/main.rs` and `daemon/src/engine.rs` job deduplication paths, eliminating redundant `String::clone()` allocations. (`cli/src/main.rs`, `daemon/src/engine.rs`)
 - **Documentation rename** — `docs/RUNTIMO_CORE_LIB.rs` renamed to `docs/RUNTIMO_CORE_LIB.rs.txt` to prevent false Rust tooling diagnostics. (`docs/`)
-- **Gitignore hardening** — Added `.moegraph/` and `.workflow-state.md` to `.gitignore` for local development artifact exclusion. (`.gitignore`)
+- **Gitignore hardening** — Added internal metadata dirs and `.workflow-state.md` to `.gitignore` for local development artifact exclusion. (`.gitignore`)
 - **CI workflow committed** — `publish-cratesio.yml` is now tracked by git. (`.github/workflows/`)
 - **Environment variable documentation** — README now documents `RUNTIMO_ENABLE_PUBLIC_IP`, `RUNTIMO_DAL`, `RUNTIMO_STATE_DIR`, and `RUNTIMO_ENABLE_NETWORK`. (`README.md`)
 
