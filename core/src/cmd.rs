@@ -21,7 +21,8 @@ use std::process::Command;
 /// # Variants
 /// - `NotFound`: The command executable was not found on the system PATH.
 ///   Constructed when `sh -c` exits with code 127 and stderr contains
-///   "not found" (indicating a missing binary).
+///   "not found" (dash/bash) or "Permission denied" (sandboxes that answer
+///   `execve` with `EACCES` for missing binaries).
 /// - `Failed`: The command executed but exited with a non-zero status code.
 ///   Contains the exit code and captured stderr output.
 ///   Note: `code` may be `-1` when the process was killed by a signal
@@ -38,6 +39,8 @@ use std::process::Command;
 ///   from `Command::output()`.
 /// - `code` may be `-1` if the process was killed by a signal
 ///   (`ExitStatus::code()` returns `None`).
+/// - A real permission failure on an existing executable exits 126 and is
+///   reported as `Failed`, never `NotFound`.
 ///
 /// # Errors
 ///
@@ -50,7 +53,7 @@ pub enum CmdError {
     ///
     /// The string value is the command that was attempted.
     /// Constructed when `sh -c` exits with code 127 and stderr
-    /// contains "not found".
+    /// contains "not found" or "Permission denied".
     #[error("command not found: {0}")]
     NotFound(String),
 
@@ -90,6 +93,11 @@ pub enum CmdError {
 /// # Errors
 ///
 /// Returns [`CmdError::NotFound`] if the command executable does not exist.
+/// Detection: `sh -c` exits with code 127 and stderr contains "not found"
+/// (dash/bash) or "Permission denied" (sandboxes that answer `execve` with
+/// `EACCES` for missing binaries). A real permission failure on an existing
+/// executable exits 126 and is reported as [`CmdError::Failed`], so the
+/// broadened message check never masks permission errors.
 /// Returns [`CmdError::Failed`] if the command exits with a non-zero status code —
 /// the variant carries both the exit code and captured stderr.
 /// Returns [`CmdError::Io`] if the process fails to spawn (permission denied, fork failure).
@@ -113,10 +121,15 @@ pub fn run_cmd_result(cmd: &str) -> std::result::Result<String, CmdError> {
     } else {
         let code = output.status.code().unwrap_or(-1);
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        // A missing binary makes `sh -c` exit with code 127 and stderr
-        // contains "not found". Distinguish this from a script that
-        // genuinely exited 127.
-        if code == 127 && stderr.contains("not found") {
+        // A missing binary makes `sh -c` exit with code 127. The stderr text
+        // is shell- and sandbox-dependent: dash/bash report "not found",
+        // while seccomp-style sandboxes that answer execve with EACCES
+        // report "Permission denied" for the same condition. Real
+        // permission failures on an existing executable exit 126, so 127
+        // plus either message identifies a missing binary without masking
+        // permission errors. A script that genuinely exits 127 without
+        // either message stays `Failed`.
+        if code == 127 && (stderr.contains("not found") || stderr.contains("Permission denied")) {
             Err(CmdError::NotFound(cmd.to_string()))
         } else {
             Err(CmdError::Failed { code, stderr })
@@ -177,13 +190,67 @@ mod tests {
     #[test]
     fn test_run_cmd_nonexistent_command() {
         // Command that doesn't exist — sh exits with code 127 and
-        // stderr contains "not found", so we get CmdError::NotFound
+        // stderr contains "not found" (dash/bash) or "Permission denied"
+        // (sandboxes answering execve with EACCES), so we get CmdError::NotFound
         let result = run_cmd("nonexistent_command_xyz_123");
         assert!(result.is_err(), "Nonexistent command should return Err");
         let err = result.unwrap_err();
         assert!(
             matches!(err, CmdError::NotFound { .. }),
             "Missing binary should return CmdError::NotFound, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_run_cmd_real_permission_denied_is_failed_not_not_found() {
+        // Falsification guard for the broadened NotFound detection: a real
+        // permission failure on an existing target must stay `Failed` with
+        // code 126, never be misreported as `NotFound`. execve on a
+        // directory fails with EACCES for every user including root, so
+        // this probe is root-safe.
+        let result = run_cmd("/tmp");
+        assert!(result.is_err(), "Executing a directory should return Err");
+        match result.unwrap_err() {
+            CmdError::Failed { code, .. } => assert_eq!(
+                code, 126,
+                "real permission failure must exit 126, got code {}",
+                code
+            ),
+            other => panic!("Expected CmdError::Failed{{code:126}}, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_run_cmd_genuine_exit_127_is_failed_not_not_found() {
+        // A script that genuinely exits 127 without a not-found message on
+        // stderr must stay `Failed` — the message check is what separates
+        // it from a missing binary.
+        let result = run_cmd("exit 127");
+        assert!(result.is_err(), "exit 127 should return Err");
+        match result.unwrap_err() {
+            CmdError::Failed { code, .. } => assert_eq!(code, 127),
+            other => panic!("Expected CmdError::Failed{{code:127}}, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_run_cmd_broken_symlink_is_not_found() {
+        // Guards the original "not found" detection branch: dash reports
+        // "not found" + 127 for a symlink whose target does not exist.
+        let link = std::env::temp_dir().join("runtimo_cmd_broken_link_test");
+        let _ = std::fs::remove_file(&link);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/nonexistent/runtimo_cmd_target_test", &link).unwrap();
+        #[cfg(not(unix))]
+        let _ = &link;
+        let result = run_cmd(&link.to_string_lossy());
+        let _ = std::fs::remove_file(&link);
+        assert!(result.is_err(), "Broken symlink should return Err");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, CmdError::NotFound { .. }),
+            "Broken symlink should return CmdError::NotFound, got: {:?}",
             err
         );
     }

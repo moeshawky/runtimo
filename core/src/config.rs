@@ -1211,14 +1211,17 @@ profile = "minimal"
     }
 }
 
+/// Mutex serializing every test that mutates `XDG_CONFIG_HOME` (or other
+/// process-global config env) across the crate. Module-level and
+/// `pub(crate)` so capability test modules lock the same mutex instead of
+/// private copies — without this, concurrent tests in different modules
+/// fight over the process-global env var and produce spurious failures.
+#[cfg(test)]
+pub(crate) static CONFIG_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Mutex to serialize config tests that set XDG_CONFIG_HOME.
-    /// Without this, concurrent tests fight over the process-global env var.
-    static CONFIG_TEST_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn config_path_is_absolute() {

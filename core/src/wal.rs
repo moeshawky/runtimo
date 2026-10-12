@@ -309,6 +309,18 @@ impl WalWriter {
     /// `seq` equal to the recovered base sequence number, and the
     /// internal sequence counter is set to `recovered_base + 1`.
     ///
+    /// # Atomicity
+    ///
+    /// File creation is atomic: the file is created with
+    /// `OpenOptions::create_new(true)`, which fails with
+    /// [`std::io::ErrorKind::AlreadyExists`] when another creator won the
+    /// race. That outcome is not an error here — it falls through to the
+    /// recovery path below, which opens the existing file in append mode
+    /// (never truncating) and acquires the exclusive lock before reading
+    /// or writing. Concurrent [`WalWriter::create`] calls on the same path
+    /// therefore never truncate each other's content: the only truncating
+    /// primitive (`O_TRUNC`) is absent from this function entirely.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::WalError`](crate::Error::WalError) if the file cannot
@@ -327,15 +339,23 @@ impl WalWriter {
             }
         }
 
-        // Create the file if it doesn't exist
-        if !path.exists() {
-            std::fs::File::create(path).map_err(|e| {
-                crate::Error::WalError(format!(
+        // Atomically create the file if it doesn't exist. create_new fails
+        // with AlreadyExists when a concurrent creator won the race — that
+        // is the expected outcome, not an error: the recovery path below
+        // opens the existing file in append mode (no truncation) under the
+        // exclusive lock. Any other I/O error is fatal.
+        if let Err(e) = std::fs::OpenOptions::new()
+            .append(true)
+            .create_new(true)
+            .open(path)
+        {
+            if e.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(crate::Error::WalError(format!(
                     "Failed to create WAL file {}: {}",
                     path.display(),
                     e
-                ))
-            })?;
+                )));
+            }
         }
 
         // Recover sequence from existing WAL content and write a marker
@@ -945,6 +965,117 @@ mod tests {
         // Create new writer — should recover seq from file
         let wal2 = WalWriter::create(&path).unwrap();
         assert_eq!(wal2.seq(), 2);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn wal_create_race_preserves_existing_events() {
+        // Discrimination: a create that truncates (`File::create`, O_TRUNC)
+        // wipes the pre-populated events and then recovers base seq 0, so
+        // BOTH assertions below fail on that code — the pre-events are gone
+        // and every creator reports seq 1. The append-mode `create_new`
+        // path preserves the file and recovers the real base, so the test
+        // passes only when no truncating primitive is on the create path.
+        const PRE_EVENTS: u64 = 5;
+        const THREADS: usize = 8;
+
+        let path = tmp_wal("create_race");
+        let _ = std::fs::remove_file(&path);
+
+        // Pre-populate with real events through the append path.
+        let expected: Vec<String> = (1..=PRE_EVENTS).map(|seq| format!("pre-{}", seq)).collect();
+        {
+            let mut wal = WalWriter::create(&path).unwrap();
+            for seq in 1..=PRE_EVENTS {
+                wal.append(WalEvent {
+                    seq,
+                    ts: 1715800000 + seq,
+                    event_type: WalEventType::JobStarted,
+                    job_id: format!("pre-{}", seq),
+                    ..Default::default()
+                })
+                .unwrap();
+            }
+        }
+
+        // N threads race create on the same path.
+        let mut handles = Vec::with_capacity(THREADS);
+        for _ in 0..THREADS {
+            let race_path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                WalWriter::create(&race_path).map(|writer| writer.seq())
+            }));
+        }
+        let recovered: Vec<u64> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap().unwrap())
+            .collect();
+
+        // Every creator must have recovered the base from the pre-existing
+        // content (base + 1), not from a file it truncated to empty.
+        for seq in &recovered {
+            assert_eq!(
+                *seq,
+                PRE_EVENTS + 1,
+                "concurrent create must recover the pre-existing base sequence, got {:?}",
+                recovered
+            );
+        }
+
+        // Read the raw file (WriterInitialized markers included) and check
+        // that every pre-existing event survived, in order.
+        let content = std::fs::read_to_string(&path).unwrap();
+        let events: Vec<WalEvent> = content
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+
+        let surviving: Vec<&str> = events
+            .iter()
+            .map(|event| event.job_id.as_str())
+            .filter(|job_id| job_id.starts_with("pre-"))
+            .collect();
+        assert_eq!(
+            surviving, expected,
+            "every pre-existing event must survive the concurrent create race"
+        );
+
+        // Every creator wrote exactly one marker: a truncating create wipes
+        // the markers of the creators that ran before it, so the count drops
+        // below the expected total. Deterministic on the append path — each
+        // creator writes its marker under the exclusive lock. The
+        // pre-populating create above contributes one marker of its own.
+        let markers = events
+            .iter()
+            .filter(|event| event.event_type == WalEventType::WriterInitialized)
+            .count();
+        assert_eq!(
+            markers,
+            THREADS + 1,
+            "each concurrent creator must leave its marker, got {} of {}",
+            markers,
+            THREADS + 1
+        );
+        assert_eq!(
+            events.len(),
+            expected.len() + THREADS + 1,
+            "the file must hold the setup marker, the pre-existing events, and one marker per creator"
+        );
+
+        // Sequence numbers never move backwards in the file. Markers written
+        // by the racing creators repeat the recovered base, so the contract
+        // is non-decreasing, not strictly increasing.
+        let mut prev = 0u64;
+        for event in &events {
+            assert!(
+                event.seq >= prev,
+                "WAL seq must be monotonic (non-decreasing): {} after {}",
+                event.seq,
+                prev
+            );
+            prev = event.seq;
+        }
 
         let _ = std::fs::remove_file(&path);
     }

@@ -85,3 +85,9 @@ chatgpt-discusss.md
 # Local scanner configs (agentic dev artifacts, not for public tree)
 .moeinclude
 .codegraphinclude
+
+# Build & audit artifacts (local, never commit)
+runtimo.tar.gz
+runtimo-results.tar.gz
+.relay/
+codegraph-for-runtimo-guide.md

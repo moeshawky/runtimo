@@ -580,6 +580,28 @@ async fn handle_dispatch(state: &Arc<DaemonState>, params: Value, id: Value) -> 
 /// Checks the background job registry first, then falls back to scanning the WAL
 /// for `JobStarted`/`JobCompleted`/`JobFailed` events. The response includes
 /// `result` (error message) when the job has failed.
+///
+/// # Status Contract
+///
+/// The `status` field of a successful response is one of:
+///
+/// * `"completed"` — a `JobCompleted` event exists for the job.
+/// * `"failed"` — a `JobFailed` event exists for the job (includes jobs
+///   reconciled by [`reconcile_orphaned_jobs`] on daemon startup).
+/// * `"unknown"` — a `JobStarted` event exists but no terminal
+///   (`JobCompleted`/`JobFailed`) event does. This means the job was still
+///   running when last observed, or its terminal event was lost to a crash
+///   before the next daemon startup reconciled it. `"unknown"` is a valid,
+///   documented terminal answer for this query — not an error.
+/// * Registry statuses (`"running"`, and post-terminal values written by
+///   [`crate::jobs::BackgroundJobRegistry::update`]) — returned when the job
+///   is found in the in-memory background registry.
+///
+/// When no `JobStarted` event exists for the ID, the response is a JSON-RPC
+/// error with code `-32602` and message `"Job not found: {job_id}"`.
+///
+/// The same `"unknown"` vocabulary is used by [`handle_jobs`] and
+/// [`handle_observe_status`] for started-without-terminal entries.
 #[allow(clippy::unused_async)]
 async fn handle_status(state: &Arc<DaemonState>, params: Value, id: Value) -> JsonRpcResponse {
     let jid: String = match params.get("job_id").and_then(|v| v.as_str()) {
@@ -2523,6 +2545,39 @@ mod tests {
         assert!(response.error.is_some());
         assert_eq!(response.error.unwrap().code, -32602);
         std::env::remove_var("XDG_DATA_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_handle_status_unknown_for_started_without_terminal() {
+        // Activation proof for the documented status contract: a job with a
+        // JobStarted event but no JobCompleted/JobFailed event must report
+        // status "unknown" — the documented value, not an error.
+        let dir = unique_test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let wal_path = dir.join("wal.jsonl");
+        make_wal(
+            &wal_path,
+            &[make_started_event(0, 1000, "job-unknown", "FileRead")],
+        );
+        let state = Arc::new(DaemonState::new(&wal_path, None).unwrap());
+
+        let params = serde_json::json!({"job_id": "job-unknown"});
+        let response = handle_status(&state, params, serde_json::Value::from(1)).await;
+
+        assert!(
+            response.error.is_none(),
+            "started-without-terminal job must not be an error"
+        );
+        let result = response.result.expect("status result must be present");
+        assert_eq!(
+            result["status"], "unknown",
+            "JobStarted without terminal event must report the documented \"unknown\" status"
+        );
+        assert_eq!(result["job_id"], "job-unknown");
+        assert_eq!(result["capability"], "FileRead");
+        assert_eq!(result["started_at"], 1000);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
