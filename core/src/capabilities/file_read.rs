@@ -112,19 +112,36 @@ impl TypedCapability for FileRead {
 
         // P0 FIX: Always use bounded reader (take) regardless of metadata.
         // Prevents TOCTOU size bypass where file grows between stat and read.
-        let mut limited = file.take(max_bytes);
+        //
+        // F-036: the cap is max_bytes + 1 so ONE byte beyond the limit can be observed
+        // and then discarded. `truncated` is therefore decided from the read itself, never
+        // from file metadata: a stat could describe a file that grew, shrank, or was
+        // replaced by a different inode between validate and open.
+        //
+        // `truncated` is a WITNESS, not a size comparison:
+        //   true  => at least one byte was actually read and discarded.
+        //   false => EOF was reached with <= max_bytes bytes available at this read.
+        let probe = max_bytes.saturating_add(1); // bounded by MAX_FILE_SIZE above; cannot overflow
+        let mut limited = file.take(probe);
 
         // Read raw bytes to handle binary detection and UTF-8 boundaries correctly.
-        let mut raw_bytes = Vec::with_capacity(std::cmp::min(
-            usize::try_from(max_bytes).unwrap_or(usize::MAX),
-            64 * 1024,
-        ));
-        let bytes_read = limited
+        // `read_to_end` reports `usize`; convert the u64 cap once with the
+        // `try_from(...).unwrap_or(usize::MAX)` idiom used below (never `as usize`,
+        // which is `cast_possible_truncation`). Saturating to `usize::MAX` is
+        // unreachable here: `max_bytes` is already clamped to MAX_FILE_SIZE above.
+        let cap = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+
+        let mut raw_bytes = Vec::with_capacity(std::cmp::min(cap, 64 * 1024));
+        let probed = limited
             .read_to_end(&mut raw_bytes)
             .map_err(CapabilityError::Io)?;
 
-        let bytes_read = bytes_read as u64;
-        let truncated = bytes_read >= max_bytes;
+        let truncated = probed > cap;
+
+        // Discard the probe byte. `bytes_read` counts bytes actually returned, so it is
+        // derived AFTER truncation — never from `probed`.
+        raw_bytes.truncate(cap);
+        let bytes_read = raw_bytes.len() as u64;
 
         // P1 FIX: Detect binary content (null bytes in the data).
         let is_binary = detect_binary(&raw_bytes);
@@ -550,5 +567,289 @@ mod tests {
                 std::fs::remove_file(&link_path).ok();
             }
         }
+    }
+
+    // --- F-036: `truncated` must mean "bytes were actually dropped" ----------
+    // Before the fix, `limited` was `file.take(max_bytes)`, so `bytes_read ==
+    // min(file_size, max_bytes)`. `bytes_read >= max_bytes` therefore evaluated TRUE
+    // when file_size == max_bytes, although zero bytes were dropped. `execute` now reads
+    // one byte past the cap and discards it, so `truncated` reflects what the read
+    // actually observed. The tests below pin both directions of that boundary.
+
+    #[allow(clippy::unwrap_used)]
+    #[test]
+    fn test_truncated_true_when_cap_omits_bytes() {
+        // 10-byte file, 9-byte cap: one byte IS dropped, so truncated must be true.
+        let mut tmp = std::env::temp_dir();
+        tmp.push("runtimo_test_f036_cap_omits.txt");
+        std::fs::write(&tmp, b"0123456789").unwrap();
+
+        let result = TypedCapability::execute(
+            &FileRead,
+            FileReadArgs {
+                path: tmp.to_str().unwrap().to_string(),
+                max_bytes: Some(9),
+            },
+            &test_ctx(),
+        )
+        .unwrap();
+
+        assert_eq!(result.status, "ok");
+        assert_eq!(
+            result
+                .data
+                .as_ref()
+                .and_then(|d| d.get("truncated"))
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            result
+                .data
+                .as_ref()
+                .and_then(|d| d.get("bytes_read"))
+                .and_then(|v| v.as_u64()),
+            Some(9)
+        );
+        assert!(
+            result.output.contains("(truncated)"),
+            "cap omitted a byte, message must say '(truncated)', got: {}",
+            result.output
+        );
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[allow(clippy::unwrap_used)]
+    #[test]
+    fn test_truncated_false_when_max_bytes_equals_file_size() {
+        // F-036: file_size == max_bytes. `take()` dropped NOTHING, yet
+        // `bytes_read >= max_bytes` reports truncated. This is the defect.
+        let mut tmp = std::env::temp_dir();
+        tmp.push("runtimo_test_f036_equal_cap.txt");
+        std::fs::write(&tmp, b"0123456789").unwrap();
+
+        let result = TypedCapability::execute(
+            &FileRead,
+            FileReadArgs {
+                path: tmp.to_str().unwrap().to_string(),
+                max_bytes: Some(10),
+            },
+            &test_ctx(),
+        )
+        .unwrap();
+
+        assert_eq!(result.status, "ok");
+        assert_eq!(
+            result
+                .data
+                .as_ref()
+                .and_then(|d| d.get("truncated"))
+                .and_then(|v| v.as_bool()),
+            Some(false),
+            "F-036: file_size == max_bytes must NOT report truncated"
+        );
+        assert_eq!(
+            result
+                .data
+                .as_ref()
+                .and_then(|d| d.get("bytes_read"))
+                .and_then(|v| v.as_u64()),
+            Some(10),
+            "F-036: all 10 bytes were returned"
+        );
+        assert!(
+            !result.output.contains("(truncated)"),
+            "F-036: complete read must not claim '(truncated)', got: {}",
+            result.output
+        );
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[allow(clippy::unwrap_used)]
+    #[test]
+    fn test_truncated_false_when_max_bytes_exceeds_file_size() {
+        // 10-byte file, 11-byte cap: complete read, no truncation.
+        let mut tmp = std::env::temp_dir();
+        tmp.push("runtimo_test_f036_cap_exceeds.txt");
+        std::fs::write(&tmp, b"0123456789").unwrap();
+
+        let result = TypedCapability::execute(
+            &FileRead,
+            FileReadArgs {
+                path: tmp.to_str().unwrap().to_string(),
+                max_bytes: Some(11),
+            },
+            &test_ctx(),
+        )
+        .unwrap();
+
+        assert_eq!(result.status, "ok");
+        assert_eq!(
+            result
+                .data
+                .as_ref()
+                .and_then(|d| d.get("truncated"))
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            result
+                .data
+                .as_ref()
+                .and_then(|d| d.get("bytes_read"))
+                .and_then(|v| v.as_u64()),
+            Some(10)
+        );
+        assert!(
+            !result.output.contains("(truncated)"),
+            "cap exceeded file size, message must not say '(truncated)', got: {}",
+            result.output
+        );
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[allow(clippy::unwrap_used)]
+    #[test]
+    fn test_truncated_false_when_file_below_cap() {
+        // 9-byte file, 10-byte cap: the ordinary below-cap case.
+        let mut tmp = std::env::temp_dir();
+        tmp.push("runtimo_test_f036_below_cap.txt");
+        std::fs::write(&tmp, b"012345678").unwrap();
+
+        let result = TypedCapability::execute(
+            &FileRead,
+            FileReadArgs {
+                path: tmp.to_str().unwrap().to_string(),
+                max_bytes: Some(10),
+            },
+            &test_ctx(),
+        )
+        .unwrap();
+
+        assert_eq!(result.status, "ok");
+        assert_eq!(
+            result
+                .data
+                .as_ref()
+                .and_then(|d| d.get("truncated"))
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            result
+                .data
+                .as_ref()
+                .and_then(|d| d.get("bytes_read"))
+                .and_then(|v| v.as_u64()),
+            Some(9)
+        );
+        assert!(
+            !result.output.contains("(truncated)"),
+            "file below cap, message must not say '(truncated)', got: {}",
+            result.output
+        );
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[allow(clippy::unwrap_used)]
+    #[test]
+    fn test_truncated_true_when_file_one_byte_over_cap() {
+        // 11-byte file, 10-byte cap: exactly one byte IS dropped.
+        // This is the counterpart to F-036 — a fix that over-corrects `>=` to `>`
+        // (or to a `>= max_bytes + 1` style guard) breaks HERE, not only in T1.
+        let mut tmp = std::env::temp_dir();
+        tmp.push("runtimo_test_f036_one_over.txt");
+        std::fs::write(&tmp, b"0123456789X").unwrap();
+
+        let result = TypedCapability::execute(
+            &FileRead,
+            FileReadArgs {
+                path: tmp.to_str().unwrap().to_string(),
+                max_bytes: Some(10),
+            },
+            &test_ctx(),
+        )
+        .unwrap();
+
+        assert_eq!(result.status, "ok");
+        assert_eq!(
+            result
+                .data
+                .as_ref()
+                .and_then(|d| d.get("truncated"))
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "F-036 counterpart: file_size (11) > max_bytes (10) must still report truncated"
+        );
+        assert_eq!(
+            result
+                .data
+                .as_ref()
+                .and_then(|d| d.get("bytes_read"))
+                .and_then(|v| v.as_u64()),
+            Some(10),
+            "take(max_bytes) must cap bytes_read at 10"
+        );
+        assert!(
+            result.output.contains("(truncated)"),
+            "one byte dropped, message must say '(truncated)', got: {}",
+            result.output
+        );
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    // F-036: the reader caps at `max_bytes + 1` so the one byte past the cap can be
+    // OBSERVED (`probed > cap` => truncated) and then DISCARDED by `raw_bytes.truncate(cap)`.
+    // The NUL below is deliberately that discarded probe byte: it sits at index 10, exactly
+    // `max_bytes` past the start, so `take(11)` reads it but `truncate(10)` must drop it
+    // BEFORE `detect_binary` ever sees it.
+    //
+    // If the truncate is ever moved after `detect_binary`, this 10-byte text file is classified
+    // "binary" purely on a byte that was never returned — and the other five F-036 tests still pass.
+    // That silent regression is what this test exists to make loud.
+    #[allow(clippy::unwrap_used)]
+    #[test]
+    fn test_probe_byte_never_reaches_output() {
+        // 11 bytes: ten ASCII digits, then a NUL as the one-over-cap probe byte.
+        let mut tmp = std::env::temp_dir();
+        tmp.push("runtimo_test_f036_probe_byte.txt");
+        std::fs::write(&tmp, b"0123456789\x00").unwrap();
+
+        let result = TypedCapability::execute(
+            &FileRead,
+            FileReadArgs {
+                path: tmp.to_str().unwrap().to_string(),
+                max_bytes: Some(10),
+            },
+            &test_ctx(),
+        )
+        .unwrap();
+
+        assert_eq!(result.status, "ok");
+        let data = result.data.as_ref().unwrap();
+
+        assert_eq!(
+            data.get("bytes_read").and_then(|v| v.as_u64()),
+            Some(10),
+            "F-036: the probe byte must be discarded, so only 10 bytes are returned"
+        );
+        assert_eq!(
+            data.get("truncated").and_then(|v| v.as_bool()),
+            Some(true),
+            "F-036: one byte was genuinely omitted, so this is a real truncation"
+        );
+        assert_eq!(
+            data.get("content_type").and_then(|v| v.as_str()),
+            Some("text"),
+            "F-036: the probe NUL must not reach detect_binary — a leak classifies this \
+             text file as \"binary\" on a byte it never returned"
+        );
+        assert_eq!(
+            data.get("content").and_then(|v| v.as_str()),
+            Some("0123456789"),
+            "F-036: content is the 10 truncated bytes — no NUL, no replacement char"
+        );
+
+        std::fs::remove_file(&tmp).ok();
     }
 }

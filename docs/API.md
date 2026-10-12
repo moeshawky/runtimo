@@ -118,7 +118,7 @@ pub enum CapabilityError {
   "type": "object",
   "properties": {
     "path": { "type": "string" },
-    "max_bytes": { "type": "integer" }
+    "max_bytes": { "type": "integer", "minimum": 1, "maximum": 10485760 }
   },
   "required": ["path"]
 }
@@ -131,7 +131,8 @@ pub enum CapabilityError {
 - Rejects non-existent files
 - O_NOFOLLOW on open (prevents TOCTOU symlink escape)
 - Binary content detection (null bytes → `content_type: "binary"`)
-- Bounded reader (max 100 MB)
+- Bounded reader (max 10 MB)
+- `truncated` is true only when bytes were actually omitted (decided from the read, not file size)
 - UTF-8 safe truncation on multibyte boundaries
 
 **Example:**
