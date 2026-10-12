@@ -28,6 +28,17 @@ pub struct UndoArgs {
     /// Job ID to undo (restores backup from that job).
     pub job_id: String,
     /// Optional: specific file to restore (if job modified multiple).
+    ///
+    /// Accepted forms, matched against each backup entry in the job's
+    /// backup directory: the backup filename, any suffix of the full
+    /// backup path, or any string the backup filename is a suffix of
+    /// (covers full original paths). When no backup entry matches,
+    /// execution fails with [`CapabilityError::NotFound`].
+    ///
+    /// An empty or whitespace-only value is rejected with
+    /// [`CapabilityError::InvalidArgs`]: an empty string is a suffix of
+    /// every path, so accepting it would silently turn a scoped undo into
+    /// a whole-job restore.
     pub file: Option<String>,
 }
 
@@ -69,6 +80,20 @@ impl TypedCapability for Undo {
     ) -> std::result::Result<Output, CapabilityError> {
         if args.job_id.is_empty() {
             return Err(CapabilityError::InvalidArgs("job_id is empty".into()));
+        }
+
+        // A scoped undo must name a file. An empty (or whitespace-only)
+        // value is a suffix of every backup path, so the matcher below
+        // would treat it as a wildcard and restore the whole job; reject
+        // it before any backup entry is examined.
+        if args
+            .file
+            .as_ref()
+            .is_some_and(|file| file.trim().is_empty())
+        {
+            return Err(CapabilityError::InvalidArgs(
+                "file is empty or whitespace-only: name a backup file to restore".into(),
+            ));
         }
 
         // Get backup directory from canonical utility
@@ -149,69 +174,89 @@ impl TypedCapability for Undo {
         // If args.file is specified, restore only that file; otherwise restore all.
         let target_file: Option<String> = args.file.clone();
 
-        if let Ok(entries) = std::fs::read_dir(&job_backup_dir) {
-            for entry in entries.flatten() {
-                let backup_path = entry.path();
-                if backup_path.is_file() {
-                    let backup_path_str = backup_path
-                        .to_str()
-                        .ok_or_else(|| CapabilityError::Internal("Invalid backup path".into()))?
-                        .to_string();
+        let entries = std::fs::read_dir(&job_backup_dir).map_err(|e| {
+            CapabilityError::Internal(format!(
+                "Cannot read backup directory {}: {}",
+                job_backup_dir.display(),
+                e
+            ))
+        })?;
+        for entry in entries.flatten() {
+            let backup_path = entry.path();
+            if backup_path.is_file() {
+                let backup_path_str = backup_path
+                    .to_str()
+                    .ok_or_else(|| CapabilityError::Internal("Invalid backup path".into()))?
+                    .to_string();
 
-                    // If a specific file was requested, skip others
-                    if let Some(ref specific_file) = target_file {
-                        let backup_name = backup_path
-                            .file_name()
-                            .map(|f| f.to_string_lossy().into_owned())
-                            .unwrap_or_default();
-                        if backup_name != *specific_file {
-                            continue;
-                        }
+                // If a specific file was requested, skip others.
+                // Match if user input equals the backup filename, is a
+                // suffix of the backup path, or the backup filename is a
+                // suffix of the user input (covers full original paths).
+                if let Some(ref specific_file) = target_file {
+                    let backup_name = backup_path
+                        .file_name()
+                        .map(|f| f.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    if !specific_file.ends_with(&backup_name)
+                        && !backup_path_str.ends_with(specific_file)
+                    {
+                        continue;
                     }
+                }
 
-                    // FINDING #12: Look up by full backup path, not just filename
-                    let target_path = original_paths
-                        .get(&backup_path_str)
-                        .map(std::path::PathBuf::from)
-                        .ok_or_else(|| {
-                            CapabilityError::NotFound(format!(
-                                "No original path found for backup {}",
-                                backup_path.display()
-                            ))
-                        })?;
+                // FINDING #12: Look up by full backup path, not just filename
+                let target_path = original_paths
+                    .get(&backup_path_str)
+                    .map(std::path::PathBuf::from)
+                    .ok_or_else(|| {
+                        CapabilityError::NotFound(format!(
+                            "No original path found for backup {}",
+                            backup_path.display()
+                        ))
+                    })?;
 
-                    // Re-validate restore target against allowed prefixes
-                    // (WAL data crossed a persistence boundary — must re-check)
-                    let restore_ctx = PathContext {
-                        require_exists: false,
-                        require_file: false,
-                        ..Default::default()
-                    };
-                    let target_path = validate_path(&target_path.to_string_lossy(), &restore_ctx)
-                        .map_err(|e| {
+                // Re-validate restore target against allowed prefixes
+                // (WAL data crossed a persistence boundary — must re-check)
+                let restore_ctx = PathContext {
+                    require_exists: false,
+                    require_file: false,
+                    ..Default::default()
+                };
+                let target_path = validate_path(&target_path.to_string_lossy(), &restore_ctx)
+                    .map_err(|e| {
                         CapabilityError::PermissionDenied(format!(
                             "restore target validation: {}",
                             e
                         ))
                     })?;
 
-                    if ctx.dry_run {
-                        restored.push(format!(
-                            "{} -> {} (dry run)",
-                            backup_path.display(),
-                            target_path.display()
-                        ));
-                    } else {
-                        backup_mgr
-                            .restore(&backup_path, &target_path)
-                            .map_err(|e| CapabilityError::Internal(e.to_string()))?;
-                        restored.push(format!(
-                            "{} -> {}",
-                            backup_path.display(),
-                            target_path.display()
-                        ));
-                    }
+                if ctx.dry_run {
+                    restored.push(format!(
+                        "{} -> {} (dry run)",
+                        backup_path.display(),
+                        target_path.display()
+                    ));
+                } else {
+                    backup_mgr
+                        .restore(&backup_path, &target_path)
+                        .map_err(|e| CapabilityError::Internal(e.to_string()))?;
+                    restored.push(format!(
+                        "{} -> {}",
+                        backup_path.display(),
+                        target_path.display()
+                    ));
                 }
+            }
+        }
+
+        // If a specific file was requested but nothing matched, return an error
+        if let Some(specific_file) = &args.file {
+            if restored.is_empty() {
+                return Err(CapabilityError::NotFound(format!(
+                    "No backup file matching '{}' found for job {}",
+                    specific_file, args.job_id
+                )));
             }
         }
 
@@ -580,6 +625,382 @@ mod tests {
             result.is_ok(),
             "Valid path restore should succeed: {:?}",
             result.err()
+        );
+
+        let _ = fs::remove_dir_all(&tmpdir);
+        std::env::remove_var("RUNTIMO_WAL_PATH");
+        std::env::remove_var("XDG_DATA_HOME");
+    }
+
+    #[test]
+    fn test_undo_selective_restore_by_path_and_filename() {
+        let _guard = UNDO_TEST_MUTEX.lock().unwrap();
+        // Selective restore: a full original path restores only that file,
+        // a filename restores the match, and a non-matching name errors
+        // instead of silently succeeding with zero restores.
+        let tmpdir = std::env::temp_dir().join("runtimo_test_undo_selective");
+        let _ = fs::remove_dir_all(&tmpdir);
+        fs::create_dir_all(&tmpdir).unwrap();
+
+        let file1 = tmpdir.join("select1.txt");
+        let file2 = tmpdir.join("select2.txt");
+        fs::write(&file1, "original one").unwrap();
+        fs::write(&file2, "original two").unwrap();
+
+        std::env::set_var("XDG_DATA_HOME", &tmpdir);
+        let backup_dir = tmpdir.join("runtimo").join("backups");
+        let job_id = "selective-job";
+        let job_backup_dir = backup_dir.join(job_id);
+        fs::create_dir_all(&job_backup_dir).unwrap();
+
+        let backup1 = job_backup_dir.join("select1.txt");
+        let backup2 = job_backup_dir.join("select2.txt");
+        fs::copy(&file1, &backup1).unwrap();
+        fs::copy(&file2, &backup2).unwrap();
+
+        fs::write(&file1, "modified one").unwrap();
+        fs::write(&file2, "modified two").unwrap();
+
+        let wal_file = tmpdir.join("selective.wal");
+        std::env::set_var("RUNTIMO_WAL_PATH", &wal_file);
+        use crate::wal::{WalEvent, WalEventType, WalWriter};
+        let mut wal = WalWriter::create(&wal_file).unwrap();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        for (seq, original, backup) in [(0u64, &file1, &backup1), (1, &file2, &backup2)] {
+            wal.append(WalEvent {
+                seq,
+                ts: ts + seq,
+                event_type: WalEventType::JobCompleted,
+                job_id: job_id.to_string(),
+                capability: Some("FileWrite".into()),
+                output: Some(serde_json::json!({
+                    "data": {
+                        "path": original.to_str().unwrap(),
+                        "backup_path": backup.to_str().unwrap()
+                    }
+                })),
+                error: None,
+                telemetry_before: None,
+                telemetry_after: None,
+                process_before: None,
+                process_after: None,
+                cmd: None,
+                cmd_stdout: None,
+                cmd_stderr: None,
+                cmd_exit_code: None,
+                cmd_corrected: None,
+                ..Default::default()
+            })
+            .unwrap();
+        }
+
+        let cap = Undo;
+        let ctx = Context {
+            dry_run: false,
+            job_id: "undo-selective".to_string(),
+            working_dir: tmpdir.clone(),
+        };
+
+        // 1. Full original path restores ONLY that file.
+        let result = Capability::execute(
+            &cap,
+            &serde_json::json!({"job_id": job_id, "file": file1.to_str().unwrap()}),
+            &ctx,
+        );
+        assert!(result.is_ok(), "selective undo failed: {:?}", result.err());
+        let output = result.unwrap();
+        let restored = output.data.as_ref().unwrap()["restored"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            restored.len(),
+            1,
+            "full-path selective restore must restore exactly one file, got: {:?}",
+            restored
+        );
+        assert!(
+            restored[0].as_str().unwrap().contains("select1.txt"),
+            "restored entry must name select1.txt, got: {:?}",
+            restored[0]
+        );
+        assert_eq!(
+            fs::read_to_string(&file1).unwrap(),
+            "original one",
+            "file1 must be restored"
+        );
+        assert_eq!(
+            fs::read_to_string(&file2).unwrap(),
+            "modified two",
+            "file2 must NOT be restored by a file1-scoped undo"
+        );
+
+        // 2. Filename restores the match.
+        let result = Capability::execute(
+            &cap,
+            &serde_json::json!({"job_id": job_id, "file": "select2.txt"}),
+            &ctx,
+        );
+        assert!(
+            result.is_ok(),
+            "filename selective undo failed: {:?}",
+            result.err()
+        );
+        assert_eq!(
+            fs::read_to_string(&file2).unwrap(),
+            "original two",
+            "file2 must be restored by filename"
+        );
+
+        // 3. Non-matching file errors — it must not report success with
+        // zero restores.
+        let result = TypedCapability::execute(
+            &cap,
+            UndoArgs {
+                job_id: job_id.to_string(),
+                file: Some("nonexistent.txt".to_string()),
+            },
+            &ctx,
+        );
+        assert!(
+            result.is_err(),
+            "non-matching file must error, not succeed with 0 restores"
+        );
+        match result.unwrap_err() {
+            CapabilityError::NotFound(_) => {}
+            other => panic!("expected NotFound for non-matching file, got: {:?}", other),
+        }
+
+        let _ = fs::remove_dir_all(&tmpdir);
+        std::env::remove_var("RUNTIMO_WAL_PATH");
+        std::env::remove_var("XDG_DATA_HOME");
+    }
+
+    #[test]
+    fn test_undo_rejects_empty_file_argument() {
+        let _guard = UNDO_TEST_MUTEX.lock().unwrap();
+        // Failure class: an empty `file` matched every backup in the job —
+        // `backup_path.ends_with("")` is always true, so a scoped undo
+        // silently restored the whole job. The argument is rejected before
+        // any backup entry is examined.
+        let tmpdir = std::env::temp_dir().join("runtimo_test_undo_empty_file");
+        let _ = fs::remove_dir_all(&tmpdir);
+        fs::create_dir_all(&tmpdir).unwrap();
+
+        let file1 = tmpdir.join("empty1.txt");
+        let file2 = tmpdir.join("empty2.txt");
+        fs::write(&file1, "original one").unwrap();
+        fs::write(&file2, "original two").unwrap();
+
+        std::env::set_var("XDG_DATA_HOME", &tmpdir);
+        let backup_dir = tmpdir.join("runtimo").join("backups");
+        let job_id = "empty-file-job";
+        let job_backup_dir = backup_dir.join(job_id);
+        fs::create_dir_all(&job_backup_dir).unwrap();
+
+        let backup1 = job_backup_dir.join("empty1.txt");
+        let backup2 = job_backup_dir.join("empty2.txt");
+        fs::copy(&file1, &backup1).unwrap();
+        fs::copy(&file2, &backup2).unwrap();
+
+        // Mutate both originals so a wildcard restore is observable.
+        fs::write(&file1, "modified one").unwrap();
+        fs::write(&file2, "modified two").unwrap();
+
+        let wal_file = tmpdir.join("empty.wal");
+        std::env::set_var("RUNTIMO_WAL_PATH", &wal_file);
+        use crate::wal::{WalEvent, WalEventType, WalWriter};
+        let mut wal = WalWriter::create(&wal_file).unwrap();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        for (seq, original, backup) in [(0u64, &file1, &backup1), (1, &file2, &backup2)] {
+            wal.append(WalEvent {
+                seq,
+                ts: ts + seq,
+                event_type: WalEventType::JobCompleted,
+                job_id: job_id.to_string(),
+                capability: Some("FileWrite".into()),
+                output: Some(serde_json::json!({
+                    "data": {
+                        "path": original.to_str().unwrap(),
+                        "backup_path": backup.to_str().unwrap()
+                    }
+                })),
+                error: None,
+                telemetry_before: None,
+                telemetry_after: None,
+                process_before: None,
+                process_after: None,
+                cmd: None,
+                cmd_stdout: None,
+                cmd_stderr: None,
+                cmd_exit_code: None,
+                cmd_corrected: None,
+                ..Default::default()
+            })
+            .unwrap();
+        }
+
+        let cap = Undo;
+        let ctx = Context {
+            dry_run: false,
+            job_id: "undo-empty-file".to_string(),
+            working_dir: tmpdir.clone(),
+        };
+
+        // Empty and whitespace-only are both rejected as InvalidArgs.
+        for file in ["", "   ", "\t"] {
+            let result = TypedCapability::execute(
+                &cap,
+                UndoArgs {
+                    job_id: job_id.to_string(),
+                    file: Some(file.to_string()),
+                },
+                &ctx,
+            );
+            assert!(
+                result.is_err(),
+                "file {:?} must be rejected, not treated as a wildcard",
+                file
+            );
+            match result.unwrap_err() {
+                CapabilityError::InvalidArgs(_) => {}
+                other => panic!("expected InvalidArgs for file {:?}, got: {:?}", file, other),
+            }
+        }
+
+        // Neither original may have been touched by the rejected calls.
+        assert_eq!(
+            fs::read_to_string(&file1).unwrap(),
+            "modified one",
+            "rejected empty-file undo must not restore anything"
+        );
+        assert_eq!(
+            fs::read_to_string(&file2).unwrap(),
+            "modified two",
+            "rejected empty-file undo must not restore anything"
+        );
+
+        // A real filename still scopes the restore to exactly that file.
+        let result = Capability::execute(
+            &cap,
+            &serde_json::json!({"job_id": job_id, "file": "empty1.txt"}),
+            &ctx,
+        );
+        assert!(
+            result.is_ok(),
+            "filename-scoped undo must still work: {:?}",
+            result.err()
+        );
+        assert_eq!(fs::read_to_string(&file1).unwrap(), "original one");
+        assert_eq!(
+            fs::read_to_string(&file2).unwrap(),
+            "modified two",
+            "a file1-scoped undo must not restore file2"
+        );
+
+        let _ = fs::remove_dir_all(&tmpdir);
+        std::env::remove_var("RUNTIMO_WAL_PATH");
+        std::env::remove_var("XDG_DATA_HOME");
+    }
+
+    #[test]
+    fn test_undo_unreadable_backup_dir_returns_error() {
+        let _guard = UNDO_TEST_MUTEX.lock().unwrap();
+        // An unreadable job backup directory must surface as an error, not
+        // as a silent success with zero restores.
+        let tmpdir = std::env::temp_dir().join("runtimo_test_undo_unreadable");
+        let _ = fs::remove_dir_all(&tmpdir);
+        fs::create_dir_all(&tmpdir).unwrap();
+
+        let test_file = tmpdir.join("locked.txt");
+        fs::write(&test_file, "original").unwrap();
+
+        std::env::set_var("XDG_DATA_HOME", &tmpdir);
+        let backup_dir = tmpdir.join("runtimo").join("backups");
+        let job_id = "locked-job";
+        let job_backup_dir = backup_dir.join(job_id);
+        fs::create_dir_all(&job_backup_dir).unwrap();
+        let backup_path = job_backup_dir.join("locked.txt");
+        fs::copy(&test_file, &backup_path).unwrap();
+
+        let wal_file = tmpdir.join("locked.wal");
+        std::env::set_var("RUNTIMO_WAL_PATH", &wal_file);
+        use crate::wal::{WalEvent, WalEventType, WalWriter};
+        let mut wal = WalWriter::create(&wal_file).unwrap();
+        wal.append(WalEvent {
+            seq: 0,
+            ts: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            event_type: WalEventType::JobCompleted,
+            job_id: job_id.to_string(),
+            capability: Some("FileWrite".into()),
+            output: Some(serde_json::json!({
+                "data": {
+                    "path": test_file.to_str().unwrap(),
+                    "backup_path": backup_path.to_str().unwrap()
+                }
+            })),
+            error: None,
+            telemetry_before: None,
+            telemetry_after: None,
+            process_before: None,
+            process_after: None,
+            cmd: None,
+            cmd_stdout: None,
+            cmd_stderr: None,
+            cmd_exit_code: None,
+            cmd_corrected: None,
+            ..Default::default()
+        })
+        .unwrap();
+
+        // Strip all permissions from the job backup directory.
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&job_backup_dir, std::fs::Permissions::from_mode(0o000)).ok();
+
+        // Root bypasses directory permissions — the fault cannot be
+        // injected there, so detect honestly instead of asserting a
+        // failure that cannot happen.
+        if fs::read_dir(&job_backup_dir).is_ok() {
+            fs::set_permissions(&job_backup_dir, std::fs::Permissions::from_mode(0o755)).ok();
+            let _ = fs::remove_dir_all(&tmpdir);
+            std::env::remove_var("RUNTIMO_WAL_PATH");
+            std::env::remove_var("XDG_DATA_HOME");
+            eprintln!(
+                "SKIP: permission-stripped directory is still readable (root?); \
+                 unreadable-dir fault cannot be injected"
+            );
+            return;
+        }
+
+        let cap = Undo;
+        let ctx = Context {
+            dry_run: false,
+            job_id: "undo-locked".to_string(),
+            working_dir: tmpdir.clone(),
+        };
+        let result = Capability::execute(&cap, &serde_json::json!({"job_id": job_id}), &ctx);
+
+        // Restore permissions before cleanup so remove_dir_all can descend.
+        fs::set_permissions(&job_backup_dir, std::fs::Permissions::from_mode(0o755)).ok();
+
+        assert!(
+            result.is_err(),
+            "unreadable backup dir must error, not succeed with 0 restores"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("Cannot read backup directory"),
+            "error must name the unreadable backup directory, got: {}",
+            msg
         );
 
         let _ = fs::remove_dir_all(&tmpdir);

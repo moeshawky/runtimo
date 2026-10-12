@@ -1621,6 +1621,7 @@ mod tests {
     use super::*;
     use crate::capability::Capability;
     use std::time::Instant;
+
     #[test]
     fn executes_uptime() {
         let r = Capability::execute(
@@ -1959,9 +1960,13 @@ mod tests {
         let marker = std::env::temp_dir().join("runtimo_stdin_marker_test_probe");
         let _ = std::fs::remove_file(&marker);
         let big_stdin = "x".repeat(MAX_STDIN_BYTES + 1);
+        // The probe command must be non-dangerous under any blocklist
+        // config: an earlier security guard firing here would mask the
+        // stdin error under test.
+        let probe_cmd = format!("echo probe > {}", marker.display());
         let err = Capability::execute(
             &ShellExec,
-            &serde_json::json!({"cmd": "touch /tmp/runtimo_stdin_marker_test_probe", "stdin": big_stdin}),
+            &serde_json::json!({"cmd": probe_cmd, "stdin": big_stdin}),
             &Context {
                 dry_run: false,
                 job_id: "test".into(),
@@ -1979,6 +1984,30 @@ mod tests {
             "oversized stdin must not spawn the child (marker file must be absent)"
         );
         let _ = std::fs::remove_file(&marker);
+    }
+
+    #[test]
+    fn stdin_guard_runs_after_security_guards() {
+        // Guard-order lock (Class 7): a command blocked by the built-in
+        // blocklist must be rejected by the security guard even when it
+        // also carries oversized stdin — the stdin resource guard sits
+        // after the security guards and before spawn.
+        let big_stdin = "x".repeat(MAX_STDIN_BYTES + 1);
+        let err = Capability::execute(
+            &ShellExec,
+            &serde_json::json!({"cmd": "eval \"echo hi\"", "stdin": big_stdin}),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::temp_dir(),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("shell builtins"),
+            "security guard must fire before the stdin guard, got: {}",
+            err
+        );
     }
     #[test]
     fn enforces_timeout() {
@@ -2665,18 +2694,46 @@ mod tests {
 
     #[test]
     fn allows_cat_in_home() {
+        let _guard = crate::config::CONFIG_TEST_MUTEX.lock().unwrap();
         // cat $HOME/somefile should be ALLOWED (within allowed prefix)
         let home = std::env::var("HOME").unwrap_or_else(|_| "/home/user".to_string());
+        let test_path = format!("{}/runtimo_home_path_test.txt", home);
+
+        // Isolate config: an empty XDG_CONFIG_HOME drops any operator
+        // config, then a generated config grants HOME explicitly. Built-in
+        // defaults (/tmp, /var/tmp) stay in effect — the grant is additive.
+        let iso = std::env::temp_dir().join("runtimo_test_shell_home_iso");
+        let _ = std::fs::remove_dir_all(&iso);
+        let cfg_dir = iso.join("runtimo");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("config.toml"),
+            format!("allowed_paths = [\"{}\"]\n", home),
+        )
+        .unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &iso);
+
+        // Skip only when the test path is genuinely outside every allowed
+        // prefix, using the same unidirectional rule as path_in_prefix:
+        // exact match or prefix + "/", with trailing slashes normalized
+        // (root "/" matches any absolute path).
         let allowed = crate::config::RuntimoConfig::get_allowed_prefixes();
-        let is_allowed = allowed
-            .iter()
-            .any(|p| home.starts_with(p) || p.starts_with(&home));
+        let is_allowed = allowed.iter().any(|p| {
+            let normalized = p.trim_end_matches('/');
+            normalized.is_empty()
+                || test_path == normalized
+                || test_path.starts_with(&format!("{}/", normalized))
+        });
         if !is_allowed {
-            // Skip test when HOME is outside allowed prefixes (e.g., /root in CI/containers)
-            eprintln!("SKIP: HOME ({}) is outside allowed prefixes; test requires HOME within allowed area", home);
+            std::env::remove_var("XDG_CONFIG_HOME");
+            let _ = std::fs::remove_dir_all(&iso);
+            eprintln!(
+                "SKIP: test path {} is outside allowed prefixes; test requires HOME within allowed area",
+                test_path
+            );
             return;
         }
-        let test_path = format!("{}/runtimo_home_path_test.txt", home);
+
         let cmd = format!("echo ok > {} && cat {}", test_path, test_path);
         let r = Capability::execute(
             &ShellExec,
@@ -2688,6 +2745,8 @@ mod tests {
             },
         );
         let _ = std::fs::remove_file(&test_path);
+        std::env::remove_var("XDG_CONFIG_HOME");
+        let _ = std::fs::remove_dir_all(&iso);
         match r {
             Ok(o) => assert_eq!(o.status, "ok", "Should allow cat in HOME"),
             Err(e) => {
@@ -3162,8 +3221,7 @@ mod tests {
     fn config_env_enables_network_gate() {
         // Writing a config `[env]` table must flip the network gate without a
         // process-level env var (the PATH-wrapper workaround is no longer needed).
-        static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = crate::config::CONFIG_TEST_MUTEX.lock().unwrap();
         let tmp = std::env::temp_dir().join("runtimo_test_shell_env_gate");
         let config_dir = tmp.join("runtimo");
         let _ = std::fs::remove_dir_all(&tmp);
