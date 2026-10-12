@@ -41,6 +41,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **OBSERVED final (precision run):** lib 489/0, integration 69/2 same-known (`observe_fixture_b_integration` + `observe_self_test_run_exits_zero`), sampler 0 samples at 50Hz container, robust 46/0, conformance09 15/0, runtime_fact_export 12/0, cli 39/0, daemon 69/0, doc 28/0; total ~767 passed / 2 failed same-known. State fmt/check/clippy/deny/machete/MSRV exit 0.
 - **Known failures (same-known, reproduced on pre-change baseline):** `observe_fixture_b_integration` + `observe_self_test_run_exits_zero` — sampler yields 0 samples at 50Hz in this container.
 
+## [0.10.2] - 2026-10-12
+
+### Added
+- **crates.io README** — `readme = "../README.md"` in all three member manifests (`core`, `daemon`, `cli`) so the registry renders project docs.
+
+### Fixed
+- **FileRead truncation F-036 (#5)** — `truncated` now derived from the read via `take(max_bytes + 1)` sentinel instead of `bytes_read >= max_bytes`, so a file exactly `max_bytes` long no longer misreports `truncated=true`. TOCTOU-safe: decided by observed bytes, not `stat()`. (`core/src/capabilities/file_read.rs`)
+- **ShellExec truncation at exact limit (#6)** — Drain threads `take(MAX_OUTPUT_BYTES + 1)`, output sliced to `MAX_OUTPUT_BYTES`, `truncated` iff `len > MAX_OUTPUT_BYTES`; exact-limit output no longer misreports truncation. (`core/src/capabilities/shell_exec.rs`)
+- **GitExec SSRF validator closures** — Normalization now covers decimal/hex/octal dotted quads, short-form numerics (≤3 parts), bracketed IPv6 (`[::1]`), `::ffff:` mapped-IPv4 hex decode, userinfo/scp-like `user@host` authorities (last-`@` split), loopback `127/8` + `10/8` first-octet gates; error paths redact credentials (`https://***@host`). Consumer dry-run probes block `git@u@127.0.0.5:repo.git`-class URLs. (`core/src/capabilities/git_exec.rs`)
+- **Undo file-scope enforcement** — `UndoArgs.file` (previously accepted-but-ignored) is now validated (`InvalidArgs` on empty) and used as a suffix/path filter; zero-match restores return `NotFound` instead of silent success; unreadable backup dirs propagate instead of `read_dir` swallow. (`core/src/capabilities/undo.rs`)
+- **WAL atomic create** — `WalWriter` creation uses `create_new(true)` so concurrent creators cannot truncate each other's events; `handle_status` documents the unknown-state contract. (`core/src/wal.rs`, `daemon/src/engine.rs`)
+- **Test isolation + guard order** — Crate-shared `CONFIG_TEST_MUTEX` serializes `XDG_CONFIG_HOME`-mutating tests across modules; stdin guard-order lock test pins security-before-resource ordering; `cmd.rs` maps missing binaries to 127 + permission-denied handling. (`core/src/config.rs`, `core/src/capabilities/shell_exec.rs`, `core/src/cmd.rs`)
+- **CLI session coverage** — `session_run::update_session_status` gains regression tests (5 cases). (`cli/src/session_run.rs`)
+
+### Testing
+- **OBSERVED final (this release):** cli 44/0, lib 524/1 same-known (`processes::tests::test_process_vsz_rss_in_kb` — container reports `vsz=1444486512KB` for the harness process), adapters_integration 28/0, conformance09 15/0, integration 69/2 same-known (`multiple_jobs_in_sequence` + `test_wal_events_monotonic_sequence` — `SafetyEscalationRequired` from `llmosafe` in this container, reproduced byte-identical on pristine `9fdaa1a` baseline worktree), robust 45/1 same-known (`drift_process_vsz_rss_reasonable`, same VSZ signature), runtime_fact_export 12/0, daemon 70/0, doc 8/0 + 28 ignored; total 815 passed / 4 failed same-known / 28 ignored. `cargo fmt --check` clean, `cargo clippy --all-targets` zero warnings.
+- **Regression tests added:** 30+ across undo file-scope, git_exec SSRF validators, WAL race, session_run, shell_exec guard order, config isolation. (`core/tests/robust.proptest-regressions`)
+
 ## [0.9.1] - 2026-09-12
 
 ### Changed

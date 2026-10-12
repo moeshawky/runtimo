@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "CLI for the Runtimo capability runtime — run, list, status, logs, undo, telemetry, processes"
+readme = "../README.md"
 
 [lints]
 workspace = true

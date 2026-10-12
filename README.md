@@ -30,7 +30,7 @@ Runtimo is a Rust workspace providing a **capability execution engine**. Every c
 - **Backup/undo** — Files backed up before mutation, rollback by job ID
 - **Input validation** — Capabilities validate arguments including path traversal, symlink, and null byte protection
 
-**Version:** 0.10.1 | **Rust Edition:** 2021 | **Tests:** ~767 passed / 2 failed same-known (observe_fixture_b_integration, observe_self_test_run_exits_zero sampler 0@50Hz container) / runtime_fact_export 12/12 including resolver_refuses_fabrication_when_resolver_flag_true PASS / lib 489/0 / conformance09 15/0 / fmt/check/clippy/deny/machete/MSRV exit 0.
+**Version:** 0.10.2 | **Rust Edition:** 2021 | **Tests:** 815 passed / 4 failed same-known (proc-VSZ env x2 + llmosafe-escalation integration x2, all reproduced on pristine baseline) / 28 ignored. `cargo fmt --check` clean, `cargo clippy --all-targets` zero warnings.
 
 See [CHANGELOG.md](CHANGELOG.md) for full release history.
 

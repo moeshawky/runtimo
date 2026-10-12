@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Daemon for the Runtimo capability runtime (JSON-RPC over Unix socket, background jobs)"
+readme = "../README.md"
 
 [lints]
 workspace = true

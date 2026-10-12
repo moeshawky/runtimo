@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Agent-centric capability runtime with telemetry, process tracking, and crash recovery"
+readme = "../README.md"
 keywords = ["agent", "runtime", "telemetry", "capability", "recovery"]
 categories = ["os", "development-tools"]
 
