@@ -271,8 +271,8 @@ runtimo run -c Delete -a '{"path":"/models/llama-70b.safetensors","no_backup":tr
 | `pid` | `u32` | Child PID |
 | `timeout_secs` | `u64` | Effective timeout |
 | `timed_out` | `bool` | `true` ONLY on timeout-kill path (elapsed > timeout and `SIGKILL` to process group). Signal kills (OOM `SIGKILL`, `SIGTERM`) leave `false`. Source: `core/src/capabilities/shell_exec.rs` |
-| `signal` | `Option<i32>` | Terminating signal number via `ExitStatus::signal()`; `Some(n)` for any signal, `None` for normal exit. Source: `core/src/capabilities/shell_exec.rs:1559` |
-| `truncated` | `bool` | `true` when stdout or stderr hit 10 MB cap |
+| `signal` | `Option<i32>` | Terminating signal number via `ExitStatus::signal()`; `Some(n)` for any signal, `None` for normal exit. Source: `core/src/capabilities/shell_exec.rs` |
+| `truncated` | `bool` | `true` when stdout or stderr exceeded 10 MB cap (bytes were dropped) |
 
 > `timed_out` replaces the prior `code().is_none()` inference (RC3 fix) — the only timeout sentinel.
 

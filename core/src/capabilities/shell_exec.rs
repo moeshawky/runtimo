@@ -97,9 +97,9 @@ use std::time::{Duration, Instant};
 struct WaitOutcome {
     /// Child exit status (may be signal-terminated).
     status: ExitStatus,
-    /// Captured stdout (bounded to `MAX_OUTPUT_BYTES`).
+    /// Captured stdout (raw bounded to `MAX_OUTPUT_BYTES + 1`; output sliced to `MAX_OUTPUT_BYTES`).
     stdout: Vec<u8>,
-    /// Captured stderr (bounded to `MAX_OUTPUT_BYTES`).
+    /// Captured stderr (raw bounded to `MAX_OUTPUT_BYTES + 1`; output sliced to `MAX_OUTPUT_BYTES`).
     stderr: Vec<u8>,
     /// Descendant PIDs seen just before return (for audit).
     descendants: Vec<u32>,
@@ -1205,7 +1205,7 @@ fn check_command_paths(cmd: &str) -> Option<String> {
 /// - `Err(Error::ExecutionFailed)`: `try_wait` I/O error or `wait` failure (not a timeout).
 ///
 /// # Side effects
-/// - Spawns two threads to drain stdout/stderr (bounded to `MAX_OUTPUT_BYTES`).
+/// - Spawns two threads to drain stdout/stderr (bounded to `MAX_OUTPUT_BYTES + 1` sentinel).
 /// - On timeout, sends `SIGKILL` to `-pgid` (kills the whole process group) and reaps
 ///   the child, joining the drain threads so no pipe is left open.
 ///
@@ -1220,14 +1220,18 @@ fn wait_with_timeout(child: &mut Child, pgid: u32, timeout_secs: u64) -> WaitRes
     let stdout_thread = child.stdout.take().map(|stdout| {
         thread::spawn(move || {
             let mut data = Vec::new();
-            let _ = stdout.take(MAX_OUTPUT_BYTES as u64).read_to_end(&mut data);
+            let _ = stdout
+                .take((MAX_OUTPUT_BYTES + 1) as u64)
+                .read_to_end(&mut data);
             data
         })
     });
     let stderr_thread = child.stderr.take().map(|stderr| {
         thread::spawn(move || {
             let mut data = Vec::new();
-            let _ = stderr.take(MAX_OUTPUT_BYTES as u64).read_to_end(&mut data);
+            let _ = stderr
+                .take((MAX_OUTPUT_BYTES + 1) as u64)
+                .read_to_end(&mut data);
             data
         })
     });
@@ -1568,8 +1572,16 @@ impl TypedCapability for ShellExec {
                 return Err(CapabilityError::Internal(msg));
             }
         };
-        let stdout_str = String::from_utf8_lossy(&outcome.stdout).to_string();
-        let stderr_str = String::from_utf8_lossy(&outcome.stderr).to_string();
+        let stdout_capped = outcome
+            .stdout
+            .get(..outcome.stdout.len().min(MAX_OUTPUT_BYTES))
+            .unwrap_or(&[]);
+        let stdout_str = String::from_utf8_lossy(stdout_capped).to_string();
+        let stderr_capped = outcome
+            .stderr
+            .get(..outcome.stderr.len().min(MAX_OUTPUT_BYTES))
+            .unwrap_or(&[]);
+        let stderr_str = String::from_utf8_lossy(stderr_capped).to_string();
         let signal: Option<i32> = outcome.status.signal();
         let success = !outcome.timed_out && outcome.status.success();
 
@@ -1597,7 +1609,7 @@ impl TypedCapability for ShellExec {
             "timeout_secs": timeout,
             "timed_out": outcome.timed_out,
             "signal": signal,
-            "truncated": outcome.stdout.len() >= MAX_OUTPUT_BYTES || outcome.stderr.len() >= MAX_OUTPUT_BYTES,
+            "truncated": outcome.stdout.len() > MAX_OUTPUT_BYTES || outcome.stderr.len() > MAX_OUTPUT_BYTES,
             "descendants": outcome.descendants,
         }));
         Ok(out)
@@ -3270,6 +3282,104 @@ mod tests {
             data["signal"].is_null(),
             "normal exit signal should be null, got {:?}",
             data["signal"]
+        );
+    }
+
+    // ── Truncation boundary tests ─────────────────────────────────────────
+
+    #[test]
+    fn output_exactly_at_cap_is_not_truncated() {
+        let r = Capability::execute(
+            &ShellExec,
+            &serde_json::json!({"cmd": format!("head -c {} /dev/zero", MAX_OUTPUT_BYTES), "timeout_secs": 60}),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::temp_dir(),
+            },
+        )
+        .expect("cap-at execution should succeed");
+        let data = r.data.expect("output must have data");
+        assert_eq!(
+            data["truncated"], false,
+            "exactly MAX_OUTPUT_BYTES produced, none dropped — must be false"
+        );
+        assert_eq!(
+            data["stdout"].as_str().unwrap().len(),
+            MAX_OUTPUT_BYTES,
+            "captured stdout must be exactly MAX_OUTPUT_BYTES"
+        );
+    }
+
+    #[test]
+    fn output_one_byte_above_cap_is_truncated() {
+        let r = Capability::execute(
+            &ShellExec,
+            &serde_json::json!({"cmd": format!("head -c {} /dev/zero", MAX_OUTPUT_BYTES + 1), "timeout_secs": 60}),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::temp_dir(),
+            },
+        )
+        .expect("cap+1 execution should succeed");
+        let data = r.data.expect("output must have data");
+        assert_eq!(
+            data["truncated"], true,
+            "MAX_OUTPUT_BYTES+1 produced, one dropped — must be true"
+        );
+        assert_eq!(
+            data["stdout"].as_str().unwrap().len(),
+            MAX_OUTPUT_BYTES,
+            "captured stdout must be capped at MAX_OUTPUT_BYTES"
+        );
+    }
+
+    #[test]
+    fn stderr_exactly_at_cap_is_not_truncated() {
+        let r = Capability::execute(
+            &ShellExec,
+            &serde_json::json!({"cmd": format!("head -c {} /dev/zero 1>&2", MAX_OUTPUT_BYTES), "timeout_secs": 60}),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::temp_dir(),
+            },
+        )
+        .expect("stderr cap-at execution should succeed");
+        let data = r.data.expect("output must have data");
+        assert_eq!(
+            data["truncated"], false,
+            "exactly MAX_OUTPUT_BYTES on stderr, none dropped — must be false"
+        );
+        assert_eq!(
+            data["stderr"].as_str().unwrap().len(),
+            MAX_OUTPUT_BYTES,
+            "captured stderr must be exactly MAX_OUTPUT_BYTES"
+        );
+    }
+
+    #[test]
+    fn stderr_one_byte_above_cap_is_truncated() {
+        let r = Capability::execute(
+            &ShellExec,
+            &serde_json::json!({"cmd": format!("head -c {} /dev/zero 1>&2", MAX_OUTPUT_BYTES + 1), "timeout_secs": 60}),
+            &Context {
+                dry_run: false,
+                job_id: "test".into(),
+                working_dir: std::env::temp_dir(),
+            },
+        )
+        .expect("stderr cap+1 execution should succeed");
+        let data = r.data.expect("output must have data");
+        assert_eq!(
+            data["truncated"], true,
+            "MAX_OUTPUT_BYTES+1 on stderr, one dropped — must be true"
+        );
+        assert_eq!(
+            data["stderr"].as_str().unwrap().len(),
+            MAX_OUTPUT_BYTES,
+            "captured stderr must be capped at MAX_OUTPUT_BYTES"
         );
     }
 
