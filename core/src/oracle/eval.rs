@@ -63,6 +63,37 @@ pub struct PropertyVerdict {
     pub matched_count: usize,
 }
 
+impl PropertyVerdict {
+    /// Build an explicit `Error` verdict for an evaluation failure that
+    /// surfaced as `Err` rather than `Ok(Verdict::Error)`.
+    ///
+    /// # Inputs
+    /// `name`: property name from the spec; `detail`: human-readable
+    /// cause; `evaluated`: records under evaluation (fills both
+    /// `selected_count` and `evaluated_count`).
+    ///
+    /// # Outputs
+    /// A verdict with `verdict` set to [`Verdict::Error`],
+    /// `matched_count` 0, and `detail` populated.
+    ///
+    /// # Invariants
+    /// The entry is never `Satisfied`, so strict consumers (CLI
+    /// `--strict-verdicts`, which fails on any non-`Satisfied` verdict)
+    /// treat it as failed, while default admissible-only consumers
+    /// report it without changing their exit code.
+    #[must_use]
+    pub fn error(name: String, detail: String, evaluated: usize) -> Self {
+        Self {
+            name,
+            verdict: Verdict::Error,
+            detail,
+            selected_count: evaluated,
+            evaluated_count: evaluated,
+            matched_count: 0,
+        }
+    }
+}
+
 /// The outcome of evaluating a single predicate against one event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PredicateOutcome {

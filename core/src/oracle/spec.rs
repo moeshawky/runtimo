@@ -25,7 +25,27 @@ use crate::wal::WalEvent;
 /// Each variant defines how a predicate's `value` is compared against
 /// a field extracted from a [`WalEvent`]. The `Regex` variant uses
 /// intentionally non-full-regex substring matching (see module docstring).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+///
+/// # Inputs
+/// Wire strings: `"Eq"`, `"Neq"`, `"Gt"`, `"Lt"`, `"Gte"`, `"Lte"`,
+/// `"Contains"`, `"Regex"` (exact case). Struct-form JSON deserializes
+/// through [`Op::parse`], the single canonical authority — the shorthand
+/// string form additionally accepts symbolic aliases (`==`, `!=`, `>`,
+/// `<`, `>=`, `<=`) and lowercase `contains`/`regex`, then delegates
+/// canonical spellings back to [`Op::parse`].
+///
+/// # Outputs
+/// The parsed [`Op`] variant; deserialization fails on unknown spellings.
+///
+/// # Errors
+/// Deserialization returns an unknown-variant error naming the expected
+/// canonical spellings when the input is not recognized.
+///
+/// # Invariants
+/// Canonical spelling table exists exactly once (in [`Op::parse`]);
+/// struct-form serde and shorthand-form canonical branch both delegate
+/// to it, so the two paths cannot diverge.
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Op {
     /// Equality: field value equals `value`.
@@ -59,8 +79,18 @@ pub enum Op {
 impl Op {
     /// Parses a string to an `Op` variant.
     ///
+    /// Single canonical authority for operator spellings. Accepts exactly
+    /// `"Eq"`, `"Neq"`, `"Gt"`, `"Lt"`, `"Gte"`, `"Lte"`, `"Contains"`,
+    /// `"Regex"` (exact case). Both the serde struct-form path and the
+    /// shorthand canonical branch delegate here.
+    ///
+    /// # Inputs
+    /// `s`: operator spelling to resolve (borrowed, not retained).
+    ///
     /// # Returns
-    /// `Some(Op)` if the string matches a known variant, `None` otherwise.
+    /// `Some(Op)` if the string matches a known canonical variant,
+    /// `None` otherwise (symbolic aliases and lowercase spellings are
+    /// resolved by the shorthand layer, not here).
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         match s {
@@ -92,15 +122,73 @@ impl Op {
     }
 }
 
+impl<'de> serde::Deserialize<'de> for Op {
+    /// Deserializes a struct-form operator spelling via [`Op::parse`].
+    ///
+    /// # Inputs
+    /// A JSON string holding one canonical spelling (`"Eq"`, `"Neq"`,
+    /// `"Gt"`, `"Lt"`, `"Gte"`, `"Lte"`, `"Contains"`, `"Regex"`).
+    ///
+    /// # Outputs
+    /// The resolved [`Op`] variant.
+    ///
+    /// # Errors
+    /// Unknown-variant error on any non-canonical spelling (symbolic
+    /// aliases such as `"=="` are shorthand-only and rejected here).
+    ///
+    /// # Invariants
+    /// Delegates to [`Op::parse`]; the canonical table is not duplicated.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Self::parse(&s).ok_or_else(|| {
+            serde::de::Error::unknown_variant(
+                &s,
+                &["Eq", "Neq", "Gt", "Lt", "Gte", "Lte", "Contains", "Regex"],
+            )
+        })
+    }
+}
+
 /// A single predicate that tests a field path against an operator and value.
 ///
 /// # Fields
-/// - `field`: The field path to extract from a [`WalEvent`]. Supported
-///   paths: `"event_type"`, `"job_id"`, `"seq"`, `"output.<key>"`, `"watermark"`.
-/// - `op`: The comparison operator.
-/// - `value`: The value to compare against. Type compatibility with the
-///   field is validated at parse time.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+/// - `field`: field path from the union vocabulary: WAL/event fields
+///   (`"event_type"`, `"job_id"`, `"seq"`, `"capability"`, `"error"`,
+///   `"output.<key>"`, `"watermark"`, `safety.*`), Runtime Facts v1 fields
+///   (`"family"`, `"run_id"`, `"provider"`, `"fidelity"`, `"observations"`,
+///   `"first_seen"`, `"last_seen"`, `"revision"`, `"process.pid"`,
+///   `"process.process_start_time"`, `"extra.<key>"`).
+/// - `op`: the comparison operator (canonical spellings via [`Op::parse`]).
+/// - `value`: the value to compare against. Op/type compatibility is
+///   validated at parse time.
+///
+/// # Deserialization
+/// Accepts either the canonical struct form
+/// (`{"field": .., "op": .., "value": ..}`) or the string shorthand
+/// `"field op value"` (e.g. `"extra.drop_count == 0"`). Shorthand values
+/// are parsed as JSON when possible, otherwise kept as strings, so `"0"`
+/// becomes `Number(0)` while `"job started"` stays `String`. Shorthand
+/// requires at least three whitespace-separated tokens; a two-token input
+/// such as `"field Eq"` is rejected (a missing value is never coerced to
+/// `""`). Struct-form operators accept canonical spellings only;
+/// shorthand additionally accepts `==`, `!=`, `>`, `<`, `>=`, `<=` and
+/// lowercase `contains`/`regex`.
+///
+/// # Source scoping
+/// [`parse_spec`] validates against the union vocabulary, so a WAL-only
+/// field (e.g. `"event_type"`) parses on a facts spec and vice versa.
+/// Per-source evaluators resolve only their own vocabulary: unknown fields
+/// at eval time yield `Verdict::Error` (WAL/generic paths), and the facts
+/// CLI maps source-mismatched predicate fields to `Error`/exit 2 rather
+/// than silent `Satisfied`.
+///
+/// # Invariants
+/// - Three-token minimum on shorthand; empty value never implied.
+/// - Canonical operator spellings resolve through [`Op::parse`] only.
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Predicate {
     /// The field path to extract from a [`WalEvent`].
@@ -109,6 +197,76 @@ pub struct Predicate {
     pub op: Op,
     /// The value to compare against.
     pub value: Value,
+}
+
+impl<'de> serde::Deserialize<'de> for Predicate {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        struct PredicateStruct {
+            field: String,
+            op: Op,
+            value: Value,
+        }
+
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum PredicateHelper {
+            Struct(PredicateStruct),
+            Shorthand(String),
+        }
+
+        match PredicateHelper::deserialize(deserializer)? {
+            PredicateHelper::Struct(s) => Ok(Self {
+                field: s.field,
+                op: s.op,
+                value: s.value,
+            }),
+            PredicateHelper::Shorthand(raw) => {
+                let parts: Vec<&str> = raw.split_whitespace().collect();
+                let [field, op, rest @ ..] = parts.as_slice() else {
+                    return Err(serde::de::Error::custom(format!(
+                        "Invalid shorthand predicate: '{raw}'. Expected 'field op value'"
+                    )));
+                };
+                if rest.is_empty() {
+                    return Err(serde::de::Error::custom(format!(
+                        "Invalid shorthand predicate: '{raw}'. Expected 'field op value' (missing value)"
+                    )));
+                }
+                let field = (*field).to_string();
+                let op_ref: &str = op;
+                // Canonical spellings resolve through the single authority
+                // (Op::parse); symbolic aliases and lowercase
+                // contains/regex are shorthand-only fallbacks.
+                let op = Op::parse(op_ref)
+                    .or(match op_ref {
+                        "==" => Some(Op::Eq),
+                        "!=" => Some(Op::Neq),
+                        ">" => Some(Op::Gt),
+                        "<" => Some(Op::Lt),
+                        ">=" => Some(Op::Gte),
+                        "<=" => Some(Op::Lte),
+                        "contains" => Some(Op::Contains),
+                        "regex" => Some(Op::Regex),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        serde::de::Error::custom(format!(
+                            "Unknown operator in shorthand '{op_ref}'"
+                        ))
+                    })?;
+                let val_str = rest.join(" ");
+                let value = match serde_json::from_str(&val_str) {
+                    Ok(v) => v,
+                    Err(_) => Value::String(val_str),
+                };
+                Ok(Self { field, op, value })
+            }
+        }
+    }
 }
 
 /// Quantifier over the selected record set (§45-46).
@@ -208,30 +366,49 @@ struct SpecWrapper {
 
 /// Parse a specification string into a [`PropertySpec`].
 ///
-/// # Input Format
+/// # Inputs
+/// A JSON object string with `name` (string), `predicates` (array of
+/// struct-form `{"field","op","value"}` objects or shorthand strings
+/// `"field op value"`), plus optional `select`, `quantifier`, `version`
+/// (v2 additive; legacy shapes parse with `select: []`,
+/// `quantifier: All`).
 ///
-/// The input must be a JSON object with:
-/// - `name`: string property name
-/// - `predicates`: JSON array of predicate objects, each with:
-///   - `field`: string field path (e.g., `"event_type"`, `"output.data.path"`)
-///   - `op`: string operator name (e.g., `"Eq"`, `"Gt"`, `"Contains"`)
-///   - `value`: JSON value to compare against
+/// # Outputs
+/// The validated [`PropertySpec`]; predicates preserve input order.
 ///
 /// # Validation
-///
-/// This function validates:
-/// 1. **Field path syntax**: Must match one of the known patterns
-///    (`"event_type"`, `"job_id"`, `"seq"`, `"output.<key>"`, `"watermark"`).
-/// 2. **Op/type compatibility**: Numeric ops (`Gt`, `Lt`, `Gte`, `Lte`) require
-///    numeric field values; `Contains`/`Regex` require string-compatible values.
+/// 1. **Field path syntax**: union vocabulary — WAL/event fields
+///    (`"event_type"`, `"job_id"`, `"seq"`, `"capability"`, `"error"`,
+///    `"output.<key>"`, `"watermark"`, `safety.*`), Runtime Facts v1 fields
+///    (`"family"`, `"run_id"`, `"provider"`, `"fidelity"`,
+///    `"observations"`, `"first_seen"`, `"last_seen"`, `"revision"`,
+///    `"process.pid"`, `"process.process_start_time"`, `"extra.<key>"`).
+///    Shorthand values parse as JSON when possible, else strings (`"0"`
+///    yields `Number(0)`; `"job started"` stays `String`).
+/// 2. **Op/type compatibility**: numeric ops (`Gt`, `Lt`, `Gte`, `Lte`)
+///    require numeric values; `Contains`/`Regex` accept string-compatible
+///    values; `Eq`/`Neq` accept any JSON type.
+/// 3. **Source scoping caveat**: validation is union-scoped, not
+///    source-scoped — a WAL-only field parses on a facts spec and vice
+///    versa. Per-source evaluators reject mismatched predicate fields at
+///    eval time (`Verdict::Error`), and the facts CLI maps them to
+///    `Error`/exit 2.
 ///
 /// # Errors
 ///
 /// Returns [`ParseSpecError::InvalidFormat`] if the string is not valid JSON
-/// or cannot be deserialized into the expected structure.
+/// or cannot be deserialized into the expected structure (including
+/// malformed shorthand: fewer than three tokens, missing value, or
+/// unknown operator).
 /// Returns [`ParseSpecError::InvalidFieldPath`] if the field path is malformed.
 /// Returns [`ParseSpecError::OpTypeMismatch`] if the operator is incompatible
 /// with the field's type.
+///
+/// # Invariants
+/// - Empty `predicates` parses successfully (total-function satisfied).
+/// - `process.pid` spans the on-disk `process_key.pid` alias; both the
+///   dotted spec spelling and the storage key resolve to the same value
+///   (see [`validate_field_path`] and the facts resolver).
 ///
 /// # Example
 ///
@@ -271,13 +448,37 @@ pub fn parse_spec(input: &str) -> Result<PropertySpec, ParseSpecError> {
 
 /// Validate that a field path follows a known pattern.
 ///
-/// Supported: `"event_type"`, `"job_id"`, `"seq"`, `"capability"`,
-/// `"error"`, `"output.<key>"`, `"watermark"`, and `safety.*`
+/// # Inputs
+/// `field`: candidate dotted path borrowed from a parsed predicate.
+///
+/// # Outputs
+/// `Ok(())` when the path is in the union vocabulary; otherwise
+/// [`ParseSpecError::InvalidFieldPath`].
+///
+/// Supported union vocabulary: `"event_type"`, `"job_id"`, `"seq"`,
+/// `"capability"`, `"error"`, `"output.<key>"` (non-empty key),
+/// `"watermark"`, `safety.*`
 /// (`safety.semantic_policy|dal|llmosafe_status|runtimo_disposition|
 /// input_class|analysis_kind|provenance_consistent|no_evidence|
-/// stages_executed|oov_ratio|detection_flags|body_pressure|schema_version`).
+/// stages_executed|oov_ratio|detection_flags|body_pressure|schema_version|field_id`),
+/// Runtime Facts v1 top-level fields (`family|run_id|provider|fidelity|
+/// observations|first_seen|last_seen|revision`), `process.*`
+/// (`process.pid|process.process_start_time`), and `extra.<key>`
+/// (non-empty key).
+///
+/// # Errors
+/// [`ParseSpecError::InvalidFieldPath`] naming the rejected path and the
+/// supported patterns (including on empty `output.`/`extra.` keys).
+///
+/// # Invariants
+/// - Union-scoped: acceptance does not imply the field resolves on every
+///   source; per-source evaluators report mismatches as `Verdict::Error`.
+/// - Storage alias: spec spelling `process.pid` (and
+///   `process.process_start_time`) resolves the on-disk RuntimeFact
+///   `process_key.pid` (resp. `process_key.process_start_time`); the
+///   `process_key.*` spelling is storage layout, not spec vocabulary.
 fn validate_field_path(field: &str) -> Result<(), ParseSpecError> {
-    // Check exact matches first
+    // Exact matches: WAL fields, Safety fields, and Runtime Facts top-level fields
     match field {
         "event_type"
         | "job_id"
@@ -298,21 +499,40 @@ fn validate_field_path(field: &str) -> Result<(), ParseSpecError> {
         | "safety.detection_flags"
         | "safety.body_pressure"
         | "safety.schema_version"
-        | "safety.field_id" => return Ok(()),
+        | "safety.field_id"
+        // Runtime Facts v1 vocabulary (matches `runtimo oracle schema`)
+        | "family"
+        | "run_id"
+        | "provider"
+        | "fidelity"
+        | "observations"
+        | "first_seen"
+        | "last_seen"
+        | "revision"
+        | "process.pid"
+        | "process.process_start_time" => return Ok(()),
         _ => {}
     }
-    // Check output.<key> pattern
+
+    // Check output.<key> pattern (WAL / Observe)
     if let Some(key) = field.strip_prefix("output.") {
         if !key.is_empty() {
             return Ok(());
         }
     }
-    // Check safety.extra.<key>? Not in v1 — reject to avoid silent scope creep.
+
+    // Check extra.<key> pattern (Runtime Facts)
+    if let Some(key) = field.strip_prefix("extra.") {
+        if !key.is_empty() {
+            return Ok(());
+        }
+    }
+
     Err(ParseSpecError::InvalidFieldPath {
         field: field.to_string(),
         message: format!(
             "Field path '{field}' is not a recognized path. \
-             Supported: event_type, job_id, seq, capability, error, output.<key>, watermark, safety.*"
+             Supported: event_type, job_id, seq, capability, error, output.<key>, watermark, safety.*, family, extra.<key>, process.*"
         ),
     })
 }
@@ -349,9 +569,15 @@ fn validate_op_type(field: &str, op: &Op, value: &Value) -> Result<(), ParseSpec
 
 /// Extract a field value from a [`WalEvent`] by field path.
 ///
+/// # Inputs
+/// `event`: borrowed WAL event to read; `field`: dotted path from the
+/// union vocabulary.
+///
 /// # Returns
 /// - `Some(Value)` if the field exists and can be extracted
-/// - `None` if the field path is unknown or the field doesn't exist
+/// - `None` if the field path is unknown on WAL records or the field
+///   is absent on this event (callers map `None` in predicate position
+///   to `Verdict::Error`)
 ///
 /// # Field Resolution
 ///
@@ -367,6 +593,15 @@ fn validate_op_type(field: &str, op: &Op, value: &Value) -> Result<(), ParseSpec
 ///   present; `None` when the event has no safety record (selector
 ///   filtering removes these before predicate eval — §47)
 /// - `"bundle_hash"` → **never accessed** (integrity invariant)
+///
+/// # Source scoping
+/// WAL-only resolver: Runtime Facts fields (`family`, `extra.<key>`,
+/// `process.*`, …) always yield `None` here even though
+/// [`parse_spec`] accepts them (union validation). Facts records use the
+/// separate CLI `fact_field` resolver over `RuntimeFactV1`, which
+/// likewise yields `None` for WAL-only fields. Source-mismatched
+/// predicate fields therefore surface as `Verdict::Error`, never silent
+/// `Satisfied`.
 #[must_use]
 pub fn extract_field(event: &WalEvent, field: &str) -> Option<Value> {
     match field {
@@ -578,5 +813,99 @@ mod tests {
     #[test]
     fn test_validate_field_path_invalid() {
         assert!(validate_field_path("unknown").is_err());
+    }
+
+    #[test]
+    fn test_shorthand_token_boundaries() {
+        // 0-token and 1-token inputs are rejected (missing field/op/value).
+        for raw in ["", "family"] {
+            let input = format!(
+                "{{\"name\":\"t\",\"predicates\":[{}]}}",
+                serde_json::to_string(&raw).unwrap()
+            );
+            assert!(parse_spec(&input).is_err(), "raw {raw:?} must be rejected");
+        }
+        // 2-token input (missing value) is rejected — never coerced to Eq "".
+        let two = r#"{"name":"t","predicates":["family Eq"]}"#;
+        let err = parse_spec(two).unwrap_err();
+        assert!(
+            err.to_string().contains("missing value"),
+            "2-token shorthand must name the missing value, got: {err}"
+        );
+        // 3-token shorthand parses; value keeps JSON-vs-string coercion.
+        let three = r#"{"name":"t","predicates":["family == f1"]}"#;
+        let spec = parse_spec(three).unwrap();
+        assert_eq!(spec.predicates[0].field, "family");
+        assert_eq!(spec.predicates[0].op, Op::Eq);
+        assert_eq!(spec.predicates[0].value, json!("f1"));
+        // Multi-word string values rejoin across tokens.
+        let multi = r#"{"name":"t","predicates":["family == job started"]}"#;
+        let spec = parse_spec(multi).unwrap();
+        assert_eq!(spec.predicates[0].value, json!("job started"));
+    }
+
+    #[test]
+    fn test_shorthand_value_coercion() {
+        // "0" coerces to Number; non-JSON text stays String (E1).
+        let num = r#"{"name":"t","predicates":["extra.drop_count == 0"]}"#;
+        let spec = parse_spec(num).unwrap();
+        assert_eq!(spec.predicates[0].value, json!(0));
+        let text = r#"{"name":"t","predicates":["family == job started"]}"#;
+        let spec = parse_spec(text).unwrap();
+        assert_eq!(spec.predicates[0].value, json!("job started"));
+    }
+
+    #[test]
+    fn test_extra_key_admission_and_empty_reject() {
+        // extra.<key> admitted with non-empty key; empty key rejected (E2).
+        assert!(validate_field_path("extra.drop_count").is_ok());
+        assert!(validate_field_path("extra.").is_err());
+        assert!(validate_field_path("output.").is_err());
+        let ok = r#"{"name":"t","predicates":[{"field":"extra.typo_xyz","op":"Eq","value":0}]}"#;
+        assert!(parse_spec(ok).is_ok());
+        let empty = r#"{"name":"t","predicates":[{"field":"extra.","op":"Eq","value":0}]}"#;
+        assert!(parse_spec(empty).is_err());
+    }
+
+    #[test]
+    fn test_union_validation_per_source_accept() {
+        // Union validator admits both WAL-only and facts-only fields;
+        // per-source resolvers scope them at eval time (RC-A).
+        for field in [
+            "event_type",
+            "output.data.path",
+            "safety.dal",
+            "family",
+            "extra.drop_count",
+            "process.pid",
+            "process.process_start_time",
+        ] {
+            let input = format!(
+                r#"{{"name":"t","predicates":[{{"field":"{field}","op":"Eq","value":"x"}}]}}"#
+            );
+            assert!(parse_spec(&input).is_ok(), "union must admit {field}");
+        }
+        // WAL resolver stays WAL-scoped: facts-only fields yield None here
+        // (callers map predicate-position None to Verdict::Error).
+        let event = sample_event();
+        assert!(extract_field(&event, "family").is_none());
+        assert!(extract_field(&event, "extra.drop_count").is_none());
+        assert!(extract_field(&event, "process.pid").is_none());
+    }
+
+    #[test]
+    fn test_op_canonical_authority() {
+        // Op::parse is the single canonical authority: struct-form serde
+        // accepts canonical spellings and rejects shorthand-only aliases.
+        for spelling in ["Eq", "Neq", "Gt", "Lt", "Gte", "Lte", "Contains", "Regex"] {
+            assert!(Op::parse(spelling).is_some());
+        }
+        assert!(Op::parse("==").is_none());
+        assert!(Op::parse("contains").is_none());
+        // Shorthand layer accepts symbols + lowercase via its own fallback.
+        let sym = r#"{"name":"t","predicates":["extra.drop_count == 0"]}"#;
+        assert_eq!(parse_spec(sym).unwrap().predicates[0].op, Op::Eq);
+        let lower = r#"{"name":"t","predicates":[{"field":"family","op":"Contains","value":"f"}]}"#;
+        assert!(parse_spec(lower).is_ok());
     }
 }

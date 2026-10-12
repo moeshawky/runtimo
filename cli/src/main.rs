@@ -348,10 +348,16 @@ Rate from --sample-rate-hz or RUNTIMO_OBSERVE_SAMPLE_HZ or config observe.sample
         verify: Option<PathBuf>,
         /// Property specification as a JSON string (e.g. {"name":"p","predicates":[...]})
         /// to evaluate against the bundle's WAL events. Property verdicts are reported
-        /// in the output but NEVER alter the verify exit code (exit depends solely on
-        /// `admissible`). Parse failure exits 1 with a clear stderr message.
+        /// in the output; without --strict-verdicts they NEVER alter the verify exit
+        /// code (exit depends solely on `admissible`). Parse failure exits 1 with a
+        /// clear stderr message.
         #[arg(long)]
         properties: Option<String>,
+        /// Fail verification (exit 1) when any evaluated property verdict is not
+        /// Satisfied, even if the bundle itself is admissible. Default false:
+        /// property verdicts are reported but do not alter the exit code.
+        #[arg(long, default_value = "false")]
+        strict_verdicts: bool,
         /// Output as JSON.
         #[arg(long, short = 'j', default_value = "false")]
         json: bool,
@@ -2688,6 +2694,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             self_test,
             verify,
             properties,
+            strict_verdicts,
             json,
         } => {
             let mode = if json {
@@ -2742,7 +2749,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                     };
                     match evaluate(&wal_events, &spec) {
                         Ok(pv) => vec![pv],
-                        Err(_) => vec![],
+                        // F8: an evaluation Err becomes an explicit Error verdict
+                        // (stderr disclosed) so strict consumers see the failure
+                        // instead of an empty verdict list passing vacuously.
+                        Err(e) => {
+                            eprintln!("verify: property evaluation error: {e}");
+                            vec![PropertyVerdict::error(
+                                spec.name.clone(),
+                                e.to_string(),
+                                wal_events.len(),
+                            )]
+                        }
                     }
                 } else {
                     Vec::new()
@@ -2810,10 +2827,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                         );
                     }
                 }
-                #[allow(clippy::bool_to_int_with_if)]
-                {
-                    std::process::exit(if res.admissible { 0 } else { 1 });
-                }
+                std::process::exit(verify_exit_code(
+                    res.admissible,
+                    strict_verdicts,
+                    &property_verdicts,
+                ));
             }
             // T10: burst is a dead contract — surface explicitly to stdout (not just daemon stderr)
             // and gate via RPC deferred error. The daemon's handle_observe_start returns
@@ -3137,9 +3155,326 @@ fn oracle_evaluate(
     code
 }
 
+/// Outcome of pure facts-record evaluation (I/O-free core of
+/// `oracle_evaluate_facts`, split out so unit tests assert verdict, skip
+/// disclosure, and source-mismatch mapping without touching files).
+struct FactsEvaluation {
+    /// Final verdict (any source mismatch forces `Error`).
+    verdict: runtimo_core::oracle::Verdict,
+    /// Human-readable detail (names mismatched fields on forced `Error`).
+    detail: String,
+    /// Records passing the select filter.
+    selected: usize,
+    /// Selected records satisfying all predicates.
+    matched: usize,
+    /// Predicate evaluations skipped on unobserved facts-vocab fields.
+    skipped: usize,
+    /// Sorted facts-vocab predicate fields unobserved on some record.
+    unobserved: Vec<String>,
+    /// Union-valid predicate/select fields outside the facts vocabulary.
+    mismatched: Vec<String>,
+}
+
+/// Facts-vocabulary field resolver over a `RuntimeFactV1` JSON record.
+///
+/// # Inputs
+/// `rec`: borrowed facts record; `field`: dotted spec path.
+///
+/// # Outputs
+/// `Some(Value)` when the field is in the facts vocabulary and present;
+/// `None` for WAL-only fields or absent facts-vocab fields.
+///
+/// # Invariants
+/// Storage alias: spec `process.pid` reads on-disk `process_key.pid`
+/// (resp. `process.process_start_time` reads
+/// `process_key.process_start_time`); the `process_key.*` spelling is
+/// storage layout, not spec vocabulary.
+fn fact_field_value(rec: &serde_json::Value, field: &str) -> Option<serde_json::Value> {
+    match field {
+        "family" => rec.get("family").cloned(),
+        "run_id" => rec.get("run_id").cloned(),
+        "provider" => rec.get("provider").cloned(),
+        "fidelity" => rec.get("fidelity").cloned(),
+        "observations" => rec.get("observations").cloned(),
+        "first_seen" => rec.get("first_seen").cloned(),
+        "last_seen" => rec.get("last_seen").cloned(),
+        "revision" => rec.get("revision").cloned(),
+        "process.pid" => rec.get("process_key").and_then(|k| k.get("pid")).cloned(),
+        "process.process_start_time" => rec
+            .get("process_key")
+            .and_then(|k| k.get("process_start_time"))
+            .cloned(),
+        _ if field.starts_with("extra.") => {
+            let key = &field["extra.".len()..];
+            rec.get("extra").and_then(|e| e.get(key)).cloned()
+        }
+        _ => None,
+    }
+}
+
+/// Facts-vocabulary gate mirroring the union validator.
+///
+/// # Inputs
+/// `field`: candidate dotted path.
+///
+/// # Returns
+/// `true` for exact facts top-level/process fields plus non-empty
+/// `extra.<key>`; `false` for WAL-only fields (`event_type`,
+/// `output.*`, `safety.*`, …).
+fn is_facts_vocab(field: &str) -> bool {
+    if matches!(
+        field,
+        "family"
+            | "run_id"
+            | "provider"
+            | "fidelity"
+            | "observations"
+            | "first_seen"
+            | "last_seen"
+            | "revision"
+            | "process.pid"
+            | "process.process_start_time"
+    ) {
+        return true;
+    }
+    if let Some(key) = field.strip_prefix("extra.") {
+        return !key.is_empty();
+    }
+    false
+}
+
+/// Facts value comparator (fail-closed to `None` on type mismatch).
+///
+/// # Inputs
+/// Borrowed field value, operator, and predicate value.
+///
+/// # Returns
+/// `Some(bool)` comparison result; `None` when coercion fails (numeric
+/// ops need `f64` on both sides; `Contains`/`Regex` need `str`).
+fn facts_cmp(
+    field_val: &serde_json::Value,
+    op: &runtimo_core::oracle::Op,
+    pred_val: &serde_json::Value,
+) -> Option<bool> {
+    use runtimo_core::oracle::Op;
+    match op {
+        Op::Eq => Some(field_val == pred_val),
+        Op::Neq => Some(field_val != pred_val),
+        Op::Gt | Op::Lt | Op::Gte | Op::Lte => {
+            let a = field_val.as_f64()?;
+            let b = pred_val.as_f64()?;
+            Some(match op {
+                Op::Gt => a > b,
+                Op::Lt => a < b,
+                Op::Gte => a >= b,
+                Op::Lte => a <= b,
+                _ => return None,
+            })
+        }
+        _ => {
+            // Contains | Regex (substring) + future ops fail closed to None.
+            match op {
+                Op::Contains | Op::Regex => Some(field_val.as_str()?.contains(pred_val.as_str()?)),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// Pure facts select-then-quantify evaluation over borrowed records.
+///
+/// # Inputs
+/// `records`: borrowed facts records; `spec`: union-validated spec.
+///
+/// # Outputs
+/// [`FactsEvaluation`] with verdict, counts, sorted `unobserved` skip
+/// disclosure, and `mismatched` source-mismatch fields.
+///
+/// # Invariants
+/// - Selectors filter on missing fields (never `Error`).
+/// - Source-mismatched fields force `Error` (never silent `Satisfied`).
+/// - Unobserved facts-vocab predicate fields skip with disclosure
+///   (`NOT OBSERVED != FALSE`); only observed fields are checked.
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::cast_precision_loss,
+    clippy::float_cmp
+)]
+fn evaluate_facts_records(
+    records: &[serde_json::Value],
+    spec: &runtimo_core::oracle::PropertySpec,
+) -> FactsEvaluation {
+    use runtimo_core::oracle::{Op, Verdict};
+    let mut mismatched: Vec<String> = Vec::new();
+    for p in spec.predicates.iter().chain(spec.select.iter()) {
+        if !is_facts_vocab(&p.field) && !mismatched.contains(&p.field) {
+            mismatched.push(p.field.clone());
+        }
+    }
+    if !mismatched.is_empty() {
+        let mut sorted = mismatched.clone();
+        sorted.sort();
+        return FactsEvaluation {
+            verdict: Verdict::Error,
+            detail: format!(
+                "Evaluation error on field(s): {}; predicate could not be evaluated on runtime facts",
+                sorted.join(", ")
+            ),
+            selected: 0,
+            matched: 0,
+            skipped: 0,
+            unobserved: Vec::new(),
+            mismatched: sorted,
+        };
+    }
+    let selected: Vec<&serde_json::Value> = records
+        .iter()
+        .filter(|r| {
+            spec.select.iter().all(|p| {
+                fact_field_value(r, &p.field)
+                    .and_then(|fv| facts_cmp(&fv, &p.op, &p.value))
+                    .unwrap_or(false)
+            })
+        })
+        .collect();
+    let mut matched = 0usize;
+    let mut skipped = 0usize;
+    let mut unobserved: Vec<String> = Vec::new();
+    for rec in &selected {
+        let mut ok = true;
+        for p in &spec.predicates {
+            // NOT OBSERVED != FALSE: skip with disclosure (see fn docs).
+            // Divergence note: WAL/generic map missing predicate fields
+            // to Verdict::Error; facts skip + disclose instead.
+            // Type-mismatch fails closed to Violated via facts_cmp → None.
+            if let Some(fv) = fact_field_value(rec, &p.field) {
+                if !matches!(facts_cmp(&fv, &p.op, &p.value), Some(true)) {
+                    ok = false;
+                    break;
+                }
+            } else {
+                skipped += 1;
+                if !unobserved.contains(&p.field) {
+                    unobserved.push(p.field.clone());
+                }
+            }
+        }
+        if ok {
+            matched += 1;
+        }
+    }
+    unobserved.sort();
+    let selected_len = selected.len();
+    let verdict = match &spec.quantifier {
+        runtimo_core::oracle::Quantifier::All => {
+            if matched == selected_len {
+                Verdict::Satisfied
+            } else {
+                Verdict::Violated
+            }
+        }
+        runtimo_core::oracle::Quantifier::Exists => {
+            if matched >= 1 {
+                Verdict::Satisfied
+            } else {
+                Verdict::Violated
+            }
+        }
+        runtimo_core::oracle::Quantifier::None => {
+            if matched == 0 {
+                Verdict::Satisfied
+            } else {
+                Verdict::Violated
+            }
+        }
+        _ => match &spec.quantifier {
+            runtimo_core::oracle::Quantifier::Count { op, threshold } => {
+                let a = matched as f64;
+                let b = *threshold as f64;
+                let ok = match op {
+                    Op::Gt => a > b,
+                    Op::Lt => a < b,
+                    Op::Gte => a >= b,
+                    Op::Lte => a <= b,
+                    Op::Eq => a == b,
+                    Op::Neq => a != b,
+                    _ => false,
+                };
+                if ok {
+                    Verdict::Satisfied
+                } else {
+                    Verdict::Violated
+                }
+            }
+            _ => Verdict::Error,
+        },
+    };
+    FactsEvaluation {
+        verdict,
+        detail: String::new(),
+        selected: selected_len,
+        matched,
+        skipped,
+        unobserved,
+        mismatched: Vec::new(),
+    }
+}
+
+/// Verify exit-code mapping for `--verify --properties` plus
+/// `--strict-verdicts` (split out so the strict matrix is unit-tested
+/// without spawning processes).
+///
+/// # Inputs
+/// `admissible`: bundle admissibility; `strict_verdicts`: strict flag;
+/// `verdicts`: evaluated property verdicts (empty when `--properties`
+/// was absent).
+///
+/// # Outputs
+/// `1` when the bundle is inadmissible, or when strict mode is on and
+/// any verdict is not `Satisfied` (including `Error`); `0` otherwise.
+///
+/// # Invariants
+/// - Default (`strict_verdicts: false`): exit keys off `admissible` alone.
+/// - Strict with zero verdicts: no failure evidence exists, so exit keys
+///   off `admissible` alone (E3).
+fn verify_exit_code(
+    admissible: bool,
+    strict_verdicts: bool,
+    verdicts: &[runtimo_core::oracle::PropertyVerdict],
+) -> i32 {
+    use runtimo_core::oracle::Verdict;
+    let property_failed = verdicts.iter().any(|pv| pv.verdict != Verdict::Satisfied);
+    i32::from(!admissible || (strict_verdicts && property_failed))
+}
+
 /// Facts source (§53-54): same selector/quantifier engine, separate field
 /// resolver over `RuntimeFactV1`. Absent `ObservedExec` is NOT proof of
 /// non-execution (`NOT OBSERVED != FALSE`).
+///
+/// # Inputs
+/// `facts_path`: JSONL file of runtime facts; `spec`: union-validated
+/// property spec; `json`: machine-readable output toggle.
+///
+/// # Outputs
+/// Process exit code: 0 `Satisfied`, 1 `Violated`, 2 property/eval error
+/// (including source-mismatched predicate fields), 3 evidence/
+/// infrastructure error.
+///
+/// # Source scoping
+/// Selectors filter on missing fields (never `Error`). Predicate fields
+/// outside the facts vocabulary (WAL-only `event_type`, `output.*`,
+/// `safety.*`, …) yield `Error`/exit 2 with the field named — the union
+/// validator admits them, per-source evaluation rejects them, so misuse
+/// surfaces instead of passing silent `Satisfied`. Facts-vocabulary
+/// fields absent from a given record (heterogeneous streams, e.g. a
+/// typo `extra.typo_xyz` never observed) skip that predicate for that
+/// record with a visible stderr warning plus `skipped_count` /
+/// `unobserved_fields` in the output — `Satisfied`-on-skip stays
+/// disclosed, never silent.
+///
+/// # Invariants
+/// - `NOT OBSERVED != FALSE`: absence never counts as violation.
+/// - Mismatched-vocabulary predicates never count as satisfied.
 #[allow(
     clippy::arithmetic_side_effects,
     clippy::cast_precision_loss,
@@ -3150,60 +3485,10 @@ fn oracle_evaluate_facts(
     spec: &runtimo_core::oracle::PropertySpec,
     json: bool,
 ) -> i32 {
-    use runtimo_core::oracle::{Op, Verdict};
+    use runtimo_core::oracle::Verdict;
 
-    // Minimal fact-field resolver: family/run_id/provider/fidelity/
-    // observations/first_seen/last_seen/revision/process.pid/
-    // process.process_start_time/extra.<key>. Unknown field → Error.
-    fn fact_field(rec: &serde_json::Value, field: &str) -> Option<serde_json::Value> {
-        match field {
-            "family" => rec.get("family").cloned(),
-            "run_id" => rec.get("run_id").cloned(),
-            "provider" => rec.get("provider").cloned(),
-            "fidelity" => rec.get("fidelity").cloned(),
-            "observations" => rec.get("observations").cloned(),
-            "first_seen" => rec.get("first_seen").cloned(),
-            "last_seen" => rec.get("last_seen").cloned(),
-            "revision" => rec.get("revision").cloned(),
-            "process.pid" => rec.get("process_key").and_then(|k| k.get("pid")).cloned(),
-            "process.process_start_time" => rec
-                .get("process_key")
-                .and_then(|k| k.get("process_start_time"))
-                .cloned(),
-            _ if field.starts_with("extra.") => {
-                let key = &field["extra.".len()..];
-                rec.get("extra").and_then(|e| e.get(key)).cloned()
-            }
-            _ => None,
-        }
-    }
-    fn cmp(field_val: &serde_json::Value, op: &Op, pred_val: &serde_json::Value) -> Option<bool> {
-        match op {
-            Op::Eq => Some(field_val == pred_val),
-            Op::Neq => Some(field_val != pred_val),
-            Op::Gt | Op::Lt | Op::Gte | Op::Lte => {
-                let a = field_val.as_f64()?;
-                let b = pred_val.as_f64()?;
-                Some(match op {
-                    Op::Gt => a > b,
-                    Op::Lt => a < b,
-                    Op::Gte => a >= b,
-                    Op::Lte => a <= b,
-                    _ => return None,
-                })
-            }
-            _ => {
-                // Contains | Regex (substring) + future ops fail closed to None.
-                match op {
-                    Op::Contains | Op::Regex => {
-                        Some(field_val.as_str()?.contains(pred_val.as_str()?))
-                    }
-                    _ => None,
-                }
-            }
-        }
-    }
-
+    // Resolvers live at module level (fact_field_value, is_facts_vocab,
+    // facts_cmp) so unit tests reach the same code the CLI runs.
     let content = match std::fs::read_to_string(facts_path) {
         Ok(s) => s,
         Err(e) => {
@@ -3226,107 +3511,50 @@ fn oracle_evaluate_facts(
             }
         }
     }
-    // Select (missing → filtered out), then quantifier.
-    let selected: Vec<&serde_json::Value> = records
-        .iter()
-        .filter(|r| {
-            spec.select.iter().all(|p| {
-                fact_field(r, &p.field)
-                    .and_then(|fv| cmp(&fv, &p.op, &p.value))
-                    .unwrap_or(false)
-            })
-        })
-        .collect();
-    let mut matched = 0usize;
-    for rec in &selected {
-        let mut ok = true;
-        for p in &spec.predicates {
-            if let Some(fv) = fact_field(rec, &p.field) {
-                if !matches!(cmp(&fv, &p.op, &p.value), Some(true)) {
-                    ok = false;
-                    break;
-                }
-            } else {
-                eprintln!("oracle evaluate: facts: unknown field '{}'", p.field);
-                return 2;
-            }
-        }
-        if ok {
-            matched += 1;
-        }
+    // Pure core owns select/quantifier/mismatch/skip semantics; this shell
+    // owns disclosure emission and exit-code mapping only.
+    let mut eval = evaluate_facts_records(&records, spec);
+    for f in &eval.mismatched {
+        eprintln!(
+            "oracle evaluate: facts: source-mismatched field '{f}' — not in facts vocabulary"
+        );
     }
-    let verdict = match &spec.quantifier {
-        runtimo_core::oracle::Quantifier::All => {
-            if matched == selected.len() {
-                Verdict::Satisfied
-            } else {
-                Verdict::Violated
-            }
-        }
-        runtimo_core::oracle::Quantifier::Exists => {
-            if matched >= 1 {
-                Verdict::Satisfied
-            } else {
-                Verdict::Violated
-            }
-        }
-        runtimo_core::oracle::Quantifier::None => {
-            if matched == 0 {
-                Verdict::Satisfied
-            } else {
-                Verdict::Violated
-            }
-        }
-        _ => {
-            // Count (struct variant) — threshold check.
-            match &spec.quantifier {
-                runtimo_core::oracle::Quantifier::Count { op, threshold } => {
-                    let a = matched as f64;
-                    let b = *threshold as f64;
-                    let ok = match op {
-                        Op::Gt => a > b,
-                        Op::Lt => a < b,
-                        Op::Gte => a >= b,
-                        Op::Lte => a <= b,
-                        Op::Eq => a == b,
-                        Op::Neq => a != b,
-                        _ => false,
-                    };
-                    if ok {
-                        Verdict::Satisfied
-                    } else {
-                        Verdict::Violated
-                    }
-                }
-                _ => Verdict::Error,
-            }
-        }
-    };
-    let code = match &verdict {
+    for f in &eval.unobserved {
+        eprintln!(
+            "oracle evaluate: facts: field '{f}' not observed on some records — skipped (NOT OBSERVED != FALSE)"
+        );
+    }
+    let code = match &eval.verdict {
         Verdict::Satisfied => 0,
         Verdict::Violated => 1,
         _ => 2,
     };
     if json {
+        let mut obj = serde_json::json!({
+            "property": spec.name,
+            "verdict": format!("{:?}", eval.verdict),
+            "source_kind": "runtime_facts",
+            "selected_count": eval.selected,
+            "matched_count": eval.matched,
+            "skipped_count": eval.skipped,
+            "unobserved_fields": eval.unobserved,
+        });
+        if !eval.detail.is_empty() {
+            if let serde_json::Value::Object(ref mut map) = obj {
+                map.insert(
+                    "detail".to_string(),
+                    serde_json::Value::String(std::mem::take(&mut eval.detail)),
+                );
+            }
+        }
+        println!("{}", serde_json::to_string_pretty(&obj).unwrap_or_default());
+    } else if eval.detail.is_empty() {
         println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "property": spec.name,
-                "verdict": format!("{verdict:?}"),
-                "source_kind": "runtime_facts",
-                "selected_count": selected.len(),
-                "matched_count": matched,
-            }))
-            .unwrap_or_default()
+            "oracle {}: {:?} (facts selected={}, matched={}, skipped={})",
+            spec.name, eval.verdict, eval.selected, eval.matched, eval.skipped
         );
     } else {
-        println!(
-            "oracle {}: {:?} (facts selected={}, matched={})",
-            spec.name,
-            verdict,
-            selected.len(),
-            matched
-        );
+        println!("oracle {}: {:?} — {}", spec.name, eval.verdict, eval.detail);
     }
     code
 }
@@ -3339,7 +3567,7 @@ fn print_oracle_schema() {
             "version": 2,
             "legacy": {
                 "name": "string",
-                "predicates": [{"field": "string", "op": "Eq|Neq|Gt|Lt|Gte|Lte|Contains|Regex", "value": "json"}],
+                "predicates": ["{\"field\": \"string\", \"op\": \"Eq|Neq|Gt|Lt|Gte|Lte|Contains|Regex\", \"value\": \"json\"} OR shorthand string \"field op value\" (e.g. \"extra.drop_count == 0\"; value parsed as JSON, else string)"],
                 "semantics": "ALL events satisfy ALL predicates; empty predicates => Satisfied; empty events + non-empty predicates => vacuously Satisfied (legacy)"
             },
             "v2_additive": {
@@ -3351,7 +3579,7 @@ fn print_oracle_schema() {
             "fields": {
                 "event": ["event_type", "job_id", "seq", "capability", "error", "output.<key>", "watermark(bundle-metadata-only=>Error)"],
                 "safety": ["safety.semantic_policy", "safety.dal", "safety.llmosafe_status", "safety.runtimo_disposition", "safety.input_class", "safety.analysis_kind", "safety.provenance_consistent", "safety.no_evidence", "safety.stages_executed", "safety.oov_ratio", "safety.detection_flags", "safety.body_pressure", "safety.schema_version", "safety.field_id"],
-                "facts": ["family", "run_id", "provider", "fidelity", "observations", "first_seen", "last_seen", "revision", "process.pid", "process.process_start_time", "extra.<key>"]
+                "facts": ["family", "run_id", "provider", "fidelity", "observations", "first_seen", "last_seen", "revision", "process.pid (reads stored process_key.pid)", "process.process_start_time (reads stored process_key.process_start_time)", "extra.<key>"]
             },
             "operators": {
                 "Regex": "SUBSTRING match (std only, no regex crate) — legacy semantics preserved; use a distinct operator + dependency for true regex",
@@ -3749,5 +3977,109 @@ mod tests {
     fn test_parse_spec_empty_predicates() {
         let spec = parse_spec(r#"{"name":"empty-prop","predicates":[]}"#).unwrap();
         assert!(spec.predicates.is_empty());
+    }
+
+    // ── F8: strict verdicts / verify exit-code matrix ────────────────
+
+    /// Real verdicts from the evaluator: PropertyVerdict is
+    /// #[non_exhaustive], so exit-code tests feed actual pipeline output
+    /// instead of constructing it.
+    fn evaluate_verdict(event_type_val: &str) -> PropertyVerdict {
+        use runtimo_core::wal::WalEvent;
+        let event = WalEvent {
+            event_type: runtimo_core::WalEventType::JobStarted,
+            job_id: "test-job-42".to_string(),
+            ..WalEvent::default()
+        };
+        let spec = parse_spec(&format!(
+            r#"{{"name":"p","predicates":[{{"field":"event_type","op":"Eq","value":"{event_type_val}"}}]}}"#
+        ))
+        .unwrap();
+        evaluate(std::slice::from_ref(&event), &spec).unwrap()
+    }
+
+    #[test]
+    fn test_verify_exit_code_strict_matrix() {
+        let violated = || vec![evaluate_verdict("job_completed")];
+        let satisfied = || vec![evaluate_verdict("job_started")];
+        // Violated + default (strict off) -> admissible alone decides: 0.
+        assert_eq!(verify_exit_code(true, false, &violated()), 0);
+        // Violated + strict -> 1 even though admissible.
+        assert_eq!(verify_exit_code(true, true, &violated()), 1);
+        // Satisfied + strict -> 0.
+        assert_eq!(verify_exit_code(true, true, &satisfied()), 0);
+        // E3: strict + zero verdicts (no --properties) -> admissible only: 0.
+        assert_eq!(verify_exit_code(true, true, &[]), 0);
+        // Inadmissible dominates in every strict/default mode.
+        assert_eq!(verify_exit_code(false, false, &satisfied()), 1);
+        assert_eq!(verify_exit_code(false, true, &satisfied()), 1);
+    }
+
+    #[test]
+    fn test_verify_exit_code_error_verdict_strict() {
+        // F8 witness: an injected evaluation Err surfaces as an explicit
+        // Error verdict; strict fires on it; default still admissible-only.
+        let err_verdicts = vec![PropertyVerdict::error(
+            "p".to_string(),
+            "injected error".to_string(),
+            3,
+        )];
+        assert_eq!(verify_exit_code(true, true, &err_verdicts), 1);
+        assert_eq!(verify_exit_code(true, false, &err_verdicts), 0);
+        // The Error verdict reports its counts and never claims satisfaction.
+        let injected = err_verdicts.into_iter().next().unwrap();
+        assert_eq!(injected.selected_count, 3);
+        assert_eq!(injected.matched_count, 0);
+    }
+
+    // ── F1/B1: source-mismatched predicate fields ────────────────────
+
+    #[test]
+    fn test_facts_source_mismatch_forces_error() {
+        use runtimo_core::oracle::Verdict;
+        // event_type is union-valid but WAL-only: on facts it must be
+        // Error with the field named, never a silent Satisfied.
+        let records = vec![serde_json::json!({"family": "f1"})];
+        let spec = parse_spec(
+            r#"{"name":"mismatch","predicates":[{"field":"event_type","op":"Eq","value":"x"}]}"#,
+        )
+        .unwrap();
+        let eval = evaluate_facts_records(&records, &spec);
+        assert_eq!(eval.verdict, Verdict::Error);
+        assert_eq!(eval.mismatched, vec!["event_type".to_string()]);
+        assert!(eval.detail.contains("event_type"));
+    }
+
+    // ── F2/B5: unobserved facts fields skip WITH disclosure ──────────
+
+    #[test]
+    fn test_facts_typo_key_skips_with_disclosure() {
+        use runtimo_core::oracle::Verdict;
+        // extra.typo_xyz is never observed: NOT OBSERVED != FALSE keeps
+        // Satisfied, but the skip must be disclosed (count + field name).
+        let records = vec![serde_json::json!({"family": "f1"})];
+        let spec = parse_spec(
+            r#"{"name":"typo","predicates":[{"field":"extra.typo_xyz","op":"Eq","value":0}]}"#,
+        )
+        .unwrap();
+        let eval = evaluate_facts_records(&records, &spec);
+        assert_eq!(eval.verdict, Verdict::Satisfied);
+        assert!(eval.skipped > 0, "skip must be counted");
+        assert_eq!(eval.unobserved, vec!["extra.typo_xyz".to_string()]);
+    }
+
+    #[test]
+    fn test_facts_observed_violation_not_masked_by_skip() {
+        use runtimo_core::oracle::Verdict;
+        // Edge: a skipped unobserved field must not mask an observed
+        // violation on another predicate.
+        let records = vec![serde_json::json!({"family": "f1"})];
+        let spec = parse_spec(
+            r#"{"name":"mix","predicates":[{"field":"extra.typo_xyz","op":"Eq","value":0},{"field":"family","op":"Eq","value":"nope"}]}"#,
+        )
+        .unwrap();
+        let eval = evaluate_facts_records(&records, &spec);
+        assert_eq!(eval.verdict, Verdict::Violated);
+        assert!(eval.skipped > 0);
     }
 }
