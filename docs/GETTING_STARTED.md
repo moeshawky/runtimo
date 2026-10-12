@@ -1,7 +1,7 @@
 # Getting Started with Runtimo
 
-**Version:** 0.10.1
-**Last Updated:** 2026-09-22
+**Version:** 0.10.2
+**Last Updated:** 2026-10-12
 
 This guide walks you through using Runtimo for the first time. By the end, you'll have executed capabilities with full telemetry, process tracking, and crash recovery.
 

@@ -1,8 +1,8 @@
 # Runtimo Core API Reference
 
-**Version:** 0.10.1
-**Updated:** 2026-09-22
-**Documentation:** [docs.rs/runtimo-core](https://docs.rs/runtimo-core/0.10.1)
+**Version:** 0.10.2
+**Updated:** 2026-10-12
+**Documentation:** [docs.rs/runtimo-core](https://docs.rs/runtimo-core/0.10.2)
 
 ## Quick Links
 
@@ -228,6 +228,34 @@ runtimo run -c Delete -a '{"path":"/tmp/libtpu_lockfile"}'
 runtimo run -c Delete -a '{"path":"/models/llama-70b.safetensors","no_backup":true}'
 ```
 
+### Undo
+
+**Purpose:** Restore files from a job's pre-mutation backup — whole job or one file
+
+**Schema:**
+```json
+{
+  "type": "object",
+  "properties": {
+    "job_id": { "type": "string" },
+    "file": { "type": "string" }
+  },
+  "required": ["job_id"]
+}
+```
+
+**Scope filter (`file`, enforced since 0.10.2):**
+- Accepted forms, matched per backup entry: the backup filename, any suffix of the backup path, or any string the backup filename is a suffix of (covers full original paths). Source: `core/src/capabilities/undo.rs:28-43`
+- Empty or whitespace-only → `InvalidArgs` (an empty string is a suffix of every path — accepting it would silently widen a scoped undo into a whole-job restore)
+- Zero matching entries → `NotFound` (never silent success)
+- Restore targets re-validated against allowed prefixes
+
+**Example:**
+```bash
+runtimo run -c Undo -a '{"job_id":"<job_id>"}'
+runtimo run -c Undo -a '{"job_id":"<job_id>","file":"config.toml"}'
+```
+
 ### ShellExec (← since 0.7.1)
 
 **Purpose:** Execute shell commands via `sh -c` with timeout, isolation, and audit trail
@@ -272,7 +300,7 @@ runtimo run -c Delete -a '{"path":"/models/llama-70b.safetensors","no_backup":tr
 | `timeout_secs` | `u64` | Effective timeout |
 | `timed_out` | `bool` | `true` ONLY on timeout-kill path (elapsed > timeout and `SIGKILL` to process group). Signal kills (OOM `SIGKILL`, `SIGTERM`) leave `false`. Source: `core/src/capabilities/shell_exec.rs` |
 | `signal` | `Option<i32>` | Terminating signal number via `ExitStatus::signal()`; `Some(n)` for any signal, `None` for normal exit. Source: `core/src/capabilities/shell_exec.rs` |
-| `truncated` | `bool` | `true` when stdout or stderr exceeded 10 MB cap (bytes were dropped) |
+| `truncated` | `bool` | `true` only when stdout or stderr strictly exceeded the 10 MB cap (bytes were dropped); output exactly at the cap reports `false`. Drain reads one sentinel byte past the cap to decide from the read, not the size |
 
 > `timed_out` replaces the prior `code().is_none()` inference (RC3 fix) — the only timeout sentinel.
 
@@ -310,7 +338,7 @@ runtimo run -c ShellExec -a '{"cmd":"rm -rf /"}'
 
 **Security:**
 - Branch name validation: rejects `--` prefixes, `refs/` injection, whitespace, metacharacters
-- URL validation: SSRF-blocked (localhost, private IPs, file://, git:// internal)
+- URL validation: SSRF-blocked (localhost, private IPs, file://, git:// internal). Hosts are normalized before the check: decimal/hex/octal dotted quads, short-form numerics, bracketed IPv6, `::ffff:`-mapped IPv4, and `user@host`/scp-like authorities; loopback `127/8` and `10/8` are gated; credentials are redacted from error messages
 - Secret detection: scans staged diffs for credential patterns
 - Undo via backup: pre-mutation snapshot for revert operations
 
@@ -843,7 +871,7 @@ cargo test -- --nocapture
 
 ## Version
 
-0.10.1
+0.10.2
 
 ## License
 

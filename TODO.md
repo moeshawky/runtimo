@@ -1,9 +1,9 @@
 # Runtimo Status
 
-**Last Updated:** 2026-09-23
+**Last Updated:** 2026-10-12
 **Build:** `cargo clippy --all-targets` — clean, 0 warnings
-**Tests:** ~767 passed / 2 failed same-known (observe_fixture_b_integration, observe_self_test_run_exits_zero) / runtime_fact_export 12/12 (39 cli + 489 core-lib + 69 integration + 46 robust + 15 conformance09 + 12 runtime_fact_export + 8 doctest)
-**Version:** 0.10.1 (released) — crate deps pinned ^0.10 (verified: daemon/Cargo.toml:18, cli/Cargo.toml:23-24)
+**Tests:** 815 passed / 4 failed same-known (proc-VSZ env x2 + llmosafe-escalation integration x2, all reproduced on pristine baseline) / 28 ignored (44 cli + 524 core-lib + 69 integration + 45 robust + 28 adapters + 15 conformance09 + 12 runtime_fact_export + 70 daemon + 8 doctest)
+**Version:** 0.10.2 (tagged locally, unpushed) — crate deps pinned ^0.10 (verified: daemon/Cargo.toml:18, cli/Cargo.toml:23-24)
 
 ---
 
@@ -37,7 +37,7 @@
 - **ShellExec** — `sh -c` execution, timeout enforcement, descendant kill, dangerous command blocklist (hardcoded + config overrides), WAL audit, skip_cognitive bypass
 - **Kill** — POSIX signal support, protected PID list, PID reuse prevention
 - **GitExec** — clone/pull/commit/revert/clean/status, URL sanitization, secret file detection, SSRF protection
-- **Undo** — restore from backup via job ID, path validation on restore targets
+- **Undo** — restore from backup via job ID, path validation on restore targets, optional `file` scope filter (backup filename / path suffix; empty rejected, zero-match returns `NotFound`)
 - **Delete** — backup-before-delete, undo support, path validation, critical file denylist
 
 ### CLI (`runtimo`)

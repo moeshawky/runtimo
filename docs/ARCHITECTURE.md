@@ -1,7 +1,7 @@
 # Runtimo Architecture
 
-**Version:** 0.10.1
-**Last Updated:** 2026-09-22
+**Version:** 0.10.2
+**Last Updated:** 2026-10-12
 
 ---
 
@@ -92,6 +92,7 @@ FileWrite.execute()
 Undo.execute() / CLI undo
   │
   ├─ WalReader.load()                  // read WAL for backup→path mapping
+  ├─ Scope filter (`file`, 0.10.2)     // backup filename / path suffix match; empty → InvalidArgs, zero-match → NotFound
   ├─ For each backup file:
   │   ├─ map backup_path → original_path (from WAL)
   │   ├─ validate_path(original_path)  // re-validate against allowed prefixes
