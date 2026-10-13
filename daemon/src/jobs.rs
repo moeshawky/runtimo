@@ -52,7 +52,12 @@ impl BackgroundJobRegistry {
     /// Returns `true` if a slot was reserved (current running jobs < MAX_CONCURRENT_JOBS),
     /// `false` if the limit has been reached.
     pub fn try_reserve(&self) -> bool {
-        #[allow(clippy::arithmetic_side_effects)] // n+1 only when n < MAX, bounded
+        #[allow(clippy::arithmetic_side_effects)]
+        // n+1 only when n < MAX, bounded
+        // allow(deprecated): the successor spelling `try_update` does not
+        // exist at the workspace MSRV floor (1.85); `fetch_update` works on
+        // every toolchain and is behavior-identical here.
+        #[allow(deprecated)]
         self.running
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                 if n < MAX_CONCURRENT_JOBS {
@@ -70,6 +75,9 @@ impl BackgroundJobRegistry {
     /// release-without-reserve, which would permanently block `try_reserve`.
     /// A release when `running == 0` is a no-op (idempotent).
     pub fn release(&self) {
+        // allow(deprecated): see try_reserve — `try_update` is unavailable
+        // at the workspace MSRV floor (1.85).
+        #[allow(deprecated)]
         let _ = self
             .running
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
