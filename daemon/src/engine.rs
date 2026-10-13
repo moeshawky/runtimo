@@ -1599,7 +1599,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let wal_path_bg = wal_path.clone();
         let backup_dir = runtimo_core::utils::backup_dir();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_hours(1));
+            // from_secs(3600): identical 1-hour cadence; Duration::from_hours
+            // is unstable below the workspace rust-version floor (1.85).
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600));
             loop {
                 interval.tick().await;
                 if let Err(e) =

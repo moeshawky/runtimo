@@ -1169,7 +1169,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                                     return Ok(());
                                 }
                                 let elapsed = start.elapsed().as_secs();
-                                if elapsed > 0 && elapsed.is_multiple_of(10) {
+                                // `% 10 == 0`: identical cadence check;
+                                // u64::is_multiple_of is unstable below the
+                                // workspace rust-version floor (1.85), while
+                                // clippy::manual_is_multiple_of wants it back
+                                // — the floor wins (AGENTS.md MSRV invariant).
+                                #[allow(clippy::manual_is_multiple_of)]
+                                if elapsed > 0 && elapsed % 10 == 0 {
                                     println!(
                                         "Job {} still running ({}s elapsed)...",
                                         job_id, elapsed
