@@ -1243,6 +1243,16 @@ async fn handle_observe_verify(
 /// # Outputs
 /// Returns `{admissible, property_verdicts: [{name, verdict, detail}]}`.
 ///
+/// # Visibility boundary
+/// This RPC reports `admissible` only: evaluation runs over every
+/// `WalReader::load_all` event, but a raw WAL with unparseable lines fails
+/// closed through `verify_report` (`structurally_parseable=false` ⇒
+/// `admissible=false`) without any dropped-line count. The counted
+/// dropped-line disclosure lives in the CLI's two oracle arms
+/// (`oracle evaluate --wal/--bundle`: `dropped_lines` JSON key + stderr
+/// warning; `observe --verify --properties`: sibling JSON key + stderr
+/// warning). This is a documented boundary, not an omission.
+///
 /// # Errors
 /// Returns `-32602` for invalid path, malformed params, or parse failure.
 /// Returns `-32602` for catastrophic evaluation errors.

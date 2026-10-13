@@ -1329,7 +1329,8 @@ fn g_perf_write_read_near_linear() {
 // WAL: Corruption Tolerance (C44)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// WalReader silently skips malformed lines — crash recovery invariant.
+/// Malformed lines are dropped AND counted ([`WalReader::dropped_lines`]),
+/// never corrupting the stream — crash recovery invariant.
 /// Verifies that invalid JSON, partial lines, and binary garbage embedded
 /// in a WAL file do not prevent reading of valid events before and after
 /// the corrupted region.
@@ -1378,7 +1379,7 @@ fn wal_corruption_tolerance() {
     let events = reader.events();
 
     // Should have 3 valid events from initial write + 1 from after corruption
-    // (the corrupted lines between are silently skipped)
+    // (the corrupted lines between are dropped and counted, never corrupting the stream)
     assert!(
         events.len() >= 3,
         "Should have at least 3 valid events, got {}",

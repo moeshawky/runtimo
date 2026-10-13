@@ -344,6 +344,10 @@ Rate from --sample-rate-hz or RUNTIMO_OBSERVE_SAMPLE_HZ or config observe.sample
         /// Verify a bundle file offline and print a full verification report
         /// (6 predicates + admissible + hash_ok + watermark + property_verdicts).
         /// Exit code 0 if admissible, 1 otherwise.
+        /// Scope: `truncated_gaps` is single-file gap accounting over the bundle
+        /// record stream; `dropped_lines` is archive-inclusive parse drops over
+        /// [`WalReader::load_all`] (current + archived WAL files). One corruption
+        /// can inflate both quantities — they are not the same number.
         #[arg(long)]
         verify: Option<PathBuf>,
         /// Property specification as a JSON string (e.g. {"name":"p","predicates":[...]})
@@ -2731,12 +2735,21 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
                 let res = runtimo_core::observe::verify_report(&vpath);
                 // Load events for oracle evaluation via the arm's existing loading path.
-                let wal_events: Vec<runtimo_core::wal::WalEvent> =
+                let (wal_events, wal_dropped): (Vec<runtimo_core::wal::WalEvent>, usize) =
                     if let Ok(reader) = WalReader::load_all(&vpath) {
-                        reader.events().to_vec()
+                        (reader.events().to_vec(), reader.dropped_lines())
                     } else {
-                        Vec::new()
+                        (Vec::new(), 0)
                     };
+                // DEBT-1 disclosure: unparseable lines never invalidate the
+                // verdict, so name the drop count on stderr instead of letting
+                // a partial event set pass as complete evidence.
+                if wal_dropped > 0 {
+                    eprintln!(
+                        "verify: {wal_dropped} line(s) failed to parse and were dropped across the current + archived files — verdict computed over {} parsed event(s) (NOT OBSERVED != ABSENT)",
+                        wal_events.len()
+                    );
+                }
                 // Evaluate --properties spec if present; parse failure exits 1.
                 let property_verdicts: Vec<PropertyVerdict> = if let Some(ref spec_str) = properties
                 {
@@ -2790,6 +2803,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                             "path": vpath.display().to_string(),
                             "total": res.total,
                             "truncated_gaps": res.truncated_gaps,
+                            "dropped_lines": wal_dropped,
                             "structurally_parseable": res.structurally_parseable,
                             "integrity_valid": res.integrity_valid,
                             "hash_ok": res.structurally_parseable && res.integrity_valid,
@@ -3036,6 +3050,15 @@ fn main() -> Result<(), Box<dyn Error>> {
 /// Oracle exit codes (§44): 0 Satisfied, 1 Violated, 2 property/eval error,
 /// 3 evidence/infrastructure error. Violated is a successful evaluation with
 /// a negative result — not a crash.
+///
+/// # WAL/bundle arm disclosure
+/// The `--wal`/`--bundle` arm reports how many non-empty evidence lines
+/// failed to parse: `dropped_lines` is always present in JSON output and as
+/// a `dropped_lines=` suffix on the text line, and a non-zero count emits a
+/// stderr warning naming the dropped and parsed counts. Unparseable lines
+/// never change a verdict, so without this disclosure a corrupt WAL could
+/// still yield a vacuous `Satisfied` over a partial event set
+/// (`NOT OBSERVED != ABSENT`).
 fn oracle_evaluate(
     wal: Option<PathBuf>,
     bundle: Option<PathBuf>,
@@ -3114,7 +3137,14 @@ fn oracle_evaluate(
             return 3;
         }
     };
+    let dropped = reader.dropped_lines();
     let events = reader.events();
+    let parsed = events.len();
+    if dropped > 0 {
+        eprintln!(
+            "oracle evaluate: {source_kind}: {dropped} line(s) failed to parse and were dropped — verdict computed over {parsed} parsed event(s) (NOT OBSERVED != ABSENT)"
+        );
+    }
     let verdict = match evaluate(events, &spec) {
         Ok(v) => v,
         Err(e) => {
@@ -3138,18 +3168,20 @@ fn oracle_evaluate(
                 "selected_count": verdict.selected_count,
                 "evaluated_count": verdict.evaluated_count,
                 "matched_count": verdict.matched_count,
+                "dropped_lines": dropped,
             }))
             .unwrap_or_default()
         );
     } else {
         println!(
-            "oracle {}: {:?} — {} (selected={}, evaluated={}, matched={})",
+            "oracle {}: {:?} — {} (selected={}, evaluated={}, matched={}, dropped_lines={})",
             verdict.name,
             verdict.verdict,
             verdict.detail,
             verdict.selected_count,
             verdict.evaluated_count,
-            verdict.matched_count
+            verdict.matched_count,
+            dropped
         );
     }
     code
@@ -3574,7 +3606,7 @@ fn print_oracle_schema() {
                 "select": "optional ANDed pre-filter (missing field => filtered out, never UnknownField)",
                 "quantifier": "all (default, legacy) | exists | none | {count: {op, threshold}}",
                 "version": "optional 1|2",
-                "counts": "selected_count/evaluated_count/matched_count always reported; zero matches never hidden"
+                "counts": "wal/bundle: selected_count/evaluated_count/matched_count/dropped_lines always reported; facts: selected_count/matched_count/skipped_count/unobserved_fields reported (facts has no evaluated_count/dropped_lines — facts parse failure is a hard exit 3); zero matches never hidden"
             },
             "fields": {
                 "event": ["event_type", "job_id", "seq", "capability", "error", "output.<key>", "watermark(bundle-metadata-only=>Error)"],

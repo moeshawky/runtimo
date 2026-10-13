@@ -530,8 +530,13 @@ impl WalWriter {
 
 /// Reads and parses a WAL file into a list of events.
 ///
-/// Malformed lines are silently skipped. This is intentional — partial writes
-/// from crashes may leave incomplete JSON at the end of the file.
+/// Malformed lines are counted, not silently discarded: every constructor
+/// records how many non-empty lines failed to parse and exposes the total
+/// via [`WalReader::dropped_lines`]. Partial writes from crashes may leave
+/// incomplete JSON at the end of the file — counting keeps that disclosure
+/// visible to consumers. Blank/whitespace-only lines are not malformed lines
+/// and are never counted; [`WalEventType::WriterInitialized`] marker
+/// filtering is not a drop.
 ///
 /// # Single-File vs Multi-File Loading
 ///
@@ -539,7 +544,8 @@ impl WalWriter {
 /// - [`WalReader::load_all`] reads the current file PLUS all archived rotation
 ///   files (`{path}.1`, `{path}.2`, ...) in chronological order (oldest first,
 ///   newest last). Use `load_all` when consumers need complete event history
-///   across WAL rotations.
+///   across WAL rotations. `dropped_lines` covers archives and the current
+///   file alike.
 ///
 /// # Example
 ///
@@ -551,10 +557,17 @@ impl WalWriter {
 /// for event in reader.events() {
 ///     println!("Event: {:?} for job {}", event.event_type, event.job_id);
 /// }
+/// if reader.dropped_lines() > 0 {
+///     eprintln!("{} WAL line(s) failed to parse", reader.dropped_lines());
+/// }
 /// ```
 #[allow(clippy::exhaustive_structs)]
 pub struct WalReader {
     events: Vec<WalEvent>,
+    /// Non-empty lines that failed `WalEvent` deserialization, summed across
+    /// every file this reader consumed (archives included for `load_all`).
+    /// Zero on clean input; blank lines never contribute.
+    dropped_lines: usize,
 }
 
 impl WalReader {
@@ -567,20 +580,36 @@ impl WalReader {
     /// # Errors
     ///
     /// Returns [`Error::WalError`](crate::Error::WalError) if the file cannot
-    /// be read. Individual malformed lines are skipped, not treated as errors.
+    /// be read. Individual malformed lines are not treated as errors: each
+    /// non-empty line that fails to parse is counted and exposed via
+    /// [`WalReader::dropped_lines`]; blank/whitespace-only lines are skipped
+    /// without counting.
     ///
-    /// [`WalEventType::WriterInitialized`] marker events are silently skipped.
+    /// [`WalEventType::WriterInitialized`] marker events are silently skipped
+    /// and are not counted as drops.
     pub fn load(path: &Path) -> Result<Self> {
         let content =
             std::fs::read_to_string(path).map_err(|e| crate::Error::WalError(e.to_string()))?;
 
-        let events: Vec<WalEvent> = content
-            .lines()
-            .filter_map(|line| serde_json::from_str::<WalEvent>(line).ok())
-            .filter(|e| e.event_type != WalEventType::WriterInitialized)
-            .collect();
+        let mut events: Vec<WalEvent> = Vec::new();
+        let mut dropped_lines = 0usize;
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<WalEvent>(line) {
+                Ok(event) if event.event_type != WalEventType::WriterInitialized => {
+                    events.push(event);
+                }
+                Ok(_) => {}
+                Err(_) => dropped_lines += 1,
+            }
+        }
 
-        Ok(Self { events })
+        Ok(Self {
+            events,
+            dropped_lines,
+        })
     }
 
     /// Loads and parses all events from the current WAL file and all archived
@@ -593,13 +622,15 @@ impl WalReader {
     /// event history across WAL rotations.
     ///
     /// Archived files that do not exist are silently skipped. Malformed lines
-    /// within any file are silently skipped (same behavior as [`Self::load`]).
+    /// within any file are counted (same behavior as [`Self::load`]) and the
+    /// totals for archives and the current file are summed into
+    /// [`WalReader::dropped_lines`].
     ///
     /// # Errors
     ///
     /// Returns [`Error::WalError`](crate::Error::WalError) if the current WAL
     /// file at `path` cannot be read. Archived file read failures are logged
-    /// and skipped (non-fatal).
+    /// and skipped (non-fatal); their unreadable contents cannot be counted.
     pub fn load_all(path: &Path) -> Result<Self> {
         // Discover archived rotation files by scanning for numeric suffixes.
         // Rotation naming: path.1, path.2, ..., path.N
@@ -633,16 +664,25 @@ impl WalReader {
         archived_indices.sort_unstable_by(|a, b| b.cmp(a));
 
         let mut events: Vec<WalEvent> = Vec::new();
+        let mut dropped_lines = 0usize;
 
         // Read archived files (newest archive first → oldest archive last)
         for index in &archived_indices {
             let rotated = rotation_path_for(path, *index);
             if let Ok(content) = std::fs::read_to_string(&rotated) {
-                let file_events: Vec<WalEvent> = content
-                    .lines()
-                    .filter_map(|line| serde_json::from_str::<WalEvent>(line).ok())
-                    .filter(|e| e.event_type != WalEventType::WriterInitialized)
-                    .collect();
+                let mut file_events: Vec<WalEvent> = Vec::new();
+                for line in content.lines() {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    match serde_json::from_str::<WalEvent>(line) {
+                        Ok(event) if event.event_type != WalEventType::WriterInitialized => {
+                            file_events.push(event);
+                        }
+                        Ok(_) => {}
+                        Err(_) => dropped_lines += 1,
+                    }
+                }
                 // Prepend: archived events are older, so they go before
                 // whatever we've already collected.
                 let mut combined = file_events;
@@ -656,14 +696,23 @@ impl WalReader {
         // Read the current (active) WAL file
         let content =
             std::fs::read_to_string(path).map_err(|e| crate::Error::WalError(e.to_string()))?;
-        let current_events: Vec<WalEvent> = content
-            .lines()
-            .filter_map(|line| serde_json::from_str::<WalEvent>(line).ok())
-            .filter(|e| e.event_type != WalEventType::WriterInitialized)
-            .collect();
-        events.extend(current_events);
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<WalEvent>(line) {
+                Ok(event) if event.event_type != WalEventType::WriterInitialized => {
+                    events.push(event);
+                }
+                Ok(_) => {}
+                Err(_) => dropped_lines += 1,
+            }
+        }
 
-        Ok(Self { events })
+        Ok(Self {
+            events,
+            dropped_lines,
+        })
     }
 
     /// Returns a slice of all parsed events.
@@ -672,13 +721,36 @@ impl WalReader {
         &self.events
     }
 
+    /// Returns the number of non-empty WAL lines that failed to parse.
+    ///
+    /// # Outputs
+    /// Count of unparseable non-empty lines across every file the reader
+    /// consumed (archives plus the current file for [`WalReader::load_all`]).
+    /// Blank/whitespace-only lines are excluded (they are structure, not
+    /// corruption); [`WalEventType::WriterInitialized`] marker lines parse
+    /// successfully and are filtered by [`WalReader::load`] and
+    /// [`WalReader::load_all`], so they never count there —
+    /// [`WalReader::tail`] does not filter them.
+    ///
+    /// # Invariants
+    /// - Purely observational: the verdicts computed over `events()` are
+    ///   unchanged by this count. A non-zero value means the event set is
+    ///   incomplete — `NOT OBSERVED != ABSENT`.
+    #[must_use]
+    pub fn dropped_lines(&self) -> usize {
+        self.dropped_lines
+    }
+
     /// Reads the last `n` parseable events from the WAL file.
     ///
     /// Streams the whole file line-by-line and retains the last `n`
     /// parseable events (I/O is the full file; only retention is
     /// bounded). More efficient than [`WalReader::load`] in memory,
     /// not in I/O, when only recent events are needed.
-    /// Malformed lines are silently skipped.
+    /// Malformed lines are counted (same rule as [`WalReader::load`]:
+    /// non-empty lines that fail to parse) and exposed via
+    /// [`WalReader::dropped_lines`]; the count covers the whole streamed
+    /// file even though only the last `n` events are retained.
     ///
     /// # Errors
     ///
@@ -691,18 +763,26 @@ impl WalReader {
         let reader = BufReader::new(file);
 
         let mut window: VecDeque<WalEvent> = VecDeque::with_capacity(n.saturating_add(1));
+        let mut dropped_lines = 0usize;
         for line in reader.lines() {
             let line = line.map_err(|e| crate::Error::WalError(e.to_string()))?;
-            if let Ok(event) = serde_json::from_str(&line) {
-                window.push_back(event);
-                if window.len() > n {
-                    window.pop_front();
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str(&line) {
+                Ok(event) => {
+                    window.push_back(event);
+                    if window.len() > n {
+                        window.pop_front();
+                    }
                 }
+                Err(_) => dropped_lines += 1,
             }
         }
 
         Ok(Self {
             events: window.into(),
+            dropped_lines,
         })
     }
 }
@@ -1599,6 +1679,118 @@ mod tests {
         let reader = WalReader::load(&path).unwrap();
         assert_eq!(reader.events().len(), 1);
         assert_eq!(reader.events()[0].job_id, "test-job");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn valid_event_line(seq: u64, job: &str) -> String {
+        format!(
+            r#"{{"seq":{},"ts":1715800000,"type":"job_started","job_id":"{}"}}"#,
+            seq, job
+        )
+    }
+
+    #[test]
+    fn test_load_counts_corrupt_line_as_dropped() {
+        let path = tmp_wal("drop_corrupt");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            format!("{}\nGARBAGE NOT JSON\n", valid_event_line(1, "j1")),
+        )
+        .unwrap();
+
+        let reader = WalReader::load(&path).unwrap();
+        assert_eq!(reader.events().len(), 1);
+        assert_eq!(reader.dropped_lines(), 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_load_blank_and_whitespace_lines_not_counted() {
+        let path = tmp_wal("drop_blank");
+        let _ = std::fs::remove_file(&path);
+        // Trailing newlines plus blank/whitespace-only interior lines are
+        // structure, not corruption: zero drops (regression pin of the
+        // blank-line counting rule — every real WAL ends with a newline).
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n\n   \n{}\n\n",
+                valid_event_line(1, "j1"),
+                valid_event_line(2, "j2")
+            ),
+        )
+        .unwrap();
+
+        let reader = WalReader::load(&path).unwrap();
+        assert_eq!(reader.events().len(), 2);
+        assert_eq!(reader.dropped_lines(), 0);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_load_all_counts_archive_and_current_drops() {
+        let path = tmp_wal("drop_all");
+        let archive = rotation_path_for(&path, 1);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&archive);
+        std::fs::write(&archive, "ARCHIVE CORRUPT\n").unwrap();
+        std::fs::write(&path, "CURRENT CORRUPT\n").unwrap();
+
+        let reader = WalReader::load_all(&path).unwrap();
+        assert_eq!(reader.events().len(), 0);
+        assert_eq!(reader.dropped_lines(), 2);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&archive);
+    }
+
+    #[test]
+    fn test_load_clean_file_zero_drops() {
+        let path = tmp_wal("drop_clean");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, valid_event_line(1, "j1")).unwrap();
+
+        let reader = WalReader::load(&path).unwrap();
+        assert_eq!(reader.dropped_lines(), 0);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_writer_initialized_line_not_counted_as_drop() {
+        let path = tmp_wal("drop_marker");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                r#"{"seq":0,"ts":1715800000,"type":"writer_initialized","job_id":""}"#,
+                valid_event_line(1, "j1")
+            ),
+        )
+        .unwrap();
+
+        let reader = WalReader::load(&path).unwrap();
+        // Marker filtering is not a drop; the event count is unchanged.
+        assert_eq!(reader.events().len(), 1);
+        assert_eq!(reader.dropped_lines(), 0);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_tail_counts_drops_over_streamed_file() {
+        let path = tmp_wal("drop_tail");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, format!("CORRUPT\n{}\n", valid_event_line(1, "j1"))).unwrap();
+
+        let reader = WalReader::tail(&path, 5).unwrap();
+        assert_eq!(reader.events().len(), 1);
+        assert_eq!(reader.dropped_lines(), 1);
 
         let _ = std::fs::remove_file(&path);
     }
