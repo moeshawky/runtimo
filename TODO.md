@@ -3,7 +3,7 @@
 **Last Updated:** 2026-10-12
 **Build:** `cargo clippy --all-targets` — clean, 0 warnings
 **Tests:** 815 passed / 4 failed same-known (proc-VSZ env x2 + llmosafe-escalation integration x2, all reproduced on pristine baseline) / 28 ignored (44 cli + 524 core-lib + 69 integration + 45 robust + 28 adapters + 15 conformance09 + 12 runtime_fact_export + 70 daemon + 8 doctest)
-**Version:** 0.10.2 (tagged locally, unpushed) — crate deps pinned ^0.10 (verified: daemon/Cargo.toml:18, cli/Cargo.toml:23-24)
+**Version:** 0.10.3 — crate deps pinned ^0.10 (verified: daemon/Cargo.toml:19, cli/Cargo.toml:24-25)
 
 ---
 

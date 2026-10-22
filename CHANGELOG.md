@@ -41,6 +41,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **OBSERVED final (precision run):** lib 489/0, integration 69/2 same-known (`observe_fixture_b_integration` + `observe_self_test_run_exits_zero`), sampler 0 samples at 50Hz container, robust 46/0, conformance09 15/0, runtime_fact_export 12/0, cli 39/0, daemon 69/0, doc 28/0; total ~767 passed / 2 failed same-known. State fmt/check/clippy/deny/machete/MSRV exit 0.
 - **Known failures (same-known, reproduced on pre-change baseline):** `observe_fixture_b_integration` + `observe_self_test_run_exits_zero` — sampler yields 0 samples at 50Hz in this container.
 
+## [0.10.3] - 2026-10-22
+
+### Added
+- **Explicit JobId Execution API** — Added `execute_with_id` in `core/src/executor.rs` and re-exported it in `core/src/lib.rs`, enabling external callers and background daemon supervisors to supply an authoritative `JobId` that threads consistently through execution, WAL logging, and session management. Retained `execute_with_telemetry_and_session` as a backwards-compatible pass-through.
+
+### Fixed
+- **Daemon background dispatch identity unification (#7)** — `handle_dispatch` in `daemon/src/engine.rs` now passes its generated background `JobId` directly to `execute_with_id`, eliminating identity divergence where executor-internal IDs mismatched background registry entries in the WAL.
+- **Job terminal status resolution in WAL** — `handle_jobs` now correctly records `WalEventType::JobFailed` as `"failed"` rather than conflating all finished events into `"completed"`.
+- **Test registry cleanup & integration coverage** — Added `BackgroundJobRegistry::clear_for_test` in `daemon/src/jobs.rs` and added `test_dispatch_identity_and_status` in `daemon/src/engine.rs` validating historical status lookup for completed, failed, and started-only jobs.
+
+### Testing
+- **OBSERVED final (this release):** cli 49/0, daemon 71/0 (includes `test_dispatch_identity_and_status`), core integration 71/0 (isolated config), robust 45/1 same-known (`drift_process_vsz_rss_reasonable` due to 64-bit 1TB container ceiling). `cargo fmt --check` clean, `cargo clippy --all-targets` zero warnings.
+
 ## [0.10.2] - 2026-10-12
 
 ### Added
