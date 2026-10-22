@@ -280,8 +280,34 @@ pub fn execute_with_telemetry_and_session(
     working_dir: Option<PathBuf>,
     timeout_secs: u64,
 ) -> Result<ExecutionResult> {
-    let job_id = JobId::new();
-    let job_id_str = job_id.as_str().to_string();
+    execute_with_id(
+        capability,
+        args,
+        dry_run,
+        wal_path,
+        session_id,
+        working_dir,
+        timeout_secs,
+        JobId::new().as_str().to_string(),
+    )
+}
+
+/// Underlying execution implementation that accepts an explicit job ID.
+///
+/// # Errors
+///
+/// See [`execute_with_telemetry_and_session`] for error conditions.
+#[allow(clippy::too_many_lines)]
+pub fn execute_with_id(
+    capability: &dyn Capability,
+    args: &Value,
+    dry_run: bool,
+    wal_path: &Path,
+    session_id: Option<&str>,
+    working_dir: Option<PathBuf>,
+    timeout_secs: u64,
+    job_id_str: String,
+) -> Result<ExecutionResult> {
     let cap_name = capability.name().to_string();
 
     // Telemetry gate (RC1): when disabled, skip capture entirely — no
