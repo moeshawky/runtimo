@@ -30,8 +30,8 @@ use runtimo_core::{
     capabilities::{
         is_dangerous_command, Delete, FileRead, FileWrite, GitExec, Kill, ShellExec, Undo,
     },
-    execute_with_telemetry_and_session, BackupManager, CapabilityRegistry, RuntimoConfig, WalEvent,
-    WalEventType, WalReader, WalWriter,
+    execute_with_id, execute_with_telemetry_and_session, BackupManager, CapabilityRegistry,
+    RuntimoConfig, WalEvent, WalEventType, WalReader, WalWriter,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -523,7 +523,7 @@ async fn handle_dispatch(state: &Arc<DaemonState>, params: Value, id: Value) -> 
             // working_dir is Option<String> from RunParams, convert to Option<PathBuf>
             #[allow(clippy::useless_conversion)]
             let wd_path = wd.map(PathBuf::from);
-            execute_with_telemetry_and_session(
+            execute_with_id(
                 cap,
                 &args,
                 dry,
@@ -531,6 +531,7 @@ async fn handle_dispatch(state: &Arc<DaemonState>, params: Value, id: Value) -> 
                 None,
                 wd_path,
                 t_secs,
+                jid.clone(),
             )
         }));
 
@@ -767,6 +768,7 @@ async fn handle_jobs(state: &Arc<DaemonState>, params: Value, id: Value) -> Json
             started: Option<u64>,
             finished: Option<u64>,
             capability: Option<String>,
+            final_status: Option<String>,
         }
         let mut job_entries: HashMap<String, JobEntry> = HashMap::new();
         for e in reader.events() {
@@ -779,8 +781,15 @@ async fn handle_jobs(state: &Arc<DaemonState>, params: Value, id: Value) -> Json
                         .capability
                         .clone_from(&e.capability);
                 }
-                WalEventType::JobCompleted | WalEventType::JobFailed => {
-                    job_entries.entry(e.job_id.clone()).or_default().finished = Some(e.ts);
+                WalEventType::JobCompleted => {
+                    let entry = job_entries.entry(e.job_id.clone()).or_default();
+                    entry.finished = Some(e.ts);
+                    entry.final_status = Some("completed".to_string());
+                }
+                WalEventType::JobFailed => {
+                    let entry = job_entries.entry(e.job_id.clone()).or_default();
+                    entry.finished = Some(e.ts);
+                    entry.final_status = Some("failed".to_string());
                 }
                 _ => {}
             }
@@ -791,10 +800,10 @@ async fn handle_jobs(state: &Arc<DaemonState>, params: Value, id: Value) -> Json
                 continue;
             }
             seen.insert(jid.clone());
-            let status = if entry.finished.is_some() {
-                "completed"
+            let status = if let Some(st) = entry.final_status {
+                st
             } else {
-                "unknown"
+                "unknown".to_string()
             };
             jobs_list.push(serde_json::json!({
                 "job_id": jid,
@@ -2109,6 +2118,7 @@ mod tests {
         assert!(dir.exists());
 
         std::env::remove_var("XDG_DATA_HOME");
+        std::env::remove_var("RUNTIMO_ALLOWED_PATHS");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2136,6 +2146,7 @@ mod tests {
         );
 
         std::env::remove_var("XDG_DATA_HOME");
+        std::env::remove_var("RUNTIMO_ALLOWED_PATHS");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2153,6 +2164,7 @@ mod tests {
         assert_eq!(state.wal_path, custom_wal);
 
         std::env::remove_var("XDG_DATA_HOME");
+        std::env::remove_var("RUNTIMO_ALLOWED_PATHS");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2170,6 +2182,7 @@ mod tests {
         assert!(deep_wal.parent().unwrap().exists());
 
         std::env::remove_var("XDG_DATA_HOME");
+        std::env::remove_var("RUNTIMO_ALLOWED_PATHS");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2185,6 +2198,7 @@ mod tests {
         assert_eq!(actual, dir.join("runtimo"));
 
         std::env::remove_var("XDG_DATA_HOME");
+        std::env::remove_var("RUNTIMO_ALLOWED_PATHS");
     }
 
     #[test]
@@ -2209,6 +2223,7 @@ mod tests {
         assert_eq!(default_socket_path(), expected);
 
         std::env::remove_var("XDG_DATA_HOME");
+        std::env::remove_var("RUNTIMO_ALLOWED_PATHS");
     }
 
     // ── Async handler early-exit paths (no daemon execution needed) ────────
@@ -2247,6 +2262,7 @@ mod tests {
         assert_eq!(response.error.unwrap().code, -32602);
 
         std::env::remove_var("XDG_DATA_HOME");
+        std::env::remove_var("RUNTIMO_ALLOWED_PATHS");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2271,6 +2287,7 @@ mod tests {
         assert_eq!(response.error.unwrap().code, -32602);
 
         std::env::remove_var("XDG_DATA_HOME");
+        std::env::remove_var("RUNTIMO_ALLOWED_PATHS");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2298,6 +2315,7 @@ mod tests {
         assert_eq!(response.error.unwrap().code, -32602);
 
         std::env::remove_var("XDG_DATA_HOME");
+        std::env::remove_var("RUNTIMO_ALLOWED_PATHS");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2321,6 +2339,7 @@ mod tests {
         assert_eq!(response.error.unwrap().code, -32602);
 
         std::env::remove_var("XDG_DATA_HOME");
+        std::env::remove_var("RUNTIMO_ALLOWED_PATHS");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2469,6 +2488,7 @@ mod tests {
         });
 
         std::env::remove_var("XDG_DATA_HOME");
+        std::env::remove_var("RUNTIMO_ALLOWED_PATHS");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2499,6 +2519,7 @@ mod tests {
         });
 
         std::env::remove_var("XDG_DATA_HOME");
+        std::env::remove_var("RUNTIMO_ALLOWED_PATHS");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2539,6 +2560,7 @@ mod tests {
             "should not have dispatched result"
         );
         std::env::remove_var("XDG_DATA_HOME");
+        std::env::remove_var("RUNTIMO_ALLOWED_PATHS");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2557,6 +2579,7 @@ mod tests {
         assert!(response.error.is_some());
         assert_eq!(response.error.unwrap().code, -32602);
         std::env::remove_var("XDG_DATA_HOME");
+        std::env::remove_var("RUNTIMO_ALLOWED_PATHS");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2613,6 +2636,7 @@ mod tests {
         assert_eq!(response.error.unwrap().code, -32602);
         assert!(response.result.is_none());
         std::env::remove_var("XDG_DATA_HOME");
+        std::env::remove_var("RUNTIMO_ALLOWED_PATHS");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2699,6 +2723,7 @@ mod tests {
         assert_eq!(result["total"], 2);
         std::env::remove_var("RUNTIMO_ALLOWED_PATHS");
         std::env::remove_var("XDG_DATA_HOME");
+        std::env::remove_var("RUNTIMO_ALLOWED_PATHS");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2751,6 +2776,7 @@ mod tests {
         assert_eq!(verdicts[0]["verdict"], "Satisfied");
         std::env::remove_var("RUNTIMO_ALLOWED_PATHS");
         std::env::remove_var("XDG_DATA_HOME");
+        std::env::remove_var("RUNTIMO_ALLOWED_PATHS");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2791,6 +2817,7 @@ mod tests {
         assert!(resp.result.is_none());
         std::env::remove_var("RUNTIMO_ALLOWED_PATHS");
         std::env::remove_var("XDG_DATA_HOME");
+        std::env::remove_var("RUNTIMO_ALLOWED_PATHS");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2893,6 +2920,7 @@ mod tests {
         );
 
         std::env::remove_var("XDG_DATA_HOME");
+        std::env::remove_var("RUNTIMO_ALLOWED_PATHS");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2925,6 +2953,172 @@ mod tests {
         }
 
         std::env::remove_var("XDG_DATA_HOME");
+        std::env::remove_var("RUNTIMO_ALLOWED_PATHS");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Dispatch and Execution Identity Tests ─────────────────────────
+
+    #[tokio::test]
+    async fn test_dispatch_identity_and_status() {
+        let dir = unique_test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let success_file = dir.join("success.txt");
+        std::fs::write(&success_file, "hello").unwrap();
+
+        let state = {
+            let _guard = ENV_MUTEX.lock().unwrap();
+            std::env::set_var("XDG_DATA_HOME", dir.to_str().unwrap());
+            std::env::set_var("RUNTIMO_ALLOWED_PATHS", dir.to_str().unwrap());
+            let wp = dir.join("wal.jsonl");
+            Arc::new(DaemonState::new(&wp, None).unwrap())
+        };
+
+        // A. Successful dispatch
+        let req = JsonRpcRequest {
+            method: "dispatch".to_string(),
+            params: serde_json::json!({
+                "capability": "FileRead",
+                "args": {"path": success_file.to_str().unwrap()}
+            }),
+            id: serde_json::Value::from(1),
+        };
+
+        let dispatch_resp = handle_request(&state, req).await;
+        assert!(dispatch_resp.error.is_none());
+        let res = dispatch_resp.result.unwrap();
+        assert_eq!(res["dispatched"], true);
+        let job_id = res["job_id"].as_str().unwrap().to_string();
+
+        // Wait for execution to finish (using bounded polling)
+        let mut completed = false;
+        for _ in 0..100 {
+            let status_req = JsonRpcRequest {
+                method: "status".to_string(),
+                params: serde_json::json!({"job_id": job_id}),
+                id: serde_json::Value::from(2),
+            };
+            let status_resp = handle_request(&state, status_req).await;
+            if let Some(r) = status_resp.result {
+                if r["status"] == "completed" {
+                    completed = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(completed, "Job should complete successfully");
+
+        // F. CLI correlation / WAL check
+        let wp = dir.join("wal.jsonl");
+        let reader = WalReader::load_all(&wp).unwrap();
+        let events: Vec<_> = reader
+            .events()
+            .iter()
+            .filter(|e| e.job_id == job_id)
+            .collect();
+        assert!(
+            !events.is_empty(),
+            "WAL must contain events for dispatch ID"
+        );
+        assert!(events
+            .iter()
+            .any(|e| matches!(e.event_type, WalEventType::JobStarted)));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e.event_type, WalEventType::JobCompleted)));
+
+        // C. Historical lookup
+        // Clear background jobs to simulate daemon restart or memory loss
+        state.bg_jobs.clear_for_test();
+
+        let hist_req = JsonRpcRequest {
+            method: "status".to_string(),
+            params: serde_json::json!({"job_id": job_id}),
+            id: serde_json::Value::from(3),
+        };
+        let hist_resp = handle_request(&state, hist_req).await;
+        assert!(hist_resp.error.is_none());
+        assert_eq!(hist_resp.result.unwrap()["status"], "completed");
+
+        // B. Failed dispatch execution
+        let req_fail = JsonRpcRequest {
+            method: "dispatch".to_string(),
+            params: serde_json::json!({
+                "capability": "FileRead",
+                "args": {"path": "/does/not/exist/9999"}
+            }),
+            id: serde_json::Value::from(4),
+        };
+        let fail_resp = handle_request(&state, req_fail).await;
+        let fail_job_id = fail_resp.result.unwrap()["job_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let mut failed = false;
+        for _ in 0..100 {
+            let status_req = JsonRpcRequest {
+                method: "status".to_string(),
+                params: serde_json::json!({"job_id": fail_job_id}),
+                id: serde_json::Value::from(5),
+            };
+            let status_resp = handle_request(&state, status_req).await;
+            if let Some(r) = status_resp.result {
+                if r["status"] == "failed" {
+                    failed = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(failed, "Job should fail execution");
+
+        // D. Historical failure
+        state.bg_jobs.clear_for_test();
+        let hist_fail_req = JsonRpcRequest {
+            method: "status".to_string(),
+            params: serde_json::json!({"job_id": fail_job_id}),
+            id: serde_json::Value::from(6),
+        };
+        let hist_fail_resp = handle_request(&state, hist_fail_req).await;
+        assert_eq!(
+            hist_fail_resp.result.unwrap()["status"],
+            "failed",
+            "historical status should be failed, not completed"
+        );
+
+        // E. Missing terminal event
+        // Inject a WAL event that is started but never finished
+        let orphan_job = "orphan-123".to_string();
+        {
+            let mut wal = WalWriter::create(&wp).unwrap();
+            wal.append(WalEvent {
+                seq: wal.seq(),
+                ts: 1000,
+                event_type: WalEventType::JobStarted,
+                job_id: orphan_job.clone(),
+                capability: Some("FileRead".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+
+        let hist_orphan_req = JsonRpcRequest {
+            method: "status".to_string(),
+            params: serde_json::json!({"job_id": orphan_job.clone()}),
+            id: serde_json::Value::from(7),
+        };
+        let hist_orphan_resp = handle_request(&state, hist_orphan_req).await;
+        assert_eq!(
+            hist_orphan_resp.result.unwrap()["status"],
+            "unknown",
+            "started but not finished job should be unknown"
+        );
+
+        std::env::remove_var("XDG_DATA_HOME");
+        std::env::remove_var("RUNTIMO_ALLOWED_PATHS");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

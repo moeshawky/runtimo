@@ -128,6 +128,12 @@ impl BackgroundJobRegistry {
         v.truncate(limit);
         v
     }
+
+    #[cfg(test)]
+    #[allow(clippy::unwrap_used)]
+    pub(crate) fn clear_for_test(&self) {
+        self.jobs.write().unwrap().clear();
+    }
 }
 
 #[cfg(test)]

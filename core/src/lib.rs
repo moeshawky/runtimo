@@ -120,7 +120,7 @@ pub use capability::{
     Capability, CapabilityError, CapabilityRegistry, Context, Output, TypedCapability,
 };
 pub use config::RuntimoConfig;
-pub use executor::{execute_with_telemetry, execute_with_telemetry_and_session};
+pub use executor::{execute_with_id, execute_with_telemetry, execute_with_telemetry_and_session};
 pub use job::{Job, JobId, JobState};
 pub use llmosafe::LlmoSafeGuard;
 pub use monitor::HealthMonitor;
